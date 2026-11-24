@@ -1080,6 +1080,71 @@ public sealed class AgentCoreTests
             "vrchat://launch?id=wrld_12345678-1234-1234-1234-1234567890ab:12345 --no-vr")); // whitespace injection
     }
 
+    [Fact]
+    public void LogTailCollector_BackfillsHistoricalOutputLogsOnceWithoutPollutingLiveParser()
+    {
+        string tempRoot = Path.Combine(Path.GetTempPath(), "vrcx-hist-logs-" + Guid.NewGuid().ToString("N"));
+        string logDir = Path.Combine(tempRoot, "logs");
+        string stateDir = Path.Combine(tempRoot, "state");
+        Directory.CreateDirectory(logDir);
+        Directory.CreateDirectory(stateDir);
+
+        try
+        {
+            string olderLog = Path.Combine(logDir, "output_log_2026-11-20_10-00-00.txt");
+            string newerLog = Path.Combine(logDir, "output_log_2026-11-24_20-00-00.txt");
+
+            File.WriteAllLines(olderLog, new[]
+            {
+                "2026.11.20 10:01:00 Log        -  [Behaviour] Joining wrld_11111111-1111-1111-1111-111111111111:1001",
+                "2026.11.20 10:01:02 Log        -  [Behaviour] Entering Room: Old Memory Shrine",
+                "2026.11.20 10:02:00 Log        -  [Behaviour] OnPlayerJoined OldFriend (usr_11111111-1111-1111-1111-111111111111)",
+                @"2026.11.20 10:03:00 Log        -  [VRC Camera] Took screenshot to: C:\old_shot.png"
+            });
+            File.SetLastWriteTimeUtc(olderLog, new DateTime(2026, 11, 20, 10, 5, 0, DateTimeKind.Utc));
+
+            File.WriteAllLines(newerLog, new[]
+            {
+                "2026.11.24 20:01:00 Log        -  [Behaviour] Joining wrld_22222222-2222-2222-2222-222222222222:2002",
+                "2026.11.24 20:01:02 Log        -  [Behaviour] Entering Room: Live Current World"
+            });
+            File.SetLastWriteTimeUtc(newerLog, new DateTime(2026, 11, 24, 20, 5, 0, DateTimeKind.Utc));
+
+            int liveScreenshotCallbacks = 0;
+            var collector1 = new LogTailCollector(stateDir);
+            collector1.ScreenshotCaptured += _ => liveScreenshotCallbacks++;
+
+            int parsed = collector1.PollLogDirectory(logDir);
+            Assert.Equal(4, parsed); // Old Memory Shrine + OldFriend + Screenshot event + Live Current World
+            // Historical log screenshot must NOT trigger live ScreenshotCaptured callback
+            Assert.Equal(0, liveScreenshotCallbacks);
+            // Live parser must reflect ONLY the newest active log file, not polluted by older logs
+            Assert.Equal("Live Current World", collector1.Parser.CurrentWorldName);
+            Assert.Equal(0, collector1.Parser.CurrentPlayerCount);
+
+            List<GameLogEventItem> queued = collector1.PeekBatch(20);
+            Assert.Contains(queued, e => e.Type == "Location" && e.WorldName == "Old Memory Shrine");
+            Assert.Contains(queued, e => e.Type == "OnPlayerJoined" && e.DisplayName == "OldFriend");
+            Assert.Contains(queued, e => e.Type == "Location" && e.WorldName == "Live Current World");
+
+            // Polling again (including after restart with a fresh LogTailCollector) must NOT re-read historical logs
+            Assert.Equal(0, collector1.PollLogDirectory(logDir));
+            var collector2 = new LogTailCollector(stateDir);
+            Assert.Equal(0, collector2.PollLogDirectory(logDir));
+
+            // Appending a new line to the latest log is still picked up cleanly
+            File.AppendAllLines(newerLog, new[]
+            {
+                "2026.11.24 20:06:00 Log        -  [Behaviour] OnPlayerJoined LiveBuddy (usr_22222222-2222-2222-2222-222222222222)"
+            });
+            Assert.Equal(1, collector2.PollLogDirectory(logDir));
+        }
+        finally
+        {
+            if (Directory.Exists(tempRoot)) Directory.Delete(tempRoot, recursive: true);
+        }
+    }
+
     private sealed class StubHttpHandler : HttpMessageHandler
     {
         private readonly Func<HttpRequestMessage, Task<HttpResponseMessage>> _responder;

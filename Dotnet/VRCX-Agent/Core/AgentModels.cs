@@ -9,7 +9,7 @@ namespace VRCX.Agent.Core;
 /// </summary>
 public static class AgentMetadata
 {
-    public const string Version = "1.10.2";
+    public const string Version = "1.10.3";
 }
 
 /// <summary>
@@ -72,11 +72,20 @@ public sealed class LogCursorState
     public long ByteOffset { get; set; }
     public string LastEventDt { get; set; } = string.Empty;
 
+    /// <summary>
+    /// Per-file byte offsets for all processed VRChat output_log_*.txt files,
+    /// enabling one-time backfill of older unread log files without re-reading them.
+    /// </summary>
+    public Dictionary<string, long> FileOffsets { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+
     public LogCursorState Clone() => new()
     {
         FileName = FileName,
         ByteOffset = ByteOffset,
-        LastEventDt = LastEventDt
+        LastEventDt = LastEventDt,
+        FileOffsets = FileOffsets is null
+            ? new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase)
+            : new Dictionary<string, long>(FileOffsets, StringComparer.OrdinalIgnoreCase)
     };
 }
 
