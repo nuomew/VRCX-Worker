@@ -3688,6 +3688,8 @@
         "devices": {
             "heading": "Windows 伴侣定时 HTTP 同步 (VRCX.Agent)",
             "desc": "将下方云端连接地址与同步密钥粘贴到 Windows 端的 VRCX.Agent 中，伴侣程序将按设定间隔通过 HTTPS 定时上传本地 VRChat 日志、状态与截图（无需长连接 WebSocket）。",
+            "download_release_btn": "下载 VRCX.Agent 桌面版 (Windows)",
+            "download_guide_btn": "安装与编译说明",
             "cloud_url": "云端连接地址",
             "copy_url": "复制地址",
             "copied": "已复制",
@@ -3767,7 +3769,7 @@
             "hub_desc": "Windows 伴侣 HTTP 同步、远程控制、R2 云相册与免费配额监控",
             "open_hub": "打开云端中心",
             "derivative_notice_prefix": "VRCX-Worker — 基于上游 ",
-            "derivative_notice_suffix": " 二次开发的 Cloudflare Workers 云端托管版本（MIT 协议）。"
+            "derivative_notice_suffix": " 由 nuomew（诺喵）二次开发的 Cloudflare Workers 云端托管版本（MIT 协议）。"
         }
     }
 }

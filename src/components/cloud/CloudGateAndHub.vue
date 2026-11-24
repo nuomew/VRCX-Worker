@@ -103,10 +103,28 @@
                 <!-- Tab 1: Windows Agent Periodic HTTP Sync (URL + Sync Secret) -->
                 <div v-if="activeTab === 'devices'" class="space-y-4">
                     <div class="rounded-lg border border-border bg-background/50 p-4 space-y-3">
-                        <div>
-                            <div class="font-medium text-foreground">{{ t('cloud_hub.devices.heading') }}</div>
-                            <div class="text-muted-foreground">
-                                {{ t('cloud_hub.devices.desc') }}
+                        <div class="space-y-2">
+                            <div>
+                                <div class="font-medium text-foreground">{{ t('cloud_hub.devices.heading') }}</div>
+                                <div class="text-muted-foreground">
+                                    {{ t('cloud_hub.devices.desc') }}
+                                </div>
+                            </div>
+                            <div class="flex flex-wrap items-center gap-2">
+                                <a
+                                    :href="links.agentDownload"
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    class="inline-flex items-center rounded-md bg-primary px-3 py-1.5 font-medium text-primary-foreground hover:opacity-90">
+                                    {{ t('cloud_hub.devices.download_release_btn') }}
+                                </a>
+                                <a
+                                    :href="links.agentGuide"
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    class="inline-flex items-center rounded-md border border-border px-3 py-1.5 font-medium text-foreground hover:bg-accent">
+                                    {{ t('cloud_hub.devices.download_guide_btn') }}
+                                </a>
                             </div>
                         </div>
 
@@ -439,6 +457,7 @@
     import { cloudFetch, connectCloudHubWs } from '../../ipc-web/apiClient';
     import { loadBootstrap, saveCloudSyncIntervalSeconds } from '../../ipc-web/bootstrapCache';
     import { cloudState } from '../../ipc-web/cloudState';
+    import { links } from '../../shared/constants/link';
 
     const { t } = useI18n();
     const isWeb = typeof WEB !== 'undefined' && WEB;

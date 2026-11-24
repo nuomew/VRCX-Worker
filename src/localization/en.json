@@ -3690,6 +3690,8 @@
         "devices": {
             "heading": "Windows Companion HTTP Sync (VRCX.Agent)",
             "desc": "Paste the Cloud URL and a Sync Secret into VRCX.Agent on Windows. The agent will periodically upload local VRChat logs, state, and screenshots over HTTPS (no persistent WebSocket needed).",
+            "download_release_btn": "Download VRCX.Agent (Windows Releases)",
+            "download_guide_btn": "Install & Build Guide",
             "cloud_url": "Cloud URL",
             "copy_url": "Copy URL",
             "copied": "Copied",
@@ -3769,7 +3771,7 @@
             "hub_desc": "Win Agent HTTP sync, remote controls, R2 gallery & free-tier quota",
             "open_hub": "Open Cloud Hub",
             "derivative_notice_prefix": "VRCX-Worker — Cloudflare Workers cloud edition derived from upstream ",
-            "derivative_notice_suffix": " (MIT)."
+            "derivative_notice_suffix": " by nuomew (MIT)."
         }
     }
 }
