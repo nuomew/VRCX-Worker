@@ -75,7 +75,7 @@ public sealed class RemoteCommandExecutor
 
     private CommandExecutionResult LaunchVrChat(string cmdId, Dictionary<string, object?> parameters)
     {
-        string launchUrl = GetString(parameters, "launchUrl");
+        string launchUrl = GetString(parameters, "launchUrl").Trim();
         if (!CommandValidator.IsValidLaunchUrl(launchUrl))
         {
             return new CommandExecutionResult { CmdId = cmdId, Status = "failed", Message = "Invalid vrchat://launch URL" };
@@ -92,6 +92,21 @@ public sealed class RemoteCommandExecutor
             };
         }
 
+        bool isRunning = false;
+        Process[] existing = Process.GetProcessesByName("VRChat");
+        try
+        {
+            isRunning = existing.Length > 0;
+        }
+        finally
+        {
+            foreach (Process p in existing) p.Dispose();
+        }
+
+        string effectiveUrl = isRunning && !launchUrl.Contains("attach=", StringComparison.OrdinalIgnoreCase)
+            ? launchUrl + "&attach=1"
+            : launchUrl;
+
         var psi = new ProcessStartInfo
         {
             FileName = vrcExe,
@@ -99,7 +114,11 @@ public sealed class RemoteCommandExecutor
             CreateNoWindow = false,
             WorkingDirectory = Path.GetDirectoryName(vrcExe) ?? Environment.CurrentDirectory
         };
-        psi.ArgumentList.Add(launchUrl);
+        psi.ArgumentList.Add(effectiveUrl);
+        if (!isRunning && GetBool(parameters, "desktopMode", false))
+        {
+            psi.ArgumentList.Add("--no-vr");
+        }
 
         Process? proc = Process.Start(psi);
         return new CommandExecutionResult
@@ -286,6 +305,22 @@ public sealed class RemoteCommandExecutor
         {
             try
             {
+                // VRChat registers its exact launch.exe path under the vrchat:// URI protocol handler regardless of Steam drive.
+                string? rawCmd = Registry.ClassesRoot.OpenSubKey(@"VRChat\shell\open\command")?.GetValue(null) as string
+                    ?? Registry.CurrentUser.OpenSubKey(@"Software\Classes\VRChat\shell\open\command")?.GetValue(null) as string;
+                string? fromProtocol = ExtractExecutablePathFromShellCommand(rawCmd);
+                if (!string.IsNullOrEmpty(fromProtocol) && File.Exists(fromProtocol))
+                {
+                    return fromProtocol;
+                }
+            }
+            catch
+            {
+                // Ignore registry errors
+            }
+
+            try
+            {
                 // Standard Steam install path from HKCU\Software\Valve\Steam
                 using RegistryKey? steamKey = Registry.CurrentUser.OpenSubKey(@"Software\Valve\Steam");
                 if (steamKey?.GetValue("SteamPath") is string steamPath && !string.IsNullOrWhiteSpace(steamPath))
@@ -315,6 +350,19 @@ public sealed class RemoteCommandExecutor
             if (File.Exists(path)) return path;
         }
         return null;
+    }
+
+    internal static string? ExtractExecutablePathFromShellCommand(string? command)
+    {
+        if (string.IsNullOrWhiteSpace(command)) return null;
+        string trimmed = command.Trim();
+        if (trimmed.StartsWith('"'))
+        {
+            int endQuote = trimmed.IndexOf('"', 1);
+            return endQuote > 1 ? trimmed[1..endQuote] : null;
+        }
+        int spaceIdx = trimmed.IndexOf(' ');
+        return spaceIdx > 0 ? trimmed[..spaceIdx] : trimmed;
     }
 
     private static string GetString(Dictionary<string, object?> dict, string key, string fallback = "")

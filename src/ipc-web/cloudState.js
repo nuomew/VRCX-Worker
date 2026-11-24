@@ -77,11 +77,49 @@ export function getOnlineAgentIds(nowMs = Date.now()) {
 }
 
 /**
- * Applies server-reported HTTP agent presence and optional cumulative uptime snapshot to `cloudState`.
+ * Aggregates live VRChat and SteamVR running flags across ALL currently online VRCX.Agent devices.
+ * If any online PC is running VRChat or SteamVR, the corresponding status indicator turns green.
+ *
+ * @param {number} [nowMs]
+ * @returns {{ vrcRunning: boolean; steamVrRunning: boolean }}
+ */
+export function getAggregatedGameState(nowMs = Date.now()) {
+    let vrcRunning = false;
+    let steamVrRunning = false;
+    for (const deviceId of getOnlineAgentIds(nowMs)) {
+        const st = cloudState.deviceStates[deviceId]?.state;
+        if (!st || typeof st !== 'object') continue;
+        if (st.vrcRunning === true || st.isGameRunning === true) {
+            vrcRunning = true;
+        }
+        if (st.steamVrRunning === true || st.isVrRunning === true) {
+            steamVrRunning = true;
+        }
+        if (vrcRunning && steamVrRunning) break;
+    }
+    return { vrcRunning, steamVrRunning };
+}
+
+/**
+ * Synchronizes aggregated multi-PC game/SteamVR running state into upstream `window.$bridge.updateIsGameRunning`.
+ *
+ * @param {number} [nowMs]
+ */
+export function syncGameRunningBridge(nowMs = Date.now()) {
+    if (typeof window === 'undefined' || !window.$bridge?.updateIsGameRunning) {
+        return;
+    }
+    const { vrcRunning, steamVrRunning } = getAggregatedGameState(nowMs);
+    window.$bridge.updateIsGameRunning(vrcRunning, steamVrRunning);
+}
+
+/**
+ * Applies server-reported HTTP agent presence, device states, and optional cumulative uptime snapshot to `cloudState`.
  *
  * @param {{
  *   deviceLastSeen?: Record<string, number>;
  *   httpAgentsOnline?: string[];
+ *   deviceStates?: Record<string, { state: Record<string, any>; updatedAt: string }>;
  *   totalUptimeSeconds?: number;
  *   syncIntervalSeconds?: number;
  *   replaceDeviceMap?: boolean;
@@ -111,12 +149,22 @@ export function applyCloudPresenceUpdate(payload) {
             }
         }
     }
+    if (payload.deviceStates && typeof payload.deviceStates === 'object') {
+        for (const [deviceId, entry] of Object.entries(payload.deviceStates)) {
+            if (!deviceId || !entry || typeof entry !== 'object') continue;
+            cloudState.deviceStates[deviceId] = {
+                state: entry.state && typeof entry.state === 'object' ? entry.state : {},
+                updatedAt: entry.updatedAt || new Date(nowMs).toISOString()
+            };
+        }
+    }
     cloudState.agentsOnline = getOnlineAgentIds(nowMs);
     if (payload.totalUptimeSeconds !== undefined) {
         const nextBase = Math.max(0, Math.floor(Number(payload.totalUptimeSeconds) || 0));
         cloudState.totalUptimeBaseSeconds = nextBase;
         cloudState.totalUptimeSyncedAt = nowMs;
     }
+    syncGameRunningBridge(nowMs);
 }
 
 export function isAnyAgentOnline(nowMs = Date.now()) {

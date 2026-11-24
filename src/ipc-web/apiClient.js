@@ -1,4 +1,4 @@
-import { cloudState } from './cloudState.js';
+import { cloudState, syncGameRunningBridge } from './cloudState.js';
 
 /** @type {WebSocket | null} */
 let hubSocket = null;
@@ -79,11 +79,7 @@ export async function cloudFetch(path, options = {}) {
 }
 
 function dispatchLiveGameState() {
-    const primary = Object.values(cloudState.deviceStates)[0]?.state;
-    if (!primary || !window.$bridge) return;
-    if (typeof primary.vrcRunning === 'boolean' || typeof primary.steamVrRunning === 'boolean') {
-        window.$bridge.updateIsGameRunning?.(Boolean(primary.vrcRunning), Boolean(primary.steamVrRunning));
-    }
+    syncGameRunningBridge();
 }
 
 export function connectCloudHubWs() {
@@ -136,11 +132,13 @@ export function connectCloudHubWs() {
                 if (!cloudState.agentsOnline.includes(deviceId)) {
                     cloudState.agentsOnline.push(deviceId);
                 }
+                dispatchLiveGameState();
             } else if (msg.type === 'agent.offline' && msg.payload?.deviceId) {
                 const deviceId = msg.payload.deviceId;
                 cloudState.wsAgentsOnline = cloudState.wsAgentsOnline.filter((id) => id !== deviceId);
                 delete cloudState.deviceLastSeen[deviceId];
                 cloudState.agentsOnline = cloudState.agentsOnline.filter((id) => id !== deviceId);
+                dispatchLiveGameState();
             } else if (msg.type === 'agent.state' && msg.payload?.deviceId) {
                 const { deviceId, ...rest } = msg.payload;
                 cloudState.deviceStates[deviceId] = {

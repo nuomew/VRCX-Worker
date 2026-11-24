@@ -280,10 +280,14 @@ public sealed class TrayApplicationContext : ApplicationContext
                     UpdateTrayStatus();
                 }
 
-                // STRICT Web-scheduled upload: never push outside the scheduled Web sync window.
-                if (_config.IsConfigured && _scheduleGate.IsDue(DateTimeOffset.UtcNow))
+                // Trigger an immediate state push when VRChat or SteamVR starts/stops (debounced >= 5s) so the Web
+                // StatusBar turns green right away; idle cycles strictly obey SyncScheduleGate with zero extra traffic.
+                bool immediateStatePush = procChanged
+                    && (DateTimeOffset.UtcNow - _lastSyncSuccessAt) >= TimeSpan.FromSeconds(5);
+
+                if (_config.IsConfigured && (immediateStatePush || _scheduleGate.IsDue(DateTimeOffset.UtcNow)))
                 {
-                    await RunSyncCycleAsync(force: false, ct).ConfigureAwait(false);
+                    await RunSyncCycleAsync(force: immediateStatePush, ct).ConfigureAwait(false);
                 }
 
                 tick++;
@@ -323,13 +327,14 @@ public sealed class TrayApplicationContext : ApplicationContext
 
         try
         {
+            // Always capture fresh VRChat/SteamVR process state before building the sync snapshot.
+            _processMonitor.Refresh(cfg);
             if (force)
             {
                 string logDir = string.IsNullOrWhiteSpace(cfg.VrChatLogDirectory)
                     ? LogTailCollector.ResolveDefaultVrChatLogDirectory()
                     : cfg.VrChatLogDirectory;
                 _logCollector.PollLogDirectory(logDir);
-                _processMonitor.Refresh(cfg);
             }
 
             var commandsToExecute = new List<PendingRemoteCommand>();

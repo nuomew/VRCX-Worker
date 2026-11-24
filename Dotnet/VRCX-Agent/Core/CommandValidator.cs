@@ -20,8 +20,16 @@ public static class CommandValidator
         "sync_now"
     };
 
-    private static readonly Regex VrcLaunchUrlRegex = new(
-        @"^vrchat://launch\?id=wrld_[0-9a-f-]{36}:[A-Za-z0-9_~()\-]+$",
+    private static readonly Regex VrcInstanceIdRegex = new(
+        @"^wrld_[0-9a-f-]{36}:[A-Za-z0-9_~()\-]+$",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+
+    private static readonly Regex VrcShortNameRegex = new(
+        @"^[A-Za-z0-9_-]{1,64}$",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+
+    private static readonly Regex VrcRefRegex = new(
+        @"^[A-Za-z0-9._-]{1,64}$",
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
     private static readonly string[] AllowedVrcHostSuffixes =
@@ -53,7 +61,7 @@ public static class CommandValidator
 
             if (!IsValidLaunchUrl(launchUrl))
             {
-                return (false, "launchUrl must strictly match vrchat://launch?id=wrld_<uuid>:<instance>.");
+                return (false, "launchUrl must be a valid vrchat://launch?id=wrld_<uuid>:<instance> link.");
             }
         }
 
@@ -66,7 +74,53 @@ public static class CommandValidator
         {
             return false;
         }
-        return VrcLaunchUrlRegex.IsMatch(launchUrl.Trim());
+        string trimmed = launchUrl.Trim();
+        if (!trimmed.StartsWith("vrchat://launch?", StringComparison.Ordinal))
+        {
+            return false;
+        }
+        foreach (char ch in trimmed)
+        {
+            if (char.IsWhiteSpace(ch) || char.IsControl(ch))
+            {
+                return false;
+            }
+        }
+
+        string query = trimmed["vrchat://launch?".Length..];
+        if (string.IsNullOrEmpty(query))
+        {
+            return false;
+        }
+
+        bool hasId = false;
+        string[] pairs = query.Split('&', StringSplitOptions.None);
+        foreach (string pair in pairs)
+        {
+            int eq = pair.IndexOf('=');
+            if (eq <= 0) return false;
+            string key = Uri.UnescapeDataString(pair[..eq]);
+            string val = Uri.UnescapeDataString(pair[(eq + 1)..]);
+            switch (key)
+            {
+                case "id":
+                    if (!VrcInstanceIdRegex.IsMatch(val)) return false;
+                    hasId = true;
+                    break;
+                case "shortName":
+                    if (!VrcShortNameRegex.IsMatch(val)) return false;
+                    break;
+                case "ref":
+                    if (!VrcRefRegex.IsMatch(val)) return false;
+                    break;
+                case "attach":
+                    if (val != "1" && val != "0") return false;
+                    break;
+                default:
+                    return false;
+            }
+        }
+        return hasId;
     }
 
     public static bool IsAllowedVrcUrl(string? rawUrl)

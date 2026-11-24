@@ -467,7 +467,7 @@
     import { openExternalLink } from '@/shared/utils/appActions';
     import { wsState } from '@/services/websocket';
     import { cloudFetch } from '@/ipc-web/apiClient';
-    import { applyCloudPresenceUpdate, cloudState, getOnlineAgentIds } from '@/ipc-web/cloudState';
+    import { applyCloudPresenceUpdate, cloudState, getOnlineAgentIds, syncGameRunningBridge } from '@/ipc-web/cloudState';
 
     import dayjs from 'dayjs';
     import timezone from 'dayjs/plugin/timezone';
@@ -780,9 +780,16 @@
         drawSparkline();
 
         if (isWeb.value) {
+            syncGameRunningBridge();
             setupCloudUptimeSync();
         }
     });
+
+    if (isWeb.value) {
+        watch(onlineAgentCount, () => {
+            syncGameRunningBridge(now.value.getTime());
+        });
+    }
 
     const zoomLevel = ref(100);
     const zoomEditing = ref(false);
@@ -804,6 +811,7 @@
                 applyCloudPresenceUpdate({
                     deviceLastSeen: data?.deviceLastSeen,
                     httpAgentsOnline: data?.httpAgentsOnline,
+                    deviceStates: data?.deviceStates,
                     totalUptimeSeconds: data?.totalUptimeSeconds,
                     syncIntervalSeconds: data?.syncIntervalSeconds,
                     replaceDeviceMap: true

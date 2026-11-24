@@ -5,7 +5,7 @@ let initPromise: Promise<void> | null = null;
 
 // Static DDL mirrored from cloud/migrations/*/0001_init.sql.
 // Uses a schema_meta version sentinel so upgrades from Phase 0 auto-add Phase 1 tables idempotently.
-const SCHEMA_VERSION = 'v3-screenshot-dedupe-idx';
+const SCHEMA_VERSION = 'v4-device-states';
 
 const CORE_STATEMENTS: readonly string[] = [
     `CREATE TABLE IF NOT EXISTS schema_meta (
@@ -218,6 +218,11 @@ const CORE_STATEMENTS: readonly string[] = [
         capabilities_json TEXT NOT NULL DEFAULT '[]',
         last_seen_at TEXT NOT NULL DEFAULT '',
         created_at TEXT NOT NULL
+    )`,
+    `CREATE TABLE IF NOT EXISTS cloud_device_states (
+        device_id TEXT PRIMARY KEY,
+        state_json TEXT NOT NULL DEFAULT '{}',
+        updated_at TEXT NOT NULL
     )`,
     `CREATE TABLE IF NOT EXISTS cloud_sync_cursors (
         device_id TEXT NOT NULL,

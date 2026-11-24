@@ -700,14 +700,17 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
         expect(page2Json.data.some((s) => s.id === '1111222233334444aaaabbbbccccdddd')).toBe(true);
         expect(page2Json.data.some((s) => s.id === page1Json.data[0]!.id)).toBe(false);
 
-        // 3. Agent performs HTTP sync -> bootstrap must surface device in agentsOnline while keeping wsAgentsOnline empty
+        // 3. Agent performs HTTP sync with live VRChat + SteamVR state -> bootstrap & uptime must persist and surface it
         const syncRes = await exports.default.fetch('http://example.com/api/agent/sync', {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
                 Authorization: `Bearer ${syncKey}`
             },
-            body: JSON.stringify({ events: [] })
+            body: JSON.stringify({
+                events: [],
+                state: { vrcRunning: true, steamVrRunning: true, currentWorldName: 'Hanging Out' }
+            })
         });
         expect(syncRes.status).toBe(200);
 
@@ -721,15 +724,44 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
                     agentsOnline: string[];
                     wsAgentsOnline: string[];
                     deviceLastSeen: Record<string, number>;
+                    deviceStates: Record<string, { state: { vrcRunning?: boolean; steamVrRunning?: boolean } }>;
                 };
             };
         };
         expect(bootJson.data.agentStatus.agentsOnline).toContain(deviceId);
         expect(bootJson.data.agentStatus.wsAgentsOnline).not.toContain(deviceId);
         expect(typeof bootJson.data.agentStatus.deviceLastSeen[deviceId]).toBe('number');
+        expect(bootJson.data.agentStatus.deviceStates[deviceId]?.state?.vrcRunning).toBe(true);
+        expect(bootJson.data.agentStatus.deviceStates[deviceId]?.state?.steamVrRunning).toBe(true);
         expect(typeof bootJson.data.totalUptimeSeconds).toBe('number');
 
-        // 4. Simulate 90s elapsed since last watermark -> POST /api/stats/uptime accrues +90s cleanly
+        // 3b. Upstream vrchat://launch invite/join URLs with ref, shortName, and attach=1 are accepted; arbitrary params are rejected
+        const validLaunchCmd = await exports.default.fetch('http://example.com/api/commands', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                action: 'launch_vrc',
+                params: {
+                    launchUrl:
+                        'vrchat://launch?ref=vrcx.app&id=wrld_11111111-1111-1111-1111-111111111111:12345~region(jp)&shortName=abc123&attach=1'
+                }
+            })
+        });
+        expect(validLaunchCmd.status).toBe(200);
+
+        const invalidLaunchCmd = await exports.default.fetch('http://example.com/api/commands', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                action: 'launch_vrc',
+                params: {
+                    launchUrl: 'vrchat://launch?id=wrld_11111111-1111-1111-1111-111111111111:12345&evil=cmd'
+                }
+            })
+        });
+        expect(invalidLaunchCmd.status).toBe(400);
+
+        // 4. Simulate 90s elapsed since last watermark -> POST /api/stats/uptime accrues +90s cleanly and returns deviceStates
         const ninetySecondsAgo = new Date(Date.now() - 90_000).toISOString();
         await env.DB_CORE.prepare(
             "INSERT INTO stats_counters (counter_key, row_count, updated_at) VALUES ('cloud_total_uptime_seconds', 100, ?) ON CONFLICT(counter_key) DO UPDATE SET row_count = 100, updated_at = excluded.updated_at"
@@ -741,11 +773,17 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
         expect(uptimeRes.status).toBe(200);
         const uptimeJson = (await uptimeRes.json()) as {
             ok: boolean;
-            data: { totalUptimeSeconds: number; httpAgentsOnline: string[] };
+            data: {
+                totalUptimeSeconds: number;
+                httpAgentsOnline: string[];
+                deviceStates: Record<string, { state: { vrcRunning?: boolean; steamVrRunning?: boolean } }>;
+            };
         };
         expect(uptimeJson.data.totalUptimeSeconds).toBeGreaterThanOrEqual(189);
         expect(uptimeJson.data.totalUptimeSeconds).toBeLessThanOrEqual(195);
         expect(uptimeJson.data.httpAgentsOnline).toContain(deviceId);
+        expect(uptimeJson.data.deviceStates[deviceId]?.state?.vrcRunning).toBe(true);
+        expect(uptimeJson.data.deviceStates[deviceId]?.state?.steamVrRunning).toBe(true);
 
         // 5. Offline gap (> 360s) must NOT add offline hours to total uptime
         const twoHoursAgo = new Date(Date.now() - 2 * 3600_000).toISOString();

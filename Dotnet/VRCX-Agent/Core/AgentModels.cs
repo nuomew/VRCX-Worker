@@ -9,7 +9,7 @@ namespace VRCX.Agent.Core;
 /// </summary>
 public static class AgentMetadata
 {
-    public const string Version = "1.10.0";
+    public const string Version = "1.10.1";
 }
 
 /// <summary>

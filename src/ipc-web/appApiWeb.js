@@ -1,6 +1,6 @@
 import { cloudFetch, onCloudGameLogEvent } from './apiClient.js';
 import { bootstrapCache, flushStorageNow, scheduleStoragePatch } from './bootstrapCache.js';
-import { getPrimaryAgentState } from './cloudState.js';
+import { getAggregatedGameState, getPrimaryAgentState, syncGameRunningBridge } from './cloudState.js';
 
 /**
  * Lightweight RFC 1321 MD5 returning Base64 (used by imageUploadCoordinator for VRChat file uploads).
@@ -417,12 +417,17 @@ export function createAppApiBridge() {
             return null;
         },
         async TryOpenInstanceInVrc(launchUrl) {
-            return dispatchRemoteCommand('launch_vrc', { launchUrl });
+            const raw = String(launchUrl || '').trim();
+            if (!raw.startsWith('vrchat://launch?')) return false;
+            const urlWithAttach = raw.includes('attach=') ? raw : `${raw}&attach=1`;
+            return dispatchRemoteCommand('launch_vrc', { launchUrl: urlWithAttach });
         },
         async StartGame(args) {
-            const match = String(args || '').match(/vrchat:\/\/launch\?id=wrld_[0-9a-f-]{36}:[A-Za-z0-9_~()-]+/);
+            const rawArgs = String(args || '');
+            const match = rawArgs.match(/vrchat:\/\/launch\?[^\s"']+/);
             if (!match) return false;
-            return dispatchRemoteCommand('launch_vrc', { launchUrl: match[0] });
+            const desktopMode = /(?:^|\s)--no-vr(?:\s|$)/.test(rawArgs);
+            return dispatchRemoteCommand('launch_vrc', desktopMode ? { launchUrl: match[0], desktopMode: true } : { launchUrl: match[0] });
         },
         async StartGameFromPath(_path, args) {
             return this.StartGame(args);
@@ -431,12 +436,14 @@ export function createAppApiBridge() {
             const ok = await dispatchRemoteCommand('quit_vrc', {});
             return ok ? 1 : 0;
         },
-        async CheckGameRunning() {},
+        async CheckGameRunning() {
+            syncGameRunningBridge();
+        },
         async IsGameRunning() {
-            return Boolean(getPrimaryAgentState()?.vrcRunning);
+            return getAggregatedGameState().vrcRunning;
         },
         async IsSteamVRRunning() {
-            return Boolean(getPrimaryAgentState()?.steamVrRunning);
+            return getAggregatedGameState().steamVrRunning;
         },
         async MD5File(base64) {
             return md5Base64(base64ToBytes(base64));

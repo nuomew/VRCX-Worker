@@ -227,7 +227,8 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
                 env.DB_CORE.prepare('SELECT user_id, updated_at, display_name, block, mute FROM moderation'),
                 env.DB_CORE.prepare('SELECT user_id, bio, bio_links, updated_at FROM user_profile'),
                 env.DB_CORE.prepare('SELECT counter_key, row_count FROM stats_counters'),
-                env.DB_CORE.prepare('SELECT device_id, device_name, last_seen_at FROM cloud_devices')
+                env.DB_CORE.prepare('SELECT device_id, device_name, last_seen_at FROM cloud_devices'),
+                env.DB_CORE.prepare('SELECT device_id, state_json, updated_at FROM cloud_device_states')
             ]),
             hub.fetch(new Request('https://agent-hub.internal/status')).then((r) => r.json() as Promise<{ data?: unknown }>)
         ]);
@@ -263,7 +264,7 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
         }) as {
             agentsOnline?: string[];
             webClientsCount?: number;
-            deviceStates?: Record<string, unknown>;
+            deviceStates?: Record<string, { state: Record<string, unknown>; updatedAt: string }>;
         };
         const wsAgentsOnline = Array.isArray(rawHub.agentsOnline) ? rawHub.agentsOnline : [];
         const deviceRows = (batchRes[13]?.results ?? []) as Array<{
@@ -277,6 +278,28 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
             getAgentOnlineWindowMs(syncIntervalSeconds)
         );
         const mergedAgentsOnline = Array.from(new Set([...wsAgentsOnline, ...httpAgentsOnline]));
+
+        const persistedStateRows = (batchRes[14]?.results ?? []) as Array<{
+            device_id: string;
+            state_json: string;
+            updated_at: string;
+        }>;
+        const mergedDeviceStates: Record<string, { state: Record<string, unknown>; updatedAt: string }> = {
+            ...(rawHub.deviceStates ?? {})
+        };
+        for (const row of persistedStateRows) {
+            if (!row.device_id) continue;
+            const parsedState = safeJsonParse<Record<string, unknown>>(row.state_json, {});
+            const prev = mergedDeviceStates[row.device_id];
+            const prevTs = prev?.updatedAt ? Date.parse(prev.updatedAt) : 0;
+            const rowTs = row.updated_at ? Date.parse(row.updated_at) : 0;
+            if (!prev || !Number.isFinite(prevTs) || rowTs >= prevTs) {
+                mergedDeviceStates[row.device_id] = {
+                    state: parsedState,
+                    updatedAt: row.updated_at || nowIso
+                };
+            }
+        }
 
         return Response.json({
             ok: true,
@@ -301,7 +324,8 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
                     ...rawHub,
                     agentsOnline: mergedAgentsOnline,
                     wsAgentsOnline,
-                    deviceLastSeen
+                    deviceLastSeen,
+                    deviceStates: mergedDeviceStates
                 },
                 r2Enabled: Boolean(env.R2_MEDIA)
             }
@@ -885,11 +909,12 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
     if (url.pathname === '/api/stats/uptime' && request.method === 'POST') {
         const nowIso = new Date().toISOString();
         const nowMs = Date.parse(nowIso);
-        const [cfgRes, devRes] = await env.DB_CORE.batch([
+        const [cfgRes, devRes, stateRes] = await env.DB_CORE.batch([
             env.DB_CORE.prepare(
                 "SELECT payload_json FROM config_bundles WHERE bundle_key = 'vrcx_config' LIMIT 1"
             ),
-            env.DB_CORE.prepare('SELECT device_id, last_seen_at FROM cloud_devices')
+            env.DB_CORE.prepare('SELECT device_id, last_seen_at FROM cloud_devices'),
+            env.DB_CORE.prepare('SELECT device_id, state_json, updated_at FROM cloud_device_states')
         ]);
         const cfgRow = (cfgRes?.results?.[0] ?? null) as { payload_json?: string } | null;
         const cfg = safeJsonParse<Record<string, string>>(cfgRow?.payload_json, {});
@@ -905,12 +930,25 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
             nowMs,
             getAgentOnlineWindowMs(syncIntervalSeconds)
         );
+        const deviceStates: Record<string, { state: Record<string, unknown>; updatedAt: string }> = {};
+        for (const row of (stateRes?.results ?? []) as Array<{
+            device_id: string;
+            state_json: string;
+            updated_at: string;
+        }>) {
+            if (!row.device_id) continue;
+            deviceStates[row.device_id] = {
+                state: safeJsonParse<Record<string, unknown>>(row.state_json, {}),
+                updatedAt: row.updated_at || nowIso
+            };
+        }
         return Response.json({
             ok: true,
             data: {
                 totalUptimeSeconds,
                 httpAgentsOnline,
                 deviceLastSeen,
+                deviceStates,
                 syncIntervalSeconds,
                 serverNow: nowIso
             }

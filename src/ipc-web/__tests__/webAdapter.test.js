@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { bootstrapCache, loadBootstrap, scheduleConfigPatch } from '../bootstrapCache.js';
-import { applyCloudPresenceUpdate, cloudState, getOnlineAgentIds } from '../cloudState.js';
+import { applyCloudPresenceUpdate, cloudState, getAggregatedGameState, getOnlineAgentIds } from '../cloudState.js';
 import { createAppApiBridge } from '../appApiWeb.js';
 import { createWebApiBridge } from '../webApiRemote.js';
 import { createCloudDatabase } from '../../services/database/cloud/index.js';
@@ -330,5 +330,67 @@ describe('WEB cloud adapter (stateless)', () => {
         expect(groups[1].dateLabel).toBe('2026年11月20日');
         expect(groups[1].timeRange).toBe('09:08');
         expect(groups[1].items[0].dateTimeLabel).toBe('2026年11月20日 09:08');
+    });
+
+    it('aggregates VRChat and SteamVR running state across multiple online PCs and forwards full invite launch URLs', async () => {
+        const nowMs = Date.now();
+        cloudState.wsAgentsOnline = [];
+        cloudState.syncIntervalSeconds = 60;
+        cloudState.deviceStates = {};
+
+        const updateSpy = vi.fn();
+        globalThis.window = /** @type {any} */ ({ $bridge: { updateIsGameRunning: updateSpy } });
+
+        try {
+            // PC-1 is online and idle; PC-2 is online running VRChat; PC-3 is offline with stale SteamVR=true
+            applyCloudPresenceUpdate({
+                deviceLastSeen: {
+                    pc_idle: nowMs - 10_000,
+                    pc_vrc: nowMs - 20_000,
+                    pc_offline: nowMs - 600_000
+                },
+                deviceStates: {
+                    pc_idle: { state: { vrcRunning: false, steamVrRunning: false }, updatedAt: new Date(nowMs).toISOString() },
+                    pc_vrc: { state: { vrcRunning: true, steamVrRunning: false }, updatedAt: new Date(nowMs).toISOString() },
+                    pc_offline: { state: { vrcRunning: true, steamVrRunning: true }, updatedAt: new Date(nowMs - 600_000).toISOString() }
+                },
+                replaceDeviceMap: true
+            });
+
+            expect(getAggregatedGameState(nowMs)).toEqual({ vrcRunning: true, steamVrRunning: false });
+            expect(updateSpy).toHaveBeenLastCalledWith(true, false);
+
+            // Bringing PC-1 SteamVR online turns SteamVR green too
+            applyCloudPresenceUpdate({
+                deviceStates: {
+                    pc_idle: { state: { vrcRunning: false, steamVrRunning: true }, updatedAt: new Date(nowMs).toISOString() }
+                }
+            });
+            const appApi = createAppApiBridge();
+            expect(await appApi.IsGameRunning()).toBe(true);
+            expect(await appApi.IsSteamVRRunning()).toBe(true);
+            await appApi.CheckGameRunning();
+            expect(updateSpy).toHaveBeenLastCalledWith(true, true);
+
+            // Full upstream invite/launch URL with ref + shortName + --no-vr
+            fetchSpy.mockResolvedValueOnce(mockOk({ cmdId: 'cmd_launch_1', status: 'queued' }));
+            const fullUrl =
+                'vrchat://launch?ref=vrcx.app&id=wrld_12345678-1234-1234-1234-1234567890ab:99999~region(jp)&shortName=xyz789';
+            expect(await appApi.StartGame(`${fullUrl} --no-vr`)).toBe(true);
+            expect(JSON.parse(fetchSpy.mock.calls[0][1].body)).toEqual({
+                action: 'launch_vrc',
+                params: { launchUrl: fullUrl, desktopMode: true }
+            });
+
+            // TryOpenInstanceInVrc appends &attach=1 automatically
+            fetchSpy.mockResolvedValueOnce(mockOk({ cmdId: 'cmd_launch_2', status: 'queued' }));
+            expect(await appApi.TryOpenInstanceInVrc(fullUrl)).toBe(true);
+            expect(JSON.parse(fetchSpy.mock.calls[1][1].body)).toEqual({
+                action: 'launch_vrc',
+                params: { launchUrl: `${fullUrl}&attach=1` }
+            });
+        } finally {
+            delete /** @type {any} */ (globalThis).window;
+        }
     });
 });

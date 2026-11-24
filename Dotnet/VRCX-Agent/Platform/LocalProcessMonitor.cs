@@ -33,7 +33,7 @@ public sealed class LocalProcessMonitor
         bool prevSteamVr = _steamVrRunning;
 
         _vrcRunning = IsProcessRunning("VRChat");
-        _steamVrRunning = IsProcessRunning("vrmonitor");
+        _steamVrRunning = IsProcessRunning("vrserver") || IsProcessRunning("vrmonitor");
 
         if ((DateTimeOffset.UtcNow - _lastCacheScanAt) > TimeSpan.FromMinutes(2))
         {

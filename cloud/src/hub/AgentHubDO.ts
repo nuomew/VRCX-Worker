@@ -62,9 +62,23 @@ export class AgentHubDO extends DurableObject<Env> {
         if (url.pathname === '/broadcast' && request.method === 'POST') {
             const body = (await request.json()) as HubEnvelope & { messages?: HubEnvelope[] };
             const now = Date.now();
+            const nowIso = new Date(now).toISOString();
             const list = Array.isArray(body?.messages) ? body.messages : body?.type ? [body] : [];
             for (const msg of list) {
                 if (msg && typeof msg.type === 'string') {
+                    if (msg.type === 'agent.state' && typeof msg.payload?.deviceId === 'string' && msg.payload.deviceId) {
+                        const { deviceId, ...statePayload } = msg.payload;
+                        this.ctx.storage.sql.exec(
+                            `INSERT INTO live_device_state (device_id, state_json, updated_at)
+                             VALUES (?, ?, ?)
+                             ON CONFLICT(device_id) DO UPDATE SET
+                                state_json = excluded.state_json,
+                                updated_at = excluded.updated_at`,
+                            deviceId,
+                            JSON.stringify(statePayload),
+                            nowIso
+                        );
+                    }
                     this.broadcastToRole('web', { ...msg, v: 1, ts: now });
                 }
             }

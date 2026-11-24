@@ -131,6 +131,7 @@ export async function loadBootstrap() {
     applyCloudPresenceUpdate({
         deviceLastSeen,
         httpAgentsOnline: mergedAgentsOnline,
+        deviceStates: data.agentStatus?.deviceStates,
         totalUptimeSeconds,
         replaceDeviceMap: true
     });

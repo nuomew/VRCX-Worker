@@ -14,8 +14,40 @@ const ALLOWED_ACTIONS = new Set([
     'sync_now'
 ]);
 
-const VRC_LAUNCH_URL_RE = /^vrchat:\/\/launch\?id=wrld_[0-9a-f-]{36}:[A-Za-z0-9_~()\-]+$/;
+const VRC_INSTANCE_ID_RE = /^wrld_[0-9a-f-]{36}:[A-Za-z0-9_~()\-]+$/;
+const VRC_SHORT_NAME_RE = /^[A-Za-z0-9_-]{1,64}$/;
+const VRC_REF_RE = /^[A-Za-z0-9._-]{1,64}$/;
 const MAX_SCREENSHOT_BYTES = 25 * 1024 * 1024; // 25 MiB ceiling (supports both WebP thumbnails and original PNGs)
+
+/**
+ * Strictly validates a `vrchat://launch?...` deep-link URL using a query-parameter allowlist
+ * (supports upstream VRCX `ref=vrcx.app`, `id`, `shortName`, and `attach=1` without allowing shell metacharacters).
+ */
+export function isValidVrcLaunchUrl(raw: string): boolean {
+    const trimmed = raw.trim();
+    if (!trimmed || trimmed.length > 512 || /\s/.test(trimmed) || !trimmed.startsWith('vrchat://launch?')) {
+        return false;
+    }
+    const query = trimmed.slice('vrchat://launch?'.length);
+    if (!query) return false;
+    const params = new URLSearchParams(query);
+    let hasId = false;
+    for (const [key, val] of params.entries()) {
+        if (key === 'id') {
+            if (!VRC_INSTANCE_ID_RE.test(val)) return false;
+            hasId = true;
+        } else if (key === 'shortName') {
+            if (!VRC_SHORT_NAME_RE.test(val)) return false;
+        } else if (key === 'ref') {
+            if (!VRC_REF_RE.test(val)) return false;
+        } else if (key === 'attach') {
+            if (val !== '1' && val !== '0') return false;
+        } else {
+            return false;
+        }
+    }
+    return hasId;
+}
 
 function generateSixDigitCode(): string {
     const arr = new Uint32Array(1);
@@ -32,10 +64,10 @@ export function validateCommand(
     }
     if (action === 'launch_vrc') {
         const launchUrl = typeof params.launchUrl === 'string' ? params.launchUrl.trim() : '';
-        if (!VRC_LAUNCH_URL_RE.test(launchUrl)) {
+        if (!isValidVrcLaunchUrl(launchUrl)) {
             return {
                 ok: false,
-                message: 'launchUrl must strictly match vrchat://launch?id=wrld_<uuid>:<instance>'
+                message: 'launchUrl must be a valid vrchat://launch?id=wrld_<uuid>:<instance> link'
             };
         }
     }
@@ -356,6 +388,19 @@ export async function handleAgentPublicRoutes(request: Request, env: Env, url: U
                     last_seen_at = excluded.last_seen_at`
             ).bind(auth.deviceId, deviceName, `sync:${auth.deviceId}`, agentVersion, nowIso, nowIso)
         ];
+
+        if (body.state) {
+            const persistedState = { syncMode: 'http', ...body.state };
+            coreWrites.push(
+                env.DB_CORE.prepare(
+                    `INSERT INTO cloud_device_states (device_id, state_json, updated_at)
+                     VALUES (?, ?, ?)
+                     ON CONFLICT(device_id) DO UPDATE SET
+                        state_json = excluded.state_json,
+                        updated_at = excluded.updated_at`
+                ).bind(auth.deviceId, JSON.stringify(persistedState), nowIso)
+            );
+        }
 
         if (body.cursor) {
             coreWrites.push(

@@ -1064,6 +1064,22 @@ public sealed class AgentCoreTests
         }
     }
 
+    [Fact]
+    public void CommandValidator_AcceptsFullVrChatInviteLaunchUrlsAndRejectsInjection()
+    {
+        Assert.True(CommandValidator.IsValidLaunchUrl(
+            "vrchat://launch?id=wrld_12345678-1234-1234-1234-1234567890ab:12345~region(jp)"));
+        Assert.True(CommandValidator.IsValidLaunchUrl(
+            "vrchat://launch?ref=vrcx.app&id=wrld_12345678-1234-1234-1234-1234567890ab:12345~private(usr_abc)&shortName=abc123&attach=1"));
+
+        Assert.False(CommandValidator.IsValidLaunchUrl(
+            "vrchat://launch?ref=vrcx.app&shortName=abc123")); // missing id
+        Assert.False(CommandValidator.IsValidLaunchUrl(
+            "vrchat://launch?id=wrld_12345678-1234-1234-1234-1234567890ab:12345&evil=1")); // unknown param
+        Assert.False(CommandValidator.IsValidLaunchUrl(
+            "vrchat://launch?id=wrld_12345678-1234-1234-1234-1234567890ab:12345 --no-vr")); // whitespace injection
+    }
+
     private sealed class StubHttpHandler : HttpMessageHandler
     {
         private readonly Func<HttpRequestMessage, Task<HttpResponseMessage>> _responder;
