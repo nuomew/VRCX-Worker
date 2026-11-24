@@ -44,12 +44,12 @@
             "tag": "v1",
             "new_sqlite_classes": ["AgentHubDO"]
         }
+    ],
+    // Omit bucket_name so Cloudflare Automatic Resource Provisioning binds/creates the private R2 bucket
+    // and Git auto-deploys never wipe Dashboard R2_MEDIA bindings.
+    "r2_buckets": [
+        {
+            "binding": "R2_MEDIA"
+        }
     ]
-    // Optional R2 binding for cloud screenshot thumbnails (uncomment after enabling R2 in Cloudflare dashboard):
-    // "r2_buckets": [
-    //     {
-    //         "binding": "R2_MEDIA",
-    //         "bucket_name": "vrcx-media"
-    //     }
-    // ]
 }
