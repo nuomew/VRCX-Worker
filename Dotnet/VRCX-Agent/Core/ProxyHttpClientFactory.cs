@@ -6,7 +6,7 @@ namespace VRCX.Agent.Core;
 
 /// <summary>
 /// Builds HttpClient / SocketsHttpHandler instances respecting the Overseas (Direct / Proxy Off)
-/// vs Mainland China (Proxy On: Windows system proxy or explicit HTTP/HTTPS/SOCKS5 URL) switch.
+/// vs Mainland China (Proxy On: Windows system proxy, HTTP/HTTPS/SOCKS4/SOCKS5, or native VMess AEAD) switch.
 /// </summary>
 public static class ProxyHttpClientFactory
 {
@@ -22,7 +22,8 @@ public static class ProxyHttpClientFactory
 
     /// <summary>
     /// Validates and normalizes an optional proxy address.
-    /// Empty string means "follow Windows system proxy". Shorthand `host:port` defaults to `http://host:port`.
+    /// Empty string means "follow Windows system proxy". Supports `http://`, `https://`,
+    /// `socks4://`, `socks5://`, `vmess://`, and shorthand `host:port` (defaults to `http://`).
     /// </summary>
     public static (bool Ok, Uri? ProxyUri, string Error) NormalizeAndValidateProxyUri(string? rawAddress)
     {
@@ -30,6 +31,18 @@ public static class ProxyHttpClientFactory
         if (string.IsNullOrEmpty(trimmed))
         {
             return (true, null, string.Empty);
+        }
+
+        if (VmessConfig.IsVmessUri(trimmed))
+        {
+            if (!VmessConfig.TryParse(trimmed, out VmessConfig? vmess, out string vmessErr) || vmess == null)
+            {
+                return (false, null, vmessErr);
+            }
+            string hostPart = vmess.Server.Contains(':') && !vmess.Server.StartsWith("[", StringComparison.Ordinal)
+                ? $"[{vmess.Server}]"
+                : vmess.Server;
+            return (true, new Uri($"vmess://{hostPart}:{vmess.Port}"), string.Empty);
         }
 
         string candidate = trimmed.Contains("://", StringComparison.Ordinal) ? trimmed : $"http://{trimmed}";
@@ -61,7 +74,8 @@ public static class ProxyHttpClientFactory
     }
 
     /// <summary>
-    /// Creates a SocketsHttpHandler configured for either Direct (Overseas) or Proxied (Mainland China) routing.
+    /// Creates a SocketsHttpHandler configured for Direct (Overseas), standard HTTP/SOCKS proxy,
+    /// Windows system proxy, or native VMess AEAD tunnel (`vmess://`).
     /// </summary>
     public static SocketsHttpHandler CreateHandler(bool proxyEnabled, string? proxyAddress)
     {
@@ -78,8 +92,19 @@ public static class ProxyHttpClientFactory
             return handler;
         }
 
+        string trimmed = (proxyAddress ?? string.Empty).Trim();
+        if (VmessConfig.IsVmessUri(trimmed) && VmessConfig.TryParse(trimmed, out VmessConfig? vmess, out _) && vmess != null)
+        {
+            // Tunnel all outbound TCP connections directly through VMess AEAD (TCP/TLS/WS/WSS)
+            handler.UseProxy = false;
+            handler.Proxy = null;
+            handler.ConnectCallback = (context, ct) =>
+                VmessAeadClient.ConnectAsync(vmess, context.DnsEndPoint.Host, context.DnsEndPoint.Port, ct);
+            return handler;
+        }
+
         handler.UseProxy = true;
-        var (ok, proxyUri, _) = NormalizeAndValidateProxyUri(proxyAddress);
+        var (ok, proxyUri, _) = NormalizeAndValidateProxyUri(trimmed);
         if (!ok || proxyUri == null)
         {
             // Empty proxy address -> follow Windows system proxy (Clash/v2rayN/WinINET)
@@ -121,8 +146,17 @@ public static class ProxyHttpClientFactory
             return AgentStrings.NetModeOverseasDirect;
         }
         string addr = (config.ProxyAddress ?? string.Empty).Trim();
-        return string.IsNullOrEmpty(addr)
-            ? AgentStrings.NetModeMainlandSystemProxy
-            : AgentStrings.NetModeMainlandCustomProxy;
+        if (string.IsNullOrEmpty(addr))
+        {
+            return AgentStrings.NetModeMainlandSystemProxy;
+        }
+        if (VmessConfig.IsVmessUri(addr) && VmessConfig.TryParse(addr, out VmessConfig? vmess, out _) && vmess != null)
+        {
+            string label = !string.IsNullOrWhiteSpace(vmess.Remarks)
+                ? vmess.Remarks
+                : $"{vmess.Server}:{vmess.Port}";
+            return AgentStrings.FormatNetModeMainlandVmess(label);
+        }
+        return AgentStrings.NetModeMainlandCustomProxy;
     }
 }

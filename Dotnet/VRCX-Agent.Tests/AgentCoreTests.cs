@@ -496,6 +496,183 @@ public sealed class AgentCoreTests
         }
     }
 
+    [Fact]
+    public async Task VmessAead_MatchesXrayCoreGoldenVectors_ParsesLinks_AndTunnelsHttpEndToEnd()
+    {
+        // 1. Verify exact byte-for-byte parity with Xray-core Go reference vectors (aead/kdf.go & authid.go)
+        Assert.True(VmessConfig.TryParseUuidBigEndian("de305d54-75b4-431b-adb2-eb6b9e546014", out byte[] uuidBytes));
+        byte[] cmdKey = VmessAeadClient.ComputeCmdKey(uuidBytes);
+        Assert.Equal("cec646f87c62b6dba283881bc99c68d7", Convert.ToHexString(cmdKey).ToLowerInvariant());
+
+        byte[] authKey = VmessAeadClient.Kdf16(cmdKey, Encoding.ASCII.GetBytes("AES Auth ID Encryption"));
+        Assert.Equal("bd22928503ab58c8acb9447e2ffcf573", Convert.ToHexString(authKey).ToLowerInvariant());
+
+        byte[] rand4 = { 0x11, 0x22, 0x33, 0x44 };
+        byte[] authId = VmessAeadClient.CreateAuthId(cmdKey, 1700000000L, rand4);
+        Assert.Equal("33d6d6abd11fdca3aa72c4ab08f49eb7", Convert.ToHexString(authId).ToLowerInvariant());
+
+        byte[] nonce8 = { 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08 };
+        byte[] lenKey = VmessAeadClient.Kdf16(cmdKey, Encoding.ASCII.GetBytes("VMess Header AEAD Key_Length"), authId, nonce8);
+        byte[] lenIv = VmessAeadClient.Kdf(cmdKey, Encoding.ASCII.GetBytes("VMess Header AEAD Nonce_Length"), authId, nonce8)[..12];
+        byte[] hdrKey = VmessAeadClient.Kdf16(cmdKey, Encoding.ASCII.GetBytes("VMess Header AEAD Key"), authId, nonce8);
+        byte[] hdrIv = VmessAeadClient.Kdf(cmdKey, Encoding.ASCII.GetBytes("VMess Header AEAD Nonce"), authId, nonce8)[..12];
+
+        Assert.Equal("fcca660effd25d4d0de16cf79773d917", Convert.ToHexString(lenKey).ToLowerInvariant());
+        Assert.Equal("824675708e90699854a6d202", Convert.ToHexString(lenIv).ToLowerInvariant());
+        Assert.Equal("9875e8ff998b6b63b598ab0e962a4094", Convert.ToHexString(hdrKey).ToLowerInvariant());
+        Assert.Equal("7b29291b1db539251f2d4713", Convert.ToHexString(hdrIv).ToLowerInvariant());
+
+        // 2. Parse v2rayN standard JSON vmess:// (WS + TLS + custom SNI/Host/Path) and Shadowrocket compact link
+        string wsJson = "{\"v\":\"2\",\"ps\":\"香港节点\",\"add\":\"1.2.3.4\",\"port\":\"443\",\"id\":\"de305d54-75b4-431b-adb2-eb6b9e546014\",\"aid\":\"0\",\"scy\":\"auto\",\"net\":\"ws\",\"type\":\"none\",\"host\":\"cdn.example.com\",\"path\":\"/vrcx\",\"tls\":\"tls\",\"sni\":\"sni.example.com\"}";
+        string wsLink = "vmess://" + Convert.ToBase64String(Encoding.UTF8.GetBytes(wsJson));
+        Assert.True(ProxyHttpClientFactory.NormalizeAndValidateProxyUri(wsLink).Ok);
+        Assert.True(VmessConfig.TryParse(wsLink, out VmessConfig? wsCfg, out _));
+        Assert.Equal("香港节点", wsCfg!.Remarks);
+        Assert.Equal("ws", wsCfg.Network);
+        Assert.True(wsCfg.UseTls);
+        Assert.Equal("sni.example.com", wsCfg.EffectiveSni);
+        Assert.Equal("/vrcx", wsCfg.EffectiveWsPath);
+        Assert.Equal(0x03, wsCfg.WireSecurityByte);
+
+        string compactPayload = Convert.ToBase64String(Encoding.UTF8.GetBytes("aes-128-gcm:de305d54-75b4-431b-adb2-eb6b9e546014@10.0.0.1:8443"));
+        string compactLink = $"vmess://{compactPayload}?remarks=Tokyo&obfs=websocket&path=/ray&obfsParam=ws.example.com&tls=1";
+        Assert.True(VmessConfig.TryParse(compactLink, out VmessConfig? compactCfg, out _));
+        Assert.Equal("Tokyo", compactCfg!.Remarks);
+        Assert.Equal("ws", compactCfg.Network);
+        Assert.Equal("ws.example.com", compactCfg.Host);
+        Assert.True(compactCfg.UseTls);
+
+        // Unsupported transport (e.g. grpc) is rejected cleanly with explanation
+        string grpcJson = "{\"add\":\"1.2.3.4\",\"port\":443,\"id\":\"de305d54-75b4-431b-adb2-eb6b9e546014\",\"net\":\"grpc\"}";
+        Assert.False(ProxyHttpClientFactory.NormalizeAndValidateProxyUri("vmess://" + Convert.ToBase64String(Encoding.UTF8.GetBytes(grpcJson))).Ok);
+
+        // 3. End-to-end real HttpClient -> ProxyHttpClientFactory(vmess://) -> loopback VMess AEAD Server
+        using var listener = new System.Net.Sockets.TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        int serverPort = ((IPEndPoint)listener.LocalEndpoint).Port;
+
+        string tcpJson = $"{{\"v\":\"2\",\"ps\":\"LocalTest\",\"add\":\"127.0.0.1\",\"port\":{serverPort},\"id\":\"de305d54-75b4-431b-adb2-eb6b9e546014\",\"aid\":0,\"scy\":\"aes-128-gcm\",\"net\":\"tcp\",\"tls\":\"\"}}";
+        string tcpVmessLink = "vmess://" + Convert.ToBase64String(Encoding.UTF8.GetBytes(tcpJson));
+
+        string? capturedTargetHost = null;
+        int capturedTargetPort = 0;
+        string? capturedHttpReq = null;
+
+        Task serverTask = Task.Run(async () =>
+        {
+            using var tcpClient = await listener.AcceptTcpClientAsync();
+            using var net = tcpClient.GetStream();
+
+            static async Task<byte[]> ReadExact(Stream s, int n)
+            {
+                byte[] buf = new byte[n];
+                int total = 0;
+                while (total < n)
+                {
+                    int r = await s.ReadAsync(buf.AsMemory(total, n - total));
+                    if (r == 0) throw new EndOfStreamException();
+                    total += r;
+                }
+                return buf;
+            }
+
+            // Read & decrypt VMess AEAD Request Header
+            byte[] reqAuthId = await ReadExact(net, 16);
+            byte[] encLen = await ReadExact(net, 18);
+            byte[] reqNonce = await ReadExact(net, 8);
+
+            // Decrypt AuthID and validate CRC32
+            using (var aes = System.Security.Cryptography.Aes.Create())
+            {
+                aes.Key = authKey;
+                byte[] decAuth = aes.DecryptEcb(reqAuthId, System.Security.Cryptography.PaddingMode.None);
+                uint crcActual = VmessAeadClient.ComputeCrc32Ieee(decAuth.AsSpan(0, 12));
+                uint crcExpected = System.Buffers.Binary.BinaryPrimitives.ReadUInt32BigEndian(decAuth.AsSpan(12, 4));
+                Assert.Equal(crcExpected, crcActual);
+            }
+
+            byte[] lKey = VmessAeadClient.Kdf16(cmdKey, Encoding.ASCII.GetBytes("VMess Header AEAD Key_Length"), reqAuthId, reqNonce);
+            byte[] lIv = VmessAeadClient.Kdf(cmdKey, Encoding.ASCII.GetBytes("VMess Header AEAD Nonce_Length"), reqAuthId, reqNonce)[..12];
+            byte[] plainLenBytes = VmessAeadClient.AesGcmOpen(lKey, lIv, encLen, reqAuthId);
+            ushort headerLen = System.Buffers.Binary.BinaryPrimitives.ReadUInt16BigEndian(plainLenBytes);
+
+            byte[] encHdr = await ReadExact(net, headerLen + 16);
+            byte[] hKey = VmessAeadClient.Kdf16(cmdKey, Encoding.ASCII.GetBytes("VMess Header AEAD Key"), reqAuthId, reqNonce);
+            byte[] hIv = VmessAeadClient.Kdf(cmdKey, Encoding.ASCII.GetBytes("VMess Header AEAD Nonce"), reqAuthId, reqNonce)[..12];
+            byte[] hdr = VmessAeadClient.AesGcmOpen(hKey, hIv, encHdr, reqAuthId);
+
+            // Verify FNV-1a32 checksum and parse fields
+            uint fnvActual = VmessAeadClient.ComputeFnv1a32(hdr.AsSpan(0, hdr.Length - 4));
+            uint fnvExpected = System.Buffers.Binary.BinaryPrimitives.ReadUInt32BigEndian(hdr.AsSpan(hdr.Length - 4, 4));
+            Assert.Equal(fnvExpected, fnvActual);
+
+            byte[] reqBodyIv = hdr[1..17];
+            byte[] reqBodyKey = hdr[17..33];
+            byte respAuthV = hdr[33];
+            capturedTargetPort = System.Buffers.Binary.BinaryPrimitives.ReadUInt16BigEndian(hdr.AsSpan(38, 2));
+            byte addrType = hdr[40];
+            Assert.Equal(0x02, addrType);
+            int domainLen = hdr[41];
+            capturedTargetHost = Encoding.ASCII.GetString(hdr, 42, domainLen);
+
+            // Read first encrypted data chunk (HTTP request)
+            byte[] chunkLenBytes = await ReadExact(net, 2);
+            ushort chunkLen = System.Buffers.Binary.BinaryPrimitives.ReadUInt16BigEndian(chunkLenBytes);
+            byte[] chunkEnc = await ReadExact(net, chunkLen);
+            byte[] chunkIv = new byte[12];
+            Buffer.BlockCopy(reqBodyIv, 2, chunkIv, 2, 10); // count = 0
+            byte[] plainReq = VmessAeadClient.AesGcmOpen(reqBodyKey, chunkIv, chunkEnc, ReadOnlySpan<byte>.Empty);
+            capturedHttpReq = Encoding.ASCII.GetString(plainReq);
+
+            // Encode AEAD Response Header + encrypted HTTP 200 response chunk + EOF chunk
+            byte[] respBodyKey = System.Security.Cryptography.SHA256.HashData(reqBodyKey)[..16];
+            byte[] respBodyIv = System.Security.Cryptography.SHA256.HashData(reqBodyIv)[..16];
+            byte[] respHdrPlain = { respAuthV, 0x00, 0x00, 0x00 };
+            byte[] respHdrLenPlain = { 0x00, 0x04 };
+            byte[] rLenKey = VmessAeadClient.Kdf16(respBodyKey, Encoding.ASCII.GetBytes("AEAD Resp Header Len Key"));
+            byte[] rLenIv = VmessAeadClient.Kdf(respBodyIv, Encoding.ASCII.GetBytes("AEAD Resp Header Len IV"))[..12];
+            byte[] rHdrKey = VmessAeadClient.Kdf16(respBodyKey, Encoding.ASCII.GetBytes("AEAD Resp Header Key"));
+            byte[] rHdrIv = VmessAeadClient.Kdf(respBodyIv, Encoding.ASCII.GetBytes("AEAD Resp Header IV"))[..12];
+
+            await net.WriteAsync(VmessAeadClient.AesGcmSeal(rLenKey, rLenIv, respHdrLenPlain, ReadOnlySpan<byte>.Empty));
+            await net.WriteAsync(VmessAeadClient.AesGcmSeal(rHdrKey, rHdrIv, respHdrPlain, ReadOnlySpan<byte>.Empty));
+
+            byte[] httpBody = Encoding.UTF8.GetBytes("HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\nVMESS_PONG");
+            byte[] respChunkIv0 = new byte[12];
+            Buffer.BlockCopy(respBodyIv, 2, respChunkIv0, 2, 10);
+            byte[] sealedResp = VmessAeadClient.AesGcmSeal(respBodyKey, respChunkIv0, httpBody, ReadOnlySpan<byte>.Empty);
+            byte[] respFrame = new byte[2 + sealedResp.Length];
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(respFrame.AsSpan(0, 2), (ushort)sealedResp.Length);
+            Buffer.BlockCopy(sealedResp, 0, respFrame, 2, sealedResp.Length);
+            await net.WriteAsync(respFrame);
+
+            // Send AEAD EOF chunk (count = 1, empty plaintext -> 16B tag)
+            byte[] respChunkIv1 = new byte[12];
+            respChunkIv1[1] = 1;
+            Buffer.BlockCopy(respBodyIv, 2, respChunkIv1, 2, 10);
+            byte[] sealedEof = VmessAeadClient.AesGcmSeal(respBodyKey, respChunkIv1, ReadOnlySpan<byte>.Empty, ReadOnlySpan<byte>.Empty);
+            byte[] eofFrame = new byte[2 + sealedEof.Length];
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(eofFrame.AsSpan(0, 2), (ushort)sealedEof.Length);
+            Buffer.BlockCopy(sealedEof, 0, eofFrame, 2, sealedEof.Length);
+            await net.WriteAsync(eofFrame);
+            await net.FlushAsync();
+        });
+
+        using HttpClient vmessHttp = ProxyHttpClientFactory.CreateHttpClient(new AgentConfig
+        {
+            ProxyEnabled = true,
+            ProxyAddress = tcpVmessLink
+        }, TimeSpan.FromSeconds(10));
+
+        string responseText = await vmessHttp.GetStringAsync("http://vrcx-test.internal:8080/ping");
+        await serverTask;
+
+        Assert.Equal("VMESS_PONG", responseText);
+        Assert.Equal("vrcx-test.internal", capturedTargetHost);
+        Assert.Equal(8080, capturedTargetPort);
+        Assert.Contains("GET /ping HTTP/1.1", capturedHttpReq);
+    }
+
     private sealed class StubHttpHandler : HttpMessageHandler
     {
         private readonly Func<HttpRequestMessage, Task<HttpResponseMessage>> _responder;

@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag (e.g. v1.4.0)'
+        description: 'Release tag (e.g. v1.5.0)'
         required: true
-        default: 'v1.4.0'
+        default: 'v1.5.0'
   push:
     tags:
       - 'v*'
@@ -35,7 +35,7 @@ jobs:
         run: |
           $tag = if ("${{ github.event_name }}" -eq "workflow_dispatch") { "${{ inputs.tag }}" } else { "${{ github.ref_name }}" }
           $ver = $tag.TrimStart('v')
-          if ($ver -notmatch '^\d+\.\d+\.\d+') { $ver = '1.4.0' }
+          if ($ver -notmatch '^\d+\.\d+\.\d+') { $ver = '1.5.0' }
           echo "tag=$tag" >> $env:GITHUB_OUTPUT
           echo "ver=$ver" >> $env:GITHUB_OUTPUT
 
@@ -160,7 +160,7 @@ jobs:
             "- **内置在线自动检测与一键更新**：自动监测 GitHub Releases 新版本（支持共享代理 IP 限流回退、SHA-256 校验与静默覆盖重启升级）",
             "- 后台系统托盘运行与开机自启动（安装向导、设置窗口、托盘菜单均可随时开关）",
             "- 定时 HTTPS 同步（${bt}POST /api/agent/sync${bt}），严格遵循网页端 **云端同步间隔**（默认 60 秒）",
-            "- 海外直连 / 中国大陆代理一键切换（支持自动跟随 Windows 系统代理或自定义 HTTP/HTTPS/SOCKS5）",
+            "- 海外直连 / 中国大陆代理一键切换（支持跟随 Windows 系统代理、HTTP/HTTPS/SOCKS4/SOCKS5，以及**原生直连 ${bt}vmess://${bt} 节点链接（TCP / TLS / WS / WSS）**）",
             "- VRChat 本地日志增量采集、照片同步开关与可选 WebP 压缩（默认关闭）、Discord RPC 与允许列表远程指令",
             "",
             "### 快速开始 / Quick Setup",

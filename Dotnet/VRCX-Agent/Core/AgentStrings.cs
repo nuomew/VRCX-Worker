@@ -78,12 +78,12 @@ public static class AgentStrings
         : "Mainland China (Proxy On)";
 
     public static string ProxyAddressLabel => IsChinese
-        ? "代理地址（留空则自动跟随 Windows 系统代理）："
-        : "Proxy URL (leave empty to follow Windows system proxy):";
+        ? "代理地址或节点链接（留空跟随系统代理；支持 HTTP / SOCKS5 / VMess）："
+        : "Proxy URL or VMess link (empty = system proxy; HTTP/SOCKS5/vmess://):";
 
     public static string ProxyAddressPlaceholder => IsChinese
-        ? "例如 http://127.0.0.1:7890 或 socks5://127.0.0.1:7891"
-        : "http://127.0.0.1:7890 or socks5://127.0.0.1:7891";
+        ? "http://127.0.0.1:7890、socks5://127.0.0.1:7891 或 vmess://..."
+        : "http://127.0.0.1:7890, socks5://127.0.0.1:7891, or vmess://...";
 
     public static string SyncScreenshotsCheckbox => IsChinese
         ? "同步 VRChat 照片到云相册（默认关闭）"
@@ -116,22 +116,45 @@ public static class AgentStrings
         ? "正在直连测试连接并获取网页端同步间隔…"
         : "Testing direct connection && fetching Web sync schedule ...";
 
-    // ProxyHttpClientFactory
+    // ProxyHttpClientFactory & VMess
     public static string InvalidProxyUrlMessage => IsChinese
-        ? "代理地址格式无效，示例：http://127.0.0.1:7890 或 socks5://127.0.0.1:7891"
-        : "Invalid proxy URL. Example: http://127.0.0.1:7890 or socks5://127.0.0.1:7891";
+        ? "代理地址格式无效，示例：http://127.0.0.1:7890、socks5://127.0.0.1:7891 或 vmess://..."
+        : "Invalid proxy URL. Example: http://127.0.0.1:7890, socks5://127.0.0.1:7891, or vmess://...";
 
     public static string FormatUnsupportedProxyScheme(string scheme) => IsChinese
-        ? $"不支持的代理协议“{scheme}”，请使用 http、https、socks4 或 socks5。"
-        : $"Unsupported proxy scheme '{scheme}'. Use http, https, socks4, or socks5.";
+        ? $"不支持的代理协议“{scheme}”，请使用 http、https、socks4、socks5 或 vmess。"
+        : $"Unsupported proxy scheme '{scheme}'. Use http, https, socks4, socks5, or vmess.";
 
     public static string InvalidProxyPortMessage => IsChinese
         ? "代理地址必须包含有效端口号（1-65535）。"
         : "Proxy URL must include a valid port (1-65535).";
 
+    public static string InvalidVmessUrlMessage => IsChinese
+        ? "VMess 节点链接格式无效，请粘贴完整的 vmess:// 分享链接。"
+        : "Invalid VMess link. Please paste a complete vmess:// share URI.";
+
+    public static string InvalidVmessBase64Message => IsChinese
+        ? "VMess 链接 Base64 解码失败，请确认链接未被截断。"
+        : "Could not Base64-decode the vmess:// payload. Check that the link is complete.";
+
+    public static string InvalidVmessJsonMessage => IsChinese
+        ? "VMess 节点 JSON 解析失败，请检查链接格式。"
+        : "Could not parse the JSON payload inside the vmess:// link.";
+
+    public static string InvalidVmessUuidMessage => IsChinese
+        ? "VMess 节点中的用户 UUID (id) 格式无效。"
+        : "Invalid user UUID ('id') inside the vmess:// node.";
+
+    public static string FormatUnsupportedVmessTransport(string transport) => IsChinese
+        ? $"暂不支持 VMess 传输协议“{transport}”，当前内置支持 tcp、ws（含 TLS）。"
+        : $"Unsupported VMess transport '{transport}'. Built-in client supports tcp and ws (with optional TLS).";
+
     public static string NetModeOverseasDirect => IsChinese ? "海外直连" : "Overseas (Direct)";
     public static string NetModeMainlandSystemProxy => IsChinese ? "中国大陆（系统代理）" : "Mainland (System Proxy)";
     public static string NetModeMainlandCustomProxy => IsChinese ? "中国大陆（自定义代理）" : "Mainland (Custom Proxy)";
+    public static string FormatNetModeMainlandVmess(string nodeLabel) => IsChinese
+        ? $"中国大陆（VMess · {nodeLabel}）"
+        : $"Mainland (VMess · {nodeLabel})";
 
     // HttpSyncClient
     public static string FormatTestConnected(string deviceName, int intervalSeconds) => IsChinese
