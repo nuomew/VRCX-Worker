@@ -236,7 +236,9 @@
                     </div>
 
                     <!-- Right section -->
-                    <div class="flex items-center shrink-0 ml-auto [&>*:last-child]:border-r-0 [&>*:last-child]:pr-0.5">
+                    <div
+                        class="flex items-center shrink-0 ml-auto [&>*:last-child]:border-r-0 [&>*:last-child]:pr-0.5"
+                        :class="{ 'hidden sm:flex': isWeb }">
                         <template v-if="visibility.clocks">
                             <Popover
                                 v-for="(clock, idx) in visibleClocks"

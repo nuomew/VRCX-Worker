@@ -16,6 +16,30 @@
                     @pointerdown.prevent="startNavResize" />
 
                 <SidebarInset class="min-w-0 bg-sidebar">
+                    <div
+                        v-if="isWeb"
+                        class="flex md:hidden items-center justify-between gap-2 h-10 px-2 border-b border-border bg-sidebar shrink-0">
+                        <div class="flex items-center gap-2 min-w-0">
+                            <SidebarTrigger class="shrink-0" />
+                            <span class="text-xs font-semibold truncate">VRCX Cloud</span>
+                        </div>
+                        <div class="flex items-center gap-1.5 shrink-0">
+                            <Button
+                                variant="ghost"
+                                size="sm"
+                                class="h-7 px-2 text-xs"
+                                @click="toggleMobileFriendsAside">
+                                {{ isAsideCollapsedStatic ? 'Friends' : 'Hide' }}
+                            </Button>
+                            <Button
+                                variant="outline"
+                                size="sm"
+                                class="h-7 px-2 text-xs"
+                                @click="cloudState.hubDialogOpen = true">
+                                Cloud
+                            </Button>
+                        </div>
+                    </div>
                     <ResizablePanelGroup
                         direction="horizontal"
                         auto-save-id="vrcx-main-layout-right-sidebar"
@@ -88,7 +112,7 @@
 </template>
 
 <script setup>
-    import { computed, nextTick, onUnmounted, ref, watch } from 'vue';
+    import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue';
     import { storeToRefs } from 'pinia';
     import { useRouter } from 'vue-router';
     import { useI18n } from 'vue-i18n';
@@ -96,10 +120,11 @@
 
     import { Button } from '../../components/ui/button';
     import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from '../../components/ui/resizable';
-    import { SidebarInset, SidebarProvider } from '../../components/ui/sidebar';
+    import { SidebarInset, SidebarProvider, SidebarTrigger } from '../../components/ui/sidebar';
     import { useAppearanceSettingsStore } from '../../stores';
     import { useMainLayoutResizable } from '../../composables/useMainLayoutResizable';
     import { watchState } from '../../services/watchState';
+    import { cloudState } from '../../ipc-web/cloudState';
 
     import AvatarImportDialog from '../Favorites/dialogs/AvatarImportDialog.vue';
     import ChangelogDialog from '../Settings/dialogs/ChangelogDialog.vue';
@@ -212,6 +237,24 @@
                 asidePanelRef.value?.expand();
             }
         } else {
+            asidePanelRef.value?.collapse();
+        }
+    });
+
+    const isWeb = typeof WEB !== 'undefined' && WEB;
+
+    function toggleMobileFriendsAside() {
+        if (!asidePanelRef.value) return;
+        if (asidePanelRef.value.isCollapsed) {
+            asidePanelRef.value.expand();
+        } else {
+            asidePanelRef.value.collapse();
+        }
+    }
+
+    onMounted(async () => {
+        if (isWeb && typeof window !== 'undefined' && window.innerWidth < 768) {
+            await nextTick();
             asidePanelRef.value?.collapse();
         }
     });

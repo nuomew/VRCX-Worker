@@ -87,9 +87,13 @@
             getGameLogTable();
             await store.auth.migrateStoredUsers();
             store.auth.autoLoginAfterMounted();
-            store.vrcx.checkAutoBackupRestoreVrcRegistry();
+            if (!isWeb) {
+                store.vrcx.checkAutoBackupRestoreVrcRegistry();
+            }
         }
 
-        runCheckVRChatDebugLoggingFlow();
+        if (!isWeb) {
+            runCheckVRChatDebugLoggingFlow();
+        }
     });
 </script>

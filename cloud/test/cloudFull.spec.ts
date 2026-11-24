@@ -251,6 +251,17 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
         expect(okCmdRes.status).toBe(200);
         expect(await agentCmdPromise).toContain('launch_vrc');
 
+        // 7. Admin quota endpoint must succeed without forbidden PRAGMA calls
+        const quotaRes = await exports.default.fetch('http://example.com/api/admin/quota');
+        expect(quotaRes.status).toBe(200);
+        const quotaJson = (await quotaRes.json()) as {
+            ok: boolean;
+            data: { healthy: boolean; databases: { core: { bytes: number }; gamelog: { bytes: number }; feed: { bytes: number } } };
+        };
+        expect(quotaJson.ok).toBe(true);
+        expect(quotaJson.data.healthy).toBe(true);
+        expect(typeof quotaJson.data.databases.core.bytes).toBe('number');
+
         agentWs.close(1000, 'done');
         webWs.close(1000, 'done');
     });

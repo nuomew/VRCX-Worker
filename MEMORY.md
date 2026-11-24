@@ -35,4 +35,5 @@
     3. Upstream `Discord.SetAssets` takes 17 parameters (including `detailsUrl`, `startUnixMilliseconds`, `endUnixMilliseconds`, `statusDisplayType`); both `src/ipc-web/appApiWeb.js` and `RemoteCommandExecutor.cs` match this exact parameter order.
     4. Added `docs/cloud-architecture/DEPLOY.md` for one-click Cloudflare deploy, optional secrets/R2, and Windows Agent build & 6-digit pairing.
     5. Added `"build": { "command": "npm run build:web" }` to root `wrangler.jsonc` so Cloudflare Workers Builds succeeds even when Dashboard Build command is left blank (verified from clean `rm -rf build/web` via `wrangler deploy --dry-run`).
+    6. **Production D1 `SQLITE_AUTH`**: Real Cloudflare D1 rejects `PRAGMA page_count` with `D1_ERROR: not authorized: SQLITE_AUTH` even though local Miniflare permits it. Read database byte sizes from `SELECT 1 AS ok` `.all().meta.size_after` instead. Also skip `runCheckVRChatDebugLoggingFlow` and `checkAutoBackupRestoreVrcRegistry` in `WEB` mode to avoid false desktop registry alerts, and collapse the right friends sidebar by default on `<768px` mobile screens with a WEB-only top toggle bar.
 

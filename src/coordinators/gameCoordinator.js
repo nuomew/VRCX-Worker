@@ -223,6 +223,9 @@ async function runRestartCrashedGameFlow(location) {
  * Checks and re-enables VRChat debug logging if disabled.
  */
 export async function runCheckVRChatDebugLoggingFlow() {
+    if (typeof WEB !== 'undefined' && WEB) {
+        return;
+    }
     const gameStore = useGameStore();
     const advancedSettingsStore = useAdvancedSettingsStore();
     const modalStore = useModalStore();

@@ -699,26 +699,21 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
 
     if (url.pathname === '/api/admin/quota' && request.method === 'GET') {
         const [coreProbe, gameProbe, feedProbe, countersRes, devicesRes] = await Promise.all([
-            env.DB_CORE.prepare('SELECT 1').first(),
-            env.DB_GAMELOG.prepare('SELECT 1').first(),
-            env.DB_FEED.prepare('SELECT 1').first(),
+            env.DB_CORE.prepare('SELECT 1 AS ok').all(),
+            env.DB_GAMELOG.prepare('SELECT 1 AS ok').all(),
+            env.DB_FEED.prepare('SELECT 1 AS ok').all(),
             env.DB_CORE.prepare('SELECT counter_key, row_count, updated_at FROM stats_counters').all(),
             env.DB_CORE.prepare('SELECT COUNT(*) AS cnt FROM cloud_devices').first<{ cnt: number }>()
         ]);
-        const [coreMeta, gameMeta, feedMeta] = await Promise.all([
-            env.DB_CORE.prepare('PRAGMA page_count').all(),
-            env.DB_GAMELOG.prepare('PRAGMA page_count').all(),
-            env.DB_FEED.prepare('PRAGMA page_count').all()
-        ]);
         const freeDbCapBytes = 500 * 1024 * 1024;
-        const sizeCore = coreMeta.meta?.size_after ?? 0;
-        const sizeGame = gameMeta.meta?.size_after ?? 0;
-        const sizeFeed = feedMeta.meta?.size_after ?? 0;
+        const sizeCore = coreProbe.meta?.size_after ?? 0;
+        const sizeGame = gameProbe.meta?.size_after ?? 0;
+        const sizeFeed = feedProbe.meta?.size_after ?? 0;
 
         return Response.json({
             ok: true,
             data: {
-                healthy: Boolean(coreProbe && gameProbe && feedProbe),
+                healthy: Boolean(coreProbe.success && gameProbe.success && feedProbe.success),
                 freeSingleDbLimitBytes: freeDbCapBytes,
                 databases: {
                     core: { bytes: sizeCore, percentOfFreeLimit: Number(((sizeCore / freeDbCapBytes) * 100).toFixed(2)) },

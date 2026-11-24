@@ -479,6 +479,15 @@ export function createAppApiBridge() {
         async GetVRChatRegistry() {
             return {};
         },
+        async GetVRChatRegistryKey() {
+            return null;
+        },
+        async SetVRChatRegistryKey() {
+            return false;
+        },
+        async DeleteVRChatRegistryKey() {
+            return false;
+        },
         async GetVRChatRegistryJson() {
             return '{}';
         },
