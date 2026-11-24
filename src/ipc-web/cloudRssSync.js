@@ -86,6 +86,9 @@ export function applyCloudRssSnapshot(data) {
     if (Array.isArray(data.recentFeeds) && data.recentFeeds.length > 0) {
         feedStore.feedTableLookup();
     }
+    if (Number(data.friendLogInserted || 0) > 0 && typeof friendStore.initFriendLogHistoryTable === 'function') {
+        friendStore.initFriendLogHistoryTable();
+    }
 
     const n1 = Array.isArray(data.notificationsV1) ? data.notificationsV1 : [];
     const n2 = Array.isArray(data.notificationsV2) ? data.notificationsV2 : [];

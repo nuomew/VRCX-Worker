@@ -722,4 +722,51 @@ describe('WEB cloud adapter (stateless)', () => {
         expect(act.detailData instanceof Map).toBe(true);
         expect(act.detailData.get('wrld_hot_1:100')).toHaveLength(1);
     });
+
+    it('chunks large setFriendLogCurrentArray baselines and maps getFriendLogHistory rows cleanly', async () => {
+        const db = createCloudDatabase({ userId: 'usr_me', userPrefix: 'usr_me', maxTableSize: 500 });
+        fetchSpy.mockResolvedValueOnce(mockOk({ count: 200 }));
+        fetchSpy.mockResolvedValueOnce(mockOk({ count: 50 }));
+
+        const largeList = Array.from({ length: 250 }, (_, idx) => ({
+            userId: `usr_f_${idx}`,
+            displayName: `Friend ${idx}`,
+            trustLevel: 'User',
+            friendNumber: idx + 1
+        }));
+        await db.setFriendLogCurrentArray(largeList);
+        expect(fetchSpy).toHaveBeenCalledTimes(2);
+        expect(JSON.parse(fetchSpy.mock.calls[0][1].body).entries).toHaveLength(200);
+        expect(JSON.parse(fetchSpy.mock.calls[1][1].body).entries).toHaveLength(50);
+
+        fetchSpy.mockResolvedValueOnce(
+            mockOk([
+                {
+                    id: 7,
+                    created_at: '2026-11-24T12:00:00.000Z',
+                    type: 'DisplayName',
+                    user_id: 'usr_f_1',
+                    display_name: 'NewName',
+                    previous_display_name: 'OldName',
+                    trust_level: '',
+                    previous_trust_level: '',
+                    friend_number: 2
+                }
+            ])
+        );
+        const history = await db.getFriendLogHistory();
+        expect(history).toEqual([
+            {
+                rowId: 7,
+                created_at: '2026-11-24T12:00:00.000Z',
+                type: 'DisplayName',
+                userId: 'usr_f_1',
+                displayName: 'NewName',
+                previousDisplayName: 'OldName',
+                trustLevel: '',
+                previousTrustLevel: '',
+                friendNumber: 2
+            }
+        ]);
+    });
 });

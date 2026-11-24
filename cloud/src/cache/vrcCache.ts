@@ -25,6 +25,7 @@ export interface RssSnapshotPayload {
     feedInserted: number;
     notificationsInserted: number;
     bioChecked: number;
+    friendLogInserted?: number;
     onlineFriends: Array<Record<string, unknown>>;
 }
 
@@ -256,6 +257,7 @@ export async function readRssSnapshot(env: Env): Promise<RssSnapshotPayload | nu
             feedInserted: Number(parsed.feedInserted ?? 0),
             notificationsInserted: Number(parsed.notificationsInserted ?? 0),
             bioChecked: Number(parsed.bioChecked ?? 0),
+            friendLogInserted: Number(parsed.friendLogInserted ?? 0),
             onlineFriends: Array.isArray(parsed.onlineFriends) ? parsed.onlineFriends : []
         };
     } catch {

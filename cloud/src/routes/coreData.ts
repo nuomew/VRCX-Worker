@@ -692,8 +692,8 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
                 }>;
             };
             const list = body.entries ?? [];
-            for (let i = 0; i < list.length; i += 25) {
-                const chunk = list.slice(i, i + 25);
+            for (let i = 0; i < list.length; i += 50) {
+                const chunk = list.slice(i, i + 50);
                 await env.DB_CORE.batch(
                     chunk.map((e) =>
                         env.DB_CORE.prepare(

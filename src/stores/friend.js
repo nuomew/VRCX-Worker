@@ -267,13 +267,18 @@ export const useFriendStore = defineStore('Friend', () => {
     });
 
     watch(
-        [router.currentRoute, () => dashboardStore.dashboards],
-        ([value]) => {
+        [
+            router.currentRoute,
+            () => dashboardStore.dashboards,
+            () => watchState.isLoggedIn,
+            () => watchState.isFriendsLoaded
+        ],
+        ([value, , isLoggedIn]) => {
             const isDashboardPanel =
                 value.name === 'dashboard' && dashboardStore.getDashboard(value.params.id, 'friend-log');
-            if (value.name === 'friend-log' || isDashboardPanel) {
+            if ((value.name === 'friend-log' || isDashboardPanel) && isLoggedIn) {
                 initFriendLogHistoryTable();
-            } else {
+            } else if (value.name !== 'friend-log' && !isDashboardPanel) {
                 friendLogTable.value.data = [];
             }
         },
@@ -896,7 +901,7 @@ export const useFriendStore = defineStore('Friend', () => {
                 sqlValues.unshift(row);
             }
         });
-        database.setFriendLogCurrentArray(sqlValues);
+        await database.setFriendLogCurrentArray(sqlValues);
         await configRepository.setBool(`friendLogInit_${currentUser.id}`, true);
         watchState.isFriendsLoaded = true;
     }
@@ -927,6 +932,16 @@ export const useFriendStore = defineStore('Friend', () => {
         }
 
         const friendLogCurrentArray = await database.getFriendLogCurrent();
+        if (
+            typeof WEB !== 'undefined' &&
+            WEB &&
+            friendLogCurrentArray.length === 0 &&
+            Array.isArray(currentUser?.friends) &&
+            currentUser.friends.length > 0
+        ) {
+            await initFriendLog(currentUser);
+            return;
+        }
         for (friend of friendLogCurrentArray) {
             friendLog.set(friend.userId, friend);
         }

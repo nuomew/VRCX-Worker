@@ -27,6 +27,7 @@ const FRIEND_PAGE_SIZE = 100;
 const MAX_WORLD_LOOKUPS_PER_TICK = 4;
 const MAX_BIO_PROFILES_PER_TICK = 5;
 const BIO_RECHECK_COOLDOWN_MS = 10 * 60_000; // Recheck each online friend's bio at most once per 10 minutes
+const FRIEND_MEMBERSHIP_CHECK_COOLDOWN_MS = 15 * 60_000; // Reconcile full friend list membership at most once per 15 minutes
 const AUTH_EXPIRED_BACKOFF_MS = 30 * 60_000;
 const RATE_LIMIT_BACKOFF_MS = 10 * 60_000;
 
@@ -72,6 +73,8 @@ export interface PollerMeta {
     lastFeedInserted: number;
     lastNotificationsInserted: number;
     lastBioChecked: number;
+    lastFriendLogInserted?: number;
+    lastFriendMembershipCheckAt?: string;
 }
 
 export interface VrcFriendApiRecord {
@@ -81,6 +84,7 @@ export interface VrcFriendApiRecord {
     status?: string;
     statusDescription?: string;
     platform?: string;
+    tags?: unknown;
 }
 
 export interface BackgroundFeedSyncResult {
@@ -90,6 +94,7 @@ export interface BackgroundFeedSyncResult {
     feedInserted: number;
     notificationsInserted: number;
     bioChecked: number;
+    friendLogInserted?: number;
     error?: string;
 }
 
@@ -104,7 +109,9 @@ function defaultPollerMeta(): PollerMeta {
         lastOnlineCount: 0,
         lastFeedInserted: 0,
         lastNotificationsInserted: 0,
-        lastBioChecked: 0
+        lastBioChecked: 0,
+        lastFriendLogInserted: 0,
+        lastFriendMembershipCheckAt: ''
     };
 }
 
@@ -846,6 +853,292 @@ async function pollNotifications(
     return { inserted, cookieChanged };
 }
 
+function computeTrustLevelFromTags(tags: unknown): string {
+    if (!Array.isArray(tags)) return '';
+    const set = new Set(tags.filter((t): t is string => typeof t === 'string'));
+    if (set.has('system_trust_veteran')) return 'Trusted User';
+    if (set.has('system_trust_trusted')) return 'Known User';
+    if (set.has('system_trust_known')) return 'User';
+    if (set.has('system_trust_basic')) return 'New User';
+    return 'Visitor';
+}
+
+/**
+ * Tracks DisplayName, TrustLevel, Friend, and Unfriend changes against DB_CORE.friend_log_current
+ * during cloud RSS sync cycles (0 extra VRChat API calls for online friend diffs; at most 1
+ * `auth/user` call every 15 minutes or on manual force sync to detect unfriends/offline additions).
+ */
+async function syncFriendLogChanges(
+    env: Env,
+    onlineFriends: VrcFriendApiRecord[],
+    jar: Record<string, string>,
+    nowIso: string,
+    nowMs: number,
+    meta: PollerMeta,
+    forceMembershipCheck: boolean
+): Promise<{ inserted: number; cookieChanged: boolean }> {
+    const currentRes = await env.DB_CORE.prepare(
+        'SELECT user_id, display_name, trust_level, friend_number FROM friend_log_current'
+    ).all<{
+        user_id: string;
+        display_name: string;
+        trust_level: string;
+        friend_number: number;
+    }>();
+
+    const rows = currentRes.results ?? [];
+    if (rows.length === 0) {
+        // Baseline has not been initialized by the Web client yet; avoid emitting false Friend events.
+        return { inserted: 0, cookieChanged: false };
+    }
+
+    const currentMap = new Map<
+        string,
+        { userId: string; displayName: string; trustLevel: string; friendNumber: number }
+    >();
+    let maxFriendNumber = 0;
+    for (const r of rows) {
+        const uid = (r.user_id ?? '').trim();
+        if (!uid) continue;
+        const num = Number(r.friend_number ?? 0);
+        if (num > maxFriendNumber) maxFriendNumber = num;
+        currentMap.set(uid, {
+            userId: uid,
+            displayName: (r.display_name ?? '').trim(),
+            trustLevel: (r.trust_level ?? '').trim(),
+            friendNumber: num
+        });
+    }
+    if (maxFriendNumber === 0) {
+        maxFriendNumber = currentMap.size;
+    }
+
+    interface HistoryWrite {
+        type: 'Friend' | 'Unfriend' | 'DisplayName' | 'TrustLevel';
+        userId: string;
+        displayName: string;
+        previousDisplayName: string;
+        trustLevel: string;
+        previousTrustLevel: string;
+        friendNumber: number;
+    }
+
+    const historyWrites: HistoryWrite[] = [];
+    const currentUpserts = new Map<
+        string,
+        { userId: string; displayName: string; trustLevel: string; friendNumber: number }
+    >();
+    const currentDeletes: string[] = [];
+    let cookieChanged = false;
+
+    // 1. Online friends diff (0 extra VRChat API calls)
+    for (const f of onlineFriends) {
+        const uid = typeof f.id === 'string' ? f.id.trim() : '';
+        if (!uid) continue;
+        const displayName = typeof f.displayName === 'string' ? f.displayName.trim() : '';
+        const trustLevel = computeTrustLevelFromTags(f.tags);
+        const existing = currentMap.get(uid);
+
+        if (!existing) {
+            maxFriendNumber += 1;
+            const nextEntry = {
+                userId: uid,
+                displayName: displayName || uid,
+                trustLevel,
+                friendNumber: maxFriendNumber
+            };
+            currentMap.set(uid, nextEntry);
+            currentUpserts.set(uid, nextEntry);
+            historyWrites.push({
+                type: 'Friend',
+                userId: uid,
+                displayName: nextEntry.displayName,
+                previousDisplayName: '',
+                trustLevel: '',
+                previousTrustLevel: '',
+                friendNumber: maxFriendNumber
+            });
+            continue;
+        }
+
+        let dirty = false;
+        if (existing.displayName && displayName && existing.displayName !== displayName) {
+            historyWrites.push({
+                type: 'DisplayName',
+                userId: uid,
+                displayName,
+                previousDisplayName: existing.displayName,
+                trustLevel: '',
+                previousTrustLevel: '',
+                friendNumber: existing.friendNumber
+            });
+            existing.displayName = displayName;
+            dirty = true;
+        }
+
+        if (trustLevel && existing.trustLevel && existing.trustLevel !== trustLevel) {
+            const isTrustedVeteranFlip =
+                (existing.trustLevel === 'Trusted User' && trustLevel === 'Veteran User') ||
+                (existing.trustLevel === 'Veteran User' && trustLevel === 'Trusted User');
+            if (!isTrustedVeteranFlip) {
+                historyWrites.push({
+                    type: 'TrustLevel',
+                    userId: uid,
+                    displayName: existing.displayName || displayName || uid,
+                    previousDisplayName: '',
+                    trustLevel,
+                    previousTrustLevel: existing.trustLevel,
+                    friendNumber: existing.friendNumber
+                });
+            }
+            existing.trustLevel = trustLevel;
+            dirty = true;
+        } else if (trustLevel && !existing.trustLevel) {
+            existing.trustLevel = trustLevel;
+            dirty = true;
+        }
+
+        if (dirty) {
+            currentUpserts.set(uid, { ...existing });
+        }
+    }
+
+    // 2. Periodic full friend membership reconciliation (1 GET auth/user at most every 15m or on manual sync)
+    const lastCheckMs = meta.lastFriendMembershipCheckAt ? Date.parse(meta.lastFriendMembershipCheckAt) : 0;
+    const dueMembershipCheck =
+        forceMembershipCheck ||
+        !Number.isFinite(lastCheckMs) ||
+        lastCheckMs <= 0 ||
+        nowMs - lastCheckMs >= FRIEND_MEMBERSHIP_CHECK_COOLDOWN_MS;
+
+    if (dueMembershipCheck) {
+        try {
+            const res = await fetchVrcJson('auth/user', jar);
+            if (res.cookieChanged) cookieChanged = true;
+            if (res.status === 200 && res.data && typeof res.data === 'object') {
+                const userObj = res.data as { id?: unknown; friends?: unknown };
+                const selfId = typeof userObj.id === 'string' ? userObj.id.trim() : '';
+                const vrcFriendIds = Array.isArray(userObj.friends)
+                    ? userObj.friends.filter((x): x is string => typeof x === 'string' && x.startsWith('usr_'))
+                    : [];
+                if (vrcFriendIds.length > 0) {
+                    meta.lastFriendMembershipCheckAt = nowIso;
+                    const vrcSet = new Set(vrcFriendIds);
+
+                    // Detect Unfriends with mass-drop circuit breaker
+                    const removedIds: string[] = [];
+                    for (const uid of currentMap.keys()) {
+                        if (uid === selfId) continue;
+                        if (!vrcSet.has(uid)) {
+                            removedIds.push(uid);
+                        }
+                    }
+                    const maxSafeRemovals = Math.max(20, Math.floor(currentMap.size * 0.5));
+                    if (removedIds.length > 0 && removedIds.length <= maxSafeRemovals) {
+                        for (const uid of removedIds) {
+                            const old = currentMap.get(uid);
+                            if (!old) continue;
+                            historyWrites.push({
+                                type: 'Unfriend',
+                                userId: uid,
+                                displayName: old.displayName || uid,
+                                previousDisplayName: '',
+                                trustLevel: '',
+                                previousTrustLevel: '',
+                                friendNumber: old.friendNumber
+                            });
+                            currentMap.delete(uid);
+                            currentUpserts.delete(uid);
+                            currentDeletes.push(uid);
+                        }
+                    }
+
+                    // Detect newly added offline friends not seen in onlineFriends above
+                    const addedOfflineIds = vrcFriendIds.filter((uid) => uid !== selfId && !currentMap.has(uid));
+                    if (addedOfflineIds.length > 0 && addedOfflineIds.length <= 50) {
+                        const knownNames = new Map<string, string>();
+                        for (let i = 0; i < addedOfflineIds.length; i += 20) {
+                            const chunk = addedOfflineIds.slice(i, i + 20);
+                            const ph = chunk.map(() => '?').join(', ');
+                            const dictRes = await env.DB_CORE.prepare(
+                                `SELECT user_id, display_name FROM entity_users WHERE user_id IN (${ph})`
+                            )
+                                .bind(...chunk)
+                                .all<{ user_id: string; display_name: string }>();
+                            for (const d of dictRes.results ?? []) {
+                                if (d.user_id && d.display_name) knownNames.set(d.user_id, d.display_name);
+                            }
+                        }
+                        for (const uid of addedOfflineIds) {
+                            maxFriendNumber += 1;
+                            const name = knownNames.get(uid) || uid;
+                            const nextEntry = {
+                                userId: uid,
+                                displayName: name,
+                                trustLevel: '',
+                                friendNumber: maxFriendNumber
+                            };
+                            currentMap.set(uid, nextEntry);
+                            currentUpserts.set(uid, nextEntry);
+                            historyWrites.push({
+                                type: 'Friend',
+                                userId: uid,
+                                displayName: name,
+                                previousDisplayName: '',
+                                trustLevel: '',
+                                previousTrustLevel: '',
+                                friendNumber: maxFriendNumber
+                            });
+                        }
+                    }
+                }
+            }
+        } catch {
+            // Non-fatal; next scheduled tick will retry
+        }
+    }
+
+    // 3. Persist changes in compact D1 batches
+    const dbStmts: D1PreparedStatement[] = [];
+    for (const h of historyWrites) {
+        dbStmts.push(
+            env.DB_CORE.prepare(
+                `INSERT INTO friend_log_history
+                 (created_at, type, user_id, display_name, previous_display_name, trust_level, previous_trust_level, friend_number)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+            ).bind(
+                nowIso,
+                h.type,
+                h.userId,
+                h.displayName,
+                h.previousDisplayName,
+                h.trustLevel,
+                h.previousTrustLevel,
+                h.friendNumber
+            )
+        );
+    }
+    for (const u of currentUpserts.values()) {
+        dbStmts.push(
+            env.DB_CORE.prepare(
+                'INSERT OR REPLACE INTO friend_log_current (user_id, display_name, trust_level, friend_number) VALUES (?, ?, ?, ?)'
+            ).bind(u.userId, u.displayName, u.trustLevel, u.friendNumber)
+        );
+    }
+    for (const uid of currentDeletes) {
+        dbStmts.push(env.DB_CORE.prepare('DELETE FROM friend_log_current WHERE user_id = ?').bind(uid));
+    }
+
+    for (let i = 0; i < dbStmts.length; i += 25) {
+        await env.DB_CORE.batch(dbStmts.slice(i, i + 25));
+    }
+    if (historyWrites.length > 0) {
+        await incrementCounter(env.DB_CORE, 'friend_log_history', historyWrites.length);
+    }
+
+    return { inserted: historyWrites.length, cookieChanged };
+}
+
 /**
  * Executes one scheduled or manual cloud-side RSS-style VRChat Feed, Online Friends & Notification sync cycle. Strictly
  * obeys the independent Web/Cloud `webSyncIntervalSeconds` (default 300s = 5 min, min 60s on Cloudflare Cron)
@@ -1051,6 +1344,10 @@ export async function runBackgroundFeedSync(
         const notifRes = await pollNotifications(env, jar, nowIso, webSyncIntervalSeconds);
         if (notifRes.cookieChanged) cookieDirty = true;
 
+        // Track friend log changes (Friend, Unfriend, DisplayName, TrustLevel) against friend_log_current
+        const friendLogRes = await syncFriendLogChanges(env, onlineFriends, jar, nowIso, nowMs, meta, force);
+        if (friendLogRes.cookieChanged) cookieDirty = true;
+
         if (cookieDirty) {
             await saveCookieJar(env, jar);
         }
@@ -1065,6 +1362,7 @@ export async function runBackgroundFeedSync(
         meta.lastFeedInserted = feedInserted;
         meta.lastNotificationsInserted = notifRes.inserted;
         meta.lastBioChecked = bioRes.bioChecked;
+        meta.lastFriendLogInserted = friendLogRes.inserted;
 
         await Promise.all([
             env.DB_CORE.batch([
@@ -1089,6 +1387,7 @@ export async function runBackgroundFeedSync(
                 feedInserted,
                 notificationsInserted: notifRes.inserted,
                 bioChecked: bioRes.bioChecked,
+                friendLogInserted: friendLogRes.inserted,
                 onlineFriends: rawOnlineFriendRecords
             }).catch(() => {}),
             pruneExpiredVrcCache(env, nowMs).catch(() => {})
@@ -1100,7 +1399,8 @@ export async function runBackgroundFeedSync(
             onlineCount: inGameCount,
             feedInserted,
             notificationsInserted: notifRes.inserted,
-            bioChecked: bioRes.bioChecked
+            bioChecked: bioRes.bioChecked,
+            friendLogInserted: friendLogRes.inserted
         };
     } catch (err) {
         const msg = err instanceof Error ? err.message : 'Unexpected background sync error';
@@ -1115,6 +1415,7 @@ export async function runBackgroundFeedSync(
             feedInserted: 0,
             notificationsInserted: 0,
             bioChecked: 0,
+            friendLogInserted: 0,
             error: meta.lastError
         };
     }
@@ -1129,6 +1430,7 @@ export interface RssAggregatedFeedResponse {
     feedInserted: number;
     notificationsInserted: number;
     bioChecked: number;
+    friendLogInserted: number;
     onlineFriends: Array<Record<string, unknown>>;
     recentFeeds: Array<Record<string, unknown>>;
     notificationsV1: Array<Record<string, unknown>>;
@@ -1169,6 +1471,7 @@ export async function getRssAggregatedFeed(
             feedInserted: 0,
             notificationsInserted: 0,
             bioChecked: 0,
+            friendLogInserted: 0,
             onlineFriends: [],
             recentFeeds: [],
             notificationsV1: [],
@@ -1188,6 +1491,7 @@ export async function getRssAggregatedFeed(
             feedInserted: snapshot.feedInserted,
             notificationsInserted: snapshot.notificationsInserted,
             bioChecked: snapshot.bioChecked,
+            friendLogInserted: Number(snapshot.friendLogInserted ?? 0),
             onlineFriends: [],
             recentFeeds: [],
             notificationsV1: [],
@@ -1280,6 +1584,7 @@ export async function getRssAggregatedFeed(
         feedInserted: snapshot.feedInserted,
         notificationsInserted: snapshot.notificationsInserted,
         bioChecked: snapshot.bioChecked,
+        friendLogInserted: Number(snapshot.friendLogInserted ?? 0),
         onlineFriends: snapshot.onlineFriends,
         recentFeeds: filteredFeeds,
         notificationsV1: (notifResults[0] as D1Result<Record<string, unknown>> | undefined)?.results ?? [],

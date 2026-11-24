@@ -750,7 +750,12 @@ export function createCloudDatabase(dbVars) {
                 friend_number: e.friendNumber
             }));
             if (entries.length === 0) return;
-            await cloudFetch('/api/friend-log/current', { method: 'POST', json: { entries } });
+            for (let i = 0; i < entries.length; i += 200) {
+                await cloudFetch('/api/friend-log/current', {
+                    method: 'POST',
+                    json: { entries: entries.slice(i, i + 200) }
+                });
+            }
         },
         async deleteFriendLogCurrent(userId) {
             await cloudFetch(`/api/friend-log/current?userId=${encodeURIComponent(userId)}`, { method: 'DELETE' });
@@ -784,7 +789,12 @@ export function createCloudDatabase(dbVars) {
                 friend_number: e.friendNumber
             }));
             if (entries.length === 0) return;
-            await cloudFetch('/api/friend-log/history', { method: 'POST', json: { entries } });
+            for (let i = 0; i < entries.length; i += 100) {
+                await cloudFetch('/api/friend-log/history', {
+                    method: 'POST',
+                    json: { entries: entries.slice(i, i + 100) }
+                });
+            }
         },
         async getFriendLogHistoryForUserId(userId, types) {
             const rows = await cloudFetch(

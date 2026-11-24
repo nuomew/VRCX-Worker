@@ -1714,4 +1714,145 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
         const aliceRow = roomARows.find((r) => r.user_id === 'usr_alice_act');
         expect(aliceRow?.time).toBe(15 * 60_000); // 10:05 -> 10:20 reconstructed from time=0 OnPlayerLeft
     });
+
+    it('tracks Friend, Unfriend, DisplayName, and TrustLevel into friend_log_history during cloud RSS sync', async () => {
+        // Seed friend_log_current baseline via POST /api/friend-log/current
+        await env.DB_CORE.prepare('DELETE FROM friend_log_current').run();
+        await env.DB_CORE.prepare('DELETE FROM friend_log_history').run();
+
+        const baselineRes = await exports.default.fetch('http://example.com/api/friend-log/current', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                entries: [
+                    { user_id: 'usr_fl_rename', display_name: 'OldName', trust_level: 'New User', friend_number: 10 },
+                    {
+                        user_id: 'usr_fl_unfriend',
+                        display_name: 'GoneFriend',
+                        trust_level: 'Known User',
+                        friend_number: 11
+                    },
+                    {
+                        user_id: 'usr_fl_veteran',
+                        display_name: 'VetFriend',
+                        trust_level: 'Veteran User',
+                        friend_number: 12
+                    }
+                ]
+            })
+        });
+        expect(baselineRes.status).toBe(200);
+
+        const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+            const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+            if (url.includes('/api/1/auth/user/friends')) {
+                return Response.json([
+                    {
+                        id: 'usr_fl_rename',
+                        displayName: 'NewCoolName',
+                        location: 'private',
+                        status: 'active',
+                        statusDescription: '',
+                        tags: ['system_trust_trusted'] // New User -> Known User
+                    },
+                    {
+                        id: 'usr_fl_veteran',
+                        displayName: 'VetFriend',
+                        location: 'private',
+                        status: 'active',
+                        statusDescription: '',
+                        tags: ['system_trust_veteran'] // Veteran User <-> Trusted User must NOT emit TrustLevel noise
+                    },
+                    {
+                        id: 'usr_fl_new_friend',
+                        displayName: 'BrandNewFriend',
+                        location: 'private',
+                        status: 'join me',
+                        statusDescription: '',
+                        tags: ['system_trust_basic']
+                    }
+                ]);
+            }
+            if (url.endsWith('/api/1/auth/user')) {
+                return Response.json({
+                    id: 'usr_self_fl',
+                    friends: ['usr_fl_rename', 'usr_fl_veteran', 'usr_fl_new_friend']
+                });
+            }
+            if (url.includes('/api/1/users/')) {
+                return Response.json({ id: 'usr_fl_rename', displayName: 'NewCoolName', bio: '', bioLinks: [] });
+            }
+            if (url.includes('/api/1/auth/user/notifications') || url.includes('/api/1/notifications')) {
+                return Response.json([]);
+            }
+            return new Response('Not Found', { status: 404 });
+        });
+
+        try {
+            const rssSyncRes = await exports.default.fetch('http://example.com/api/rss/sync', { method: 'POST' });
+            expect(rssSyncRes.status).toBe(200);
+            const rssSyncJson = (await rssSyncRes.json()) as {
+                ok: boolean;
+                data: { friendLogInserted: number };
+            };
+            // DisplayName + TrustLevel + Friend + Unfriend = 4 rows (Trusted/Veteran flip ignored)
+            expect(rssSyncJson.data.friendLogInserted).toBe(4);
+
+            const historyRes = await exports.default.fetch('http://example.com/api/friend-log/history?limit=20');
+            expect(historyRes.status).toBe(200);
+            const historyJson = (await historyRes.json()) as {
+                ok: boolean;
+                data: Array<{
+                    type: string;
+                    user_id: string;
+                    display_name: string;
+                    previous_display_name: string;
+                    trust_level: string;
+                    previous_trust_level: string;
+                    friend_number: number;
+                }>;
+            };
+            expect(
+                historyJson.data.some(
+                    (h) =>
+                        h.type === 'DisplayName' &&
+                        h.user_id === 'usr_fl_rename' &&
+                        h.previous_display_name === 'OldName' &&
+                        h.display_name === 'NewCoolName'
+                )
+            ).toBe(true);
+            expect(
+                historyJson.data.some(
+                    (h) =>
+                        h.type === 'TrustLevel' &&
+                        h.user_id === 'usr_fl_rename' &&
+                        h.previous_trust_level === 'New User' &&
+                        h.trust_level === 'Known User'
+                )
+            ).toBe(true);
+            expect(
+                historyJson.data.some(
+                    (h) =>
+                        h.type === 'Friend' &&
+                        h.user_id === 'usr_fl_new_friend' &&
+                        h.display_name === 'BrandNewFriend' &&
+                        h.friend_number === 13
+                )
+            ).toBe(true);
+            expect(
+                historyJson.data.some(
+                    (h) => h.type === 'Unfriend' && h.user_id === 'usr_fl_unfriend' && h.display_name === 'GoneFriend'
+                )
+            ).toBe(true);
+            expect(historyJson.data.some((h) => h.user_id === 'usr_fl_veteran')).toBe(false);
+
+            // Confirm unfriended user was removed from friend_log_current
+            const currentRes = await exports.default.fetch('http://example.com/api/friend-log/current');
+            const currentJson = (await currentRes.json()) as { ok: boolean; data: Array<{ user_id: string }> };
+            expect(currentJson.data.some((r) => r.user_id === 'usr_fl_unfriend')).toBe(false);
+            expect(currentJson.data.some((r) => r.user_id === 'usr_fl_new_friend')).toBe(true);
+        } finally {
+            fetchSpy.mockRestore();
+        }
+    });
 });
