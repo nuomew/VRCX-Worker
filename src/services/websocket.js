@@ -28,6 +28,10 @@ let webSocket = null;
 let lastWebSocketMessage = '';
 let webSocketClosedGracefully = true;
 let wsReconnectDelayMs = 5000;
+let wsStableTimer = null;
+let wsAuthMismatchCount = 0;
+let wsLastErrorWasAuthMismatch = false;
+const isWebMode = typeof WEB !== 'undefined' && WEB;
 
 const refreshOwnedItems = debounce(() => useUserStore().getAllProductPurchases(), 5000);
 
@@ -44,6 +48,11 @@ export const wsState = reactive({
 
 export function initWebsocket() {
     if (!watchState.isFriendsLoaded || webSocket !== null) {
+        return;
+    }
+    if (isWebMode && typeof window !== 'undefined') {
+        const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        connectWebSocketUrl(`${wsProtocol}//${window.location.host}/api/vrc/pipeline`);
         return;
     }
     return request('auth', {
@@ -67,16 +76,40 @@ export function initWebsocket() {
  * @returns {void}
  */
 function connectWebSocket(token) {
+    connectWebSocketUrl(`${AppDebug.websocketDomain}/?auth=${token}`);
+}
+
+/**
+ * @param {string} wsUrl
+ * @returns {void}
+ */
+function connectWebSocketUrl(wsUrl) {
     const userStore = useUserStore();
     const notificationStore = useNotificationStore();
     const friendStore = useFriendStore();
     if (webSocket !== null) {
         return;
     }
-    const socket = new WebSocket(`${AppDebug.websocketDomain}/?auth=${token}`);
+    wsLastErrorWasAuthMismatch = false;
+    const socket = new WebSocket(wsUrl);
     socket.onopen = () => {
         wsState.connected = true;
-        wsReconnectDelayMs = 5000;
+        if (wsStableTimer) {
+            clearTimeout(wsStableTimer);
+            wsStableTimer = null;
+        }
+        if (isWebMode) {
+            // Only reset backoff after the connection stays healthy for 15s (VRChat accepts the 101 handshake
+            // before pushing {"err":"authToken doesn't correspond with an active session"} and closing).
+            wsStableTimer = setTimeout(() => {
+                if (webSocket === socket && wsState.connected && !wsLastErrorWasAuthMismatch) {
+                    wsReconnectDelayMs = 5000;
+                    wsAuthMismatchCount = 0;
+                }
+            }, 15000);
+        } else {
+            wsReconnectDelayMs = 5000;
+        }
         if (!webSocketClosedGracefully && watchState.isLoggedIn && watchState.isFriendsLoaded) {
             console.warn('WebSocket reconnected after unexpected closure');
             webSocketClosedGracefully = true;
@@ -89,6 +122,10 @@ function connectWebSocket(token) {
     };
     socket.onclose = ({ code, reason }) => {
         wsState.connected = false;
+        if (wsStableTimer) {
+            clearTimeout(wsStableTimer);
+            wsStableTimer = null;
+        }
         const isCurrentSocket = webSocket === socket;
         if (isCurrentSocket) {
             webSocket = null;
@@ -102,8 +139,14 @@ function connectWebSocket(token) {
         if (!webSocketClosedGracefully || AppDebug.debugWebSocket) {
             console.log('WebSocket closed', { code, reason });
         }
-        const delayMs = typeof WEB !== 'undefined' && WEB ? wsReconnectDelayMs : 5000;
-        if (typeof WEB !== 'undefined' && WEB) {
+        if (isWebMode && wsAuthMismatchCount >= 3) {
+            console.warn(
+                'WebSocket pipeline paused after repeated session IP mismatches; regular polling remains active.'
+            );
+            return;
+        }
+        const delayMs = isWebMode ? wsReconnectDelayMs : 5000;
+        if (isWebMode) {
             wsReconnectDelayMs = Math.min(wsReconnectDelayMs * 2, 60000);
         }
         workerTimers.setTimeout(() => {
@@ -113,10 +156,12 @@ function connectWebSocket(token) {
         }, delayMs);
     };
     socket.onerror = () => {
-        if (AppDebug.errorNoty) {
-            toast.dismiss(AppDebug.errorNoty);
+        if (!isWebMode) {
+            if (AppDebug.errorNoty) {
+                toast.dismiss(AppDebug.errorNoty);
+            }
+            AppDebug.errorNoty = toast.error('WebSocket Error');
         }
-        AppDebug.errorNoty = toast.error('WebSocket Error');
         socket.onclose(
             new CloseEvent('close', {
                 code: 1006, // Abnormal Closure
@@ -163,6 +208,12 @@ function connectWebSocket(token) {
  */
 export function closeWebSocket() {
     const socket = webSocket;
+    if (wsStableTimer) {
+        clearTimeout(wsStableTimer);
+        wsStableTimer = null;
+    }
+    wsAuthMismatchCount = 0;
+    wsReconnectDelayMs = 5000;
     if (socket === null) {
         return;
     }
@@ -202,11 +253,25 @@ function handlePipeline(args) {
     const { type, content, err } = args.json;
     if (typeof err !== 'undefined') {
         console.error('PIPELINE: error', args);
+        const errText = String(err);
+        if (isWebMode && /authToken|active session/i.test(errText)) {
+            wsLastErrorWasAuthMismatch = true;
+            wsAuthMismatchCount += 1;
+            if (wsAuthMismatchCount === 1) {
+                // Touch auth/user through Worker proxy once to refresh session cookie before next retry
+                request('auth/user', { method: 'GET' }).catch(() => {});
+            }
+            return;
+        }
         if (AppDebug.errorNoty) {
             toast.dismiss(AppDebug.errorNoty);
         }
         AppDebug.errorNoty = toast.error(`WebSocket Error: ${err}`);
         return;
+    }
+    if (isWebMode && typeof content !== 'undefined') {
+        wsAuthMismatchCount = 0;
+        wsReconnectDelayMs = 5000;
     }
     if (typeof content === 'undefined') {
         console.error('PIPELINE: missing content', args);

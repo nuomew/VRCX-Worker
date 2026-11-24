@@ -323,6 +323,24 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
         const secondInit = fetchSpy.mock.calls[1]?.[1];
         const sentHeaders = new Headers(secondInit?.headers);
         expect(sentHeaders.get('Cookie')).toContain('auth=authcookie_secret_123');
+
+        // /api/vrc/pipeline requires WebSocket upgrade header and forwards encrypted authToken via Worker egress
+        const nonWsRes = await worker.fetch(new Request('http://example.com/api/vrc/pipeline'), env);
+        expect(nonWsRes.status).toBe(426);
+
+        fetchSpy.mockResolvedValueOnce(new Response(null, { status: 200 }));
+        await worker.fetch(
+            new Request('http://example.com/api/vrc/pipeline', {
+                headers: { Upgrade: 'websocket' }
+            }),
+            env
+        );
+        const wsTargetUrl = String(fetchSpy.mock.calls[2]?.[0] ?? '');
+        const wsTargetHeaders = new Headers(fetchSpy.mock.calls[2]?.[1]?.headers);
+        expect(wsTargetUrl).toBe('https://pipeline.vrchat.cloud/?authToken=authcookie_secret_123');
+        expect(wsTargetHeaders.get('Upgrade')).toBe('websocket');
+        expect(wsTargetHeaders.get('Cookie')).toContain('auth=authcookie_secret_123');
+
         fetchSpy.mockRestore();
 
         // Passcode session login flow

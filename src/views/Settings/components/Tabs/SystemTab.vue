@@ -146,7 +146,7 @@
             </SettingsItem>
         </SettingsGroup>
 
-        <SettingsGroup :title="t('view.settings.general.contributors.header')">
+        <SettingsGroup v-if="!isWeb" :title="t('view.settings.general.contributors.header')">
             <div>
                 <img
                     src="https://contrib.rocks/image?repo=vrcx-team/VRCX"

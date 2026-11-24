@@ -234,6 +234,39 @@ export async function handleVrcProxyRoutes(request: Request, env: Env, url: URL)
         }
     }
 
+    // Same-origin WebSocket passthrough to VRChat Pipeline using Worker egress IP + encrypted auth cookie.
+    // Prevents VRChat's strict session-IP binding error ("authToken doesn't correspond with an active session")
+    // caused by browser direct-connecting from a different IP than /api/vrc/execute.
+    if (url.pathname === '/api/vrc/pipeline' && request.method === 'GET') {
+        if ((request.headers.get('Upgrade') ?? '').toLowerCase() !== 'websocket') {
+            return Response.json(
+                { ok: false, error: { code: 'UPGRADE_REQUIRED', message: 'Expected WebSocket upgrade' } },
+                { status: 426 }
+            );
+        }
+        const jar = await loadCookieJar(env);
+        const authToken = jar.auth?.trim();
+        if (!authToken) {
+            return Response.json(
+                { ok: false, error: { code: 'NO_VRC_SESSION', message: 'No active VRChat session cookie' } },
+                { status: 401 }
+            );
+        }
+
+        const upstreamUrl = `https://pipeline.vrchat.cloud/?authToken=${encodeURIComponent(authToken)}`;
+        const upstreamHeaders = new Headers();
+        upstreamHeaders.set('Upgrade', 'websocket');
+        upstreamHeaders.set('User-Agent', VRC_USER_AGENT);
+        const cookieHeader = buildCookieHeader(jar);
+        if (cookieHeader) {
+            upstreamHeaders.set('Cookie', cookieHeader);
+        }
+        return fetch(upstreamUrl, {
+            method: 'GET',
+            headers: upstreamHeaders
+        });
+    }
+
     if (url.pathname === '/api/vrc/execute' && request.method === 'POST') {
         let payload: WebApiExecutePayload;
         try {
