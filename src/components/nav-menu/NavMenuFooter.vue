@@ -23,7 +23,7 @@
                         <DropdownMenuItem @click="emit('support-link', 'github')">
                             <span>{{ t('nav_menu.github') }}</span>
                         </DropdownMenuItem>
-                        <DropdownMenuItem @click="emit('support-link', 'discord')">
+                        <DropdownMenuItem v-if="!isWeb" @click="emit('support-link', 'discord')">
                             <span>{{ t('nav_menu.discord') }}</span>
                         </DropdownMenuItem>
                     </DropdownMenuContent>
@@ -260,6 +260,7 @@
         'open-github'
     ]);
     const { t } = useI18n();
+    const isWeb = typeof WEB !== 'undefined' && WEB;
 
     const router = useRouter();
     const isSettingsRoute = ref(false);
