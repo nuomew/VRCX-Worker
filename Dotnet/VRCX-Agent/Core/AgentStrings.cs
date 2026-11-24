@@ -187,8 +187,8 @@ public static class AgentStrings
     public static string MenuExit => IsChinese ? "退出程序" : "Exit";
 
     public static string BalloonNotConfigured => IsChinese
-        ? "双击或右键点击右下角托盘图标 →「同步设置（地址、密钥与代理）…」即可完成配置。"
-        : "Double-click or right-click the tray icon -> 'Sync Settings (URL, Secret & Proxy)...' to configure.";
+        ? "单击右下角托盘图标可打开设置界面，双击可打开云端网页。"
+        : "Single-click the tray icon to open settings, or double-click to open the Cloud Web UI.";
 
     public static string BalloonAlreadyRunning => IsChinese
         ? "VRCX 云端伴侣已在后台托盘运行，已为您打开设置窗口。"

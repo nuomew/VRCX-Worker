@@ -45,6 +45,7 @@ public sealed class TrayApplicationContext : ApplicationContext
     private readonly ToolStripMenuItem _compressScreenshotsItem;
     private readonly ToolStripMenuItem _autoStartItem;
     private readonly ToolStripMenuItem _checkUpdateItem;
+    private readonly System.Windows.Forms.Timer _singleClickTimer;
     private readonly SynchronizationContext? _uiSyncContext;
     private readonly RegisteredWaitHandle? _wakeWaitHandle;
 
@@ -55,6 +56,7 @@ public sealed class TrayApplicationContext : ApplicationContext
     private AgentReleaseInfo? _availableUpdate;
     private string _lastNotifiedUpdateTag = string.Empty;
     private bool _balloonPointsToUpdate;
+    private DateTimeOffset _lastDoubleClickAtUtc = DateTimeOffset.MinValue;
     private DateTimeOffset _lastSyncSuccessAt = DateTimeOffset.MinValue;
     private int _consecutiveFailures;
     private string _lastSyncError = string.Empty;
@@ -140,6 +142,16 @@ public sealed class TrayApplicationContext : ApplicationContext
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(AgentStrings.MenuExit, null, (_, _) => ShutdownAndExit());
 
+        _singleClickTimer = new System.Windows.Forms.Timer
+        {
+            Interval = Math.Clamp(SystemInformation.DoubleClickTime, 250, 400)
+        };
+        _singleClickTimer.Tick += (_, _) =>
+        {
+            _singleClickTimer.Stop();
+            ShowSyncSettingsDialog();
+        };
+
         _trayIcon = new NotifyIcon
         {
             Icon = LoadTrayIcon(),
@@ -147,10 +159,22 @@ public sealed class TrayApplicationContext : ApplicationContext
             Visible = true,
             Text = AgentStrings.AppTitle
         };
-        _trayIcon.DoubleClick += (_, _) =>
+        // Single left-click opens the agent settings dialog; double left-click opens the Cloud Web UI.
+        // Debounce MouseClick through _singleClickTimer so the first click of a double-click does not
+        // pop up the modal settings dialog and swallow the second click.
+        _trayIcon.MouseClick += (_, e) =>
         {
-            if (!_config.IsConfigured) ShowSyncSettingsDialog();
-            else OpenCloudWebUi();
+            if (e.Button != MouseButtons.Left) return;
+            if ((DateTimeOffset.UtcNow - _lastDoubleClickAtUtc).TotalMilliseconds < 450) return;
+            _singleClickTimer.Stop();
+            _singleClickTimer.Start();
+        };
+        _trayIcon.MouseDoubleClick += (_, e) =>
+        {
+            if (e.Button != MouseButtons.Left) return;
+            _singleClickTimer.Stop();
+            _lastDoubleClickAtUtc = DateTimeOffset.UtcNow;
+            OpenCloudWebUi();
         };
         _trayIcon.BalloonTipClicked += (_, _) =>
         {
@@ -922,6 +946,8 @@ public sealed class TrayApplicationContext : ApplicationContext
     private void ShutdownAndExit()
     {
         _cts.Cancel();
+        _singleClickTimer.Stop();
+        _singleClickTimer.Dispose();
         _wakeWaitHandle?.Unregister(null);
         VRCX.Discord.Instance.Exit();
         _trayIcon.Visible = false;
