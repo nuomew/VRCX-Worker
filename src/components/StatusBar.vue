@@ -57,8 +57,49 @@
                             </div>
                         </TooltipWrapper>
 
+                        <HoverCard
+                            v-if="
+                                !isMacOS &&
+                                visibility.steamvr &&
+                                gameStore.isSteamVRRunning &&
+                                gameStore.steamVrStartedAt > 0
+                            "
+                            v-model:open="steamVrHoverOpen"
+                            :open-delay="50"
+                            :close-delay="50">
+                            <HoverCardTrigger as-child>
+                                <div
+                                    class="flex items-center gap-1 px-2 h-[22px] whitespace-nowrap border-r border-border">
+                                    <span class="inline-block size-2 rounded-full shrink-0 bg-status-online" />
+                                    <span class="text-foreground text-[11px]">{{ t('status_bar.steamvr') }}</span>
+                                    <span v-if="steamVrSessionText" class="text-[10px] text-foreground">{{
+                                        steamVrSessionText
+                                    }}</span>
+                                </div>
+                            </HoverCardTrigger>
+                            <HoverCardContent
+                                class="w-auto min-w-[160px] px-3 py-2"
+                                side="top"
+                                align="start"
+                                :side-offset="4">
+                                <div class="flex flex-col gap-1">
+                                    <div class="flex items-center justify-between gap-3">
+                                        <span class="text-[11px] text-muted-foreground">{{
+                                            t('status_bar.game_started_at')
+                                        }}</span>
+                                        <span class="text-[11px] text-foreground">{{ steamVrStartedAtText }}</span>
+                                    </div>
+                                    <div class="flex items-center justify-between gap-3">
+                                        <span class="text-[11px] text-muted-foreground">{{
+                                            t('status_bar.game_session_duration')
+                                        }}</span>
+                                        <span class="text-[11px] text-foreground">{{ steamVrSessionDetailText }}</span>
+                                    </div>
+                                </div>
+                            </HoverCardContent>
+                        </HoverCard>
                         <TooltipWrapper
-                            v-if="!isMacOS && visibility.steamvr"
+                            v-else-if="!isMacOS && visibility.steamvr"
                             :content="
                                 gameStore.isSteamVRRunning
                                     ? t('status_bar.steamvr_running')
@@ -315,25 +356,34 @@
                         <template v-if="visibility.uptime">
                             <template v-if="isWeb">
                                 <TooltipWrapper :content="t('cloud_hub.total_uptime_tooltip')" side="top">
-                                    <div class="flex items-center gap-1 px-2 h-[22px] whitespace-nowrap border-r border-border">
+                                    <div
+                                        class="flex items-center gap-1 px-2 h-[22px] whitespace-nowrap border-r border-border">
                                         <span class="text-[10px] text-muted-foreground">{{
                                             t('cloud_hub.total_uptime_short')
                                         }}</span>
-                                        <span class="text-[10px] text-foreground tabular-nums">{{ totalUptimeText }}</span>
+                                        <span class="text-[10px] text-foreground tabular-nums">{{
+                                            totalUptimeText
+                                        }}</span>
                                     </div>
                                 </TooltipWrapper>
                                 <TooltipWrapper :content="t('cloud_hub.current_uptime_tooltip')" side="top">
-                                    <div class="flex items-center gap-1 px-2 h-[22px] whitespace-nowrap border-r border-border">
+                                    <div
+                                        class="flex items-center gap-1 px-2 h-[22px] whitespace-nowrap border-r border-border">
                                         <span class="text-[10px] text-muted-foreground">{{
                                             t('cloud_hub.current_uptime_short')
                                         }}</span>
-                                        <span class="text-[10px] text-foreground tabular-nums">{{ appUptimeText }}</span>
+                                        <span class="text-[10px] text-foreground tabular-nums">{{
+                                            appUptimeText
+                                        }}</span>
                                     </div>
                                 </TooltipWrapper>
                             </template>
                             <TooltipWrapper v-else :content="t('status_bar.app_uptime')" side="top">
-                                <div class="flex items-center gap-1 px-2 h-[22px] whitespace-nowrap border-r border-border">
-                                    <span class="text-[10px] text-foreground">{{ t('status_bar.app_uptime_short') }}</span>
+                                <div
+                                    class="flex items-center gap-1 px-2 h-[22px] whitespace-nowrap border-r border-border">
+                                    <span class="text-[10px] text-foreground">{{
+                                        t('status_bar.app_uptime_short')
+                                    }}</span>
                                     <span class="text-[10px] text-foreground">{{ appUptimeText }}</span>
                                 </div>
                             </TooltipWrapper>
@@ -467,7 +517,12 @@
     import { openExternalLink } from '@/shared/utils/appActions';
     import { wsState } from '@/services/websocket';
     import { cloudFetch } from '@/ipc-web/apiClient';
-    import { applyCloudPresenceUpdate, cloudState, getOnlineAgentIds, syncGameRunningBridge } from '@/ipc-web/cloudState';
+    import {
+        applyCloudPresenceUpdate,
+        cloudState,
+        getOnlineAgentIds,
+        syncGameRunningBridge
+    } from '@/ipc-web/cloudState';
 
     import dayjs from 'dayjs';
     import timezone from 'dayjs/plugin/timezone';
@@ -522,8 +577,9 @@
 
     const isYouTubeNowPlaying = computed(() => /youtu\.?be/i.test(nowPlaying.value.url));
 
-    // --- Game session timer ---
+    // --- Game & SteamVR session timers ---
     const gameHoverOpen = ref(false);
+    const steamVrHoverOpen = ref(false);
 
     const gameSessionText = computed(() => {
         if (!gameStore.isGameRunning || !userStore.currentUser.$online_for) return '';
@@ -539,6 +595,23 @@
     const gameSessionDetailText = computed(() => {
         if (!gameStore.isGameRunning || !userStore.currentUser.$online_for) return '-';
         const elapsed = now.value.getTime() - userStore.currentUser.$online_for;
+        return elapsed > 0 ? timeToText(elapsed, true) : '-';
+    });
+
+    const steamVrSessionText = computed(() => {
+        if (!gameStore.isSteamVRRunning || !gameStore.steamVrStartedAt) return '';
+        const elapsed = now.value.getTime() - gameStore.steamVrStartedAt;
+        return elapsed > 0 ? timeToText(elapsed) : '';
+    });
+
+    const steamVrStartedAtText = computed(() => {
+        if (!gameStore.steamVrStartedAt) return '-';
+        return dayjs(gameStore.steamVrStartedAt).format('MM/DD HH:mm');
+    });
+
+    const steamVrSessionDetailText = computed(() => {
+        if (!gameStore.isSteamVRRunning || !gameStore.steamVrStartedAt) return '-';
+        const elapsed = now.value.getTime() - gameStore.steamVrStartedAt;
         return elapsed > 0 ? timeToText(elapsed, true) : '-';
     });
 

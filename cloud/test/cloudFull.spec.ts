@@ -256,7 +256,10 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
         expect(quotaRes.status).toBe(200);
         const quotaJson = (await quotaRes.json()) as {
             ok: boolean;
-            data: { healthy: boolean; databases: { core: { bytes: number }; gamelog: { bytes: number }; feed: { bytes: number } } };
+            data: {
+                healthy: boolean;
+                databases: { core: { bytes: number }; gamelog: { bytes: number }; feed: { bytes: number } };
+            };
         };
         expect(quotaJson.ok).toBe(true);
         expect(quotaJson.data.healthy).toBe(true);
@@ -505,7 +508,13 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
         expect(envOk.status).toBe(200);
         const envOkJson = (await envOk.json()) as {
             ok: boolean;
-            data: { deviceId: string; deviceName: string; syncIntervalSeconds: number; syncedAt: string; nextSyncAt: string };
+            data: {
+                deviceId: string;
+                deviceName: string;
+                syncIntervalSeconds: number;
+                syncedAt: string;
+                nextSyncAt: string;
+            };
         };
         expect(envOkJson.data.deviceId).toBe('win-home-pc');
         expect(envOkJson.data.deviceName).toBe('Home-Gaming-PC');
@@ -700,8 +709,30 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
         expect(page2Json.data.some((s) => s.id === '1111222233334444aaaabbbbccccdddd')).toBe(true);
         expect(page2Json.data.some((s) => s.id === page1Json.data[0]!.id)).toBe(false);
 
-        // 3. Agent performs HTTP sync with live VRChat + SteamVR state -> bootstrap & uptime must persist and surface it
+        // 3. Agent performs HTTP sync with live VRChat + SteamVR state + real OS process start times -> bootstrap & uptime must persist and surface them
+        const vrcStartedAt = new Date(Date.now() - 45 * 60_000).toISOString();
+        const steamVrStartedAt = new Date(Date.now() - 60 * 60_000).toISOString();
         const syncRes = await exports.default.fetch('http://example.com/api/agent/sync', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                Authorization: `Bearer ${syncKey}`
+            },
+            body: JSON.stringify({
+                events: [],
+                state: {
+                    vrcRunning: true,
+                    vrcStartedAt,
+                    steamVrRunning: true,
+                    steamVrStartedAt,
+                    currentWorldName: 'Hanging Out'
+                }
+            })
+        });
+        expect(syncRes.status).toBe(200);
+
+        // Subsequent sync omitting explicit timestamps (e.g. legacy agent fallback) must preserve the earlier startedAt timestamps
+        const followSyncRes = await exports.default.fetch('http://example.com/api/agent/sync', {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
@@ -712,7 +743,7 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
                 state: { vrcRunning: true, steamVrRunning: true, currentWorldName: 'Hanging Out' }
             })
         });
-        expect(syncRes.status).toBe(200);
+        expect(followSyncRes.status).toBe(200);
 
         const bootRes = await exports.default.fetch('http://example.com/api/bootstrap');
         expect(bootRes.status).toBe(200);
@@ -724,7 +755,17 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
                     agentsOnline: string[];
                     wsAgentsOnline: string[];
                     deviceLastSeen: Record<string, number>;
-                    deviceStates: Record<string, { state: { vrcRunning?: boolean; steamVrRunning?: boolean } }>;
+                    deviceStates: Record<
+                        string,
+                        {
+                            state: {
+                                vrcRunning?: boolean;
+                                vrcStartedAt?: string;
+                                steamVrRunning?: boolean;
+                                steamVrStartedAt?: string;
+                            };
+                        }
+                    >;
                 };
             };
         };
@@ -732,7 +773,9 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
         expect(bootJson.data.agentStatus.wsAgentsOnline).not.toContain(deviceId);
         expect(typeof bootJson.data.agentStatus.deviceLastSeen[deviceId]).toBe('number');
         expect(bootJson.data.agentStatus.deviceStates[deviceId]?.state?.vrcRunning).toBe(true);
+        expect(bootJson.data.agentStatus.deviceStates[deviceId]?.state?.vrcStartedAt).toBe(vrcStartedAt);
         expect(bootJson.data.agentStatus.deviceStates[deviceId]?.state?.steamVrRunning).toBe(true);
+        expect(bootJson.data.agentStatus.deviceStates[deviceId]?.state?.steamVrStartedAt).toBe(steamVrStartedAt);
         expect(typeof bootJson.data.totalUptimeSeconds).toBe('number');
 
         // 3b. Upstream vrchat://launch invite/join URLs with ref, shortName, and attach=1 are accepted; arbitrary params are rejected

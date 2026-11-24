@@ -907,10 +907,11 @@ export const useUserStore = defineStore('User', () => {
         D.visible = true;
     }
 
-    function markCurrentUserGameStarted() {
-        currentUser.value.$online_for = Date.now();
+    function markCurrentUserGameStarted(startedAt = Date.now()) {
+        const ts = Number.isFinite(startedAt) && startedAt > 0 ? startedAt : Date.now();
+        currentUser.value.$online_for = ts;
         currentUser.value.$offline_for = null;
-        currentUser.value.$previousAvatarSwapTime = Date.now();
+        currentUser.value.$previousAvatarSwapTime = ts;
     }
 
     function markCurrentUserGameStopped() {

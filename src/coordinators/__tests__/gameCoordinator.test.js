@@ -15,7 +15,19 @@ const mocks = vi.hoisted(() => ({
         setIsGameRunning: vi.fn(),
         isGameRunning: false,
         setIsSteamVRRunning: vi.fn(),
-        isSteamVRRunning: false
+        isSteamVRRunning: false,
+        steamVrStartedAt: 0,
+        setSteamVrStartedAt: vi.fn((v) => {
+            mocks.gameStore.steamVrStartedAt = v;
+        }),
+        cloudVrcStartedAt: 0,
+        setCloudVrcStartedAt: vi.fn((v) => {
+            mocks.gameStore.cloudVrcStartedAt = v;
+        }),
+        cloudSteamVrStartedAt: 0,
+        setCloudSteamVrStartedAt: vi.fn((v) => {
+            mocks.gameStore.cloudSteamVrStartedAt = v;
+        })
     },
     instanceStore: {
         removeAllQueuedInstances: vi.fn()
@@ -136,13 +148,22 @@ vi.mock('worker-timers', () => ({
     setTimeout: vi.fn()
 }));
 
-import { runGameRunningChangedFlow } from '../gameCoordinator';
+import {
+    runGameRunningChangedFlow,
+    runUpdateCloudGameStartTimesFlow,
+    runUpdateIsGameRunningFlow
+} from '../gameCoordinator';
 
 describe('runGameRunningChangedFlow', () => {
     beforeEach(() => {
         vi.clearAllMocks();
         mocks.userStore.currentUser.$online_for = 1000;
         mocks.gameStore.isGameNoVR = false;
+        mocks.gameStore.isGameRunning = false;
+        mocks.gameStore.isSteamVRRunning = false;
+        mocks.gameStore.steamVrStartedAt = 0;
+        mocks.gameStore.cloudVrcStartedAt = 0;
+        mocks.gameStore.cloudSteamVrStartedAt = 0;
     });
 
     test('persists and stores last game session when game stops', async () => {
@@ -164,5 +185,33 @@ describe('runGameRunningChangedFlow', () => {
         expect(mocks.gameStore.setLastSession).not.toHaveBeenCalled();
         expect(mocks.configRepository.setString).not.toHaveBeenCalledWith('VRCX_lastGameSessionMs', expect.any(String));
         expect(mocks.configRepository.setString).not.toHaveBeenCalledWith('VRCX_lastGameOfflineAt', expect.any(String));
+    });
+
+    test('preserves cloud VRChat and SteamVR process start times across refreshes and re-syncs', async () => {
+        const realVrcStart = 1_700_000_100_000;
+        const realSteamStart = 1_700_000_050_000;
+
+        runUpdateCloudGameStartTimesFlow({
+            vrcStartedAtMs: realVrcStart,
+            steamVrStartedAtMs: realSteamStart
+        });
+        mocks.gameStore.setIsGameRunning.mockImplementation((v) => {
+            mocks.gameStore.isGameRunning = v;
+        });
+        mocks.gameStore.setIsSteamVRRunning.mockImplementation((v) => {
+            mocks.gameStore.isSteamVRRunning = v;
+        });
+
+        await runUpdateIsGameRunningFlow(true, true);
+        expect(mocks.userStore.markCurrentUserGameStarted).toHaveBeenCalledWith(realVrcStart);
+        expect(mocks.gameStore.steamVrStartedAt).toBe(realSteamStart);
+
+        // Even if currentUser.$online_for gets temporarily cleared during login hydration,
+        // subsequent CheckGameRunning restores realVrcStart without resetting locations/state.
+        mocks.userStore.currentUser.$online_for = null;
+        mocks.userStore.markCurrentUserGameStarted.mockClear();
+        await runUpdateIsGameRunningFlow(true, true);
+        expect(mocks.userStore.markCurrentUserGameStarted).toHaveBeenCalledWith(realVrcStart);
+        expect(mocks.runLastLocationResetFlow).toHaveBeenCalledTimes(1);
     });
 });

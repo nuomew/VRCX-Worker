@@ -101,7 +101,48 @@ export function getAggregatedGameState(nowMs = Date.now()) {
 }
 
 /**
- * Synchronizes aggregated multi-PC game/SteamVR running state into upstream `window.$bridge.updateIsGameRunning`.
+ * Aggregates the earliest VRChat and SteamVR process start timestamps across currently online VRCX.Agent devices.
+ * Falls back to device `updatedAt` when an older agent has not yet reported `vrcStartedAt` / `steamVrStartedAt`.
+ *
+ * @param {number} [nowMs]
+ * @returns {{ vrcStartedAtMs: number; steamVrStartedAtMs: number }}
+ */
+export function getAggregatedGameStartTimes(nowMs = Date.now()) {
+    let earliestVrcMs = 0;
+    let earliestSteamMs = 0;
+
+    const parseStartMs = (raw, fallbackIso) => {
+        const primary = typeof raw === 'string' && raw ? Date.parse(raw) : NaN;
+        const fallback = typeof fallbackIso === 'string' && fallbackIso ? Date.parse(fallbackIso) : NaN;
+        const ts = Number.isFinite(primary) && primary > 0 ? primary : fallback;
+        if (!Number.isFinite(ts) || ts <= 0) return 0;
+        return Math.min(ts, nowMs);
+    };
+
+    for (const deviceId of getOnlineAgentIds(nowMs)) {
+        const entry = cloudState.deviceStates[deviceId];
+        const st = entry?.state;
+        if (!st || typeof st !== 'object') continue;
+
+        if (st.vrcRunning === true || st.isGameRunning === true) {
+            const vrcTs = parseStartMs(st.vrcStartedAt, entry?.updatedAt);
+            if (vrcTs > 0 && (earliestVrcMs === 0 || vrcTs < earliestVrcMs)) {
+                earliestVrcMs = vrcTs;
+            }
+        }
+        if (st.steamVrRunning === true || st.isVrRunning === true) {
+            const steamTs = parseStartMs(st.steamVrStartedAt, entry?.updatedAt);
+            if (steamTs > 0 && (earliestSteamMs === 0 || steamTs < earliestSteamMs)) {
+                earliestSteamMs = steamTs;
+            }
+        }
+    }
+
+    return { vrcStartedAtMs: earliestVrcMs, steamVrStartedAtMs: earliestSteamMs };
+}
+
+/**
+ * Synchronizes aggregated multi-PC game/SteamVR running state and process start times into upstream `window.$bridge`.
  *
  * @param {number} [nowMs]
  */
@@ -110,6 +151,8 @@ export function syncGameRunningBridge(nowMs = Date.now()) {
         return;
     }
     const { vrcRunning, steamVrRunning } = getAggregatedGameState(nowMs);
+    const startTimes = getAggregatedGameStartTimes(nowMs);
+    window.$bridge.updateCloudGameStartTimes?.(startTimes);
     window.$bridge.updateIsGameRunning(vrcRunning, steamVrRunning);
 }
 
@@ -117,12 +160,12 @@ export function syncGameRunningBridge(nowMs = Date.now()) {
  * Applies server-reported HTTP agent presence, device states, and optional cumulative uptime snapshot to `cloudState`.
  *
  * @param {{
- *   deviceLastSeen?: Record<string, number>;
- *   httpAgentsOnline?: string[];
- *   deviceStates?: Record<string, { state: Record<string, any>; updatedAt: string }>;
- *   totalUptimeSeconds?: number;
- *   syncIntervalSeconds?: number;
- *   replaceDeviceMap?: boolean;
+ *     deviceLastSeen?: Record<string, number>;
+ *     httpAgentsOnline?: string[];
+ *     deviceStates?: Record<string, { state: Record<string, any>; updatedAt: string }>;
+ *     totalUptimeSeconds?: number;
+ *     syncIntervalSeconds?: number;
+ *     replaceDeviceMap?: boolean;
  * }} payload
  */
 export function applyCloudPresenceUpdate(payload) {

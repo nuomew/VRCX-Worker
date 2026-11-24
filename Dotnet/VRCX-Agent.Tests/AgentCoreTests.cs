@@ -6,6 +6,7 @@ using System.Net.Http;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using Newtonsoft.Json;
 using SixLabors.ImageSharp;
 using SixLabors.ImageSharp.PixelFormats;
 using VRCX.Agent.Core;
@@ -1143,6 +1144,33 @@ public sealed class AgentCoreTests
         {
             if (Directory.Exists(tempRoot)) Directory.Delete(tempRoot, recursive: true);
         }
+    }
+
+    [Fact]
+    public void LocalProcessMonitor_SelectsEarliestStartTimeAndSerializesStateTimestamps()
+    {
+        var older = new DateTimeOffset(2026, 11, 24, 1, 15, 0, TimeSpan.Zero);
+        var newer = new DateTimeOffset(2026, 11, 24, 2, 30, 0, TimeSpan.Zero);
+        var prev = new DateTimeOffset(2026, 11, 24, 2, 0, 0, TimeSpan.Zero);
+        var fallbackNow = new DateTimeOffset(2026, 11, 24, 3, 0, 0, TimeSpan.Zero);
+
+        // Prefers earliest valid OS process start timestamp
+        Assert.Equal(older, LiveAgentState.SelectEarliestStartTimeUtc(new[] { newer, older }, prev, fallbackNow));
+        // Falls back to previously observed start timestamp when Win32 handle permissions restrict reads
+        Assert.Equal(prev, LiveAgentState.SelectEarliestStartTimeUtc(Array.Empty<DateTimeOffset>(), prev, fallbackNow));
+        // Falls back to detection time only when no prior timestamp exists
+        Assert.Equal(fallbackNow, LiveAgentState.SelectEarliestStartTimeUtc(Array.Empty<DateTimeOffset>(), null, fallbackNow));
+
+        var liveState = new LiveAgentState
+        {
+            VrcRunning = true,
+            VrcStartedAt = older.ToString("O"),
+            SteamVrRunning = true,
+            SteamVrStartedAt = prev.ToString("O")
+        };
+        string json = JsonConvert.SerializeObject(liveState);
+        Assert.Contains("\"vrcStartedAt\":\"2026-11-24T01:15:00.0000000+00:00\"", json);
+        Assert.Contains("\"steamVrStartedAt\":\"2026-11-24T02:00:00.0000000+00:00\"", json);
     }
 
     private sealed class StubHttpHandler : HttpMessageHandler

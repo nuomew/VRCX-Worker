@@ -1,6 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { bootstrapCache, loadBootstrap, scheduleConfigPatch } from '../bootstrapCache.js';
-import { applyCloudPresenceUpdate, cloudState, getAggregatedGameState, getOnlineAgentIds } from '../cloudState.js';
+import {
+    applyCloudPresenceUpdate,
+    cloudState,
+    getAggregatedGameStartTimes,
+    getAggregatedGameState,
+    getOnlineAgentIds
+} from '../cloudState.js';
 import { createAppApiBridge } from '../appApiWeb.js';
 import { createWebApiBridge } from '../webApiRemote.js';
 import { createCloudDatabase } from '../../services/database/cloud/index.js';
@@ -111,13 +117,17 @@ describe('WEB cloud adapter (stateless)', () => {
             })
         );
 
-        const resJson = await webApi.ExecuteJson(JSON.stringify({ url: 'https://api.vrchat.cloud/api/1/auth/user', method: 'GET' }));
+        const resJson = await webApi.ExecuteJson(
+            JSON.stringify({ url: 'https://api.vrchat.cloud/api/1/auth/user', method: 'GET' })
+        );
         expect(JSON.parse(resJson)).toEqual({ status: 200, message: '{"id":"usr_me"}' });
         expect(cloudState.lastVrcRoute).toBe('agent_residential_ip');
 
         // Graceful readonly error when PC agent is offline and fallback is disabled.
         fetchSpy.mockResolvedValueOnce(mockErr('AGENT_OFFLINE_READONLY', 'Offline', 503));
-        const offlineRes = JSON.parse(await webApi.ExecuteJson(JSON.stringify({ url: 'https://api.vrchat.cloud/api/1/auth/user', method: 'GET' })));
+        const offlineRes = JSON.parse(
+            await webApi.ExecuteJson(JSON.stringify({ url: 'https://api.vrchat.cloud/api/1/auth/user', method: 'GET' }))
+        );
         expect(offlineRes.status).toBe(-1);
         expect(cloudState.lastVrcRoute).toBe('offline');
     });
@@ -163,7 +173,15 @@ describe('WEB cloud adapter (stateless)', () => {
 
         fetchSpy.mockResolvedValueOnce(
             mockOk({
-                locationRows: [{ id: 2, created_at: '2026-11-24T01:00:00Z', location: 'wrld_1:1', world_id: 'wrld_1', world_name: 'Japanese Shrine' }],
+                locationRows: [
+                    {
+                        id: 2,
+                        created_at: '2026-11-24T01:00:00Z',
+                        location: 'wrld_1:1',
+                        world_id: 'wrld_1',
+                        world_name: 'Japanese Shrine'
+                    }
+                ],
                 joinLeaveRows: []
             })
         );
@@ -279,7 +297,10 @@ describe('WEB cloud adapter (stateless)', () => {
         expect(fetchSpy).toHaveBeenCalledTimes(1);
         await vi.advanceTimersByTimeAsync(16_000);
         expect(fetchSpy).toHaveBeenCalledTimes(4);
-        const calledUrls = fetchSpy.mock.calls.slice(1).map((c) => c[0]).sort();
+        const calledUrls = fetchSpy.mock.calls
+            .slice(1)
+            .map((c) => c[0])
+            .sort();
         expect(calledUrls).toEqual(['/api/friend-log/current', '/api/notifications', '/api/user-profiles']);
     });
 
@@ -323,10 +344,7 @@ describe('WEB cloud adapter (stateless)', () => {
         expect(groups).toHaveLength(2);
         expect(groups[0].dateLabel).toBe('2026年11月24日');
         expect(groups[0].timeRange).toBe('14:05 – 21:35');
-        expect(groups[0].items.map((i) => i.dateTimeLabel)).toEqual([
-            '2026年11月24日 21:35',
-            '2026年11月24日 14:05'
-        ]);
+        expect(groups[0].items.map((i) => i.dateTimeLabel)).toEqual(['2026年11月24日 21:35', '2026年11月24日 14:05']);
         expect(groups[1].dateLabel).toBe('2026年11月20日');
         expect(groups[1].timeRange).toBe('09:08');
         expect(groups[1].items[0].dateTimeLabel).toBe('2026年11月20日 09:08');
@@ -350,9 +368,18 @@ describe('WEB cloud adapter (stateless)', () => {
                     pc_offline: nowMs - 600_000
                 },
                 deviceStates: {
-                    pc_idle: { state: { vrcRunning: false, steamVrRunning: false }, updatedAt: new Date(nowMs).toISOString() },
-                    pc_vrc: { state: { vrcRunning: true, steamVrRunning: false }, updatedAt: new Date(nowMs).toISOString() },
-                    pc_offline: { state: { vrcRunning: true, steamVrRunning: true }, updatedAt: new Date(nowMs - 600_000).toISOString() }
+                    pc_idle: {
+                        state: { vrcRunning: false, steamVrRunning: false },
+                        updatedAt: new Date(nowMs).toISOString()
+                    },
+                    pc_vrc: {
+                        state: { vrcRunning: true, steamVrRunning: false },
+                        updatedAt: new Date(nowMs).toISOString()
+                    },
+                    pc_offline: {
+                        state: { vrcRunning: true, steamVrRunning: true },
+                        updatedAt: new Date(nowMs - 600_000).toISOString()
+                    }
                 },
                 replaceDeviceMap: true
             });
@@ -363,7 +390,10 @@ describe('WEB cloud adapter (stateless)', () => {
             // Bringing PC-1 SteamVR online turns SteamVR green too
             applyCloudPresenceUpdate({
                 deviceStates: {
-                    pc_idle: { state: { vrcRunning: false, steamVrRunning: true }, updatedAt: new Date(nowMs).toISOString() }
+                    pc_idle: {
+                        state: { vrcRunning: false, steamVrRunning: true },
+                        updatedAt: new Date(nowMs).toISOString()
+                    }
                 }
             });
             const appApi = createAppApiBridge();
@@ -390,7 +420,75 @@ describe('WEB cloud adapter (stateless)', () => {
                 params: { launchUrl: `${fullUrl}&attach=1` }
             });
         } finally {
-            delete /** @type {any} */ (globalThis).window;
+            delete (/** @type {any} */ (globalThis).window);
+        }
+    });
+
+    it('aggregates earliest real VRChat & SteamVR process start times across online PCs and syncs them to bridge', () => {
+        const nowMs = Date.now();
+        cloudState.wsAgentsOnline = [];
+        cloudState.syncIntervalSeconds = 60;
+        cloudState.deviceStates = {};
+
+        const vrcEarly = nowMs - 90 * 60_000;
+        const vrcLate = nowMs - 10 * 60_000;
+        const steamEarly = nowMs - 120 * 60_000;
+        const startTimesSpy = vi.fn();
+        const updateSpy = vi.fn();
+        globalThis.window = /** @type {any} */ ({
+            $bridge: {
+                updateCloudGameStartTimes: startTimesSpy,
+                updateIsGameRunning: updateSpy
+            }
+        });
+
+        try {
+            applyCloudPresenceUpdate({
+                deviceLastSeen: {
+                    pc_early: nowMs - 5_000,
+                    pc_late: nowMs - 5_000,
+                    pc_offline: nowMs - 600_000
+                },
+                deviceStates: {
+                    pc_early: {
+                        state: {
+                            vrcRunning: true,
+                            vrcStartedAt: new Date(vrcEarly).toISOString(),
+                            steamVrRunning: true,
+                            steamVrStartedAt: new Date(steamEarly).toISOString()
+                        },
+                        updatedAt: new Date(nowMs).toISOString()
+                    },
+                    pc_late: {
+                        state: {
+                            vrcRunning: true,
+                            vrcStartedAt: new Date(vrcLate).toISOString(),
+                            steamVrRunning: false
+                        },
+                        updatedAt: new Date(nowMs).toISOString()
+                    },
+                    pc_offline: {
+                        state: {
+                            vrcRunning: true,
+                            vrcStartedAt: new Date(nowMs - 500 * 60_000).toISOString()
+                        },
+                        updatedAt: new Date(nowMs - 600_000).toISOString()
+                    }
+                },
+                replaceDeviceMap: true
+            });
+
+            expect(getAggregatedGameStartTimes(nowMs)).toEqual({
+                vrcStartedAtMs: vrcEarly,
+                steamVrStartedAtMs: steamEarly
+            });
+            expect(startTimesSpy).toHaveBeenCalledWith({
+                vrcStartedAtMs: vrcEarly,
+                steamVrStartedAtMs: steamEarly
+            });
+            expect(updateSpy).toHaveBeenCalledWith(true, true);
+        } finally {
+            delete (/** @type {any} */ (globalThis).window);
         }
     });
 });

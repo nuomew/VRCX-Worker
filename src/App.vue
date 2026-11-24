@@ -28,6 +28,7 @@
     import { addGameLogEvent, getGameLogTable } from './coordinators/gameLogCoordinator';
     import {
         runCheckVRChatDebugLoggingFlow,
+        runUpdateCloudGameStartTimesFlow,
         runUpdateIsGameRunningFlow,
         runUpdateIsHmdAfkFlow
     } from './coordinators/gameCoordinator';
@@ -72,10 +73,14 @@
         window.$pinia = store;
         window.$coordinators = coordinators;
         window.$bridge = {
+            updateCloudGameStartTimes: runUpdateCloudGameStartTimesFlow,
             updateIsGameRunning: runUpdateIsGameRunningFlow,
             updateIsHmdAfk: runUpdateIsHmdAfkFlow,
             addGameLogEvent
         };
+        if (isWeb && typeof AppApi !== 'undefined' && typeof AppApi.CheckGameRunning === 'function') {
+            AppApi.CheckGameRunning();
+        }
     }
 
     onBeforeMount(() => {

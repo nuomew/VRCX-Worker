@@ -527,7 +527,9 @@ public sealed class TrayApplicationContext : ApplicationContext
         var state = new LiveAgentState
         {
             VrcRunning = _processMonitor.IsVrcRunning,
+            VrcStartedAt = _processMonitor.IsVrcRunning ? _processMonitor.VrcStartedAtUtc?.ToString("O") : null,
             SteamVrRunning = _processMonitor.IsSteamVrRunning,
+            SteamVrStartedAt = _processMonitor.IsSteamVrRunning ? _processMonitor.SteamVrStartedAtUtc?.ToString("O") : null,
             CacheSizeBytes = _processMonitor.CacheSizeBytes,
             CurrentLocation = _logCollector.Parser.CurrentLocation,
             CurrentWorldId = _logCollector.Parser.CurrentWorldId,
@@ -536,7 +538,7 @@ public sealed class TrayApplicationContext : ApplicationContext
             OfflineQueueCount = _logCollector.OfflineQueueCount
         };
 
-        string sig = $"{state.VrcRunning}|{state.SteamVrRunning}|{state.CurrentLocation}|{state.CurrentWorldName}|{state.PlayerCount}|{state.OfflineQueueCount}";
+        string sig = $"{state.VrcRunning}|{state.VrcStartedAt}|{state.SteamVrRunning}|{state.SteamVrStartedAt}|{state.CurrentLocation}|{state.CurrentWorldName}|{state.PlayerCount}|{state.OfflineQueueCount}";
         if (sig != _lastSentStateSignature)
         {
             _lastSentStateSignature = sig;

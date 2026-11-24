@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
@@ -17,27 +18,34 @@ public sealed class LocalProcessMonitor
 
     private bool _vrcRunning;
     private bool _steamVrRunning;
+    private DateTimeOffset? _vrcStartedAtUtc;
+    private DateTimeOffset? _steamVrStartedAtUtc;
     private long _cachedCacheBytes;
     private DateTimeOffset _lastCacheScanAt = DateTimeOffset.MinValue;
 
     public bool IsVrcRunning => _vrcRunning;
     public bool IsSteamVrRunning => _steamVrRunning;
+    public DateTimeOffset? VrcStartedAtUtc => _vrcStartedAtUtc;
+    public DateTimeOffset? SteamVrStartedAtUtc => _steamVrStartedAtUtc;
     public long CacheSizeBytes => _cachedCacheBytes;
 
     /// <summary>
-    /// Refreshes local process and cache telemetry. Returns true if VRChat/SteamVR running state changed.
+    /// Refreshes local process and cache telemetry. Returns true if VRChat/SteamVR running state or start time changed.
     /// </summary>
     public bool Refresh(AgentConfig config)
     {
         bool prevVrc = _vrcRunning;
         bool prevSteamVr = _steamVrRunning;
+        DateTimeOffset? prevVrcStart = _vrcStartedAtUtc;
+        DateTimeOffset? prevSteamStart = _steamVrStartedAtUtc;
+        DateTimeOffset nowUtc = DateTimeOffset.UtcNow;
 
-        _vrcRunning = IsProcessRunning("VRChat");
-        _steamVrRunning = IsProcessRunning("vrserver") || IsProcessRunning("vrmonitor");
+        (_vrcRunning, _vrcStartedAtUtc) = ProbeProcessGroup(_vrcStartedAtUtc, nowUtc, "VRChat");
+        (_steamVrRunning, _steamVrStartedAtUtc) = ProbeProcessGroup(_steamVrStartedAtUtc, nowUtc, "vrserver", "vrmonitor");
 
-        if ((DateTimeOffset.UtcNow - _lastCacheScanAt) > TimeSpan.FromMinutes(2))
+        if ((nowUtc - _lastCacheScanAt) > TimeSpan.FromMinutes(2))
         {
-            _lastCacheScanAt = DateTimeOffset.UtcNow;
+            _lastCacheScanAt = nowUtc;
             _cachedCacheBytes = ComputeCacheSizeBytes();
         }
 
@@ -46,7 +54,62 @@ public sealed class LocalProcessMonitor
             RunAutoLaunchApps(config.AutoLaunchDirectory);
         }
 
-        return prevVrc != _vrcRunning || prevSteamVr != _steamVrRunning;
+        return prevVrc != _vrcRunning
+            || prevSteamVr != _steamVrRunning
+            || prevVrcStart != _vrcStartedAtUtc
+            || prevSteamStart != _steamVrStartedAtUtc;
+    }
+
+    private static (bool Running, DateTimeOffset? StartedAtUtc) ProbeProcessGroup(
+        DateTimeOffset? previousStartedAtUtc,
+        DateTimeOffset fallbackNowUtc,
+        params string[] processNames)
+    {
+        bool anyRunning = false;
+        var discoveredStarts = new List<DateTimeOffset>();
+
+        foreach (string processName in processNames)
+        {
+            Process[] procs = Process.GetProcessesByName(processName);
+            foreach (Process p in procs)
+            {
+                try
+                {
+                    if (!p.HasExited)
+                    {
+                        anyRunning = true;
+                        DateTime utc = p.StartTime.ToUniversalTime();
+                        discoveredStarts.Add(new DateTimeOffset(DateTime.SpecifyKind(utc, DateTimeKind.Utc)));
+                    }
+                }
+                catch
+                {
+                    // Process handle access denied or exited mid-probe; count running conservatively if still present
+                    try
+                    {
+                        if (!p.HasExited)
+                        {
+                            anyRunning = true;
+                        }
+                    }
+                    catch
+                    {
+                        anyRunning = true;
+                    }
+                }
+                finally
+                {
+                    p.Dispose();
+                }
+            }
+        }
+
+        if (!anyRunning)
+        {
+            return (false, null);
+        }
+
+        return (true, LiveAgentState.SelectEarliestStartTimeUtc(discoveredStarts, previousStartedAtUtc, fallbackNowUtc));
     }
 
     private static bool IsProcessRunning(string processName)

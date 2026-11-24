@@ -294,7 +294,10 @@ export async function handleAgentPublicRoutes(request: Request, env: Env, url: U
         }
 
         const ym = takenAt.slice(0, 7).replace(/[^0-9-]/g, '') || 'unknown';
-        const rawContentType = (request.headers.get('Content-Type') || 'image/webp').split(';')[0]!.trim().toLowerCase();
+        const rawContentType = (request.headers.get('Content-Type') || 'image/webp')
+            .split(';')[0]!
+            .trim()
+            .toLowerCase();
         const contentType =
             rawContentType === 'image/png' || rawContentType === 'image/jpeg' || rawContentType === 'image/webp'
                 ? rawContentType
@@ -389,8 +392,69 @@ export async function handleAgentPublicRoutes(request: Request, env: Env, url: U
             ).bind(auth.deviceId, deviceName, `sync:${auth.deviceId}`, agentVersion, nowIso, nowIso)
         ];
 
+        const [pendingRes, prevStateRes] = await env.DB_CORE.batch([
+            env.DB_CORE.prepare(
+                `SELECT cmd_id, action, payload_json, expires_at
+                 FROM cloud_commands
+                 WHERE status = 'pending' AND expires_at > ? AND (target_device_id = '' OR target_device_id = ?)
+                 ORDER BY created_at ASC LIMIT 10`
+            ).bind(nowIso, auth.deviceId),
+            env.DB_CORE.prepare(
+                'SELECT state_json, updated_at FROM cloud_device_states WHERE device_id = ? LIMIT 1'
+            ).bind(auth.deviceId)
+        ]);
+
+        let prevState: Record<string, unknown> = {};
+        let prevUpdatedAt = '';
+        const prevRow = (prevStateRes?.results?.[0] ?? null) as { state_json?: string; updated_at?: string } | null;
+        if (prevRow?.state_json) {
+            try {
+                const parsed = JSON.parse(prevRow.state_json);
+                if (parsed && typeof parsed === 'object') {
+                    prevState = parsed as Record<string, unknown>;
+                }
+            } catch {
+                prevState = {};
+            }
+            prevUpdatedAt = prevRow.updated_at || '';
+        }
+
+        const normalizeIso = (raw: unknown): string => {
+            if (typeof raw !== 'string' || !raw.trim()) return '';
+            const ms = Date.parse(raw);
+            return Number.isFinite(ms) && ms > 0 ? new Date(ms).toISOString() : '';
+        };
+
+        let persistedState: Record<string, unknown> | null = null;
         if (body.state) {
-            const persistedState = { syncMode: 'http', ...body.state };
+            const vrcNow = body.state.vrcRunning === true || body.state.isGameRunning === true;
+            const steamNow = body.state.steamVrRunning === true || body.state.isVrRunning === true;
+            const prevVrcWasRunning = prevState.vrcRunning === true || prevState.isGameRunning === true;
+            const prevSteamWasRunning = prevState.steamVrRunning === true || prevState.isVrRunning === true;
+
+            const vrcStartedAt = vrcNow
+                ? normalizeIso(body.state.vrcStartedAt) ||
+                  (prevVrcWasRunning
+                      ? normalizeIso(prevState.vrcStartedAt) || normalizeIso(prevUpdatedAt) || nowIso
+                      : nowIso)
+                : '';
+            const steamVrStartedAt = steamNow
+                ? normalizeIso(body.state.steamVrStartedAt) ||
+                  (prevSteamWasRunning
+                      ? normalizeIso(prevState.steamVrStartedAt) || normalizeIso(prevUpdatedAt) || nowIso
+                      : nowIso)
+                : '';
+
+            const { vrcStartedAt: _dropVrc, steamVrStartedAt: _dropSteam, ...restState } = body.state;
+            persistedState = {
+                syncMode: 'http',
+                ...restState,
+                vrcRunning: vrcNow,
+                steamVrRunning: steamNow,
+                ...(vrcStartedAt ? { vrcStartedAt } : {}),
+                ...(steamVrStartedAt ? { steamVrStartedAt } : {})
+            };
+
             coreWrites.push(
                 env.DB_CORE.prepare(
                     `INSERT INTO cloud_device_states (device_id, state_json, updated_at)
@@ -422,17 +486,14 @@ export async function handleAgentPublicRoutes(request: Request, env: Env, url: U
             );
         }
 
-        // Pull pending remote commands queued for this device (or any device)
-        const pendingRes = await env.DB_CORE.prepare(
-            `SELECT cmd_id, action, payload_json, expires_at
-             FROM cloud_commands
-             WHERE status = 'pending' AND expires_at > ? AND (target_device_id = '' OR target_device_id = ?)
-             ORDER BY created_at ASC LIMIT 10`
-        )
-            .bind(nowIso, auth.deviceId)
-            .all<{ cmd_id: string; action: string; payload_json: string; expires_at: string }>();
-
-        const pendingCommands = (pendingRes.results ?? []).map((row) => {
+        const pendingCommands = (
+            (pendingRes?.results ?? []) as Array<{
+                cmd_id: string;
+                action: string;
+                payload_json: string;
+                expires_at: string;
+            }>
+        ).map((row) => {
             let params: Record<string, unknown> = {};
             try {
                 params = JSON.parse(row.payload_json || '{}') as Record<string, unknown>;
@@ -455,7 +516,7 @@ export async function handleAgentPublicRoutes(request: Request, env: Env, url: U
         await env.DB_CORE.batch(coreWrites);
 
         // Broadcast fresh GameLog events and/or live state snapshot in a single DO request
-        if (events.length > 0 || body.state) {
+        if (events.length > 0 || persistedState) {
             const messages: Array<{ type: string; payload: Record<string, unknown> }> = [];
             if (events.length > 0) {
                 messages.push({
@@ -463,10 +524,10 @@ export async function handleAgentPublicRoutes(request: Request, env: Env, url: U
                     payload: { deviceId: auth.deviceId, events }
                 });
             }
-            if (body.state) {
+            if (persistedState) {
                 messages.push({
                     type: 'agent.state',
-                    payload: { deviceId: auth.deviceId, syncMode: 'http', ...body.state }
+                    payload: { deviceId: auth.deviceId, ...persistedState }
                 });
             }
             const hub = env.AGENT_HUB.get(env.AGENT_HUB.idFromName('primary'));
@@ -713,9 +774,7 @@ export async function handleAgentWebRoutes(request: Request, env: Env, url: URL)
                       .bind(before, limit)
                       .all();
         } else {
-            res = await env.DB_CORE.prepare(
-                'SELECT * FROM cloud_screenshots ORDER BY taken_at DESC, id DESC LIMIT ?'
-            )
+            res = await env.DB_CORE.prepare('SELECT * FROM cloud_screenshots ORDER BY taken_at DESC, id DESC LIMIT ?')
                 .bind(limit)
                 .all();
         }
@@ -735,11 +794,17 @@ export async function handleAgentWebRoutes(request: Request, env: Env, url: URL)
             .bind(id)
             .first<{ r2_thumb_key: string }>();
         if (!row?.r2_thumb_key) {
-            return Response.json({ ok: false, error: { code: 'NOT_FOUND', message: 'Screenshot not found' } }, { status: 404 });
+            return Response.json(
+                { ok: false, error: { code: 'NOT_FOUND', message: 'Screenshot not found' } },
+                { status: 404 }
+            );
         }
         const obj = await env.R2_MEDIA.get(row.r2_thumb_key);
         if (!obj) {
-            return Response.json({ ok: false, error: { code: 'NOT_FOUND', message: 'Thumbnail blob missing' } }, { status: 404 });
+            return Response.json(
+                { ok: false, error: { code: 'NOT_FOUND', message: 'Thumbnail blob missing' } },
+                { status: 404 }
+            );
         }
         const headers = new Headers();
         obj.writeHttpMetadata(headers);

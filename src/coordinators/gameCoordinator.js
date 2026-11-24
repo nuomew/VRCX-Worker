@@ -36,7 +36,8 @@ export async function runGameRunningChangedFlow(isGameRunning) {
     const gameStore = useGameStore();
 
     if (isGameRunning) {
-        userStore.markCurrentUserGameStarted();
+        const startedAt = gameStore.cloudVrcStartedAt > 0 ? gameStore.cloudVrcStartedAt : Date.now();
+        userStore.markCurrentUserGameStarted(startedAt);
     } else {
         await configRepository.setBool('isGameNoVR', gameStore.isGameNoVR);
         // persist last session data before markCurrentUserGameStopped resets $online_for
@@ -68,6 +69,47 @@ export async function runGameRunningChangedFlow(isGameRunning) {
 }
 
 /**
+ * Updates cached currentUser `$online_for` (and its `cachedUsers` mirror) without triggering a full
+ * game-state transition reset when reconciling process start timestamps in Cloud Web mode.
+ *
+ * @param {number} startedAtMs
+ */
+function applyResolvedGameStartedAt(startedAtMs) {
+    if (!Number.isFinite(startedAtMs) || startedAtMs <= 0) return;
+    const userStore = useUserStore();
+    if (userStore.currentUser?.$online_for !== startedAtMs) {
+        userStore.markCurrentUserGameStarted(startedAtMs);
+        const selfRef = userStore.currentUser?.id && userStore.cachedUsers?.get?.(userStore.currentUser.id);
+        if (selfRef) {
+            selfRef.$online_for = startedAtMs;
+            selfRef.$offline_for = null;
+        }
+    }
+}
+
+/**
+ * Receives authoritative VRChat & SteamVR process start timestamps from Cloud Web presence aggregation
+ * so browser reloads continue counting from the real process start time instead of resetting to 0.
+ *
+ * @param {{ vrcStartedAtMs?: number; steamVrStartedAtMs?: number }} [timing]
+ */
+export function runUpdateCloudGameStartTimesFlow(timing) {
+    const gameStore = useGameStore();
+    const vrcStartedAtMs = Number(timing?.vrcStartedAtMs) > 0 ? Number(timing?.vrcStartedAtMs) : 0;
+    const steamVrStartedAtMs = Number(timing?.steamVrStartedAtMs) > 0 ? Number(timing?.steamVrStartedAtMs) : 0;
+
+    gameStore.setCloudVrcStartedAt?.(vrcStartedAtMs);
+    gameStore.setCloudSteamVrStartedAt?.(steamVrStartedAtMs);
+
+    if (gameStore.isGameRunning && vrcStartedAtMs > 0) {
+        applyResolvedGameStartedAt(vrcStartedAtMs);
+    }
+    if (gameStore.isSteamVRRunning && steamVrStartedAtMs > 0 && gameStore.steamVrStartedAt !== steamVrStartedAtMs) {
+        gameStore.setSteamVrStartedAt?.(steamVrStartedAtMs);
+    }
+}
+
+/**
  * Orchestrates the game running state update from IPC.
  *
  * @param {boolean} isGameRunningArg Game running flag from IPC.
@@ -85,11 +127,26 @@ export async function runUpdateIsGameRunningFlow(isGameRunningArg, isSteamVRRunn
         gameStore.setIsGameRunning(isGameRunningArg);
         await runGameRunningChangedFlow(isGameRunningArg);
         console.log(new Date(), 'isGameRunning', isGameRunningArg);
+    } else if (isGameRunningArg && gameStore.cloudVrcStartedAt > 0) {
+        // Re-apply real start time if applyCurrentUser replaced currentUser ($online_for: null) during login
+        applyResolvedGameStartedAt(gameStore.cloudVrcStartedAt);
     }
 
     if (isSteamVRRunningArg !== gameStore.isSteamVRRunning) {
         gameStore.setIsSteamVRRunning(isSteamVRRunningArg);
+        if (isSteamVRRunningArg) {
+            const steamStart = gameStore.cloudSteamVrStartedAt > 0 ? gameStore.cloudSteamVrStartedAt : Date.now();
+            gameStore.setSteamVrStartedAt?.(steamStart);
+        } else {
+            gameStore.setSteamVrStartedAt?.(0);
+        }
         console.log('isSteamVRRunning:', isSteamVRRunningArg);
+    } else if (
+        isSteamVRRunningArg &&
+        gameStore.cloudSteamVrStartedAt > 0 &&
+        gameStore.steamVrStartedAt !== gameStore.cloudSteamVrStartedAt
+    ) {
+        gameStore.setSteamVrStartedAt?.(gameStore.cloudSteamVrStartedAt);
     }
     vrStore.updateOpenVR();
 }

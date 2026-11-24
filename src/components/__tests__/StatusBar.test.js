@@ -174,6 +174,7 @@ function mountStatusBar(storeOverrides = {}) {
                         Game: {
                             isGameRunning: false,
                             isSteamVRRunning: false,
+                            steamVrStartedAt: 0,
                             lastSessionDurationMs: 0,
                             lastOfflineAt: 0,
                             ...storeOverrides.Game
@@ -258,9 +259,18 @@ describe('StatusBar.vue - Servers indicator', () => {
         expect(text).toContain('Servers');
     });
 
-    test('shows SteamVR indicator', () => {
-        const wrapper = mountStatusBar({ Game: { isSteamVRRunning: true } });
+    test('shows SteamVR indicator and elapsed runtime details when running with start time', () => {
+        const wrapper = mountStatusBar({
+            Game: {
+                isSteamVRRunning: true,
+                steamVrStartedAt: Date.now() - 3_665_000
+            }
+        });
         expect(wrapper.text()).toContain('SteamVR');
+        const hoverContent = wrapper.find('[data-testid="hover-card-content"]');
+        expect(hoverContent.exists()).toBe(true);
+        expect(hoverContent.text()).toContain('Started');
+        expect(hoverContent.text()).toContain('Duration');
     });
 
     test('shows last game session details when game is offline and there is session data', () => {

@@ -9,7 +9,7 @@ namespace VRCX.Agent.Core;
 /// </summary>
 public static class AgentMetadata
 {
-    public const string Version = "1.10.3";
+    public const string Version = "1.10.4";
 }
 
 /// <summary>
@@ -143,8 +143,14 @@ public sealed class LiveAgentState
     [JsonProperty("vrcRunning")]
     public bool VrcRunning { get; set; }
 
+    [JsonProperty("vrcStartedAt", NullValueHandling = NullValueHandling.Ignore)]
+    public string? VrcStartedAt { get; set; }
+
     [JsonProperty("steamVrRunning")]
     public bool SteamVrRunning { get; set; }
+
+    [JsonProperty("steamVrStartedAt", NullValueHandling = NullValueHandling.Ignore)]
+    public string? SteamVrStartedAt { get; set; }
 
     [JsonProperty("cacheSizeBytes")]
     public long CacheSizeBytes { get; set; }
@@ -169,6 +175,27 @@ public sealed class LiveAgentState
 
     [JsonProperty("offlineQueueCount")]
     public int OfflineQueueCount { get; set; }
+
+    /// <summary>
+    /// Selects the earliest valid OS process start timestamp, falling back to the previously observed
+    /// timestamp or current detection time when Win32 process StartTime access is restricted.
+    /// </summary>
+    public static DateTimeOffset SelectEarliestStartTimeUtc(
+        IEnumerable<DateTimeOffset> candidateStartsUtc,
+        DateTimeOffset? previousStartedAtUtc,
+        DateTimeOffset fallbackNowUtc)
+    {
+        DateTimeOffset? earliest = null;
+        foreach (DateTimeOffset ts in candidateStartsUtc)
+        {
+            DateTimeOffset utc = ts.ToUniversalTime();
+            if (earliest == null || utc < earliest.Value)
+            {
+                earliest = utc;
+            }
+        }
+        return earliest ?? previousStartedAtUtc?.ToUniversalTime() ?? fallbackNowUtc.ToUniversalTime();
+    }
 }
 
 public sealed class PendingRemoteCommand

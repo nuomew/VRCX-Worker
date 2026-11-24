@@ -20,6 +20,12 @@ export const useGameStore = defineStore('Game', () => {
 
     const isSteamVRRunning = ref(false);
 
+    const steamVrStartedAt = ref(0);
+
+    const cloudVrcStartedAt = ref(0);
+
+    const cloudSteamVrStartedAt = ref(0);
+
     const isHmdAfk = ref(false);
 
     const lastSessionDurationMs = ref(0);
@@ -57,6 +63,27 @@ export const useGameStore = defineStore('Game', () => {
      */
     function setIsSteamVRRunning(value) {
         isSteamVRRunning.value = value;
+    }
+
+    /**
+     * @param {number} value SteamVR process start epoch ms (0 when stopped).
+     */
+    function setSteamVrStartedAt(value) {
+        steamVrStartedAt.value = Number.isFinite(value) && value > 0 ? value : 0;
+    }
+
+    /**
+     * @param {number} value Authoritative cloud VRChat process start epoch ms (0 when unavailable/stopped).
+     */
+    function setCloudVrcStartedAt(value) {
+        cloudVrcStartedAt.value = Number.isFinite(value) && value > 0 ? value : 0;
+    }
+
+    /**
+     * @param {number} value Authoritative cloud SteamVR process start epoch ms (0 when unavailable/stopped).
+     */
+    function setCloudSteamVrStartedAt(value) {
+        cloudSteamVrStartedAt.value = Number.isFinite(value) && value > 0 ? value : 0;
     }
 
     /**
@@ -114,6 +141,9 @@ export const useGameStore = defineStore('Game', () => {
         isGameRunning,
         isGameNoVR,
         isSteamVRRunning,
+        steamVrStartedAt,
+        cloudVrcStartedAt,
+        cloudSteamVrStartedAt,
         isHmdAfk,
         lastSessionDurationMs,
         lastOfflineAt,
@@ -121,6 +151,9 @@ export const useGameStore = defineStore('Game', () => {
         setIsGameRunning,
         setIsGameNoVR,
         setIsSteamVRRunning,
+        setSteamVrStartedAt,
+        setCloudVrcStartedAt,
+        setCloudSteamVrStartedAt,
         setIsHmdAfk,
         setLastSession,
         setLastCrashedTime,
