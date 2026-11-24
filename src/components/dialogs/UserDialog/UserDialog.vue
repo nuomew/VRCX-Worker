@@ -45,7 +45,7 @@
                     <UserDialogFavoriteWorldsTab ref="favoriteWorldsTabRef" />
                 </template>
 
-                <template #Avatars>
+                <template v-if="showAvatarsTab" #Avatars>
                     <UserDialogAvatarsTab ref="avatarsTabRef" />
                 </template>
 
@@ -131,13 +131,15 @@
     });
 
     const { t } = useI18n();
+    const isWebMode = typeof WEB !== 'undefined' && WEB;
+    const showAvatarsTab = computed(() => !isWebMode || userDialog.value.id === currentUser.value.id);
     const userDialogTabs = computed(() => {
         const tabs = [
             { value: 'Info', label: t('dialog.user.info.header') },
             { value: 'Groups', label: t('dialog.user.groups.header') },
             { value: 'Worlds', label: t('dialog.user.worlds.header') },
             { value: 'favorite-worlds', label: t('dialog.user.favorite_worlds.header') },
-            { value: 'Avatars', label: t('dialog.user.avatars.header') },
+            ...(showAvatarsTab.value ? [{ value: 'Avatars', label: t('dialog.user.avatars.header') }] : []),
             { value: 'JSON', label: t('dialog.user.json.header') }
         ];
         if (userDialog.value.id !== currentUser.value.id && !currentUser.value.hasSharedConnectionsOptOut) {
@@ -237,6 +239,13 @@
         }
     );
 
+    watch(showAvatarsTab, (visible) => {
+        if (!visible && (userDialog.value.activeTab === 'Avatars' || userDialog.value.lastActiveTab === 'Avatars')) {
+            userDialog.value.activeTab = 'Info';
+            userDialog.value.lastActiveTab = 'Info';
+        }
+    });
+
     /** @type {import('vue').Ref<any>} */
     const treeData = ref({});
 
@@ -317,6 +326,12 @@
                 groupsTabRef.value?.getUserGroups(userId);
             }
         } else if (tabName === 'Avatars') {
+            if (!showAvatarsTab.value) {
+                userDialog.value.activeTab = 'Info';
+                userDialog.value.lastActiveTab = 'Info';
+                infoTabRef.value?.onTabActivated();
+                return;
+            }
             avatarsTabRef.value?.setUserDialogAvatars(userId);
             if (props.previousIds.avatar !== userId) {
                 props.updatePreviousId('avatar', userId);
