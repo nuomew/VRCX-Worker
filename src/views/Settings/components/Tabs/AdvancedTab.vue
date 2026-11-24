@@ -164,11 +164,11 @@
                     t('view.settings.advanced.advanced.cache_debug.refresh_cache')
                 }}</Button>
             </div>
-            <SettingsItem v-else :label="t('view.settings.advanced.advanced.cache_debug.refresh_cache')">
+            <div v-else class="flex justify-end py-1">
                 <Button size="sm" variant="outline" @click="refreshCacheSize">{{
                     t('view.settings.advanced.advanced.cache_debug.refresh_cache')
                 }}</Button>
-            </SettingsItem>
+            </div>
 
             <SettingsItem
                 v-if="!isWeb"
@@ -181,7 +181,7 @@
                     @update:modelValue="disableGameLogDialog()" />
             </SettingsItem>
 
-            <div class="flex flex-col gap-1 text-sm">
+            <div class="flex flex-col gap-1 text-sm" :class="{ 'items-center text-center': isWeb }">
                 <span
                     >{{ t('view.settings.advanced.advanced.cache_debug.user_cache') }}
                     <span v-text="cacheSize.cachedUsers"></span
@@ -216,13 +216,18 @@
         </SettingsGroup>
 
         <SettingsGroup :title="t('view.settings.advanced_groups.database.header')">
-            <SettingsItem :label="t('view.settings.advanced.advanced.sqlite_table_size.refresh')">
+            <SettingsItem v-if="!isWeb" :label="t('view.settings.advanced.advanced.sqlite_table_size.refresh')">
                 <Button size="sm" variant="outline" @click="getSqliteTableSizes">{{
                     t('view.settings.advanced.advanced.sqlite_table_size.refresh')
                 }}</Button>
             </SettingsItem>
+            <div v-else class="flex justify-end py-1">
+                <Button size="sm" variant="outline" @click="getSqliteTableSizes">{{
+                    t('view.settings.advanced.advanced.sqlite_table_size.refresh')
+                }}</Button>
+            </div>
 
-            <div class="flex flex-col gap-1 text-sm">
+            <div class="flex flex-col gap-1 text-sm" :class="{ 'items-center text-center': isWeb }">
                 <span
                     >{{ t('view.settings.advanced.advanced.sqlite_table_size.gps') }}
                     <span v-text="sqliteTableSizes.gps"></span
