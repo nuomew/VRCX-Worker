@@ -3,6 +3,7 @@ import { beforeAll, describe, expect, it, vi } from 'vitest';
 import { hmacSha256Hex, sha256Hex } from '../src/crypto/vault';
 import type { Env } from '../src/env';
 import worker from '../src/index';
+import { runBackgroundFeedSync } from '../src/sync/backgroundFeedSync';
 
 const env = rawEnv as unknown as Env;
 const exports = rawExports as unknown as { default: Fetcher };
@@ -841,5 +842,251 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
             data: { totalUptimeSeconds: number };
         };
         expect(afterOfflineJson.data.totalUptimeSeconds).toBe(500);
+    });
+
+    it('records friend Online/Offline/GPS/Status/Bio feeds and v1/v2 notifications via cloud Cron when Web tab is closed', async () => {
+        // Store a VRChat auth cookie in the encrypted cloud cookie vault
+        const encodedJar = btoa(JSON.stringify({ auth: 'authcookie_bg_sync_test' }));
+        const putCookieRes = await exports.default.fetch('http://example.com/api/vrc/cookies', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ cookies: encodedJar })
+        });
+        expect(putCookieRes.status).toBe(200);
+
+        const world1 = 'wrld_aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
+        const world2 = 'wrld_bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb';
+        let round = 1;
+
+        const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+            const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+            if (url.includes('/api/1/auth/user/friends')) {
+                if (round === 1) {
+                    return Response.json([
+                        {
+                            id: 'usr_friend_a',
+                            displayName: 'Alice',
+                            location: `${world1}:1001`,
+                            status: 'active',
+                            statusDescription: 'Chilling'
+                        },
+                        {
+                            id: 'usr_friend_c',
+                            displayName: 'Charlie',
+                            location: `${world1}:1001`,
+                            status: 'busy',
+                            statusDescription: 'AFK'
+                        }
+                    ]);
+                }
+                return Response.json([
+                    {
+                        id: 'usr_friend_a',
+                        displayName: 'Alice',
+                        location: `${world2}:2002`,
+                        status: 'join me',
+                        statusDescription: 'Come hang out!'
+                    },
+                    {
+                        id: 'usr_friend_b',
+                        displayName: 'Bob',
+                        location: 'private',
+                        status: 'ask me',
+                        statusDescription: 'Just hopped on'
+                    }
+                ]);
+            }
+            if (url.includes(`/api/1/worlds/${world1}`)) {
+                return Response.json({ id: world1, name: 'Sakura Shrine' });
+            }
+            if (url.includes(`/api/1/worlds/${world2}`)) {
+                return Response.json({ id: world2, name: 'Starlight Rooftop' });
+            }
+            if (url.includes('/api/1/users/usr_friend_a')) {
+                return Response.json({
+                    id: 'usr_friend_a',
+                    displayName: 'Alice',
+                    bio: round === 1 ? 'Old bio text' : 'New updated bio!',
+                    bioLinks: round === 1 ? ['https://old.example'] : ['https://new.example']
+                });
+            }
+            if (url.includes('/api/1/users/usr_friend_b')) {
+                return Response.json({
+                    id: 'usr_friend_b',
+                    displayName: 'Bob',
+                    bio: 'Bob bio',
+                    bioLinks: []
+                });
+            }
+            if (url.includes('/api/1/users/usr_friend_c')) {
+                return Response.json({
+                    id: 'usr_friend_c',
+                    displayName: 'Charlie',
+                    bio: 'Charlie bio',
+                    bioLinks: []
+                });
+            }
+            if (url.includes('/api/1/auth/user/notifications')) {
+                return Response.json(
+                    round === 1
+                        ? []
+                        : [
+                              {
+                                  id: 'not_bg_v1_1',
+                                  created_at: new Date().toISOString(),
+                                  type: 'invite',
+                                  senderUserId: 'usr_friend_a',
+                                  senderUsername: 'Alice',
+                                  receiverUserId: 'usr_self',
+                                  message: 'Join me!',
+                                  details: JSON.stringify({
+                                      worldId: `${world2}:2002`,
+                                      worldName: 'Starlight Rooftop',
+                                      inviteMessage: 'Come over'
+                                  })
+                              }
+                          ]
+                );
+            }
+            if (url.includes('/api/1/notifications')) {
+                return Response.json(
+                    round === 1
+                        ? []
+                        : [
+                              {
+                                  id: 'not_bg_v2_1',
+                                  createdAt: new Date().toISOString(),
+                                  type: 'boop',
+                                  title: 'Boop!',
+                                  message: 'Bob booped you',
+                                  senderUserId: 'usr_friend_b',
+                                  senderUsername: 'Bob',
+                                  seen: false
+                              }
+                          ]
+                );
+            }
+            return new Response('Not Found', { status: 404 });
+        });
+
+        try {
+            // 1. While Web tab is active (bootstrap just ran), scheduled Cron defers cleanly without calling VRChat API
+            await exports.default.fetch('http://example.com/api/bootstrap');
+            const deferred = await runBackgroundFeedSync(env, { trigger: 'cron' });
+            expect(deferred.ran).toBe(false);
+            expect(deferred.status).toBe('skipped_web_active');
+
+            // 2. Closing the Web tab (?closing=1) clears webLastActiveAt so Cron immediately takes over
+            const closeRes = await exports.default.fetch('http://example.com/api/stats/uptime?closing=1', {
+                method: 'POST'
+            });
+            expect(closeRes.status).toBe(200);
+
+            // Round 1 establishes baseline snapshot & initial bios without emitting false Online events
+            const r1 = await runBackgroundFeedSync(env, { trigger: 'cron' });
+            expect(r1.ran).toBe(true);
+            expect(r1.status).toBe('baseline');
+            expect(r1.onlineCount).toBe(2);
+            expect(r1.feedInserted).toBe(0);
+            expect(r1.bioChecked).toBe(2);
+
+            // Immediate second cron tick before syncIntervalSeconds elapses is gated without VRChat calls
+            const gated = await runBackgroundFeedSync(env, { trigger: 'cron' });
+            expect(gated.ran).toBe(false);
+            expect(gated.status).toBe('skipped_interval');
+
+            // Earlier test configured syncIntervalSeconds = 180s: backdating only 120s must still gate (strictly obeys Web interval)
+            const twoMinAgo = new Date(Date.now() - 120_000).toISOString();
+            const fourMinAgo = new Date(Date.now() - 240_000).toISOString();
+            const fifteenMinAgo = new Date(Date.now() - 15 * 60_000).toISOString();
+            const metaRow = await env.DB_CORE.prepare(
+                "SELECT payload_json FROM cloud_bg_sync_state WHERE state_key = 'poller_meta'"
+            ).first<{ payload_json: string }>();
+            const metaObj = JSON.parse(metaRow!.payload_json) as Record<string, unknown>;
+            metaObj.lastRunAt = twoMinAgo;
+            await env.DB_CORE.prepare("UPDATE cloud_bg_sync_state SET payload_json = ? WHERE state_key = 'poller_meta'")
+                .bind(JSON.stringify(metaObj))
+                .run();
+            const stillGated = await runBackgroundFeedSync(env, { trigger: 'cron' });
+            expect(stillGated.ran).toBe(false);
+            expect(stillGated.status).toBe('skipped_interval');
+
+            // Backdate past 180s (240s) and Alice's cached profile past 10m (15m) -> next scheduled tick executes
+            metaObj.lastRunAt = fourMinAgo;
+            await env.DB_CORE.batch([
+                env.DB_CORE.prepare(
+                    "UPDATE cloud_bg_sync_state SET payload_json = ? WHERE state_key = 'poller_meta'"
+                ).bind(JSON.stringify(metaObj)),
+                env.DB_CORE.prepare("UPDATE user_profile SET updated_at = ? WHERE user_id = 'usr_friend_a'").bind(
+                    fifteenMinAgo
+                )
+            ]);
+
+            // Round 2: Alice changes world (GPS), status (Status), bio (Bio); Bob comes Online; Charlie goes Offline; v1 & v2 notifs arrive
+            round = 2;
+            const r2 = await runBackgroundFeedSync(env, { trigger: 'cron' });
+            expect(r2.ran).toBe(true);
+            expect(r2.status).toBe('ok');
+            expect(r2.onlineCount).toBe(2);
+            expect(r2.feedInserted).toBe(5); // Online(Bob) + Offline(Charlie) + GPS(Alice) + Status(Alice) + Bio(Alice)
+            expect(r2.notificationsInserted).toBe(2); // v1 invite + v2 boop
+
+            // Verify all 5 Feed types and both notification versions are persisted and queryable via existing APIs
+            const feedRes = await exports.default.fetch('http://example.com/api/feed?limit=50');
+            const feedJson = (await feedRes.json()) as {
+                ok: boolean;
+                data: Array<Record<string, unknown>>;
+            };
+            expect(
+                feedJson.data.some(
+                    (f) => f.type === 'GPS' && f.userId === 'usr_friend_a' && f.worldName === 'Starlight Rooftop'
+                )
+            ).toBe(true);
+            expect(
+                feedJson.data.some((f) => f.type === 'Status' && f.userId === 'usr_friend_a' && f.status === 'join me')
+            ).toBe(true);
+            expect(
+                feedJson.data.some(
+                    (f) => f.type === 'Bio' && f.userId === 'usr_friend_a' && f.bio === 'New updated bio!'
+                )
+            ).toBe(true);
+            expect(feedJson.data.some((f) => f.type === 'Online' && f.userId === 'usr_friend_b')).toBe(true);
+            expect(
+                feedJson.data.some(
+                    (f) => f.type === 'Offline' && f.userId === 'usr_friend_c' && f.worldName === 'Sakura Shrine'
+                )
+            ).toBe(true);
+
+            const n1Res = await exports.default.fetch('http://example.com/api/notifications?v=1&limit=20');
+            const n1Json = (await n1Res.json()) as { ok: boolean; data: Array<{ id: string; world_name: string }> };
+            expect(n1Json.data.some((n) => n.id === 'not_bg_v1_1' && n.world_name === 'Starlight Rooftop')).toBe(true);
+
+            const n2Res = await exports.default.fetch('http://example.com/api/notifications?v=2&limit=20');
+            const n2Json = (await n2Res.json()) as { ok: boolean; data: Array<{ id: string; type: string }> };
+            expect(n2Json.data.some((n) => n.id === 'not_bg_v2_1' && n.type === 'boop')).toBe(true);
+
+            // 3. Toggle disabled via PUT /api/bg-sync/config and verify Cron skips cleanly
+            const disableRes = await exports.default.fetch('http://example.com/api/bg-sync/config', {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ enabled: false })
+            });
+            expect(disableRes.status).toBe(200);
+            const skippedDisabled = await runBackgroundFeedSync(env, { trigger: 'cron' });
+            expect(skippedDisabled.ran).toBe(false);
+            expect(skippedDisabled.status).toBe('skipped_disabled');
+
+            const statusRes = await exports.default.fetch('http://example.com/api/bg-sync/status');
+            expect(statusRes.status).toBe(200);
+            const statusJson = (await statusRes.json()) as {
+                ok: boolean;
+                data: { enabled: boolean; hasVrcSession: boolean; meta: { lastOnlineCount: number } };
+            };
+            expect(statusJson.data.enabled).toBe(false);
+            expect(statusJson.data.hasVrcSession).toBe(true);
+            expect(statusJson.data.meta.lastOnlineCount).toBe(2);
+        } finally {
+            fetchSpy.mockRestore();
+        }
     });
 });

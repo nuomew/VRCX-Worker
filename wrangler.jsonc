@@ -51,5 +51,9 @@
         {
             "binding": "R2_MEDIA"
         }
-    ]
+    ],
+    // 1-minute cron tick gated inside scheduled() by user-configured syncIntervalSeconds (0 external fetch when idle/web active).
+    "triggers": {
+        "crons": ["* * * * *"]
+    }
 }

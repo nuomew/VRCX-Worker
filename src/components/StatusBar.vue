@@ -913,7 +913,7 @@
         const handlePageHide = () => {
             if (!cloudState.authenticated) return;
             try {
-                fetch('/api/stats/uptime', {
+                fetch('/api/stats/uptime?closing=1', {
                     method: 'POST',
                     credentials: 'include',
                     keepalive: true

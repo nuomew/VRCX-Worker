@@ -2,7 +2,7 @@ import { getMasterKey } from '../auth/auth';
 import { decryptAesGcm, encryptAesGcm } from '../crypto/vault';
 import type { Env } from '../env';
 
-const VRC_USER_AGENT = 'VRCX-Cloud/2026.11 (personal-self-hosted-vrcx)';
+export const VRC_USER_AGENT = 'VRCX-Cloud/2026.11 (personal-self-hosted-vrcx)';
 
 // Strict SSRF allowlist: only VRChat API/CDN/presigned upload hosts and known status/translation services VRCX calls.
 const ALLOWED_HOST_SUFFIXES = [
@@ -59,7 +59,7 @@ function base64ToUint8Array(b64: string): Uint8Array {
     return out;
 }
 
-async function loadCookieJar(env: Env, accountKey = 'default'): Promise<Record<string, string>> {
+export async function loadCookieJar(env: Env, accountKey = 'default'): Promise<Record<string, string>> {
     const row = await env.DB_CORE.prepare(
         'SELECT ciphertext_b64, iv_b64 FROM cloud_cookie_vault WHERE account_key = ? LIMIT 1'
     )
@@ -84,7 +84,7 @@ async function loadCookieJar(env: Env, accountKey = 'default'): Promise<Record<s
     }
 }
 
-async function saveCookieJar(env: Env, jar: Record<string, string>, accountKey = 'default'): Promise<void> {
+export async function saveCookieJar(env: Env, jar: Record<string, string>, accountKey = 'default'): Promise<void> {
     const { ciphertextB64, ivB64 } = await encryptAesGcm(getMasterKey(env), JSON.stringify(jar));
     const now = new Date().toISOString();
     await env.DB_CORE.prepare(
@@ -99,7 +99,7 @@ async function saveCookieJar(env: Env, jar: Record<string, string>, accountKey =
         .run();
 }
 
-function mergeSetCookies(jar: Record<string, string>, headers: Headers): boolean {
+export function mergeSetCookies(jar: Record<string, string>, headers: Headers): boolean {
     let changed = false;
     const rawList: string[] = [];
     const headersWithGetSetCookie = headers as Headers & { getSetCookie?: () => string[] };
@@ -132,7 +132,7 @@ function mergeSetCookies(jar: Record<string, string>, headers: Headers): boolean
     return changed;
 }
 
-function buildCookieHeader(jar: Record<string, string>): string {
+export function buildCookieHeader(jar: Record<string, string>): string {
     return Object.entries(jar)
         .map(([k, v]) => `${k}=${v}`)
         .join('; ');
@@ -151,8 +151,7 @@ function buildUpstreamRequestInit(payload: WebApiExecutePayload, cookieHeader: s
     }
 
     const parsedUrl = new URL(payload.url);
-    const isVrchatDomain =
-        parsedUrl.hostname.endsWith('vrchat.cloud') || parsedUrl.hostname.endsWith('vrchat.com');
+    const isVrchatDomain = parsedUrl.hostname.endsWith('vrchat.cloud') || parsedUrl.hostname.endsWith('vrchat.com');
     if (isVrchatDomain && cookieHeader) {
         headers.set('Cookie', cookieHeader);
     }
@@ -349,8 +348,7 @@ export async function handleVrcProxyRoutes(request: Request, env: Env, url: URL)
             }
             const text = await upstream.text();
             const wafBlocked =
-                upstream.status === 403 &&
-                (upstream.headers.has('cf-mitigated') || text.includes('Just a moment'));
+                upstream.status === 403 && (upstream.headers.has('cf-mitigated') || text.includes('Just a moment'));
 
             return Response.json({
                 ok: true,

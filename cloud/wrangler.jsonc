@@ -41,7 +41,10 @@
             "tag": "v1",
             "new_sqlite_classes": ["AgentHubDO"]
         }
-    ]
+    ],
+    "triggers": {
+        "crons": ["* * * * *"]
+    }
     // Optional R2 binding (uncomment after enabling R2 in Cloudflare dashboard):
     // "r2_buckets": [
     //     {

@@ -5,7 +5,7 @@ let initPromise: Promise<void> | null = null;
 
 // Static DDL mirrored from cloud/migrations/*/0001_init.sql.
 // Uses a schema_meta version sentinel so upgrades from Phase 0 auto-add Phase 1 tables idempotently.
-const SCHEMA_VERSION = 'v4-device-states';
+const SCHEMA_VERSION = 'v5-bg-feed-sync';
 
 const CORE_STATEMENTS: readonly string[] = [
     `CREATE TABLE IF NOT EXISTS schema_meta (
@@ -267,6 +267,11 @@ const CORE_STATEMENTS: readonly string[] = [
         ciphertext_b64 TEXT NOT NULL,
         iv_b64 TEXT NOT NULL,
         source_device_id TEXT NOT NULL DEFAULT '',
+        updated_at TEXT NOT NULL
+    )`,
+    `CREATE TABLE IF NOT EXISTS cloud_bg_sync_state (
+        state_key TEXT PRIMARY KEY,
+        payload_json TEXT NOT NULL DEFAULT '{}',
         updated_at TEXT NOT NULL
     )`
 ];

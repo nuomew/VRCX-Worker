@@ -11,14 +11,7 @@ function clampLimit(val: string | null, fallback = 50): number {
 }
 
 export interface GameLogIngestItem {
-    type:
-        | 'Location'
-        | 'OnPlayerJoined'
-        | 'OnPlayerLeft'
-        | 'PortalSpawn'
-        | 'VideoPlay'
-        | 'Event'
-        | 'External';
+    type: 'Location' | 'OnPlayerJoined' | 'OnPlayerLeft' | 'PortalSpawn' | 'VideoPlay' | 'Event' | 'External';
     created_at?: string;
     location?: string;
     worldId?: string;
@@ -181,6 +174,120 @@ export async function ingestGameLogItems(
     }
 
     return { inserted, lastRowId };
+}
+
+/**
+ * Inserts a batch of structured Feed events (GPS, Online/Offline, Status, Bio) into DB_FEED,
+ * updates deduplicated user entities in DB_CORE, and increments stats_counters idempotently.
+ */
+export async function ingestFeedItems(
+    env: Env,
+    items: Array<Record<string, unknown>>
+): Promise<{ count: number; inserted: number; lastRowId: number }> {
+    const stmts: Array<{ stmt: D1PreparedStatement; counterKey: string }> = [];
+    const users = new Map<string, string>();
+
+    for (const e of items) {
+        const type = String(e.type ?? '');
+        const createdAt = String(e.created_at ?? new Date().toISOString());
+        const userId = String(e.userId ?? '');
+        const displayName = String(e.displayName ?? '');
+        if (userId && displayName) users.set(userId, displayName);
+
+        if (type === 'GPS') {
+            stmts.push({
+                counterKey: 'feed_gps',
+                stmt: env.DB_FEED.prepare(
+                    'INSERT OR IGNORE INTO feed_gps (created_at, user_id, display_name, location, world_name, previous_location, time, group_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+                ).bind(
+                    createdAt,
+                    userId,
+                    displayName,
+                    String(e.location ?? ''),
+                    String(e.worldName ?? ''),
+                    String(e.previousLocation ?? ''),
+                    Number(e.time ?? 0),
+                    String(e.groupName ?? '')
+                )
+            });
+        } else if (type === 'Online' || type === 'Offline') {
+            stmts.push({
+                counterKey: 'feed_online_offline',
+                stmt: env.DB_FEED.prepare(
+                    'INSERT OR IGNORE INTO feed_online_offline (created_at, user_id, display_name, type, location, world_name, time, group_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+                ).bind(
+                    createdAt,
+                    userId,
+                    displayName,
+                    type,
+                    String(e.location ?? ''),
+                    String(e.worldName ?? ''),
+                    Number(e.time ?? 0),
+                    String(e.groupName ?? '')
+                )
+            });
+        } else if (type === 'Status') {
+            stmts.push({
+                counterKey: 'feed_status',
+                stmt: env.DB_FEED.prepare(
+                    'INSERT OR IGNORE INTO feed_status (created_at, user_id, display_name, status, status_description, previous_status, previous_status_description) VALUES (?, ?, ?, ?, ?, ?, ?)'
+                ).bind(
+                    createdAt,
+                    userId,
+                    displayName,
+                    String(e.status ?? ''),
+                    String(e.statusDescription ?? ''),
+                    String(e.previousStatus ?? ''),
+                    String(e.previousStatusDescription ?? '')
+                )
+            });
+        } else if (type === 'Bio') {
+            stmts.push({
+                counterKey: 'feed_bio',
+                stmt: env.DB_FEED.prepare(
+                    'INSERT OR IGNORE INTO feed_bio (created_at, user_id, display_name, bio, previous_bio, bio_links, previous_bio_links) VALUES (?, ?, ?, ?, ?, ?, ?)'
+                ).bind(
+                    createdAt,
+                    userId,
+                    displayName,
+                    String(e.bio ?? ''),
+                    String(e.previousBio ?? ''),
+                    JSON.stringify(e.bioLinks ?? []),
+                    JSON.stringify(e.previousBioLinks ?? [])
+                )
+            });
+        }
+        // Avatar feed intentionally skipped by default on Free D1 tier to prevent multi-GB bloat
+    }
+
+    let inserted = 0;
+    let lastRowId = 0;
+    const counterDeltas = new Map<string, number>();
+    for (let i = 0; i < stmts.length; i += 25) {
+        const chunk = stmts.slice(i, i + 25);
+        const results = await env.DB_FEED.batch(chunk.map((c) => c.stmt));
+        for (let j = 0; j < results.length; j++) {
+            const r = results[j]!;
+            const changes = r.meta?.changes ?? 0;
+            if (changes > 0) {
+                inserted += changes;
+                const key = chunk[j]!.counterKey;
+                counterDeltas.set(key, (counterDeltas.get(key) ?? 0) + changes);
+            }
+            if (r.meta?.last_row_id) lastRowId = Number(r.meta.last_row_id);
+        }
+    }
+
+    let ops = 0;
+    for (const [uid, name] of users) {
+        if (ops++ >= 8) break;
+        await upsertEntityUser(env.DB_CORE, uid, name);
+    }
+    for (const [k, delta] of counterDeltas) {
+        await incrementCounter(env.DB_CORE, k, delta);
+    }
+
+    return { count: stmts.length, inserted, lastRowId };
 }
 
 function normalizeGameLogRows(results: D1Result<Record<string, unknown>>[]): Array<Record<string, unknown>> {
@@ -357,9 +464,10 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
                 location,
                 limit
             ),
-            env.DB_GAMELOG.prepare(
-                'SELECT * FROM gamelog_join_leave WHERE location = ? ORDER BY id DESC LIMIT ?'
-            ).bind(location, limit)
+            env.DB_GAMELOG.prepare('SELECT * FROM gamelog_join_leave WHERE location = ? ORDER BY id DESC LIMIT ?').bind(
+                location,
+                limit
+            )
         ]);
         const rows = normalizeGameLogRows([
             locRes as D1Result<Record<string, unknown>>,
@@ -441,7 +549,9 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
         }
 
         if (kind === 'last_date') {
-            const row = await env.DB_GAMELOG.prepare('SELECT created_at FROM gamelog_location ORDER BY id DESC LIMIT 1').first<{
+            const row = await env.DB_GAMELOG.prepare(
+                'SELECT created_at FROM gamelog_location ORDER BY id DESC LIMIT 1'
+            ).first<{
                 created_at: string;
             }>();
             return Response.json({ ok: true, data: { lastDate: row?.created_at ?? '' } });
@@ -543,101 +653,8 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
                 items: Array<Record<string, unknown>>;
             };
             const list = (body.items ?? []).slice(0, 50);
-            const stmts: D1PreparedStatement[] = [];
-            const users = new Map<string, string>();
-            const counterDeltas = new Map<string, number>();
-            const bump = (k: string) => counterDeltas.set(k, (counterDeltas.get(k) ?? 0) + 1);
-
-            for (const e of list) {
-                const type = String(e.type ?? '');
-                const createdAt = String(e.created_at ?? new Date().toISOString());
-                const userId = String(e.userId ?? '');
-                const displayName = String(e.displayName ?? '');
-                if (userId && displayName) users.set(userId, displayName);
-
-                if (type === 'GPS') {
-                    stmts.push(
-                        env.DB_FEED.prepare(
-                            'INSERT OR IGNORE INTO feed_gps (created_at, user_id, display_name, location, world_name, previous_location, time, group_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
-                        ).bind(
-                            createdAt,
-                            userId,
-                            displayName,
-                            String(e.location ?? ''),
-                            String(e.worldName ?? ''),
-                            String(e.previousLocation ?? ''),
-                            Number(e.time ?? 0),
-                            String(e.groupName ?? '')
-                        )
-                    );
-                    bump('feed_gps');
-                } else if (type === 'Online' || type === 'Offline') {
-                    stmts.push(
-                        env.DB_FEED.prepare(
-                            'INSERT OR IGNORE INTO feed_online_offline (created_at, user_id, display_name, type, location, world_name, time, group_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
-                        ).bind(
-                            createdAt,
-                            userId,
-                            displayName,
-                            type,
-                            String(e.location ?? ''),
-                            String(e.worldName ?? ''),
-                            Number(e.time ?? 0),
-                            String(e.groupName ?? '')
-                        )
-                    );
-                    bump('feed_online_offline');
-                } else if (type === 'Status') {
-                    stmts.push(
-                        env.DB_FEED.prepare(
-                            'INSERT OR IGNORE INTO feed_status (created_at, user_id, display_name, status, status_description, previous_status, previous_status_description) VALUES (?, ?, ?, ?, ?, ?, ?)'
-                        ).bind(
-                            createdAt,
-                            userId,
-                            displayName,
-                            String(e.status ?? ''),
-                            String(e.statusDescription ?? ''),
-                            String(e.previousStatus ?? ''),
-                            String(e.previousStatusDescription ?? '')
-                        )
-                    );
-                    bump('feed_status');
-                } else if (type === 'Bio') {
-                    stmts.push(
-                        env.DB_FEED.prepare(
-                            'INSERT OR IGNORE INTO feed_bio (created_at, user_id, display_name, bio, previous_bio, bio_links, previous_bio_links) VALUES (?, ?, ?, ?, ?, ?, ?)'
-                        ).bind(
-                            createdAt,
-                            userId,
-                            displayName,
-                            String(e.bio ?? ''),
-                            String(e.previousBio ?? ''),
-                            JSON.stringify(e.bioLinks ?? []),
-                            JSON.stringify(e.previousBioLinks ?? [])
-                        )
-                    );
-                    bump('feed_bio');
-                }
-                // Avatar feed intentionally skipped by default on Free D1 tier to prevent multi-GB bloat
-            }
-
-            let lastRowId = 0;
-            for (let i = 0; i < stmts.length; i += 25) {
-                const results = await env.DB_FEED.batch(stmts.slice(i, i + 25));
-                for (const r of results) {
-                    if (r.meta?.last_row_id) lastRowId = Number(r.meta.last_row_id);
-                }
-            }
-            let ops = 0;
-            for (const [uid, name] of users) {
-                if (ops++ >= 8) break;
-                await upsertEntityUser(env.DB_CORE, uid, name);
-            }
-            for (const [k, delta] of counterDeltas) {
-                await incrementCounter(env.DB_CORE, k, delta);
-            }
-
-            return Response.json({ ok: true, data: { count: stmts.length, lastRowId } });
+            const result = await ingestFeedItems(env, list);
+            return Response.json({ ok: true, data: result });
         }
     }
 
@@ -676,10 +693,9 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
         }
         const ph = userIds.map(() => '?').join(', ');
         const [gps, oo, status] = await env.DB_FEED.batch([
-            env.DB_FEED.prepare(`SELECT *, 'GPS' AS _kind FROM feed_gps WHERE user_id IN (${ph}) ORDER BY id DESC LIMIT ?`).bind(
-                ...userIds,
-                limit
-            ),
+            env.DB_FEED.prepare(
+                `SELECT *, 'GPS' AS _kind FROM feed_gps WHERE user_id IN (${ph}) ORDER BY id DESC LIMIT ?`
+            ).bind(...userIds, limit),
             env.DB_FEED.prepare(
                 `SELECT *, type AS _kind FROM feed_online_offline WHERE user_id IN (${ph}) ORDER BY id DESC LIMIT ?`
             ).bind(...userIds, limit),
@@ -687,11 +703,9 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
                 `SELECT *, 'Status' AS _kind FROM feed_status WHERE user_id IN (${ph}) ORDER BY id DESC LIMIT ?`
             ).bind(...userIds, limit)
         ]);
-        const merged = [
-            ...(gps?.results ?? []),
-            ...(oo?.results ?? []),
-            ...(status?.results ?? [])
-        ] as Array<Record<string, unknown>>;
+        const merged = [...(gps?.results ?? []), ...(oo?.results ?? []), ...(status?.results ?? [])] as Array<
+            Record<string, unknown>
+        >;
         merged.sort((a, b) => String(b.created_at ?? '').localeCompare(String(a.created_at ?? '')));
         return Response.json({ ok: true, data: merged.slice(0, limit) });
     }
@@ -716,9 +730,7 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
             };
             const stmts: D1PreparedStatement[] = [];
             if (body.replace) {
-                stmts.push(
-                    env.DB_FEED.prepare('DELETE FROM activity_sessions_v2 WHERE user_id = ?').bind(body.userId)
-                );
+                stmts.push(env.DB_FEED.prepare('DELETE FROM activity_sessions_v2 WHERE user_id = ?').bind(body.userId));
             }
             for (const s of (body.sessions ?? []).slice(0, 40)) {
                 stmts.push(

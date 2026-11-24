@@ -7,6 +7,11 @@ import { handleCoreDataRoutes } from './routes/coreData';
 import { handleEventsDataRoutes } from './routes/eventsData';
 import { handleVrcProxyRoutes } from './routes/vrcProxy';
 import { searchGameLogByEntity } from './search/entityFts';
+import {
+    getBackgroundFeedSyncStatus,
+    runBackgroundFeedSync,
+    setBackgroundFeedSyncEnabled
+} from './sync/backgroundFeedSync';
 
 export { AgentHubDO };
 
@@ -154,6 +159,22 @@ export default {
                 return Response.json({ ok: true, data });
             }
 
+            if (url.pathname === '/api/bg-sync/status' && request.method === 'GET') {
+                const data = await getBackgroundFeedSyncStatus(env);
+                return Response.json({ ok: true, data }, { headers: { 'Cache-Control': 'no-store' } });
+            }
+
+            if (url.pathname === '/api/bg-sync/run' && request.method === 'POST') {
+                const data = await runBackgroundFeedSync(env, { force: true, trigger: 'manual' });
+                return Response.json({ ok: true, data }, { headers: { 'Cache-Control': 'no-store' } });
+            }
+
+            if (url.pathname === '/api/bg-sync/config' && request.method === 'PUT') {
+                const body = (await request.json().catch(() => ({}))) as { enabled?: unknown };
+                const enabled = await setBackgroundFeedSyncEnabled(env, body.enabled !== false);
+                return Response.json({ ok: true, data: { enabled } });
+            }
+
             const vrcResp = await handleVrcProxyRoutes(request, env, url);
             if (vrcResp) return vrcResp;
 
@@ -182,5 +203,14 @@ export default {
                 { status: 500 }
             );
         }
+    },
+
+    async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+        const task = (async () => {
+            await ensureSchemaReady(env);
+            await runBackgroundFeedSync(env, { trigger: 'cron' });
+        })();
+        ctx.waitUntil(task);
+        await task;
     }
 } satisfies ExportedHandler<Env>;

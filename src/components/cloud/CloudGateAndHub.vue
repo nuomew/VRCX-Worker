@@ -141,7 +141,11 @@
                                     type="button"
                                     class="rounded-md border border-border px-3 py-1.5 font-medium hover:bg-accent"
                                     @click="copyText(cloudOriginUrl, 'url')">
-                                    {{ copiedField === 'url' ? t('cloud_hub.devices.copied') : t('cloud_hub.devices.copy_url') }}
+                                    {{
+                                        copiedField === 'url'
+                                            ? t('cloud_hub.devices.copied')
+                                            : t('cloud_hub.devices.copy_url')
+                                    }}
                                 </button>
                             </div>
                         </div>
@@ -166,7 +170,9 @@
                             </div>
                         </div>
 
-                        <div v-if="createdSyncKey" class="space-y-1.5 rounded-md border border-primary/30 bg-muted/60 p-3">
+                        <div
+                            v-if="createdSyncKey"
+                            class="space-y-1.5 rounded-md border border-primary/30 bg-muted/60 p-3">
                             <div class="flex items-center justify-between gap-2">
                                 <span class="font-medium text-foreground">
                                     {{ t('cloud_hub.devices.secret_created_for', { deviceName: createdDeviceName }) }}
@@ -175,10 +181,15 @@
                                     type="button"
                                     class="rounded bg-primary px-2.5 py-1 text-[11px] font-medium text-primary-foreground"
                                     @click="copyText(createdSyncKey, 'secret')">
-                                    {{ copiedField === 'secret' ? t('cloud_hub.devices.copied') : t('cloud_hub.devices.copy_secret') }}
+                                    {{
+                                        copiedField === 'secret'
+                                            ? t('cloud_hub.devices.copied')
+                                            : t('cloud_hub.devices.copy_secret')
+                                    }}
                                 </button>
                             </div>
-                            <div class="break-all rounded bg-background/80 px-2.5 py-1.5 font-mono text-[11px] text-primary">
+                            <div
+                                class="break-all rounded bg-background/80 px-2.5 py-1.5 font-mono text-[11px] text-primary">
                                 {{ createdSyncKey }}
                             </div>
                         </div>
@@ -200,7 +211,11 @@
                                     class="rounded-md border border-border px-3 py-1.5 font-medium hover:bg-accent"
                                     :disabled="savingSyncInterval"
                                     @click="saveSyncInterval">
-                                    {{ savingSyncInterval ? t('cloud_hub.devices.saving') : t('cloud_hub.devices.save_interval') }}
+                                    {{
+                                        savingSyncInterval
+                                            ? t('cloud_hub.devices.saving')
+                                            : t('cloud_hub.devices.save_interval')
+                                    }}
                                 </button>
                                 <span v-if="syncIntervalNotice" class="text-[11px] text-primary">
                                     {{ syncIntervalNotice }}
@@ -211,8 +226,78 @@
                             </div>
                         </div>
 
+                        <div class="rounded-md border border-border bg-muted/20 p-3 space-y-2">
+                            <div class="flex flex-wrap items-center justify-between gap-2">
+                                <div class="space-y-0.5">
+                                    <div class="font-medium text-foreground">
+                                        {{ t('cloud_hub.bg_feed.heading') }}
+                                    </div>
+                                    <div class="text-[11px] text-muted-foreground">
+                                        {{
+                                            t('cloud_hub.bg_feed.desc', {
+                                                seconds:
+                                                    bgSyncStatus?.effectiveCronIntervalSeconds ??
+                                                    Math.max(syncIntervalInput || 60, 60)
+                                            })
+                                        }}
+                                    </div>
+                                </div>
+                                <div class="flex items-center gap-2">
+                                    <button
+                                        type="button"
+                                        class="rounded-md border border-border px-2.5 py-1 text-[11px] font-medium hover:bg-accent disabled:opacity-50"
+                                        :disabled="bgSyncToggling"
+                                        @click="toggleBgSync">
+                                        {{
+                                            bgSyncEnabled
+                                                ? t('cloud_hub.bg_feed.enabled_btn')
+                                                : t('cloud_hub.bg_feed.disabled_btn')
+                                        }}
+                                    </button>
+                                    <button
+                                        type="button"
+                                        class="rounded-md border border-border px-2.5 py-1 text-[11px] font-medium hover:bg-accent disabled:opacity-50"
+                                        :disabled="bgSyncRunning"
+                                        @click="runBgSyncNow">
+                                        {{
+                                            bgSyncRunning
+                                                ? t('cloud_hub.bg_feed.running_btn')
+                                                : t('cloud_hub.bg_feed.run_now_btn')
+                                        }}
+                                    </button>
+                                </div>
+                            </div>
+                            <div
+                                v-if="bgSyncStatus"
+                                class="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-muted-foreground">
+                                <span>
+                                    {{
+                                        bgSyncStatus.hasVrcSession
+                                            ? t('cloud_hub.bg_feed.session_ok')
+                                            : t('cloud_hub.bg_feed.session_missing')
+                                    }}
+                                </span>
+                                <span v-if="bgSyncStatus.meta?.lastSuccessAt">
+                                    {{
+                                        t('cloud_hub.bg_feed.last_run', {
+                                            time: new Date(bgSyncStatus.meta.lastSuccessAt).toLocaleString(),
+                                            online: bgSyncStatus.meta.lastOnlineCount ?? 0,
+                                            feed: bgSyncStatus.meta.lastFeedInserted ?? 0,
+                                            notif: bgSyncStatus.meta.lastNotificationsInserted ?? 0
+                                        })
+                                    }}
+                                </span>
+                                <span v-else>{{ t('cloud_hub.bg_feed.never_run') }}</span>
+                            </div>
+                            <div v-if="bgSyncNotice" class="text-[11px] text-primary">{{ bgSyncNotice }}</div>
+                            <div v-if="bgSyncStatus?.meta?.lastError" class="text-[11px] text-destructive">
+                                {{ bgSyncStatus.meta.lastError }}
+                            </div>
+                        </div>
+
                         <div class="text-[11px] text-muted-foreground">
-                            {{ t('cloud_hub.devices.static_secret_tip_prefix') }}<code class="font-mono">AGENT_SYNC_KEY</code
+                            {{ t('cloud_hub.devices.static_secret_tip_prefix')
+                            }}<code class="font-mono">AGENT_SYNC_KEY</code
                             >{{ t('cloud_hub.devices.static_secret_tip_suffix') }}
                         </div>
                     </div>
@@ -237,7 +322,11 @@
                                 <div class="flex items-center gap-2 font-medium">
                                     <span
                                         class="inline-block size-2 rounded-full"
-                                        :class="isRecentlySynced(dev.last_seen_at) ? 'bg-status-online' : 'bg-status-offline-alt'" />
+                                        :class="
+                                            isRecentlySynced(dev.last_seen_at)
+                                                ? 'bg-status-online'
+                                                : 'bg-status-offline-alt'
+                                        " />
                                     <span>{{ dev.device_name }}</span>
                                     <span class="font-mono text-[11px] text-muted-foreground">{{ dev.device_id }}</span>
                                 </div>
@@ -360,9 +449,10 @@
                                 {{ t('cloud_hub.quota.run_probe') }}
                             </button>
                         </div>
-                        <pre v-if="wafProbeResult" class="overflow-x-auto rounded bg-muted/60 p-2.5 font-mono text-[11px]">{{
-                            wafProbeResult
-                        }}</pre>
+                        <pre
+                            v-if="wafProbeResult"
+                            class="overflow-x-auto rounded bg-muted/60 p-2.5 font-mono text-[11px]"
+                            >{{ wafProbeResult }}</pre>
                     </div>
                 </div>
             </div>
@@ -402,6 +492,11 @@
     const syncIntervalInput = ref(cloudState.syncIntervalSeconds || 60);
     const savingSyncInterval = ref(false);
     const syncIntervalNotice = ref('');
+    const bgSyncStatus = ref(null);
+    const bgSyncEnabled = ref(true);
+    const bgSyncRunning = ref(false);
+    const bgSyncToggling = ref(false);
+    const bgSyncNotice = ref('');
     const devices = ref([]);
     const launchUrlInput = ref('');
     const commandNotice = ref('');
@@ -548,10 +643,63 @@
         }
     }
 
+    async function loadBgSyncStatus() {
+        const res = await cloudFetch('/api/bg-sync/status').catch(() => null);
+        if (res) {
+            bgSyncStatus.value = res;
+            bgSyncEnabled.value = res.enabled !== false;
+        }
+    }
+
+    async function toggleBgSync() {
+        bgSyncToggling.value = true;
+        bgSyncNotice.value = '';
+        try {
+            const next = !bgSyncEnabled.value;
+            const res = await cloudFetch('/api/bg-sync/config', {
+                method: 'PUT',
+                json: { enabled: next }
+            });
+            bgSyncEnabled.value = res?.enabled !== false;
+            await loadBgSyncStatus();
+        } catch (err) {
+            bgSyncNotice.value = err?.message || String(err);
+        } finally {
+            bgSyncToggling.value = false;
+        }
+    }
+
+    async function runBgSyncNow() {
+        bgSyncRunning.value = true;
+        bgSyncNotice.value = '';
+        try {
+            const res = await cloudFetch('/api/bg-sync/run', { method: 'POST' });
+            if (res?.error) {
+                bgSyncNotice.value = res.error;
+            } else {
+                bgSyncNotice.value = t('cloud_hub.bg_feed.run_done', {
+                    online: res?.onlineCount ?? 0,
+                    feed: res?.feedInserted ?? 0,
+                    notif: res?.notificationsInserted ?? 0,
+                    bio: res?.bioChecked ?? 0
+                });
+            }
+            await loadBgSyncStatus();
+        } catch (err) {
+            bgSyncNotice.value = err?.message || String(err);
+        } finally {
+            bgSyncRunning.value = false;
+        }
+    }
+
     function selectTab(id) {
         activeTab.value = id;
-        if (id === 'devices' || id === 'synced_devices') loadDevices();
-        else if (id === 'commands') loadCommands();
+        if (id === 'devices') {
+            loadDevices();
+            loadBgSyncStatus();
+        } else if (id === 'synced_devices') {
+            loadDevices();
+        } else if (id === 'commands') loadCommands();
         else if (id === 'quota') loadQuota();
     }
 

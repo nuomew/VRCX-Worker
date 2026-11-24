@@ -1,4 +1,5 @@
 import type { Env } from '../env';
+import { markWebClientActive } from '../sync/backgroundFeedSync';
 
 function safeJsonParse<T>(raw: string | null | undefined, fallback: T): T {
     if (!raw) return fallback;
@@ -24,11 +25,7 @@ export async function incrementCounter(db: D1Database, counterKey: string, delta
         .run();
 }
 
-export async function upsertEntityUser(
-    db: D1Database,
-    userId: string,
-    displayName: string
-): Promise<void> {
+export async function upsertEntityUser(db: D1Database, userId: string, displayName: string): Promise<void> {
     if (!userId || !displayName) return;
     const now = new Date().toISOString();
     const existing = await db
@@ -58,11 +55,7 @@ export async function upsertEntityUser(
         .run();
 }
 
-export async function upsertEntityWorld(
-    db: D1Database,
-    worldId: string,
-    worldName: string
-): Promise<void> {
+export async function upsertEntityWorld(db: D1Database, worldId: string, worldName: string): Promise<void> {
     if (!worldId || !worldName) return;
     const now = new Date().toISOString();
     const existing = await db
@@ -130,11 +123,7 @@ export function resolveRecentHttpAgents(
  * Uses a single shared `updated_at` watermark so concurrent Web heartbeats and VRCX.Agent periodic sync ticks
  * never double-count the same wall-clock interval, while offline gaps (> maxStepSeconds) only advance the watermark.
  */
-export async function accrueCloudUptime(
-    db: D1Database,
-    nowIso: string,
-    maxStepSeconds: number
-): Promise<number> {
+export async function accrueCloudUptime(db: D1Database, nowIso: string, maxStepSeconds: number): Promise<number> {
     const nowMs = Date.parse(nowIso);
     if (!Number.isFinite(nowMs)) return 0;
 
@@ -145,9 +134,7 @@ export async function accrueCloudUptime(
 
     if (!existing) {
         await db
-            .prepare(
-                'INSERT OR IGNORE INTO stats_counters (counter_key, row_count, updated_at) VALUES (?, 0, ?)'
-            )
+            .prepare('INSERT OR IGNORE INTO stats_counters (counter_key, row_count, updated_at) VALUES (?, 0, ?)')
             .bind(CLOUD_TOTAL_UPTIME_COUNTER_KEY, nowIso)
             .run();
         const afterInsert = await db
@@ -202,8 +189,9 @@ export async function accrueCloudUptime(
  * Used by both Web bootstrap and Windows VRCX.Agent periodic HTTP sync responses.
  */
 export async function getCloudSyncIntervalSeconds(env: Env): Promise<number> {
-    const row = await env.DB_CORE.prepare("SELECT payload_json FROM config_bundles WHERE bundle_key = 'vrcx_config' LIMIT 1")
-        .first<{ payload_json: string }>();
+    const row = await env.DB_CORE.prepare(
+        "SELECT payload_json FROM config_bundles WHERE bundle_key = 'vrcx_config' LIMIT 1"
+    ).first<{ payload_json: string }>();
     const cfg = safeJsonParse<Record<string, string>>(row?.payload_json, {});
     return parseCloudSyncIntervalSeconds(cfg['cloud:syncIntervalSeconds']);
 }
@@ -230,7 +218,9 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
                 env.DB_CORE.prepare('SELECT device_id, device_name, last_seen_at FROM cloud_devices'),
                 env.DB_CORE.prepare('SELECT device_id, state_json, updated_at FROM cloud_device_states')
             ]),
-            hub.fetch(new Request('https://agent-hub.internal/status')).then((r) => r.json() as Promise<{ data?: unknown }>)
+            hub
+                .fetch(new Request('https://agent-hub.internal/status'))
+                .then((r) => r.json() as Promise<{ data?: unknown }>)
         ]);
 
         const bundles: Record<string, Record<string, string>> = {
@@ -250,11 +240,8 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
         const syncIntervalSeconds = parseCloudSyncIntervalSeconds(vrcxConfigs['cloud:syncIntervalSeconds']);
         const nowIso = new Date().toISOString();
         const nowMs = Date.parse(nowIso);
-        const totalUptimeSeconds = await accrueCloudUptime(
-            env.DB_CORE,
-            nowIso,
-            Math.max(syncIntervalSeconds * 3, 360)
-        );
+        const totalUptimeSeconds = await accrueCloudUptime(env.DB_CORE, nowIso, Math.max(syncIntervalSeconds * 3, 360));
+        await markWebClientActive(env, nowIso, false).catch(() => {});
         counters[CLOUD_TOTAL_UPTIME_COUNTER_KEY] = totalUptimeSeconds;
 
         const rawHub = (hubRes?.data ?? {
@@ -391,9 +378,7 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
             };
             const editedAt = body.editedAt || new Date().toISOString();
             if (body.kind === 'user') {
-                await env.DB_CORE.prepare(
-                    'INSERT OR REPLACE INTO memos (user_id, edited_at, memo) VALUES (?, ?, ?)'
-                )
+                await env.DB_CORE.prepare('INSERT OR REPLACE INTO memos (user_id, edited_at, memo) VALUES (?, ?, ?)')
                     .bind(body.id, editedAt, body.memo)
                     .run();
             } else if (body.kind === 'world') {
@@ -409,7 +394,10 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
                     .bind(body.id, editedAt, body.memo)
                     .run();
             } else {
-                return Response.json({ ok: false, error: { code: 'BAD_KIND', message: 'Invalid memo kind' } }, { status: 400 });
+                return Response.json(
+                    { ok: false, error: { code: 'BAD_KIND', message: 'Invalid memo kind' } },
+                    { status: 400 }
+                );
             }
             return Response.json({ ok: true });
         }
@@ -477,9 +465,7 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
                     .bind(now, body.targetId, body.groupName ?? '')
                     .run();
             } else if (body.kind === 'print') {
-                await env.DB_CORE.prepare(
-                    'INSERT OR IGNORE INTO favorite_print (print_id, created_at) VALUES (?, ?)'
-                )
+                await env.DB_CORE.prepare('INSERT OR IGNORE INTO favorite_print (print_id, created_at) VALUES (?, ?)')
                     .bind(body.targetId, now)
                     .run();
             }
@@ -500,7 +486,10 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
                         ? 'favorite_avatar'
                         : null;
             if (!table) {
-                return Response.json({ ok: false, error: { code: 'BAD_KIND', message: 'Invalid kind' } }, { status: 400 });
+                return Response.json(
+                    { ok: false, error: { code: 'BAD_KIND', message: 'Invalid kind' } },
+                    { status: 400 }
+                );
             }
             await env.DB_CORE.prepare(`UPDATE ${table} SET group_name = ? WHERE group_name = ?`)
                 .bind(body.newGroupName, body.oldGroupName)
@@ -546,9 +535,7 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
     if (url.pathname === '/api/avatar-tags') {
         if (request.method === 'POST') {
             const body = (await request.json()) as { avatarId: string; tag: string; color?: string | null };
-            await env.DB_CORE.prepare(
-                'INSERT OR REPLACE INTO avatar_tags (avatar_id, tag, color) VALUES (?, ?, ?)'
-            )
+            await env.DB_CORE.prepare('INSERT OR REPLACE INTO avatar_tags (avatar_id, tag, color) VALUES (?, ?, ?)')
                 .bind(body.avatarId, body.tag, body.color ?? null)
                 .run();
             return Response.json({ ok: true });
@@ -910,20 +897,16 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
         const nowIso = new Date().toISOString();
         const nowMs = Date.parse(nowIso);
         const [cfgRes, devRes, stateRes] = await env.DB_CORE.batch([
-            env.DB_CORE.prepare(
-                "SELECT payload_json FROM config_bundles WHERE bundle_key = 'vrcx_config' LIMIT 1"
-            ),
+            env.DB_CORE.prepare("SELECT payload_json FROM config_bundles WHERE bundle_key = 'vrcx_config' LIMIT 1"),
             env.DB_CORE.prepare('SELECT device_id, last_seen_at FROM cloud_devices'),
             env.DB_CORE.prepare('SELECT device_id, state_json, updated_at FROM cloud_device_states')
         ]);
         const cfgRow = (cfgRes?.results?.[0] ?? null) as { payload_json?: string } | null;
         const cfg = safeJsonParse<Record<string, string>>(cfgRow?.payload_json, {});
         const syncIntervalSeconds = parseCloudSyncIntervalSeconds(cfg['cloud:syncIntervalSeconds']);
-        const totalUptimeSeconds = await accrueCloudUptime(
-            env.DB_CORE,
-            nowIso,
-            Math.max(syncIntervalSeconds * 3, 360)
-        );
+        const totalUptimeSeconds = await accrueCloudUptime(env.DB_CORE, nowIso, Math.max(syncIntervalSeconds * 3, 360));
+        const isClosing = url.searchParams.get('closing') === '1';
+        await markWebClientActive(env, nowIso, isClosing).catch(() => {});
         const deviceRows = (devRes?.results ?? []) as Array<{ device_id: string; last_seen_at: string }>;
         const { httpAgentsOnline, deviceLastSeen } = resolveRecentHttpAgents(
             deviceRows,
@@ -989,9 +972,18 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
                 healthy: Boolean(coreProbe.success && gameProbe.success && feedProbe.success),
                 freeSingleDbLimitBytes: freeDbCapBytes,
                 databases: {
-                    core: { bytes: sizeCore, percentOfFreeLimit: Number(((sizeCore / freeDbCapBytes) * 100).toFixed(2)) },
-                    gamelog: { bytes: sizeGame, percentOfFreeLimit: Number(((sizeGame / freeDbCapBytes) * 100).toFixed(2)) },
-                    feed: { bytes: sizeFeed, percentOfFreeLimit: Number(((sizeFeed / freeDbCapBytes) * 100).toFixed(2)) }
+                    core: {
+                        bytes: sizeCore,
+                        percentOfFreeLimit: Number(((sizeCore / freeDbCapBytes) * 100).toFixed(2))
+                    },
+                    gamelog: {
+                        bytes: sizeGame,
+                        percentOfFreeLimit: Number(((sizeGame / freeDbCapBytes) * 100).toFixed(2))
+                    },
+                    feed: {
+                        bytes: sizeFeed,
+                        percentOfFreeLimit: Number(((sizeFeed / freeDbCapBytes) * 100).toFixed(2))
+                    }
                 },
                 pairedDevicesCount: devicesRes?.cnt ?? 0,
                 r2Enabled: Boolean(env.R2_MEDIA),

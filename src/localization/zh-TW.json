@@ -3382,6 +3382,19 @@
             "never_synced": "尚未同步",
             "revoke": "撤銷"
         },
+        "bg_feed": {
+            "heading": "雲端背景好友動態同步（關閉網頁生效）",
+            "desc": "關閉網頁後，Cloudflare 定時按同步間隔（目前每 {seconds} 秒，最低 60 秒）自動記錄好友上下線、切換世界、變更狀態、簡介變化與通知。",
+            "enabled_btn": "已開啟",
+            "disabled_btn": "已關閉",
+            "run_now_btn": "立即同步一次",
+            "running_btn": "同步中...",
+            "session_ok": "VRChat 工作階段有效",
+            "session_missing": "尚未偵測到 VRChat 登入工作階段",
+            "never_run": "尚未執行背景同步",
+            "last_run": "上次成功：{time} · 線上 {online} · 動態 +{feed} · 通知 +{notif}",
+            "run_done": "同步完成：遊戲線上好友 {online} 人，新增動態 {feed} 筆、通知 {notif} 筆（檢查簡介 {bio} 人）"
+        },
         "commands": {
             "launch_heading": "於 Windows 電腦遠端啟動 VRChat 房間",
             "launch_btn": "啟動房間",
