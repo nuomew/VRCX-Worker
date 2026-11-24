@@ -60,9 +60,13 @@ export class AgentHubDO extends DurableObject<Env> {
         }
 
         if (url.pathname === '/broadcast' && request.method === 'POST') {
-            const body = (await request.json()) as HubEnvelope;
-            if (body && typeof body.type === 'string') {
-                this.broadcastToRole('web', { ...body, v: 1, ts: Date.now() });
+            const body = (await request.json()) as HubEnvelope & { messages?: HubEnvelope[] };
+            const now = Date.now();
+            const list = Array.isArray(body?.messages) ? body.messages : body?.type ? [body] : [];
+            for (const msg of list) {
+                if (msg && typeof msg.type === 'string') {
+                    this.broadcastToRole('web', { ...msg, v: 1, ts: now });
+                }
             }
             return Response.json({ ok: true });
         }

@@ -479,23 +479,30 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
 
     if (url.pathname === '/api/user-profiles') {
         if (request.method === 'PUT') {
-            const body = (await request.json()) as {
+            type UserProfileInput = {
                 userId: string;
                 bio?: string;
                 bioLinks?: unknown[];
                 updatedAt?: string;
             };
-            await env.DB_CORE.prepare(
-                'INSERT OR REPLACE INTO user_profile (user_id, bio, bio_links, updated_at) VALUES (?, ?, ?, ?)'
-            )
-                .bind(
-                    body.userId,
-                    body.bio ?? '',
-                    JSON.stringify(body.bioLinks ?? []),
-                    body.updatedAt || new Date().toISOString()
-                )
-                .run();
-            return Response.json({ ok: true });
+            const body = (await request.json()) as UserProfileInput & { entries?: UserProfileInput[] };
+            const list = Array.isArray(body.entries)
+                ? body.entries.filter((e) => Boolean(e?.userId))
+                : body?.userId
+                  ? [body]
+                  : [];
+            const nowIso = new Date().toISOString();
+            for (let i = 0; i < list.length; i += 25) {
+                const chunk = list.slice(i, i + 25);
+                await env.DB_CORE.batch(
+                    chunk.map((e) =>
+                        env.DB_CORE.prepare(
+                            'INSERT OR REPLACE INTO user_profile (user_id, bio, bio_links, updated_at) VALUES (?, ?, ?, ?)'
+                        ).bind(e.userId, e.bio ?? '', JSON.stringify(e.bioLinks ?? []), e.updatedAt || nowIso)
+                    )
+                );
+            }
+            return Response.json({ ok: true, data: { count: list.length } });
         }
         if (request.method === 'DELETE') {
             const userId = url.searchParams.get('userId') ?? '';
@@ -618,60 +625,88 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
             return Response.json({ ok: true, data: res.results ?? [] });
         }
         if (request.method === 'POST') {
-            const body = (await request.json()) as { version?: 1 | 2; entry: Record<string, unknown> };
-            const e = body.entry ?? {};
-            if (body.version === 2) {
-                await env.DB_CORE.prepare(
-                    `INSERT OR REPLACE INTO notifications_v2
-                     (id, created_at, updated_at, expires_at, type, link, link_text, message, title, image_url, seen, sender_user_id, sender_username, data, responses, details)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-                )
-                    .bind(
-                        String(e.id ?? crypto.randomUUID()),
-                        String(e.createdAt ?? e.created_at ?? new Date().toISOString()),
-                        String(e.updatedAt ?? e.updated_at ?? ''),
-                        String(e.expiresAt ?? e.expires_at ?? ''),
-                        String(e.type ?? ''),
-                        String(e.link ?? ''),
-                        String(e.linkText ?? e.link_text ?? ''),
-                        String(e.message ?? ''),
-                        String(e.title ?? ''),
-                        String(e.imageUrl ?? e.image_url ?? ''),
-                        e.seen ? 1 : 0,
-                        String(e.senderUserId ?? e.sender_user_id ?? ''),
-                        String(e.senderUsername ?? e.sender_username ?? ''),
-                        typeof e.data === 'string' ? e.data : JSON.stringify(e.data ?? {}),
-                        typeof e.responses === 'string' ? e.responses : JSON.stringify(e.responses ?? []),
-                        typeof e.details === 'string' ? e.details : JSON.stringify(e.details ?? {})
-                    )
-                    .run();
-            } else {
-                const details = (e.details ?? {}) as Record<string, unknown>;
-                await env.DB_CORE.prepare(
-                    `INSERT OR IGNORE INTO notifications
-                     (id, created_at, type, sender_user_id, sender_username, receiver_user_id, message, world_id, world_name, image_url, invite_message, request_message, response_message, expired)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-                )
-                    .bind(
-                        String(e.id ?? crypto.randomUUID()),
-                        String(e.created_at ?? new Date().toISOString()),
-                        String(e.type ?? ''),
-                        String(e.senderUserId ?? ''),
-                        String(e.senderUsername ?? ''),
-                        String(e.receiverUserId ?? ''),
-                        String(e.message ?? ''),
-                        String(details.worldId ?? ''),
-                        String(details.worldName ?? ''),
-                        String(details.imageUrl ?? ''),
-                        String(details.inviteMessage ?? ''),
-                        String(details.requestMessage ?? ''),
-                        String(details.responseMessage ?? ''),
-                        e.$isExpired ? 1 : 0
-                    )
-                    .run();
-                await incrementCounter(env.DB_CORE, 'notifications', 1);
+            const body = (await request.json()) as {
+                version?: 1 | 2;
+                entry?: Record<string, unknown>;
+                entries?: Array<Record<string, unknown>>;
+            };
+            const list = Array.isArray(body.entries)
+                ? body.entries.filter((x) => Boolean(x && typeof x === 'object'))
+                : body.entry
+                  ? [body.entry]
+                  : [];
+            if (list.length === 0) {
+                return Response.json({ ok: true, data: { count: 0 } });
             }
-            return Response.json({ ok: true });
+            const nowIso = new Date().toISOString();
+            if (body.version === 2) {
+                for (let i = 0; i < list.length; i += 25) {
+                    const chunk = list.slice(i, i + 25);
+                    await env.DB_CORE.batch(
+                        chunk.map((e) =>
+                            env.DB_CORE.prepare(
+                                `INSERT OR REPLACE INTO notifications_v2
+                                 (id, created_at, updated_at, expires_at, type, link, link_text, message, title, image_url, seen, sender_user_id, sender_username, data, responses, details)
+                                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+                            ).bind(
+                                String(e.id ?? crypto.randomUUID()),
+                                String(e.createdAt ?? e.created_at ?? nowIso),
+                                String(e.updatedAt ?? e.updated_at ?? ''),
+                                String(e.expiresAt ?? e.expires_at ?? ''),
+                                String(e.type ?? ''),
+                                String(e.link ?? ''),
+                                String(e.linkText ?? e.link_text ?? ''),
+                                String(e.message ?? ''),
+                                String(e.title ?? ''),
+                                String(e.imageUrl ?? e.image_url ?? ''),
+                                e.seen ? 1 : 0,
+                                String(e.senderUserId ?? e.sender_user_id ?? ''),
+                                String(e.senderUsername ?? e.sender_username ?? ''),
+                                typeof e.data === 'string' ? e.data : JSON.stringify(e.data ?? {}),
+                                typeof e.responses === 'string' ? e.responses : JSON.stringify(e.responses ?? []),
+                                typeof e.details === 'string' ? e.details : JSON.stringify(e.details ?? {})
+                            )
+                        )
+                    );
+                }
+            } else {
+                let insertedCount = 0;
+                for (let i = 0; i < list.length; i += 25) {
+                    const chunk = list.slice(i, i + 25);
+                    const results = await env.DB_CORE.batch(
+                        chunk.map((e) => {
+                            const details = (e.details ?? {}) as Record<string, unknown>;
+                            return env.DB_CORE.prepare(
+                                `INSERT OR IGNORE INTO notifications
+                                 (id, created_at, type, sender_user_id, sender_username, receiver_user_id, message, world_id, world_name, image_url, invite_message, request_message, response_message, expired)
+                                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+                            ).bind(
+                                String(e.id ?? crypto.randomUUID()),
+                                String(e.created_at ?? nowIso),
+                                String(e.type ?? ''),
+                                String(e.senderUserId ?? ''),
+                                String(e.senderUsername ?? ''),
+                                String(e.receiverUserId ?? ''),
+                                String(e.message ?? ''),
+                                String(details.worldId ?? ''),
+                                String(details.worldName ?? ''),
+                                String(details.imageUrl ?? ''),
+                                String(details.inviteMessage ?? ''),
+                                String(details.requestMessage ?? ''),
+                                String(details.responseMessage ?? ''),
+                                e.$isExpired ? 1 : 0
+                            );
+                        })
+                    );
+                    for (const r of results) {
+                        insertedCount += r.meta?.changes ?? 0;
+                    }
+                }
+                if (insertedCount > 0) {
+                    await incrementCounter(env.DB_CORE, 'notifications', insertedCount);
+                }
+            }
+            return Response.json({ ok: true, data: { count: list.length } });
         }
         if (request.method === 'PATCH') {
             const body = (await request.json()) as {

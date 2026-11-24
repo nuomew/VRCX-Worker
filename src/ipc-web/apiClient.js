@@ -105,12 +105,15 @@ export function connectCloudHubWs() {
             cloudState.wsConnected = true;
             reconnectDelayMs = 2000;
             if (pingTimer) clearInterval(pingTimer);
-            // Matches AgentHubDO setWebSocketAutoResponse("ping", "pong") — zero DO duration cost.
+            // Matches AgentHubDO setWebSocketAutoResponse("ping", "pong") — reduced to 120s to minimize WS messages.
             pingTimer = setInterval(() => {
-                if (ws.readyState === WebSocket.OPEN) {
+                if (
+                    ws.readyState === WebSocket.OPEN &&
+                    (typeof document === 'undefined' || document.visibilityState === 'visible')
+                ) {
                     ws.send('ping');
                 }
-            }, 45_000);
+            }, 120_000);
         };
 
         ws.onmessage = (event) => {
@@ -128,8 +131,12 @@ export function connectCloudHubWs() {
                 if (!cloudState.agentsOnline.includes(msg.payload.deviceId)) {
                     cloudState.agentsOnline.push(msg.payload.deviceId);
                 }
+                if (!cloudState.wsAgentsOnline.includes(msg.payload.deviceId)) {
+                    cloudState.wsAgentsOnline.push(msg.payload.deviceId);
+                }
             } else if (msg.type === 'agent.offline' && msg.payload?.deviceId) {
                 cloudState.agentsOnline = cloudState.agentsOnline.filter((id) => id !== msg.payload.deviceId);
+                cloudState.wsAgentsOnline = cloudState.wsAgentsOnline.filter((id) => id !== msg.payload.deviceId);
             } else if (msg.type === 'agent.state' && msg.payload?.deviceId) {
                 const { deviceId, ...rest } = msg.payload;
                 cloudState.deviceStates[deviceId] = {
@@ -138,6 +145,10 @@ export function connectCloudHubWs() {
                 };
                 if (!cloudState.agentsOnline.includes(deviceId)) {
                     cloudState.agentsOnline.push(deviceId);
+                }
+                // Only WS-connected agents can serve /rpc/vrc-http; HTTP periodic sync agents must not wake DO on VRChat calls.
+                if (rest.syncMode !== 'http' && !cloudState.wsAgentsOnline.includes(deviceId)) {
+                    cloudState.wsAgentsOnline.push(deviceId);
                 }
                 dispatchLiveGameState();
             } else if (msg.type === 'gamelog.batch' && Array.isArray(msg.payload?.events)) {

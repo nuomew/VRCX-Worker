@@ -20,27 +20,210 @@ let pendingFeedBatch = [];
 /** @type {ReturnType<typeof setTimeout> | null} */
 let feedFlushTimer = null;
 
+/** @type {Map<string, Record<string, any>>} */
+let pendingUserProfiles = new Map();
+/** @type {ReturnType<typeof setTimeout> | null} */
+let userProfileFlushTimer = null;
+
+/** @type {Map<string, Record<string, any>>} */
+let pendingFriendLogCurrent = new Map();
+/** @type {ReturnType<typeof setTimeout> | null} */
+let friendLogCurrentFlushTimer = null;
+
+/** @type {Map<string, Record<string, any>>} */
+let pendingNotificationsV1 = new Map();
+/** @type {Map<string, Record<string, any>>} */
+let pendingNotificationsV2 = new Map();
+/** @type {ReturnType<typeof setTimeout> | null} */
+let notificationsFlushTimer = null;
+
+const STATS_CACHE_TTL_MS = 60_000;
+/** @type {Map<string, { expiresAt: number; data: any }>} */
+const worldStatsCache = new Map();
+/** @type {Map<string, Promise<any>>} */
+const worldStatsInflight = new Map();
+/** @type {Map<string, { expiresAt: number; data: any }>} */
+const userStatsCache = new Map();
+/** @type {Map<string, Promise<any>>} */
+const userStatsInflight = new Map();
+
+function fetchWorldStatsCached(worldId) {
+    if (!worldId) return Promise.resolve({});
+    const cached = worldStatsCache.get(worldId);
+    if (cached && cached.expiresAt > Date.now()) {
+        return Promise.resolve(cached.data);
+    }
+    const existing = worldStatsInflight.get(worldId);
+    if (existing) return existing;
+    const req = cloudFetch(`/api/gamelog/stats?kind=world&worldId=${encodeURIComponent(worldId)}`)
+        .then((data) => {
+            const safe = data || {};
+            if (worldStatsCache.size >= 200) {
+                const firstKey = worldStatsCache.keys().next().value;
+                if (firstKey !== undefined) worldStatsCache.delete(firstKey);
+            }
+            worldStatsCache.set(worldId, { expiresAt: Date.now() + STATS_CACHE_TTL_MS, data: safe });
+            return safe;
+        })
+        .catch(() => ({}))
+        .finally(() => {
+            worldStatsInflight.delete(worldId);
+        });
+    worldStatsInflight.set(worldId, req);
+    return req;
+}
+
+function fetchUserStatsCached(userId) {
+    const empty = { joinCount: 0, timeSpent: 0, lastSeen: '' };
+    if (!userId) return Promise.resolve(empty);
+    const cached = userStatsCache.get(userId);
+    if (cached && cached.expiresAt > Date.now()) {
+        return Promise.resolve(cached.data);
+    }
+    const existing = userStatsInflight.get(userId);
+    if (existing) return existing;
+    const req = cloudFetch(`/api/gamelog/stats?kind=user&userId=${encodeURIComponent(userId)}`)
+        .then((data) => {
+            const safe = data || empty;
+            if (userStatsCache.size >= 200) {
+                const firstKey = userStatsCache.keys().next().value;
+                if (firstKey !== undefined) userStatsCache.delete(firstKey);
+            }
+            userStatsCache.set(userId, { expiresAt: Date.now() + STATS_CACHE_TTL_MS, data: safe });
+            return safe;
+        })
+        .catch(() => empty)
+        .finally(() => {
+            userStatsInflight.delete(userId);
+        });
+    userStatsInflight.set(userId, req);
+    return req;
+}
+
 function queueFeedWrite(entry) {
     pendingFeedBatch.push(entry);
-    if (pendingFeedBatch.length >= 20) {
+    if (pendingFeedBatch.length >= 40) {
         flushFeedBatch();
         return;
     }
     if (!feedFlushTimer) {
-        feedFlushTimer = setTimeout(flushFeedBatch, 6000);
+        feedFlushTimer = setTimeout(() => flushFeedBatch(false), 30_000);
     }
 }
 
-function flushFeedBatch() {
+function flushFeedBatch(keepalive = false) {
     if (feedFlushTimer) {
         clearTimeout(feedFlushTimer);
         feedFlushTimer = null;
     }
     if (pendingFeedBatch.length === 0) return;
     const items = pendingFeedBatch.splice(0, 50);
-    cloudFetch('/api/feed', { method: 'POST', json: { items } }).catch((err) =>
+    cloudFetch('/api/feed', { method: 'POST', keepalive, json: { items } }).catch((err) =>
         console.warn('[cloud] Feed batch flush failed:', err)
     );
+}
+
+function queueUserProfileWrite(entry) {
+    if (!entry?.userId) return;
+    pendingUserProfiles.set(entry.userId, entry);
+    if (pendingUserProfiles.size >= 30) {
+        flushUserProfileBatch();
+        return;
+    }
+    if (!userProfileFlushTimer) {
+        userProfileFlushTimer = setTimeout(() => flushUserProfileBatch(false), 15_000);
+    }
+}
+
+function flushUserProfileBatch(keepalive = false) {
+    if (userProfileFlushTimer) {
+        clearTimeout(userProfileFlushTimer);
+        userProfileFlushTimer = null;
+    }
+    if (pendingUserProfiles.size === 0) return;
+    const entries = Array.from(pendingUserProfiles.values());
+    pendingUserProfiles.clear();
+    for (let i = 0; i < entries.length; i += 50) {
+        cloudFetch('/api/user-profiles', {
+            method: 'PUT',
+            keepalive,
+            json: { entries: entries.slice(i, i + 50) }
+        }).catch(() => {});
+    }
+}
+
+function queueFriendLogCurrentWrite(entry) {
+    if (!entry?.user_id) return;
+    pendingFriendLogCurrent.set(entry.user_id, entry);
+    if (pendingFriendLogCurrent.size >= 50) {
+        flushFriendLogCurrentBatch();
+        return;
+    }
+    if (!friendLogCurrentFlushTimer) {
+        friendLogCurrentFlushTimer = setTimeout(() => flushFriendLogCurrentBatch(false), 8_000);
+    }
+}
+
+function flushFriendLogCurrentBatch(keepalive = false) {
+    if (friendLogCurrentFlushTimer) {
+        clearTimeout(friendLogCurrentFlushTimer);
+        friendLogCurrentFlushTimer = null;
+    }
+    if (pendingFriendLogCurrent.size === 0) return;
+    const entries = Array.from(pendingFriendLogCurrent.values());
+    pendingFriendLogCurrent.clear();
+    for (let i = 0; i < entries.length; i += 100) {
+        cloudFetch('/api/friend-log/current', {
+            method: 'POST',
+            keepalive,
+            json: { entries: entries.slice(i, i + 100) }
+        }).catch(() => {});
+    }
+}
+
+function queueNotificationWrite(version, entry) {
+    if (!entry || typeof entry !== 'object') return;
+    const key = String(entry.id || `${Date.now()}_${Math.random()}`);
+    if (version === 2) {
+        pendingNotificationsV2.set(key, entry);
+    } else {
+        pendingNotificationsV1.set(key, entry);
+    }
+    if (pendingNotificationsV1.size + pendingNotificationsV2.size >= 25) {
+        flushNotificationsBatch();
+        return;
+    }
+    if (!notificationsFlushTimer) {
+        notificationsFlushTimer = setTimeout(() => flushNotificationsBatch(false), 10_000);
+    }
+}
+
+function flushNotificationsBatch(keepalive = false) {
+    if (notificationsFlushTimer) {
+        clearTimeout(notificationsFlushTimer);
+        notificationsFlushTimer = null;
+    }
+    if (pendingNotificationsV1.size > 0) {
+        const entries = Array.from(pendingNotificationsV1.values());
+        pendingNotificationsV1.clear();
+        cloudFetch('/api/notifications', { method: 'POST', keepalive, json: { version: 1, entries } }).catch(() => {});
+    }
+    if (pendingNotificationsV2.size > 0) {
+        const entries = Array.from(pendingNotificationsV2.values());
+        pendingNotificationsV2.clear();
+        cloudFetch('/api/notifications', { method: 'POST', keepalive, json: { version: 2, entries } }).catch(() => {});
+    }
+}
+
+function flushAllPendingCloudDbWrites() {
+    flushFeedBatch(true);
+    flushUserProfileBatch(true);
+    flushFriendLogCurrentBatch(true);
+    flushNotificationsBatch(true);
+}
+
+if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+    window.addEventListener('pagehide', flushAllPendingCloudDbWrites);
 }
 
 export function createCloudDatabase(dbVars) {
@@ -520,8 +703,16 @@ export function createCloudDatabase(dbVars) {
                 bioLinks: profile.bioLinks || [],
                 updatedAt: profile.updatedAt || new Date().toISOString()
             };
+            const prev = bootstrapCache.userProfiles.get(next.userId);
+            if (
+                prev &&
+                prev.bio === next.bio &&
+                JSON.stringify(prev.bioLinks || []) === JSON.stringify(next.bioLinks)
+            ) {
+                return;
+            }
             bootstrapCache.userProfiles.set(next.userId, next);
-            await cloudFetch('/api/user-profiles', { method: 'PUT', json: next }).catch(() => {});
+            queueUserProfileWrite(next);
         },
         async deleteUserProfile(userId) {
             bootstrapCache.userProfiles.delete(userId);
@@ -539,18 +730,11 @@ export function createCloudDatabase(dbVars) {
             }));
         },
         async setFriendLogCurrent(entry) {
-            await cloudFetch('/api/friend-log/current', {
-                method: 'POST',
-                json: {
-                    entries: [
-                        {
-                            user_id: entry.userId,
-                            display_name: entry.displayName,
-                            trust_level: entry.trustLevel,
-                            friend_number: entry.friendNumber
-                        }
-                    ]
-                }
+            queueFriendLogCurrentWrite({
+                user_id: entry.userId,
+                display_name: entry.displayName,
+                trust_level: entry.trustLevel,
+                friend_number: entry.friendNumber
             });
         },
         async setFriendLogCurrentArray(inputData) {
@@ -659,7 +843,7 @@ export function createCloudDatabase(dbVars) {
                 .slice(0, maxEntries);
         },
         async addNotificationToDatabase(entry) {
-            await cloudFetch('/api/notifications', { method: 'POST', json: { version: 1, entry } }).catch(() => {});
+            queueNotificationWrite(1, entry);
         },
         async deleteNotification(rowId) {
             await cloudFetch(`/api/notifications?v=1&id=${encodeURIComponent(rowId)}`, { method: 'DELETE' });
@@ -692,7 +876,7 @@ export function createCloudDatabase(dbVars) {
             }));
         },
         async addNotificationV2ToDatabase(entry) {
-            await cloudFetch('/api/notifications', { method: 'POST', json: { version: 2, entry } }).catch(() => {});
+            queueNotificationWrite(2, entry);
         },
         async expireNotificationV2(id) {
             await cloudFetch('/api/notifications', { method: 'PATCH', json: { version: 2, id, expired: true } });
@@ -817,34 +1001,24 @@ export function createCloudDatabase(dbVars) {
             return res?.lastRowId ? { ...entry, rowId: res.lastRowId } : undefined;
         },
         async getLastVisit(worldId) {
-            const stats = await cloudFetch(`/api/gamelog/stats?kind=world&worldId=${encodeURIComponent(worldId)}`).catch(
-                () => ({})
-            );
+            const stats = await fetchWorldStatsCached(worldId);
             return stats.lastVisit || '';
         },
         async getVisitCount(worldId) {
-            const stats = await cloudFetch(`/api/gamelog/stats?kind=world&worldId=${encodeURIComponent(worldId)}`).catch(
-                () => ({})
-            );
+            const stats = await fetchWorldStatsCached(worldId);
             return stats.visitCount || 0;
         },
         async getTimeSpentInWorld(worldId) {
-            const stats = await cloudFetch(`/api/gamelog/stats?kind=world&worldId=${encodeURIComponent(worldId)}`).catch(
-                () => ({})
-            );
+            const stats = await fetchWorldStatsCached(worldId);
             return stats.timeSpent || 0;
         },
         async getGameLogWorldNameByWorldId(worldId) {
-            const stats = await cloudFetch(`/api/gamelog/stats?kind=world&worldId=${encodeURIComponent(worldId)}`).catch(
-                () => ({})
-            );
+            const stats = await fetchWorldStatsCached(worldId);
             return stats.worldName || '';
         },
         async getPreviousInstancesByWorldId(input) {
             const worldId = typeof input === 'string' ? input : input?.id || input?.worldId || '';
-            const stats = await cloudFetch(`/api/gamelog/stats?kind=world&worldId=${encodeURIComponent(worldId)}`).catch(
-                () => ({})
-            );
+            const stats = await fetchWorldStatsCached(worldId);
             return stats.instances || [];
         },
         async getLastGroupVisit() {
@@ -858,12 +1032,7 @@ export function createCloudDatabase(dbVars) {
         },
         async getUserStats(input) {
             const userId = typeof input === 'string' ? input : input?.id || input?.userId || '';
-            if (!userId) return { joinCount: 0, timeSpent: 0, lastSeen: '' };
-            return cloudFetch(`/api/gamelog/stats?kind=user&userId=${encodeURIComponent(userId)}`).catch(() => ({
-                joinCount: 0,
-                timeSpent: 0,
-                lastSeen: ''
-            }));
+            return fetchUserStatsCached(userId);
         },
         async getLastSeen(input) {
             const s = await this.getUserStats(input);

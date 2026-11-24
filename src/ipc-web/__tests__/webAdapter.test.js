@@ -30,7 +30,9 @@ describe('WEB cloud adapter (stateless)', () => {
         bootstrapCache.storage = {};
         bootstrapCache.memos.clear();
         bootstrapCache.notes.clear();
+        bootstrapCache.userProfiles.clear();
         cloudState.agentsOnline = [];
+        cloudState.wsAgentsOnline = [];
         cloudState.deviceStates = {};
         cloudState.lastVrcRoute = '';
         fetchSpy = vi.spyOn(globalThis, 'fetch');
@@ -73,6 +75,11 @@ describe('WEB cloud adapter (stateless)', () => {
         expect(cloudState.r2Enabled).toBe(true);
         expect(cloudState.agentsOnline).toEqual(['dev_win1']);
 
+        // Writing an unchanged value is a no-op (0 Worker requests).
+        scheduleConfigPatch('VRCX_theme', 'dark');
+        await vi.advanceTimersByTimeAsync(9000);
+        expect(fetchSpy).toHaveBeenCalledTimes(1);
+
         // Multiple config mutations coalesce into a single PUT /api/config/bundle write.
         fetchSpy.mockResolvedValueOnce(mockOk({ saved: true }));
         scheduleConfigPatch('k1', 'v1');
@@ -80,7 +87,7 @@ describe('WEB cloud adapter (stateless)', () => {
         scheduleConfigPatch('k1', 'v1_updated');
 
         expect(fetchSpy).toHaveBeenCalledTimes(1);
-        await vi.advanceTimersByTimeAsync(2100);
+        await vi.advanceTimersByTimeAsync(8100);
         expect(fetchSpy).toHaveBeenCalledTimes(2);
 
         const [url, init] = fetchSpy.mock.calls[1];
@@ -163,7 +170,7 @@ describe('WEB cloud adapter (stateless)', () => {
         expect(fetchSpy.mock.calls[2][0]).toContain('/api/gamelog/search?q=Shrine');
     });
 
-    it('throttles repetitive api.vrchat.cloud GET sync calls within cloudState.syncIntervalSeconds and invalidates on writes', async () => {
+    it('throttles repetitive api.vrchat.cloud GET sync calls within cloudState.syncIntervalSeconds and invalidates volatile cache on writes', async () => {
         cloudState.syncIntervalSeconds = 60;
         const webApi = createWebApiBridge();
         const friendsUrl = 'https://api.vrchat.cloud/api/1/auth/user/friends?offline=false&n=50&offset=0';
@@ -187,7 +194,7 @@ describe('WEB cloud adapter (stateless)', () => {
         expect(third.message).toContain('usr_f2');
         expect(fetchSpy).toHaveBeenCalledTimes(2);
 
-        // Any write operation immediately invalidates read cache
+        // Any write operation immediately invalidates volatile read cache
         fetchSpy.mockResolvedValueOnce(mockOk({ status: 200, data: '{"ok":true}', route: 'cloud_direct' }));
         await webApi.ExecuteJson(
             JSON.stringify({ url: 'https://api.vrchat.cloud/api/1/users/usr_me', method: 'PUT', body: '{}' })
@@ -196,5 +203,81 @@ describe('WEB cloud adapter (stateless)', () => {
         const fourth = JSON.parse(await webApi.ExecuteJson(JSON.stringify({ url: friendsUrl, method: 'GET' })));
         expect(fourth.message).toContain('usr_f3');
         expect(fetchSpy).toHaveBeenCalledTimes(4);
+    });
+
+    it('coalesces concurrent read GETs into one /api/vrc/execute-batch call and preserves stable entity cache across unrelated writes', async () => {
+        cloudState.syncIntervalSeconds = 60;
+        const webApi = createWebApiBridge();
+        const worldUrl = 'https://api.vrchat.cloud/api/1/worlds/wrld_abc';
+        const instanceUrl = 'https://api.vrchat.cloud/api/1/instances/wrld_abc:12345';
+        const userUrl = 'https://api.vrchat.cloud/api/1/users/usr_friend1';
+
+        fetchSpy.mockResolvedValueOnce(
+            mockOk({
+                route: 'cloud_direct',
+                results: [
+                    { status: 200, data: '{"id":"wrld_abc","name":"Sakura"}' },
+                    { status: 200, data: '{"id":"wrld_abc:12345","n_users":5}' },
+                    { status: 200, data: '{"id":"usr_friend1","displayName":"Sakura"}' }
+                ]
+            })
+        );
+
+        const [wRes, iRes, uRes] = await Promise.all([
+            webApi.ExecuteJson(JSON.stringify({ url: worldUrl, method: 'GET' })),
+            webApi.ExecuteJson(JSON.stringify({ url: instanceUrl, method: 'GET' })),
+            webApi.ExecuteJson(JSON.stringify({ url: userUrl, method: 'GET' }))
+        ]);
+
+        // All 3 concurrent GETs collapsed into a single Worker invocation
+        expect(fetchSpy).toHaveBeenCalledTimes(1);
+        expect(fetchSpy.mock.calls[0][0]).toBe('/api/vrc/execute-batch');
+        expect(JSON.parse(wRes).message).toContain('Sakura');
+        expect(JSON.parse(iRes).message).toContain('12345');
+        expect(JSON.parse(uRes).message).toContain('usr_friend1');
+
+        // An unrelated PUT (updating current user) must NOT wipe the stable world entity cache
+        fetchSpy.mockResolvedValueOnce(mockOk({ status: 200, data: '{"ok":true}', route: 'cloud_direct' }));
+        await webApi.ExecuteJson(
+            JSON.stringify({ url: 'https://api.vrchat.cloud/api/1/users/usr_me', method: 'PUT', body: '{}' })
+        );
+        const cachedWorld = await webApi.ExecuteJson(JSON.stringify({ url: worldUrl, method: 'GET' }));
+        expect(JSON.parse(cachedWorld).message).toContain('Sakura');
+        expect(fetchSpy).toHaveBeenCalledTimes(2);
+    });
+
+    it('deduplicates concurrent world stats reads and batches userProfile/friendLog/notification writes', async () => {
+        const db = createCloudDatabase({ userPrefix: 'usr_me', maxTableSize: 500 });
+
+        // 3 simultaneous world stats getters (world dialog open) issue only 1 Worker request
+        fetchSpy.mockResolvedValueOnce(
+            mockOk({ lastVisit: '2026-11-24T00:00:00Z', visitCount: 7, timeSpent: 3600, worldName: 'Shrine' })
+        );
+        const [lastVisit, visitCount, timeSpent] = await Promise.all([
+            db.getLastVisit('wrld_dedupe'),
+            db.getVisitCount('wrld_dedupe'),
+            db.getTimeSpentInWorld('wrld_dedupe')
+        ]);
+        expect(lastVisit).toBe('2026-11-24T00:00:00Z');
+        expect(visitCount).toBe(7);
+        expect(timeSpent).toBe(3600);
+        expect(fetchSpy).toHaveBeenCalledTimes(1);
+
+        // Multiple setUserProfile / setFriendLogCurrent / addNotificationToDatabase calls coalesce into 1 request each
+        fetchSpy.mockResolvedValue(mockOk({ count: 2 }));
+        await db.setUserProfile({ userId: 'usr_a', bio: 'hi', bioLinks: [] });
+        await db.setUserProfile({ userId: 'usr_b', bio: 'yo', bioLinks: [] });
+        await db.setUserProfile({ userId: 'usr_a', bio: 'hi', bioLinks: [] }); // unchanged -> skipped
+        await db.setFriendLogCurrent({ userId: 'usr_a', displayName: 'A', trustLevel: 'Known', friendNumber: 1 });
+        await db.setFriendLogCurrent({ userId: 'usr_b', displayName: 'B', trustLevel: 'Trusted', friendNumber: 2 });
+        await db.addNotificationToDatabase({ id: 'not_1', type: 'invite', message: 'join' });
+        await db.addNotificationToDatabase({ id: 'not_2', type: 'invite', message: 'join 2' });
+
+        // None sent immediately; all flush in batches once timers elapse
+        expect(fetchSpy).toHaveBeenCalledTimes(1);
+        await vi.advanceTimersByTimeAsync(16_000);
+        expect(fetchSpy).toHaveBeenCalledTimes(4);
+        const calledUrls = fetchSpy.mock.calls.slice(1).map((c) => c[0]).sort();
+        expect(calledUrls).toEqual(['/api/friend-log/current', '/api/notifications', '/api/user-profiles']);
     });
 });

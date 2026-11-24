@@ -375,5 +375,95 @@ export async function handleVrcProxyRoutes(request: Request, env: Env, url: URL)
         }
     }
 
+    // Batched read-only VRChat GET proxy: executes up to 12 concurrent GETs in a single Worker invocation
+    // with only 1 D1 cookie vault read, dramatically reducing Cloudflare Workers Free-tier request usage.
+    if (url.pathname === '/api/vrc/execute-batch' && request.method === 'POST') {
+        if (env.VRC_ALLOW_CLOUD_FALLBACK === 'false') {
+            return Response.json(
+                {
+                    ok: false,
+                    error: {
+                        code: 'AGENT_OFFLINE_READONLY',
+                        message: 'Windows companion agent is offline and cloud fallback is disabled'
+                    }
+                },
+                { status: 503 }
+            );
+        }
+
+        let body: { requests?: WebApiExecutePayload[] };
+        try {
+            body = (await request.json()) as { requests?: WebApiExecutePayload[] };
+        } catch {
+            return Response.json(
+                { ok: false, error: { code: 'BAD_REQUEST', message: 'Invalid JSON payload' } },
+                { status: 400 }
+            );
+        }
+
+        const items = Array.isArray(body?.requests) ? body.requests.slice(0, 12) : [];
+        if (items.length === 0) {
+            return Response.json({ ok: true, data: { results: [], route: 'cloud_direct' } });
+        }
+
+        const needsAuthCookie = items.some((item) => {
+            const u = typeof item?.url === 'string' ? item.url : '';
+            return (
+                Boolean(u) &&
+                !u.startsWith('https://status.vrchat.com/') &&
+                u !== 'https://api.vrchat.cloud/api/1/config'
+            );
+        });
+        const jar = needsAuthCookie ? await loadCookieJar(env) : {};
+        const cookieHeader = needsAuthCookie ? buildCookieHeader(jar) : '';
+        let cookieChanged = false;
+
+        const results = await Promise.all(
+            items.map(async (item) => {
+                const method = (item?.method || 'GET').toUpperCase();
+                if (method !== 'GET' || !item?.url || !isAllowedTargetUrl(item.url)) {
+                    return {
+                        status: 403,
+                        data: '',
+                        error: 'Batch only allows read-only GET requests on VRChat allowlist'
+                    };
+                }
+                const isPublicTarget =
+                    item.url.startsWith('https://status.vrchat.com/') ||
+                    item.url === 'https://api.vrchat.cloud/api/1/config';
+                const init = buildUpstreamRequestInit({ ...item, method: 'GET' }, isPublicTarget ? '' : cookieHeader);
+                try {
+                    const upstream = await fetch(item.url, init);
+                    if (!isPublicTarget && mergeSetCookies(jar, upstream.headers)) {
+                        cookieChanged = true;
+                    }
+                    const text = await upstream.text();
+                    return {
+                        status: upstream.status,
+                        data: text
+                    };
+                } catch (err) {
+                    return {
+                        status: -1,
+                        data: '',
+                        error: err instanceof Error ? err.message : 'Failed to contact VRChat API'
+                    };
+                }
+            })
+        );
+
+        if (cookieChanged) {
+            await saveCookieJar(env, jar);
+        }
+
+        return Response.json({
+            ok: true,
+            data: {
+                results,
+                route: 'cloud_direct'
+            }
+        });
+    }
+
     return null;
 }

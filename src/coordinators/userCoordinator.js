@@ -131,6 +131,11 @@ const PROFILE_REFRESH_INTERVAL = 7 * 24 * 60 * 60 * 1000;
 const pendingProfileRefresh = new Set();
 
 async function refreshStaleUserProfile(userId) {
+    // In WEB mode, avoid background per-friend profile sweeps that consume Worker quota;
+    // opening a user dialog already fetches the full profile on demand.
+    if (typeof WEB !== 'undefined' && WEB) {
+        return;
+    }
     if (pendingProfileRefresh.has(userId)) {
         return;
     }

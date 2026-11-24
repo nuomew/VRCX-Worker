@@ -35,8 +35,10 @@ export const cloudState = reactive({
     syncIntervalSeconds: DEFAULT_CLOUD_SYNC_INTERVAL_SECONDS,
     /** @type {'agent_residential_ip' | 'cloud_direct' | 'offline' | ''} */
     lastVrcRoute: '',
-    /** @type {string[]} */
+    /** @type {string[]} All active/known companion devices (WS + HTTP sync). */
     agentsOnline: [],
+    /** @type {string[]} Only devices with an active /ws/agent socket capable of vrc-http RPC relay. */
+    wsAgentsOnline: [],
     /** @type {Record<string, { state: Record<string, any>; updatedAt: string }>} */
     deviceStates: {},
     hubDialogOpen: false

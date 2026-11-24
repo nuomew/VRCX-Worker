@@ -113,11 +113,48 @@ export async function loadBootstrap() {
     );
 
     if (data.agentStatus) {
-        cloudState.agentsOnline = Array.isArray(data.agentStatus.agentsOnline) ? data.agentStatus.agentsOnline : [];
+        const wsOnline = Array.isArray(data.agentStatus.agentsOnline) ? data.agentStatus.agentsOnline : [];
+        cloudState.wsAgentsOnline = [...wsOnline];
+        cloudState.agentsOnline = [...wsOnline];
         cloudState.deviceStates = data.agentStatus.deviceStates || {};
     }
 
     bootstrapCache.loaded = true;
+}
+
+const BUNDLE_FLUSH_DELAY_MS = 8000;
+
+function flushPendingBundlesWithKeepalive() {
+    if (flushConfigTimer) {
+        clearTimeout(flushConfigTimer);
+        flushConfigTimer = null;
+    }
+    if (flushStorageTimer) {
+        clearTimeout(flushStorageTimer);
+        flushStorageTimer = null;
+    }
+    const cfgPatch = pendingConfigPatch;
+    pendingConfigPatch = {};
+    if (Object.keys(cfgPatch).length > 0) {
+        cloudFetch('/api/config/bundle', {
+            method: 'PUT',
+            keepalive: true,
+            json: { bundleKey: 'vrcx_config', patch: cfgPatch }
+        }).catch(() => {});
+    }
+    const stPatch = pendingStoragePatch;
+    pendingStoragePatch = {};
+    if (Object.keys(stPatch).length > 0) {
+        cloudFetch('/api/config/bundle', {
+            method: 'PUT',
+            keepalive: true,
+            json: { bundleKey: 'vrcx_storage', patch: stPatch }
+        }).catch(() => {});
+    }
+}
+
+if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+    window.addEventListener('pagehide', flushPendingBundlesWithKeepalive);
 }
 
 /**
@@ -142,12 +179,18 @@ export async function saveCloudSyncIntervalSeconds(rawSeconds) {
 }
 
 export function scheduleConfigPatch(key, value) {
-    if (value === null) {
+    const normalized = value === null ? null : String(value);
+    const hasExisting = Object.prototype.hasOwnProperty.call(bootstrapCache.configs, key);
+    // Skip no-op writes to avoid unnecessary PUT /api/config/bundle Worker requests.
+    if (normalized === null ? !hasExisting : hasExisting && bootstrapCache.configs[key] === normalized) {
+        return;
+    }
+    if (normalized === null) {
         delete bootstrapCache.configs[key];
     } else {
-        bootstrapCache.configs[key] = String(value);
+        bootstrapCache.configs[key] = normalized;
     }
-    pendingConfigPatch[key] = value === null ? null : String(value);
+    pendingConfigPatch[key] = normalized;
     if (flushConfigTimer) clearTimeout(flushConfigTimer);
     flushConfigTimer = setTimeout(() => {
         const patch = pendingConfigPatch;
@@ -158,16 +201,22 @@ export function scheduleConfigPatch(key, value) {
             method: 'PUT',
             json: { bundleKey: 'vrcx_config', patch }
         }).catch((err) => console.error('[cloud] Failed to flush config bundle:', err));
-    }, 2000);
+    }, BUNDLE_FLUSH_DELAY_MS);
 }
 
 export function scheduleStoragePatch(key, value) {
-    if (value === null) {
+    const normalized = value === null ? null : String(value);
+    const hasExisting = Object.prototype.hasOwnProperty.call(bootstrapCache.storage, key);
+    // Skip no-op writes to avoid unnecessary PUT /api/config/bundle Worker requests.
+    if (normalized === null ? !hasExisting : hasExisting && bootstrapCache.storage[key] === normalized) {
+        return;
+    }
+    if (normalized === null) {
         delete bootstrapCache.storage[key];
     } else {
-        bootstrapCache.storage[key] = String(value);
+        bootstrapCache.storage[key] = normalized;
     }
-    pendingStoragePatch[key] = value === null ? null : String(value);
+    pendingStoragePatch[key] = normalized;
     if (flushStorageTimer) clearTimeout(flushStorageTimer);
     flushStorageTimer = setTimeout(() => {
         const patch = pendingStoragePatch;
@@ -178,7 +227,7 @@ export function scheduleStoragePatch(key, value) {
             method: 'PUT',
             json: { bundleKey: 'vrcx_storage', patch }
         }).catch((err) => console.error('[cloud] Failed to flush storage bundle:', err));
-    }, 2000);
+    }, BUNDLE_FLUSH_DELAY_MS);
 }
 
 export async function flushStorageNow() {

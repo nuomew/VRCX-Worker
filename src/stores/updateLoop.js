@@ -51,11 +51,11 @@ export const useUpdateLoopStore = defineStore('UpdateLoop', () => {
         () => watchState.isLoggedIn,
         () => {
             const isWebMode = typeof WEB !== 'undefined' && WEB;
-            const minPollSec = isWebMode ? Math.max(300, cloudState.syncIntervalSeconds || 60) : 300;
+            const minPollSec = isWebMode ? Math.max(600, cloudState.syncIntervalSeconds || 60) : 300;
             state.nextCurrentUserRefresh = minPollSec;
             state.nextFriendsRefresh = Math.max(3600, minPollSec);
             state.nextGroupInstanceRefresh = 0;
-            state.nextBundleCheck = isWebMode ? Math.max(300, cloudState.syncIntervalSeconds || 60) : 60;
+            state.nextBundleCheck = isWebMode ? Math.max(600, cloudState.syncIntervalSeconds || 60) : 60;
         },
         { flush: 'sync' }
     );
@@ -72,28 +72,36 @@ export const useUpdateLoopStore = defineStore('UpdateLoop', () => {
         try {
             if (watchState.isLoggedIn) {
                 const isWebMode = typeof WEB !== 'undefined' && WEB;
-                const webMinIntervalSec = isWebMode ? Math.max(300, cloudState.syncIntervalSeconds || 60) : 300;
+                const isTabHidden =
+                    isWebMode && typeof document !== 'undefined' && document.visibilityState === 'hidden';
+                const webMinIntervalSec = isWebMode ? Math.max(600, cloudState.syncIntervalSeconds || 60) : 300;
                 if (--state.nextCurrentUserRefresh <= 0) {
-                    state.nextCurrentUserRefresh = webMinIntervalSec; // >= 5min (scales with Web sync interval)
-                    getCurrentUser();
+                    state.nextCurrentUserRefresh = webMinIntervalSec; // >= 10min on Web (pipeline WS pushes live updates)
+                    if (!isTabHidden) {
+                        getCurrentUser();
+                    }
                 }
                 if (--state.nextFriendsRefresh <= 0) {
                     state.nextFriendsRefresh = Math.max(3600, webMinIntervalSec); // >= 1hour
-                    runRefreshFriendsListFlow();
-                    authStore.updateStoredUser(userStore.currentUser);
-                    if (
-                        userStore.currentUser.last_activity &&
-                        new Date(userStore.currentUser.last_activity) > new Date(Date.now() - 3600 * 1000) // 1hour
-                    ) {
-                        runRefreshPlayerModerationsFlow();
-                        userStore.getAllProductPurchases();
+                    if (!isTabHidden) {
+                        runRefreshFriendsListFlow();
+                        authStore.updateStoredUser(userStore.currentUser);
+                        if (
+                            userStore.currentUser.last_activity &&
+                            new Date(userStore.currentUser.last_activity) > new Date(Date.now() - 3600 * 1000) // 1hour
+                        ) {
+                            runRefreshPlayerModerationsFlow();
+                            userStore.getAllProductPurchases();
+                        }
                     }
                 }
                 if (--state.nextGroupInstanceRefresh <= 0) {
                     if (watchState.isFriendsLoaded) {
-                        state.nextGroupInstanceRefresh = webMinIntervalSec; // >= 5min (scales with Web sync interval)
-                        const args = await groupRequest.getUsersGroupInstances();
-                        handleGroupUserInstances(args);
+                        state.nextGroupInstanceRefresh = webMinIntervalSec;
+                        if (!isTabHidden) {
+                            const args = await groupRequest.getUsersGroupInstances();
+                            handleGroupUserInstances(args);
+                        }
                     }
                     AppApi.CheckGameRunning();
                 }

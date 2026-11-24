@@ -541,4 +541,59 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
         expect(nextSyncJson.data.syncIntervalSeconds).toBe(180);
         expect(Date.parse(nextSyncJson.data.nextSyncAt) - Date.parse(nextSyncJson.data.syncedAt)).toBe(180_000);
     });
+
+    it('supports batched user-profiles, batched notifications, and SSRF-guarded /api/vrc/execute-batch', async () => {
+        // 1. Batched user-profiles write
+        const profRes = await exports.default.fetch('http://example.com/api/user-profiles', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                entries: [
+                    { userId: 'usr_batch_1', bio: 'hello 1', bioLinks: ['https://example.com'] },
+                    { userId: 'usr_batch_2', bio: 'hello 2', bioLinks: [] }
+                ]
+            })
+        });
+        expect(profRes.status).toBe(200);
+        const profJson = (await profRes.json()) as { ok: boolean; data: { count: number } };
+        expect(profJson.data.count).toBe(2);
+
+        // 2. Batched notifications v1 write
+        const notyRes = await exports.default.fetch('http://example.com/api/notifications', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                version: 1,
+                entries: [
+                    { id: 'not_b1', type: 'invite', senderUserId: 'usr_1', message: 'hi 1' },
+                    { id: 'not_b2', type: 'invite', senderUserId: 'usr_2', message: 'hi 2' }
+                ]
+            })
+        });
+        expect(notyRes.status).toBe(200);
+        const notyListRes = await exports.default.fetch('http://example.com/api/notifications?v=1&limit=10');
+        const notyListJson = (await notyListRes.json()) as { ok: boolean; data: Array<{ id: string }> };
+        expect(notyListJson.data.some((n) => n.id === 'not_b1')).toBe(true);
+        expect(notyListJson.data.some((n) => n.id === 'not_b2')).toBe(true);
+
+        // 3. /api/vrc/execute-batch enforces GET-only + VRChat SSRF allowlist
+        const batchRes = await exports.default.fetch('http://example.com/api/vrc/execute-batch', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                requests: [
+                    { url: 'https://evil.example.com/steal', method: 'GET' },
+                    { url: 'https://api.vrchat.cloud/api/1/users/usr_1', method: 'POST' }
+                ]
+            })
+        });
+        expect(batchRes.status).toBe(200);
+        const batchJson = (await batchRes.json()) as {
+            ok: boolean;
+            data: { results: Array<{ status: number; error?: string }> };
+        };
+        expect(batchJson.data.results).toHaveLength(2);
+        expect(batchJson.data.results[0]!.status).toBe(403);
+        expect(batchJson.data.results[1]!.status).toBe(403);
+    });
 });

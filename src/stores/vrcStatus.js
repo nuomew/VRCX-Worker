@@ -106,7 +106,7 @@ export const useVrcStatusStore = defineStore('VrcStatus', () => {
         (newValue) => {
             if (newValue) {
                 const isWebMode = typeof WEB !== 'undefined' && WEB;
-                const minCooldownMs = isWebMode ? Math.max(60, cloudState.syncIntervalSeconds || 60) * 1000 : 60 * 1000;
+                const minCooldownMs = isWebMode ? Math.max(600, cloudState.syncIntervalSeconds || 60) * 1000 : 60 * 1000;
                 if (Date.now() - lastTimeFetched.value > minCooldownMs) {
                     getVrcStatus();
                 }
@@ -121,9 +121,12 @@ export const useVrcStatusStore = defineStore('VrcStatus', () => {
         getVrcStatus();
         workerTimers.setInterval(() => {
             const isWebMode = typeof WEB !== 'undefined' && WEB;
+            if (isWebMode && typeof document !== 'undefined' && document.visibilityState === 'hidden') {
+                return;
+            }
             const baseInterval = vrcxStore.isBrowserFocused ? pollingInterval.value : slowPollingInterval.value;
             const interval = isWebMode
-                ? Math.max(baseInterval, (cloudState.syncIntervalSeconds || 60) * 1000)
+                ? Math.max(baseInterval, 600 * 1000, (cloudState.syncIntervalSeconds || 60) * 1000)
                 : baseInterval;
             if (Date.now() - lastTimeFetched.value > interval) {
                 getVrcStatus();

@@ -384,33 +384,29 @@ export async function handleAgentPublicRoutes(request: Request, env: Env, url: U
 
         await env.DB_CORE.batch(coreWrites);
 
-        // Broadcast fresh GameLog events or live state snapshot to any open browser tabs
+        // Broadcast fresh GameLog events and/or live state snapshot in a single DO request
         if (events.length > 0 || body.state) {
-            const hub = env.AGENT_HUB.get(env.AGENT_HUB.idFromName('primary'));
+            const messages: Array<{ type: string; payload: Record<string, unknown> }> = [];
             if (events.length > 0) {
-                await hub.fetch(
-                    new Request('https://agent-hub.internal/broadcast', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
-                            type: 'gamelog.batch',
-                            payload: { deviceId: auth.deviceId, events }
-                        })
-                    })
-                );
+                messages.push({
+                    type: 'gamelog.batch',
+                    payload: { deviceId: auth.deviceId, events }
+                });
             }
             if (body.state) {
-                await hub.fetch(
-                    new Request('https://agent-hub.internal/broadcast', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
-                            type: 'agent.state',
-                            payload: { deviceId: auth.deviceId, syncMode: 'http', ...body.state }
-                        })
-                    })
-                );
+                messages.push({
+                    type: 'agent.state',
+                    payload: { deviceId: auth.deviceId, syncMode: 'http', ...body.state }
+                });
             }
+            const hub = env.AGENT_HUB.get(env.AGENT_HUB.idFromName('primary'));
+            await hub.fetch(
+                new Request('https://agent-hub.internal/broadcast', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ messages })
+                })
+            );
         }
 
         const syncIntervalSeconds = await getCloudSyncIntervalSeconds(env);
