@@ -95,8 +95,9 @@ function getAssetFilename({ name }) {
  */
 export default defineConfig(({ mode }) => {
     const { SENTRY_AUTH_TOKEN: sentryAuthToken } = loadEnv(mode, process.cwd(), '');
+    const isWeb = mode === 'web';
 
-    const buildAndUploadSourceMaps = !!sentryAuthToken;
+    const buildAndUploadSourceMaps = !!sentryAuthToken && !isWeb;
 
     const version = fs.readFileSync(new URL('../Version', import.meta.url), 'utf-8').trim();
 
@@ -104,7 +105,7 @@ export default defineConfig(({ mode }) => {
 
     /** @type {import('vite').UserConfig} */
     return {
-        base: '',
+        base: isWeb ? '/' : '',
         plugins: [
             remixiconWoff2Only(),
             vue(),
@@ -140,7 +141,9 @@ export default defineConfig(({ mode }) => {
                     customMedia: true
                 },
                 errorRecovery: true,
-                targets: browserslistToTargets(browserslist('Chrome 145'))
+                targets: browserslistToTargets(
+                    browserslist(isWeb ? 'chrome >= 115, safari >= 16, firefox >= 115' : 'Chrome 145')
+                )
             }
         },
         optimizeDeps: {
@@ -159,15 +162,30 @@ export default defineConfig(({ mode }) => {
         },
         define: {
             VERSION: JSON.stringify(version),
-            NIGHTLY: JSON.stringify(nightly)
+            NIGHTLY: JSON.stringify(nightly),
+            WEB: JSON.stringify(isWeb),
+            ...(isWeb ? { WINDOWS: 'false', LINUX: 'false' } : {})
         },
         server: {
             port: 9000,
-            strictPort: true
+            strictPort: true,
+            ...(isWeb
+                ? {
+                      proxy: {
+                          '/api': 'http://127.0.0.1:8787',
+                          '/health': 'http://127.0.0.1:8787',
+                          '/poc': 'http://127.0.0.1:8787',
+                          '/ws': {
+                              target: 'http://127.0.0.1:8787',
+                              ws: true
+                          }
+                      }
+                  }
+                : {})
         },
         build: {
-            target: 'chrome145',
-            outDir: '../build/html',
+            target: isWeb ? ['es2022', 'chrome115', 'safari16', 'firefox115'] : 'chrome145',
+            outDir: isWeb ? '../build/web' : '../build/html',
             license: true,
             emptyOutDir: true,
             copyPublicDir: true,
@@ -181,10 +199,12 @@ export default defineConfig(({ mode }) => {
             },
             rolldownOptions: {
                 preserveEntrySignatures: false,
-                input: {
-                    index: resolve(import.meta.dirname, './index.html'),
-                    vr: resolve(import.meta.dirname, './vr.html')
-                },
+                input: isWeb
+                    ? { index: resolve(import.meta.dirname, './index.html') }
+                    : {
+                          index: resolve(import.meta.dirname, './index.html'),
+                          vr: resolve(import.meta.dirname, './vr.html')
+                      },
                 output: {
                     assetFileNames: getAssetFilename,
                     manualChunks: getManualChunk,

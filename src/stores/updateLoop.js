@@ -92,7 +92,8 @@ export const useUpdateLoopStore = defineStore('UpdateLoop', () => {
                     }
                     AppApi.CheckGameRunning();
                 }
-                if (--state.nextAppUpdateCheck <= 0) {
+                const isWebMode = typeof WEB !== 'undefined' && WEB;
+                if (!isWebMode && --state.nextAppUpdateCheck <= 0) {
                     state.nextAppUpdateCheck = 3600; // 1hour
                     if (vrcxUpdaterStore.autoUpdateVRCX !== 'Off') {
                         vrcxUpdaterStore.checkForVRCXUpdate();
@@ -107,7 +108,7 @@ export const useUpdateLoopStore = defineStore('UpdateLoop', () => {
                     clearVRCXCache();
                 }
                 if (--state.nextDiscordUpdate <= 0) {
-                    state.nextDiscordUpdate = 3;
+                    state.nextDiscordUpdate = isWebMode ? 15 : 3;
                     if (discordPresenceSettingsStore.discordActive) {
                         discordPresenceSettingsStore.updateDiscord();
                     }
@@ -128,7 +129,7 @@ export const useUpdateLoopStore = defineStore('UpdateLoop', () => {
                     await runUpdateIsGameRunningFlow(await AppApi.IsGameRunning(), await AppApi.IsSteamVRRunning());
                     vrStore.vrInit(); // TODO: make this event based
                 }
-                if (--state.nextDatabaseOptimize <= 0) {
+                if (!isWebMode && --state.nextDatabaseOptimize <= 0) {
                     state.nextDatabaseOptimize = 86400; // 1 day
                     database.optimize().catch(console.error);
                 }

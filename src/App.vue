@@ -16,6 +16,7 @@
             <DatabaseUpgradeDialog></DatabaseUpgradeDialog>
 
             <VRCXUpdateDialog></VRCXUpdateDialog>
+            <CloudGateAndHub v-if="isWeb"></CloudGateAndHub>
         </div>
         <div id="x-dialog-portal" class="x-dialog-portal"></div>
     </TooltipProvider>
@@ -36,6 +37,7 @@
     import { initNoty } from './plugins/noty';
 
     import AlertDialogModal from './components/ui/alert-dialog/AlertDialogModal.vue';
+    import CloudGateAndHub from './components/cloud/CloudGateAndHub.vue';
     import DatabaseUpgradeDialog from './components/dialogs/DatabaseUpgradeDialog.vue';
     import MacOSTitleBar from './components/MacOSTitleBar.vue';
     import OpenExternalLinkDialog from './components/dialogs/OpenExternalLinkDialog.vue';
@@ -45,9 +47,10 @@
 
     import '@/styles/globals.css';
 
-    console.log(`isLinux: ${LINUX}`);
+    const isWeb = typeof WEB !== 'undefined' && WEB;
+    console.log(`isLinux: ${LINUX}, isWeb: ${isWeb}`);
 
-    const isMacOS = computed(() => navigator.platform.includes('Mac'));
+    const isMacOS = computed(() => !isWeb && navigator.platform.includes('Mac'));
 
     const theme = computed(() => {
         return store.appearanceSettings.isDarkMode ? 'dark' : 'light';

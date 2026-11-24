@@ -1,32 +1,28 @@
+import { authenticateAgent, authenticateWeb, handleAuthRoutes } from './auth/auth';
 import { ensureSchemaReady } from './db/schemaBootstrap';
 import type { Env } from './env';
 import { AgentHubDO } from './hub/AgentHubDO';
+import { handleAgentPublicRoutes, handleAgentWebRoutes } from './routes/agentRoutes';
+import { handleCoreDataRoutes } from './routes/coreData';
+import { handleEventsDataRoutes } from './routes/eventsData';
+import { handleVrcProxyRoutes } from './routes/vrcProxy';
 import { searchGameLogByEntity } from './search/entityFts';
 
 export { AgentHubDO };
 
 const VRC_PUBLIC_CONFIG_URL = 'https://api.vrchat.cloud/api/1/config';
-const VRC_PROBE_USER_AGENT = 'VRCX-Cloud-POC/0.1 (personal-self-hosted-connectivity-check)';
-
-function isAuthorized(request: Request, env: Env): boolean {
-    const requiredToken = env.POC_ADMIN_TOKEN?.trim();
-    if (!requiredToken) {
-        return true;
-    }
-    const authHeader = request.headers.get('Authorization') ?? '';
-    return authHeader === `Bearer ${requiredToken}`;
-}
+const VRC_PROBE_USER_AGENT = 'VRCX-Cloud/2026.11 (connectivity-probe)';
 
 function unauthorizedResponse(): Response {
     return Response.json(
-        { ok: false, error: { code: 'UNAUTHORIZED', message: 'Valid bearer token required' } },
+        { ok: false, error: { code: 'UNAUTHORIZED', message: 'Authentication required' } },
         { status: 401 }
     );
 }
 
 /**
  * Probes VRChat's public read-only config endpoint (hardcoded URL to prevent SSRF)
- * to measure whether Cloudflare Workers egress IPs encounter WAF/403 challenges.
+ * to verify whether Cloudflare Workers egress IPs encounter WAF/403 challenges.
  */
 async function probeVrchatApi(): Promise<Response> {
     const startedAt = Date.now();
@@ -50,7 +46,6 @@ async function probeVrchatApi(): Promise<Response> {
             parsedJson = true;
             parsedClientApiKeyPresent = typeof body.clientApiKey === 'string' && body.clientApiKey.length > 0;
         } else {
-            // Drain body without returning potentially large HTML challenge pages.
             await res.text();
         }
 
@@ -88,49 +83,104 @@ export default {
     async fetch(request: Request, env: Env): Promise<Response> {
         const url = new URL(request.url);
 
-        if (url.pathname === '/health' && request.method === 'GET') {
+        try {
+            // 1. Public health check (also triggers idempotent cold-start D1 schema bootstrap)
+            if (url.pathname === '/health' && request.method === 'GET') {
+                await ensureSchemaReady(env);
+                return Response.json({
+                    ok: true,
+                    data: {
+                        service: 'vrcx-cloud',
+                        version: '2026.11',
+                        schemaReady: true,
+                        r2Enabled: Boolean(env.R2_MEDIA),
+                        timestamp: new Date().toISOString()
+                    }
+                });
+            }
+
+            // 2. Auth endpoints (/api/auth/me, /api/auth/login, /api/auth/logout)
+            const authResp = await handleAuthRoutes(request, env, url);
+            if (authResp) {
+                return authResp;
+            }
+
+            // Ensure D1 tables exist before handling any DB-backed route
             await ensureSchemaReady(env);
-            return Response.json({
-                ok: true,
-                data: {
-                    service: 'vrcx-cloud',
-                    phase: 'phase-0-poc',
-                    schemaReady: true,
-                    timestamp: new Date().toISOString()
+
+            // 3. Windows Agent routes (pairing redemption & Device Bearer+HMAC authenticated endpoints)
+            const agentPublicResp = await handleAgentPublicRoutes(request, env, url);
+            if (agentPublicResp) {
+                return agentPublicResp;
+            }
+
+            // 4. Windows Agent WebSocket upgrade (Device Bearer auth)
+            if (url.pathname === '/ws/agent') {
+                const agentAuth = await authenticateAgent(request, env, '');
+                if (!agentAuth.authenticated || !agentAuth.deviceId) {
+                    return unauthorizedResponse();
                 }
-            });
-        }
+                const hub = env.AGENT_HUB.get(env.AGENT_HUB.idFromName('primary'));
+                const targetUrl = new URL(request.url);
+                targetUrl.searchParams.set('deviceId', agentAuth.deviceId);
+                return hub.fetch(new Request(targetUrl.toString(), request));
+            }
 
-        if (!isAuthorized(request, env)) {
-            return unauthorizedResponse();
-        }
+            // 5. All remaining /api/*, /poc/*, /ws/web routes require Web user authentication
+            const webAuth = await authenticateWeb(request, env);
+            if (!webAuth.authenticated) {
+                return unauthorizedResponse();
+            }
 
-        if (url.pathname === '/poc/vrc-probe' && request.method === 'GET') {
-            return probeVrchatApi();
-        }
+            if (url.pathname === '/ws/web') {
+                const hub = env.AGENT_HUB.get(env.AGENT_HUB.idFromName('primary'));
+                return hub.fetch(request);
+            }
 
-        if (url.pathname === '/poc/search' && request.method === 'GET') {
-            await ensureSchemaReady(env);
-            const q = url.searchParams.get('q') ?? '';
-            const limit = Number(url.searchParams.get('limit') ?? '50');
-            const includeExplain = url.searchParams.get('explain') === '1';
-            const data = await searchGameLogByEntity(env, q, { limit, includeExplain });
-            return Response.json({ ok: true, data });
-        }
+            if (url.pathname === '/api/agent/status' && request.method === 'GET') {
+                const hub = env.AGENT_HUB.get(env.AGENT_HUB.idFromName('primary'));
+                return hub.fetch(new Request('https://agent-hub.internal/status'));
+            }
 
-        if (url.pathname === '/api/agent/status' && request.method === 'GET') {
-            const stub = env.AGENT_HUB.get(env.AGENT_HUB.idFromName('primary'));
-            return stub.fetch(new Request('https://agent-hub.internal/status'));
-        }
+            if (url.pathname === '/poc/vrc-probe' && request.method === 'GET') {
+                return probeVrchatApi();
+            }
 
-        if (url.pathname === '/ws/agent' || url.pathname === '/ws/web') {
-            const stub = env.AGENT_HUB.get(env.AGENT_HUB.idFromName('primary'));
-            return stub.fetch(request);
-        }
+            if (url.pathname === '/poc/search' && request.method === 'GET') {
+                const q = url.searchParams.get('q') ?? '';
+                const limit = Number(url.searchParams.get('limit') ?? '50');
+                const includeExplain = url.searchParams.get('explain') === '1';
+                const data = await searchGameLogByEntity(env, q, { limit, includeExplain });
+                return Response.json({ ok: true, data });
+            }
 
-        return Response.json(
-            { ok: false, error: { code: 'NOT_FOUND', message: 'Route not found' } },
-            { status: 404 }
-        );
+            const vrcResp = await handleVrcProxyRoutes(request, env, url);
+            if (vrcResp) return vrcResp;
+
+            const coreResp = await handleCoreDataRoutes(request, env, url);
+            if (coreResp) return coreResp;
+
+            const eventsResp = await handleEventsDataRoutes(request, env, url);
+            if (eventsResp) return eventsResp;
+
+            const agentWebResp = await handleAgentWebRoutes(request, env, url);
+            if (agentWebResp) return agentWebResp;
+
+            return Response.json(
+                { ok: false, error: { code: 'NOT_FOUND', message: 'Route not found' } },
+                { status: 404 }
+            );
+        } catch (err) {
+            return Response.json(
+                {
+                    ok: false,
+                    error: {
+                        code: 'INTERNAL_ERROR',
+                        message: err instanceof Error ? err.message : 'Unexpected server error'
+                    }
+                },
+                { status: 500 }
+            );
+        }
     }
 } satisfies ExportedHandler<Env>;

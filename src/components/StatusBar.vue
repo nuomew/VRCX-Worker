@@ -14,7 +14,29 @@
                             -webkit-mask-image: linear-gradient(to right, black calc(100% - 20px), transparent 100%);
                         ">
                         <TooltipWrapper
-                            v-if="!isLinux && visibility.proxy"
+                            v-if="isWeb"
+                            :content="
+                                cloudState.agentsOnline.length > 0
+                                    ? `VRCX Cloud · Win Agent Online (${cloudState.agentsOnline.length}) · Click to manage`
+                                    : 'VRCX Cloud · Win Agent Offline · Click to pair or inspect quota'
+                            "
+                            side="top">
+                            <div
+                                class="flex items-center gap-1 px-2 h-[22px] whitespace-nowrap border-r border-border cursor-pointer hover:bg-accent"
+                                @click="cloudState.hubDialogOpen = true">
+                                <span
+                                    class="inline-block size-2 rounded-full shrink-0"
+                                    :class="
+                                        cloudState.agentsOnline.length > 0 ? 'bg-status-online' : 'bg-status-offline-alt'
+                                    " />
+                                <span class="text-foreground text-[11px]">
+                                    Cloud{{ cloudState.agentsOnline.length > 0 ? ' · Win' : '' }}
+                                </span>
+                            </div>
+                        </TooltipWrapper>
+
+                        <TooltipWrapper
+                            v-if="!isLinux && !isWeb && visibility.proxy"
                             :content="
                                 vrcxStore.proxyServer
                                     ? `${t('status_bar.proxy')}: ${vrcxStore.proxyServer}`
@@ -420,6 +442,7 @@
     import { useI18n } from 'vue-i18n';
     import { openExternalLink } from '@/shared/utils/appActions';
     import { wsState } from '@/services/websocket';
+    import { cloudState } from '@/ipc-web/cloudState';
 
     import dayjs from 'dayjs';
     import timezone from 'dayjs/plugin/timezone';
@@ -441,7 +464,8 @@
 
     const { t } = useI18n();
 
-    const isMacOS = computed(() => navigator.platform.includes('Mac'));
+    const isWeb = computed(() => typeof WEB !== 'undefined' && WEB);
+    const isMacOS = computed(() => !isWeb.value && navigator.platform.includes('Mac'));
     const isLinux = computed(() => LINUX);
 
     const gameStore = useGameStore();

@@ -150,6 +150,10 @@ export function createOverlayDispatch({
     function desktopNotification(displayName, message, image) {
         if (WINDOWS) {
             AppApi.DesktopNotification(displayName, message, image);
+        } else if (typeof WEB !== 'undefined' && WEB) {
+            if (typeof Notification !== 'undefined' && Notification.permission === 'granted') {
+                new Notification(displayName || 'VRCX', { body: message, icon: image || undefined });
+            }
         } else {
             window.electron.desktopNotification(displayName, message, image);
         }

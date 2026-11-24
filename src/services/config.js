@@ -1,4 +1,7 @@
+import { bootstrapCache, scheduleConfigPatch } from '../ipc-web/bootstrapCache.js';
 import sqliteService from './sqlite.js';
+
+const isWebMode = () => typeof WEB !== 'undefined' && WEB;
 
 /**
  * @param key
@@ -9,6 +12,9 @@ function transformKey(key) {
 
 class ConfigRepository {
     async init() {
+        if (isWebMode()) {
+            return;
+        }
         await sqliteService.executeNonQuery(
             'CREATE TABLE IF NOT EXISTS configs (`key` TEXT PRIMARY KEY, `value` TEXT)'
         );
@@ -16,6 +22,10 @@ class ConfigRepository {
 
     async remove(key) {
         const _key = transformKey(key);
+        if (isWebMode()) {
+            scheduleConfigPatch(_key, null);
+            return;
+        }
         await sqliteService.executeNonQuery(`DELETE FROM configs WHERE key = @key`, {
             '@key': _key
         });
@@ -28,6 +38,13 @@ class ConfigRepository {
      */
     async getString(key, defaultValue = null) {
         const _key = transformKey(key);
+        if (isWebMode()) {
+            const value = bootstrapCache.configs[_key];
+            if (value === null || value === undefined || value === 'undefined') {
+                return defaultValue;
+            }
+            return value;
+        }
         let value = undefined;
         await sqliteService.execute(
             (row) => {
@@ -53,6 +70,10 @@ class ConfigRepository {
     async setString(key, value) {
         const _key = transformKey(key);
         const _value = String(value);
+        if (isWebMode()) {
+            scheduleConfigPatch(_key, _value);
+            return;
+        }
         await sqliteService.executeNonQuery(`INSERT OR REPLACE INTO configs (key, value) VALUES (@key, @value)`, {
             '@key': _key,
             '@value': _value

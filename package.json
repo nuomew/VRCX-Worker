@@ -19,6 +19,9 @@
     "main": "src-electron/main.js",
     "scripts": {
         "dev": "vite serve src",
+        "dev:web": "vite serve src --mode web",
+        "build": "vite build src --mode web",
+        "build:web": "vite build src --mode web",
         "localization": "node ./src/shared/utils/localizationHelperCLI.js",
         "format": "oxfmt",
         "format:check": "oxfmt --check",

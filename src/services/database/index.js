@@ -16,6 +16,7 @@ import { tableSize } from './tableSize.js';
 import { userProfile } from './userProfile.js';
 import { worldFavorites } from './worldFavorites.js';
 import { printFavorites } from './printFavorites.js';
+import { createCloudDatabase } from './cloud/index.js';
 
 import sqliteService from '../sqlite.js';
 
@@ -30,7 +31,7 @@ if (import.meta.hot) {
     import.meta.hot.data.dbVars = dbVars;
 }
 
-const database = {
+const localDatabase = {
     ...feed,
     ...activityV2,
     ...gameLog,
@@ -248,6 +249,8 @@ const database = {
         await sqliteService.executeNonQuery('PRAGMA optimize');
     }
 };
+
+const database = typeof WEB !== 'undefined' && WEB ? createCloudDatabase(dbVars) : localDatabase;
 
 window.database = database;
 export { database, dbVars };

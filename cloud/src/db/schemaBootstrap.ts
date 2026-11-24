@@ -3,10 +3,15 @@ import type { Env } from '../env';
 let schemaInitialized = false;
 let initPromise: Promise<void> | null = null;
 
-// Static DDL statements mirrored from cloud/migrations/*/0001_init.sql so
-// one-click Cloudflare Dashboard / Deploy Button deployments with automatic
-// D1 provisioning initialize tables and FTS5 triggers without manual CLI steps.
+// Static DDL mirrored from cloud/migrations/*/0001_init.sql.
+// Uses a schema_meta version sentinel so upgrades from Phase 0 auto-add Phase 1 tables idempotently.
+const SCHEMA_VERSION = 'v2-full-core';
+
 const CORE_STATEMENTS: readonly string[] = [
+    `CREATE TABLE IF NOT EXISTS schema_meta (
+        meta_key TEXT PRIMARY KEY,
+        meta_value TEXT NOT NULL
+    )`,
     `CREATE TABLE IF NOT EXISTS config_bundles (
         bundle_key TEXT PRIMARY KEY,
         version INTEGER NOT NULL DEFAULT 1,
@@ -72,6 +77,138 @@ const CORE_STATEMENTS: readonly string[] = [
         INSERT INTO entity_worlds_fts(rowid, world_name)
         VALUES (new.rowid, new.world_name);
     END`,
+    `CREATE TABLE IF NOT EXISTS memos (
+        user_id TEXT PRIMARY KEY,
+        edited_at TEXT NOT NULL,
+        memo TEXT NOT NULL
+    )`,
+    `CREATE TABLE IF NOT EXISTS world_memos (
+        world_id TEXT PRIMARY KEY,
+        edited_at TEXT NOT NULL,
+        memo TEXT NOT NULL
+    )`,
+    `CREATE TABLE IF NOT EXISTS avatar_memos (
+        avatar_id TEXT PRIMARY KEY,
+        edited_at TEXT NOT NULL,
+        memo TEXT NOT NULL
+    )`,
+    `CREATE TABLE IF NOT EXISTS notes (
+        user_id TEXT PRIMARY KEY,
+        display_name TEXT NOT NULL DEFAULT '',
+        note TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL
+    )`,
+    `CREATE TABLE IF NOT EXISTS favorite_friend (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        group_name TEXT NOT NULL,
+        UNIQUE (user_id, group_name)
+    )`,
+    `CREATE TABLE IF NOT EXISTS favorite_world (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at TEXT NOT NULL,
+        world_id TEXT NOT NULL,
+        group_name TEXT NOT NULL,
+        UNIQUE (world_id, group_name)
+    )`,
+    `CREATE TABLE IF NOT EXISTS favorite_avatar (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at TEXT NOT NULL,
+        avatar_id TEXT NOT NULL,
+        group_name TEXT NOT NULL,
+        UNIQUE (avatar_id, group_name)
+    )`,
+    `CREATE TABLE IF NOT EXISTS favorite_print (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        print_id TEXT NOT NULL UNIQUE,
+        created_at TEXT NOT NULL
+    )`,
+    `CREATE TABLE IF NOT EXISTS avatar_tags (
+        avatar_id TEXT NOT NULL,
+        tag TEXT NOT NULL,
+        color TEXT,
+        PRIMARY KEY (avatar_id, tag)
+    )`,
+    `CREATE TABLE IF NOT EXISTS avatar_history (
+        avatar_id TEXT PRIMARY KEY,
+        created_at TEXT NOT NULL,
+        time INTEGER NOT NULL DEFAULT 0
+    )`,
+    `CREATE TABLE IF NOT EXISTS friend_log_current (
+        user_id TEXT PRIMARY KEY,
+        display_name TEXT NOT NULL DEFAULT '',
+        trust_level TEXT NOT NULL DEFAULT '',
+        friend_number INTEGER NOT NULL DEFAULT 0
+    )`,
+    `CREATE TABLE IF NOT EXISTS friend_log_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at TEXT NOT NULL,
+        type TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        display_name TEXT NOT NULL DEFAULT '',
+        previous_display_name TEXT NOT NULL DEFAULT '',
+        trust_level TEXT NOT NULL DEFAULT '',
+        previous_trust_level TEXT NOT NULL DEFAULT '',
+        friend_number INTEGER NOT NULL DEFAULT 0
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_friend_log_history_user ON friend_log_history (user_id, id DESC)`,
+    `CREATE TABLE IF NOT EXISTS notifications (
+        id TEXT PRIMARY KEY,
+        created_at TEXT NOT NULL,
+        type TEXT NOT NULL DEFAULT '',
+        sender_user_id TEXT NOT NULL DEFAULT '',
+        sender_username TEXT NOT NULL DEFAULT '',
+        receiver_user_id TEXT NOT NULL DEFAULT '',
+        message TEXT NOT NULL DEFAULT '',
+        world_id TEXT NOT NULL DEFAULT '',
+        world_name TEXT NOT NULL DEFAULT '',
+        image_url TEXT NOT NULL DEFAULT '',
+        invite_message TEXT NOT NULL DEFAULT '',
+        request_message TEXT NOT NULL DEFAULT '',
+        response_message TEXT NOT NULL DEFAULT '',
+        expired INTEGER NOT NULL DEFAULT 0
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_notifications_created ON notifications (created_at DESC)`,
+    `CREATE TABLE IF NOT EXISTS notifications_v2 (
+        id TEXT PRIMARY KEY,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL DEFAULT '',
+        expires_at TEXT NOT NULL DEFAULT '',
+        type TEXT NOT NULL DEFAULT '',
+        link TEXT NOT NULL DEFAULT '',
+        link_text TEXT NOT NULL DEFAULT '',
+        message TEXT NOT NULL DEFAULT '',
+        title TEXT NOT NULL DEFAULT '',
+        image_url TEXT NOT NULL DEFAULT '',
+        seen INTEGER NOT NULL DEFAULT 0,
+        sender_user_id TEXT NOT NULL DEFAULT '',
+        sender_username TEXT NOT NULL DEFAULT '',
+        data TEXT NOT NULL DEFAULT '{}',
+        responses TEXT NOT NULL DEFAULT '[]',
+        details TEXT NOT NULL DEFAULT '{}'
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_notifications_v2_created ON notifications_v2 (created_at DESC)`,
+    `CREATE TABLE IF NOT EXISTS moderation (
+        user_id TEXT PRIMARY KEY,
+        updated_at TEXT NOT NULL,
+        display_name TEXT NOT NULL DEFAULT '',
+        block INTEGER NOT NULL DEFAULT 0,
+        mute INTEGER NOT NULL DEFAULT 0
+    )`,
+    `CREATE TABLE IF NOT EXISTS user_profile (
+        user_id TEXT PRIMARY KEY,
+        bio TEXT NOT NULL DEFAULT '',
+        bio_links TEXT NOT NULL DEFAULT '[]',
+        updated_at TEXT NOT NULL
+    )`,
+    `CREATE TABLE IF NOT EXISTS cloud_pairing_codes (
+        code TEXT PRIMARY KEY,
+        device_label TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        used INTEGER NOT NULL DEFAULT 0
+    )`,
     `CREATE TABLE IF NOT EXISTS cloud_devices (
         device_id TEXT PRIMARY KEY,
         device_name TEXT NOT NULL,
@@ -252,8 +389,29 @@ const FEED_STATEMENTS: readonly string[] = [
     `CREATE INDEX IF NOT EXISTS idx_activity_sessions_user_start ON activity_sessions_v2 (user_id, start_at DESC)`
 ];
 
-async function initDatabaseIfNeeded(db: D1Database, markerTable: string, statements: readonly string[]): Promise<void> {
-    // Fast 1-row metadata check prevents re-running CREATE INDEX on cold starts once initialized.
+async function initCoreIfNeeded(db: D1Database): Promise<void> {
+    try {
+        const meta = await db
+            .prepare("SELECT meta_value FROM schema_meta WHERE meta_key = 'version' LIMIT 1")
+            .first<{ meta_value: string }>();
+        if (meta?.meta_value === SCHEMA_VERSION) {
+            return;
+        }
+    } catch {
+        // schema_meta does not exist yet
+    }
+
+    // Chunk under 25 statements per batch to stay well inside Free-tier D1 limits.
+    for (let i = 0; i < CORE_STATEMENTS.length; i += 20) {
+        await db.batch(CORE_STATEMENTS.slice(i, i + 20).map((sql) => db.prepare(sql)));
+    }
+    await db
+        .prepare("INSERT OR REPLACE INTO schema_meta (meta_key, meta_value) VALUES ('version', ?)")
+        .bind(SCHEMA_VERSION)
+        .run();
+}
+
+async function initShardIfNeeded(db: D1Database, markerTable: string, statements: readonly string[]): Promise<void> {
     const existing = await db
         .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1")
         .bind(markerTable)
@@ -267,8 +425,7 @@ async function initDatabaseIfNeeded(db: D1Database, markerTable: string, stateme
 }
 
 /**
- * Ensures all 3 sharded D1 databases have their initial schema created on first boot.
- * Runs at most once per Worker isolate; subsequent requests incur zero D1 overhead.
+ * Ensures all 3 sharded D1 databases have their latest schema applied idempotently.
  */
 export async function ensureSchemaReady(env: Env): Promise<void> {
     if (schemaInitialized) {
@@ -276,9 +433,9 @@ export async function ensureSchemaReady(env: Env): Promise<void> {
     }
     if (!initPromise) {
         initPromise = Promise.all([
-            initDatabaseIfNeeded(env.DB_CORE, 'cloud_cookie_vault', CORE_STATEMENTS),
-            initDatabaseIfNeeded(env.DB_GAMELOG, 'gamelog_external', GAMELOG_STATEMENTS),
-            initDatabaseIfNeeded(env.DB_FEED, 'activity_sessions_v2', FEED_STATEMENTS)
+            initCoreIfNeeded(env.DB_CORE),
+            initShardIfNeeded(env.DB_GAMELOG, 'gamelog_external', GAMELOG_STATEMENTS),
+            initShardIfNeeded(env.DB_FEED, 'activity_sessions_v2', FEED_STATEMENTS)
         ])
             .then(() => {
                 schemaInitialized = true;
@@ -291,7 +448,6 @@ export async function ensureSchemaReady(env: Env): Promise<void> {
     await initPromise;
 }
 
-/** Test-only helper to reset the per-isolate schema cache. */
 export function resetSchemaBootstrapCacheForTest(): void {
     schemaInitialized = false;
     initPromise = null;

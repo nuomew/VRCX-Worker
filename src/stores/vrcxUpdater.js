@@ -57,7 +57,7 @@ export const useVRCXUpdaterStore = defineStore('VRCXUpdater', () => {
             noUpdater.value = await window.electron.getNoUpdater();
             console.log('Architecture:', arch.value);
         }
-        if (isMacOS.value) {
+        if (isMacOS.value || (typeof WEB !== 'undefined' && WEB)) {
             noUpdater.value = true;
         }
 
