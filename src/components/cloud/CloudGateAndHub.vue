@@ -5,13 +5,16 @@
         class="fixed inset-0 z-[9999] flex items-center justify-center bg-background/95 backdrop-blur-sm p-4">
         <div class="w-full max-w-sm rounded-xl border border-border bg-card p-6 shadow-2xl space-y-4">
             <div class="space-y-1">
-                <h2 class="text-lg font-semibold text-foreground">VRCX Cloud Unlock</h2>
+                <h2 class="text-lg font-semibold text-foreground">{{ t('cloud_hub.unlock.title') }}</h2>
                 <p class="text-xs text-muted-foreground">
                     <template v-if="cloudState.authMode === 'cloudflare_access'">
-                        Protected by Cloudflare Access. Please sign in through your Access portal and reload.
+                        {{ t('cloud_hub.unlock.cf_access_desc') }}
+                    </template>
+                    <template v-else-if="cloudState.requiresTotp">
+                        {{ t('cloud_hub.unlock.passcode_totp_desc') }}
                     </template>
                     <template v-else>
-                        Enter your private cloud passcode{{ cloudState.requiresTotp ? ' and 6-digit TOTP code' : '' }}.
+                        {{ t('cloud_hub.unlock.passcode_desc') }}
                     </template>
                 </p>
             </div>
@@ -21,7 +24,7 @@
                     v-model="passcode"
                     type="password"
                     autocomplete="current-password"
-                    placeholder="Cloud Passcode"
+                    :placeholder="t('cloud_hub.unlock.passcode_placeholder')"
                     class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm text-foreground"
                     required />
                 <input
@@ -30,7 +33,7 @@
                     type="text"
                     inputmode="numeric"
                     maxlength="6"
-                    placeholder="6-digit TOTP Code"
+                    :placeholder="t('cloud_hub.unlock.totp_placeholder')"
                     class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm text-foreground"
                     required />
                 <p v-if="unlockError" class="text-xs text-destructive">{{ unlockError }}</p>
@@ -38,13 +41,13 @@
                     type="submit"
                     :disabled="unlocking"
                     class="w-full rounded-md bg-primary px-3 py-2 text-sm font-medium text-primary-foreground hover:opacity-90 disabled:opacity-50">
-                    {{ unlocking ? 'Verifying...' : 'Unlock VRCX Cloud' }}
+                    {{ unlocking ? t('cloud_hub.unlock.verifying') : t('cloud_hub.unlock.submit') }}
                 </button>
             </form>
         </div>
     </div>
 
-    <!-- 2. VRCX Cloud Hub Modal (Device Pairing, Remote Commands, R2 Gallery, Free-Tier Quota & WAF Probe) -->
+    <!-- 2. VRCX Cloud Hub Modal (HTTP Sync, Remote Commands, R2 Gallery, Free-Tier Quota & WAF Probe) -->
     <div
         v-if="isWeb && cloudState.hubDialogOpen"
         class="fixed inset-0 z-[9990] flex items-center justify-center bg-black/60 backdrop-blur-xs p-3"
@@ -60,22 +63,22 @@
                                 ? 'bg-status-online'
                                 : 'bg-status-offline-alt'
                         " />
-                    <h2 class="text-sm font-semibold">VRCX Cloud Hub</h2>
+                    <h2 class="text-sm font-semibold">{{ t('cloud_hub.title') }}</h2>
                     <span class="rounded bg-muted px-2 py-0.5 text-[11px] text-muted-foreground">
                         <template v-if="cloudState.agentsOnline.length > 0">
-                            Win Agent Online ({{ cloudState.agentsOnline.length }})
+                            {{ t('cloud_hub.agent_online', { count: cloudState.agentsOnline.length }) }}
                         </template>
                         <template v-else-if="recentSyncedCount > 0">
-                            Win Agent Synced ({{ recentSyncedCount }})
+                            {{ t('cloud_hub.agent_synced', { count: recentSyncedCount }) }}
                         </template>
-                        <template v-else>Win Agent Idle</template>
+                        <template v-else>{{ t('cloud_hub.agent_idle') }}</template>
                     </span>
                 </div>
                 <button
                     type="button"
                     class="rounded px-2 py-1 text-xs text-muted-foreground hover:bg-accent hover:text-foreground"
                     @click="cloudState.hubDialogOpen = false">
-                    Close
+                    {{ t('cloud_hub.close') }}
                 </button>
             </div>
 
@@ -101,15 +104,16 @@
                 <div v-if="activeTab === 'devices'" class="space-y-4">
                     <div class="rounded-lg border border-border bg-background/50 p-4 space-y-3">
                         <div>
-                            <div class="font-medium text-foreground">Windows Companion HTTP Sync (VRCX.Agent)</div>
+                            <div class="font-medium text-foreground">{{ t('cloud_hub.devices.heading') }}</div>
                             <div class="text-muted-foreground">
-                                Paste the Cloud URL and a Sync Secret into VRCX.Agent on Windows. The agent will periodically
-                                upload local VRChat logs, state, and screenshots over HTTPS (no persistent WebSocket needed).
+                                {{ t('cloud_hub.devices.desc') }}
                             </div>
                         </div>
 
                         <div class="space-y-1">
-                            <div class="text-[11px] font-medium text-muted-foreground">Cloud URL</div>
+                            <div class="text-[11px] font-medium text-muted-foreground">
+                                {{ t('cloud_hub.devices.cloud_url') }}
+                            </div>
                             <div class="flex items-center gap-2">
                                 <input
                                     :value="cloudOriginUrl"
@@ -120,25 +124,27 @@
                                     type="button"
                                     class="rounded-md border border-border px-3 py-1.5 font-medium hover:bg-accent"
                                     @click="copyText(cloudOriginUrl, 'url')">
-                                    {{ copiedField === 'url' ? 'Copied' : 'Copy URL' }}
+                                    {{ copiedField === 'url' ? t('cloud_hub.devices.copied') : t('cloud_hub.devices.copy_url') }}
                                 </button>
                             </div>
                         </div>
 
                         <div class="space-y-1.5 pt-1">
-                            <div class="text-[11px] font-medium text-muted-foreground">Create Sync Secret</div>
+                            <div class="text-[11px] font-medium text-muted-foreground">
+                                {{ t('cloud_hub.devices.create_secret_label') }}
+                            </div>
                             <div class="flex flex-wrap items-center gap-2">
                                 <input
                                     v-model="newDeviceName"
                                     type="text"
                                     maxlength="64"
-                                    placeholder="Device Name (e.g. Gaming-PC)"
+                                    :placeholder="t('cloud_hub.devices.device_name_placeholder')"
                                     class="min-w-[180px] flex-1 rounded-md border border-input bg-background px-3 py-1.5 text-xs text-foreground" />
                                 <button
                                     type="button"
                                     class="rounded-md bg-primary px-3 py-1.5 font-medium text-primary-foreground"
                                     @click="createSyncSecret">
-                                    Create Sync Secret
+                                    {{ t('cloud_hub.devices.create_secret_btn') }}
                                 </button>
                             </div>
                         </div>
@@ -146,13 +152,13 @@
                         <div v-if="createdSyncKey" class="space-y-1.5 rounded-md border border-primary/30 bg-muted/60 p-3">
                             <div class="flex items-center justify-between gap-2">
                                 <span class="font-medium text-foreground">
-                                    Sync Secret for {{ createdDeviceName }} (shown once):
+                                    {{ t('cloud_hub.devices.secret_created_for', { deviceName: createdDeviceName }) }}
                                 </span>
                                 <button
                                     type="button"
                                     class="rounded bg-primary px-2.5 py-1 text-[11px] font-medium text-primary-foreground"
                                     @click="copyText(createdSyncKey, 'secret')">
-                                    {{ copiedField === 'secret' ? 'Copied' : 'Copy Secret' }}
+                                    {{ copiedField === 'secret' ? t('cloud_hub.devices.copied') : t('cloud_hub.devices.copy_secret') }}
                                 </button>
                             </div>
                             <div class="break-all rounded bg-background/80 px-2.5 py-1.5 font-mono text-[11px] text-primary">
@@ -162,7 +168,7 @@
 
                         <div class="space-y-1.5 pt-1">
                             <div class="text-[11px] font-medium text-muted-foreground">
-                                Sync Interval (Web &amp; VRCX.Agent, seconds · default 60s)
+                                {{ t('cloud_hub.devices.sync_interval_label') }}
                             </div>
                             <div class="flex flex-wrap items-center gap-2">
                                 <input
@@ -177,30 +183,31 @@
                                     class="rounded-md border border-border px-3 py-1.5 font-medium hover:bg-accent"
                                     :disabled="savingSyncInterval"
                                     @click="saveSyncInterval">
-                                    {{ savingSyncInterval ? 'Saving...' : 'Save Interval' }}
+                                    {{ savingSyncInterval ? t('cloud_hub.devices.saving') : t('cloud_hub.devices.save_interval') }}
                                 </button>
                                 <span v-if="syncIntervalNotice" class="text-[11px] text-primary">
                                     {{ syncIntervalNotice }}
                                 </span>
                                 <span v-else class="text-[11px] text-muted-foreground">
-                                    VRCX.Agent follows this schedule strictly and only uploads at each scheduled tick.
+                                    {{ t('cloud_hub.devices.sync_interval_hint') }}
                                 </span>
                             </div>
                         </div>
 
                         <div class="text-[11px] text-muted-foreground">
-                            Tip: You can also configure a static <code class="font-mono">AGENT_SYNC_KEY</code> in Cloudflare
-                            Worker Secrets instead of generating per-device keys here.
+                            {{ t('cloud_hub.devices.static_secret_tip_prefix') }}<code class="font-mono">AGENT_SYNC_KEY</code
+                            >{{ t('cloud_hub.devices.static_secret_tip_suffix') }}
                         </div>
                     </div>
 
                     <div class="space-y-2">
-                        <div class="font-medium text-foreground">Configured Sync Devices ({{ devices.length }})</div>
+                        <div class="font-medium text-foreground">
+                            {{ t('cloud_hub.devices.configured_list', { count: devices.length }) }}
+                        </div>
                         <div
                             v-if="devices.length === 0"
                             class="rounded-lg border border-dashed border-border p-4 text-muted-foreground">
-                            No Windows sync device configured yet. Create a Sync Secret above, install VRCX.Agent on Windows,
-                            and enter the Cloud URL and Secret.
+                            {{ t('cloud_hub.devices.empty_devices') }}
                         </div>
                         <div
                             v-for="dev in devices"
@@ -215,15 +222,19 @@
                                     <span class="font-mono text-[11px] text-muted-foreground">{{ dev.device_id }}</span>
                                 </div>
                                 <div class="text-muted-foreground">
-                                    v{{ dev.agent_version || '1.1.0' }} · Last sync:
-                                    {{ dev.last_seen_at || 'Never synced yet' }}
+                                    v{{ dev.agent_version || '1.1.0' }} ·
+                                    {{
+                                        t('cloud_hub.devices.last_sync', {
+                                            time: dev.last_seen_at || t('cloud_hub.devices.never_synced')
+                                        })
+                                    }}
                                 </div>
                             </div>
                             <button
                                 type="button"
                                 class="rounded border border-destructive/40 px-2.5 py-1 text-destructive hover:bg-destructive/10"
                                 @click="revokeDevice(dev.device_id)">
-                                Revoke
+                                {{ t('cloud_hub.devices.revoke') }}
                             </button>
                         </div>
                     </div>
@@ -232,7 +243,7 @@
                 <!-- Tab 2: Remote Commands -->
                 <div v-if="activeTab === 'commands'" class="space-y-4">
                     <div class="rounded-lg border border-border bg-background/50 p-4 space-y-3">
-                        <div class="font-medium text-foreground">Launch VRChat Instance on Windows PC</div>
+                        <div class="font-medium text-foreground">{{ t('cloud_hub.commands.launch_heading') }}</div>
                         <div class="flex flex-wrap gap-2">
                             <input
                                 v-model="launchUrlInput"
@@ -243,7 +254,7 @@
                                 type="button"
                                 class="rounded-md bg-primary px-3 py-1.5 font-medium text-primary-foreground"
                                 @click="sendCommand('launch_vrc', { launchUrl: launchUrlInput })">
-                                Launch Instance
+                                {{ t('cloud_hub.commands.launch_btn') }}
                             </button>
                         </div>
                         <div class="flex flex-wrap gap-2 pt-1">
@@ -251,26 +262,32 @@
                                 type="button"
                                 class="rounded-md border border-border px-3 py-1.5 hover:bg-accent"
                                 @click="sendCommand('clear_cache', { scope: 'all' })">
-                                Clear VRChat Cache
+                                {{ t('cloud_hub.commands.clear_cache') }}
                             </button>
                             <button
                                 type="button"
                                 class="rounded-md border border-border px-3 py-1.5 hover:bg-accent"
-                                @click="sendCommand('send_vr_notify', { target: 'xsoverlay', title: 'VRCX Cloud', content: 'Test notification from Web' })">
-                                Test VR Notification
+                                @click="
+                                    sendCommand('send_vr_notify', {
+                                        target: 'xsoverlay',
+                                        title: t('cloud_hub.mobile_title'),
+                                        content: t('cloud_hub.commands.test_vr_notify_content')
+                                    })
+                                ">
+                                {{ t('cloud_hub.commands.test_vr_notify') }}
                             </button>
                             <button
                                 type="button"
                                 class="rounded-md border border-destructive/40 px-3 py-1.5 text-destructive hover:bg-destructive/10"
                                 @click="sendCommand('quit_vrc', {})">
-                                Quit VRChat
+                                {{ t('cloud_hub.commands.quit_vrc') }}
                             </button>
                         </div>
                         <p v-if="commandNotice" class="text-muted-foreground">{{ commandNotice }}</p>
                     </div>
 
                     <div class="space-y-1.5">
-                        <div class="font-medium text-foreground">Command Audit History</div>
+                        <div class="font-medium text-foreground">{{ t('cloud_hub.commands.history_heading') }}</div>
                         <div
                             v-for="cmd in commandHistory"
                             :key="cmd.cmd_id"
@@ -288,17 +305,25 @@
                 <div v-if="activeTab === 'gallery'" class="space-y-3">
                     <div class="flex items-center justify-between">
                         <span class="text-muted-foreground">
-                            R2 Storage: {{ cloudState.r2Enabled ? 'Enabled (Private Bucket)' : 'Not bound yet (Metadata-only mode)' }}
+                            {{
+                                t('cloud_hub.gallery.r2_status', {
+                                    status: cloudState.r2Enabled
+                                        ? t('cloud_hub.gallery.r2_enabled')
+                                        : t('cloud_hub.gallery.r2_disabled')
+                                })
+                            }}
                         </span>
                         <button
                             type="button"
                             class="rounded border border-border px-2.5 py-1 hover:bg-accent"
                             @click="loadScreenshots">
-                            Refresh
+                            {{ t('cloud_hub.gallery.refresh') }}
                         </button>
                     </div>
-                    <div v-if="screenshots.length === 0" class="rounded-lg border border-dashed border-border p-6 text-center text-muted-foreground">
-                        No cloud screenshots synced yet. Take a screenshot in VRChat while VRCX.Agent is running.
+                    <div
+                        v-if="screenshots.length === 0"
+                        class="rounded-lg border border-dashed border-border p-6 text-center text-muted-foreground">
+                        {{ t('cloud_hub.gallery.empty') }}
                     </div>
                     <div v-else class="grid grid-cols-2 gap-3 sm:grid-cols-3">
                         <div
@@ -333,24 +358,29 @@
                                     class="h-full bg-primary"
                                     :style="{ width: Math.min(100, info.percentOfFreeLimit) + '%' }" />
                             </div>
-                            <div class="text-[11px] text-muted-foreground">{{ info.percentOfFreeLimit }}% of Free shard</div>
+                            <div class="text-[11px] text-muted-foreground">
+                                {{ t('cloud_hub.quota.shard_percent', { percent: info.percentOfFreeLimit }) }}
+                            </div>
                         </div>
                     </div>
 
                     <div class="rounded-lg border border-border bg-background/50 p-4 space-y-2">
                         <div class="flex items-center justify-between">
                             <div>
-                                <div class="font-medium text-foreground">VRChat API Edge Egress Probe</div>
+                                <div class="font-medium text-foreground">{{ t('cloud_hub.quota.probe_heading') }}</div>
                                 <div class="text-muted-foreground">
-                                    Tests direct Worker -> api.vrchat.cloud reachability (Current VRC route:
-                                    <span class="font-mono">{{ cloudState.lastVrcRoute || 'idle' }}</span>)
+                                    {{ t('cloud_hub.quota.probe_desc_prefix')
+                                    }}<span class="font-mono">{{
+                                        cloudState.lastVrcRoute || t('cloud_hub.quota.route_idle')
+                                    }}</span
+                                    >{{ t('cloud_hub.quota.probe_desc_suffix') }}
                                 </div>
                             </div>
                             <button
                                 type="button"
                                 class="rounded-md bg-primary px-3 py-1.5 font-medium text-primary-foreground"
                                 @click="runWafProbe">
-                                Run Probe
+                                {{ t('cloud_hub.quota.run_probe') }}
                             </button>
                         </div>
                         <pre v-if="wafProbeResult" class="overflow-x-auto rounded bg-muted/60 p-2.5 font-mono text-[11px]">{{
@@ -365,10 +395,12 @@
 
 <script setup>
     import { computed, ref, watch } from 'vue';
+    import { useI18n } from 'vue-i18n';
     import { cloudFetch, connectCloudHubWs } from '../../ipc-web/apiClient';
     import { loadBootstrap, saveCloudSyncIntervalSeconds } from '../../ipc-web/bootstrapCache';
     import { cloudState } from '../../ipc-web/cloudState';
 
+    const { t } = useI18n();
     const isWeb = typeof WEB !== 'undefined' && WEB;
     const cloudOriginUrl = typeof window !== 'undefined' ? window.location.origin : '';
 
@@ -377,15 +409,15 @@
     const unlockError = ref('');
     const unlocking = ref(false);
 
-    const tabs = [
-        { id: 'devices', label: 'Win Agent (HTTP Sync)' },
-        { id: 'commands', label: 'Remote Control' },
-        { id: 'gallery', label: 'Cloud Gallery (R2)' },
-        { id: 'quota', label: 'Free-Tier Quota & WAF' }
-    ];
+    const tabs = computed(() => [
+        { id: 'devices', label: t('cloud_hub.tabs.devices') },
+        { id: 'commands', label: t('cloud_hub.tabs.commands') },
+        { id: 'gallery', label: t('cloud_hub.tabs.gallery') },
+        { id: 'quota', label: t('cloud_hub.tabs.quota') }
+    ]);
     const activeTab = ref('devices');
 
-    const newDeviceName = ref('Windows PC');
+    const newDeviceName = ref('');
     const createdSyncKey = ref('');
     const createdDeviceName = ref('');
     const copiedField = ref('');
@@ -413,12 +445,12 @@
         try {
             const saved = await saveCloudSyncIntervalSeconds(syncIntervalInput.value);
             syncIntervalInput.value = saved;
-            syncIntervalNotice.value = `Saved (${saved}s)`;
+            syncIntervalNotice.value = t('cloud_hub.devices.saved_interval', { seconds: saved });
             setTimeout(() => {
                 syncIntervalNotice.value = '';
             }, 3000);
         } catch (err) {
-            syncIntervalNotice.value = `Failed: ${err?.message || err}`;
+            syncIntervalNotice.value = t('cloud_hub.devices.save_failed', { error: err?.message || err });
         } finally {
             savingSyncInterval.value = false;
         }
@@ -458,7 +490,7 @@
             connectCloudHubWs();
             window.location.reload();
         } catch (err) {
-            unlockError.value = err?.message || 'Unlock failed';
+            unlockError.value = err?.message || t('cloud_hub.unlock.failed');
         } finally {
             unlocking.value = false;
         }
@@ -476,7 +508,7 @@
     }
 
     async function createSyncSecret() {
-        const name = (newDeviceName.value || '').trim() || 'Windows PC';
+        const name = (newDeviceName.value || '').trim() || t('cloud_hub.devices.default_device_name');
         const data = await cloudFetch('/api/agent/sync-key', {
             method: 'POST',
             json: { deviceName: name }
@@ -496,7 +528,7 @@
     }
 
     async function sendCommand(action, params) {
-        commandNotice.value = `Sending ${action}...`;
+        commandNotice.value = t('cloud_hub.commands.sending', { action });
         try {
             const res = await cloudFetch('/api/commands', {
                 method: 'POST',
@@ -504,10 +536,12 @@
             });
             commandNotice.value =
                 res.status === 'queued'
-                    ? `Queued ${action} for next Agent HTTP sync (${res.cmdId})`
-                    : `Dispatched ${action} (${res.cmdId})`;
+                    ? t('cloud_hub.commands.queued', { action, cmdId: res.cmdId })
+                    : t('cloud_hub.commands.dispatched', { action, cmdId: res.cmdId });
         } catch (err) {
-            commandNotice.value = `Failed: ${err?.message || 'Unknown error'}`;
+            commandNotice.value = t('cloud_hub.commands.failed', {
+                error: err?.message || t('cloud_hub.commands.unknown_error')
+            });
         }
         await loadCommands();
     }
@@ -521,12 +555,12 @@
     }
 
     async function runWafProbe() {
-        wafProbeResult.value = 'Probing https://api.vrchat.cloud/api/1/config ...';
+        wafProbeResult.value = t('cloud_hub.quota.probing');
         try {
             const res = await cloudFetch('/poc/vrc-probe');
             wafProbeResult.value = JSON.stringify(res, null, 2);
         } catch (err) {
-            wafProbeResult.value = `Error: ${err?.message || err}`;
+            wafProbeResult.value = t('cloud_hub.quota.probe_error', { error: err?.message || err });
         }
     }
 

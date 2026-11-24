@@ -17,8 +17,8 @@
                             v-if="isWeb"
                             :content="
                                 cloudState.agentsOnline.length > 0
-                                    ? `VRCX Cloud · Win Agent Online (${cloudState.agentsOnline.length}) · Click to manage`
-                                    : 'VRCX Cloud · Win Agent Offline · Click to pair or inspect quota'
+                                    ? t('cloud_hub.status_bar_online', { count: cloudState.agentsOnline.length })
+                                    : t('cloud_hub.status_bar_idle')
                             "
                             side="top">
                             <div
@@ -30,7 +30,11 @@
                                         cloudState.agentsOnline.length > 0 ? 'bg-status-online' : 'bg-status-offline-alt'
                                     " />
                                 <span class="text-foreground text-[11px]">
-                                    Cloud{{ cloudState.agentsOnline.length > 0 ? ' · Win' : '' }}
+                                    {{
+                                        cloudState.agentsOnline.length > 0
+                                            ? t('cloud_hub.short_label_win')
+                                            : t('cloud_hub.short_label')
+                                    }}
                                 </span>
                             </div>
                         </TooltipWrapper>

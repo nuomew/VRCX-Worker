@@ -45,32 +45,32 @@
 
             <SettingsItem
                 v-if="isWeb"
-                label="Cloud Sync Interval (Web & VRCX.Agent)"
-                description="Controls both Web api.vrchat.cloud sync throttling and Windows VRCX.Agent scheduled upload interval (default 1 min)">
+                :label="t('cloud_hub.settings.sync_interval_label')"
+                :description="t('cloud_hub.settings.sync_interval_desc')">
                 <Select
                     :model-value="String(cloudState.syncIntervalSeconds)"
                     @update:model-value="onSelectCloudSyncInterval">
-                    <SelectTrigger size="sm" class="min-w-[155px]">
+                    <SelectTrigger size="sm" class="min-w-[165px]">
                         <SelectValue />
                     </SelectTrigger>
                     <SelectContent>
-                        <SelectItem value="60">1 min (60s · Default)</SelectItem>
-                        <SelectItem value="120">2 min (120s)</SelectItem>
-                        <SelectItem value="300">5 min (300s)</SelectItem>
-                        <SelectItem value="600">10 min (600s)</SelectItem>
-                        <SelectItem value="900">15 min (900s)</SelectItem>
-                        <SelectItem value="1800">30 min (1800s)</SelectItem>
-                        <SelectItem value="3600">60 min (3600s)</SelectItem>
+                        <SelectItem value="60">{{ t('cloud_hub.settings.interval_60') }}</SelectItem>
+                        <SelectItem value="120">{{ t('cloud_hub.settings.interval_120') }}</SelectItem>
+                        <SelectItem value="300">{{ t('cloud_hub.settings.interval_300') }}</SelectItem>
+                        <SelectItem value="600">{{ t('cloud_hub.settings.interval_600') }}</SelectItem>
+                        <SelectItem value="900">{{ t('cloud_hub.settings.interval_900') }}</SelectItem>
+                        <SelectItem value="1800">{{ t('cloud_hub.settings.interval_1800') }}</SelectItem>
+                        <SelectItem value="3600">{{ t('cloud_hub.settings.interval_3600') }}</SelectItem>
                     </SelectContent>
                 </Select>
             </SettingsItem>
 
             <SettingsItem
                 v-if="isWeb"
-                label="VRCX Cloud Hub"
-                description="Win Agent HTTP sync, remote controls, R2 gallery & free-tier quota">
+                :label="t('cloud_hub.settings.hub_label')"
+                :description="t('cloud_hub.settings.hub_desc')">
                 <Button size="sm" variant="outline" @click="cloudState.hubDialogOpen = true">
-                    Open Cloud Hub
+                    {{ t('cloud_hub.settings.open_hub') }}
                 </Button>
             </SettingsItem>
         </SettingsGroup>
@@ -184,11 +184,10 @@
         <SettingsGroup :title="t('view.settings.general.legal_notice.header')">
             <div class="flex flex-col gap-2 text-sm text-muted-foreground mb-2">
                 <p v-if="isWeb" class="m-0">
-                    VRCX-Worker — Cloudflare Workers cloud edition derived from upstream
-                    <a class="cursor-pointer underline" @click="openExternalLink('https://github.com/vrcx-team/VRCX')"
+                    {{ t('cloud_hub.settings.derivative_notice_prefix')
+                    }}<a class="cursor-pointer underline" @click="openExternalLink('https://github.com/vrcx-team/VRCX')"
                         >vrcx-team/VRCX</a
-                    >
-                    (MIT).
+                    >{{ t('cloud_hub.settings.derivative_notice_suffix') }}
                 </p>
                 <p class="m-0">
                     &copy; 2019-2026
@@ -274,9 +273,9 @@
     async function onSelectCloudSyncInterval(val) {
         try {
             const saved = await saveCloudSyncIntervalSeconds(val);
-            toast.success(`Cloud sync interval set to ${saved}s (applies to Web & VRCX.Agent)`);
+            toast.success(t('cloud_hub.settings.sync_interval_saved_toast', { seconds: saved }));
         } catch (err) {
-            toast.error(`Failed to save sync interval: ${err?.message || err}`);
+            toast.error(t('cloud_hub.settings.sync_interval_failed_toast', { error: err?.message || err }));
         }
     }
 </script>

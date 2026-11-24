@@ -21,7 +21,7 @@
                         class="flex md:hidden items-center justify-between gap-2 h-10 px-2 border-b border-border bg-sidebar shrink-0">
                         <div class="flex items-center gap-2 min-w-0">
                             <SidebarTrigger class="shrink-0" />
-                            <span class="text-xs font-semibold truncate">VRCX Cloud</span>
+                            <span class="text-xs font-semibold truncate">{{ t('cloud_hub.mobile_title') }}</span>
                         </div>
                         <div class="flex items-center gap-1.5 shrink-0">
                             <Button
@@ -29,14 +29,14 @@
                                 size="sm"
                                 class="h-7 px-2 text-xs"
                                 @click="toggleMobileFriendsAside">
-                                {{ isAsideCollapsedStatic ? 'Friends' : 'Hide' }}
+                                {{ isAsideCollapsedStatic ? t('cloud_hub.mobile_friends') : t('cloud_hub.mobile_hide') }}
                             </Button>
                             <Button
                                 variant="outline"
                                 size="sm"
                                 class="h-7 px-2 text-xs"
                                 @click="cloudState.hubDialogOpen = true">
-                                Cloud
+                                {{ t('cloud_hub.short_label') }}
                             </Button>
                         </div>
                     </div>
