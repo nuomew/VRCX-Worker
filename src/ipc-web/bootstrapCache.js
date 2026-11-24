@@ -1,5 +1,5 @@
 import { cloudFetch } from './apiClient.js';
-import { clampSyncIntervalSeconds, cloudState } from './cloudState.js';
+import { applyCloudPresenceUpdate, clampSyncIntervalSeconds, cloudState } from './cloudState.js';
 
 /**
  * Pure in-memory session cache hydrated by a single GET /api/bootstrap request.
@@ -113,11 +113,27 @@ export async function loadBootstrap() {
     );
 
     if (data.agentStatus) {
-        const wsOnline = Array.isArray(data.agentStatus.agentsOnline) ? data.agentStatus.agentsOnline : [];
+        const wsOnline = Array.isArray(data.agentStatus.wsAgentsOnline)
+            ? data.agentStatus.wsAgentsOnline
+            : Array.isArray(data.agentStatus.agentsOnline)
+              ? data.agentStatus.agentsOnline
+              : [];
         cloudState.wsAgentsOnline = [...wsOnline];
-        cloudState.agentsOnline = [...wsOnline];
         cloudState.deviceStates = data.agentStatus.deviceStates || {};
     }
+
+    const deviceLastSeen =
+        data.agentStatus && typeof data.agentStatus.deviceLastSeen === 'object' ? data.agentStatus.deviceLastSeen : {};
+    const mergedAgentsOnline = Array.isArray(data.agentStatus?.agentsOnline) ? data.agentStatus.agentsOnline : [];
+    const totalUptimeSeconds = Number(
+        data.totalUptimeSeconds ?? bootstrapCache.statsCounters.cloud_total_uptime_seconds ?? 0
+    );
+    applyCloudPresenceUpdate({
+        deviceLastSeen,
+        httpAgentsOnline: mergedAgentsOnline,
+        totalUptimeSeconds,
+        replaceDeviceMap: true
+    });
 
     bootstrapCache.loaded = true;
 }

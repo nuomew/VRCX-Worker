@@ -5,7 +5,7 @@ let initPromise: Promise<void> | null = null;
 
 // Static DDL mirrored from cloud/migrations/*/0001_init.sql.
 // Uses a schema_meta version sentinel so upgrades from Phase 0 auto-add Phase 1 tables idempotently.
-const SCHEMA_VERSION = 'v2-full-core';
+const SCHEMA_VERSION = 'v3-screenshot-dedupe-idx';
 
 const CORE_STATEMENTS: readonly string[] = [
     `CREATE TABLE IF NOT EXISTS schema_meta (
@@ -244,6 +244,7 @@ const CORE_STATEMENTS: readonly string[] = [
     )`,
     `CREATE INDEX IF NOT EXISTS idx_screenshots_taken ON cloud_screenshots (taken_at DESC)`,
     `CREATE INDEX IF NOT EXISTS idx_screenshots_world ON cloud_screenshots (world_id, taken_at DESC)`,
+    `CREATE INDEX IF NOT EXISTS idx_screenshots_filename ON cloud_screenshots (local_filename COLLATE NOCASE)`,
     `CREATE TABLE IF NOT EXISTS cloud_commands (
         cmd_id TEXT PRIMARY KEY,
         target_device_id TEXT NOT NULL,

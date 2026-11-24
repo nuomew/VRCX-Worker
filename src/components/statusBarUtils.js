@@ -175,3 +175,17 @@ export function formatAppUptime(elapsedSeconds) {
         .padStart(2, '0');
     return `${hours}:${minutes}:${seconds}`;
 }
+
+/**
+ * Format cumulative cloud uptime seconds into `HH:MM:SS`, or `Xd HH:MM:SS` once >= 24 hours.
+ *
+ * @param {number} elapsedSeconds
+ * @returns {string}
+ */
+export function formatTotalUptime(elapsedSeconds) {
+    const safe = Math.max(0, Math.floor(elapsedSeconds));
+    const days = Math.floor(safe / 86400);
+    const rem = safe % 86400;
+    const hhmmss = formatAppUptime(rem);
+    return days > 0 ? `${days}d ${hhmmss}` : hhmmss;
+}

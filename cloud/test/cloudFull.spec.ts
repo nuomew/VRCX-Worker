@@ -596,4 +596,130 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
         expect(batchJson.data.results[0]!.status).toBe(403);
         expect(batchJson.data.results[1]!.status).toBe(403);
     });
+
+    it('deduplicates screenshots by id or localFilename, exposes HTTP agents in bootstrap, and accrues total uptime monotonically', async () => {
+        const keyRes = await exports.default.fetch('http://example.com/api/agent/sync-key', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ deviceName: 'Dedupe-PC' })
+        });
+        const keyJson = (await keyRes.json()) as {
+            ok: boolean;
+            data: { deviceId: string; syncKey: string };
+        };
+        const { deviceId, syncKey } = keyJson.data;
+
+        const metaB64 = btoa(
+            JSON.stringify({
+                takenAt: '2026-11-24T05:00:00.000Z',
+                localFilename: 'VRChat_2026-11-24_05-00-00.000_1920x1080.png',
+                worldId: 'wrld_dedupe',
+                worldName: 'Dedupe World'
+            })
+        );
+
+        // 1. First upload succeeds with duplicate: false
+        const firstUpload = await exports.default.fetch(
+            'http://example.com/api/agent/media/screenshots/aaaabbbbccccdddd1111222233334444',
+            {
+                method: 'PUT',
+                headers: {
+                    Authorization: `Bearer ${syncKey}`,
+                    'Content-Type': 'image/png',
+                    'X-Screenshot-Meta': metaB64
+                },
+                body: new Uint8Array([137, 80, 78, 71, 1, 2, 3, 4])
+            }
+        );
+        expect(firstUpload.status).toBe(200);
+        const firstJson = (await firstUpload.json()) as { ok: boolean; data: { id: string; duplicate: boolean } };
+        expect(firstJson.data.duplicate).toBe(false);
+
+        // 2. Re-uploading same photo with a DIFFERENT id (e.g. compression toggle changed bytes) but same localFilename is deduplicated
+        const secondUpload = await exports.default.fetch(
+            'http://example.com/api/agent/media/screenshots/ffff0000eeee1111dddd2222cccc3333',
+            {
+                method: 'PUT',
+                headers: {
+                    Authorization: `Bearer ${syncKey}`,
+                    'Content-Type': 'image/webp',
+                    'X-Screenshot-Meta': metaB64
+                },
+                body: new Uint8Array([82, 73, 70, 70, 9, 8, 7, 6])
+            }
+        );
+        expect(secondUpload.status).toBe(200);
+        const secondJson = (await secondUpload.json()) as { ok: boolean; data: { id: string; duplicate: boolean } };
+        expect(secondJson.data.duplicate).toBe(true);
+        expect(secondJson.data.id).toBe('aaaabbbbccccdddd1111222233334444');
+
+        // Confirm only 1 row exists in cloud_screenshots for this filename
+        const countRow = await env.DB_CORE.prepare(
+            'SELECT COUNT(*) AS cnt FROM cloud_screenshots WHERE local_filename = ? COLLATE NOCASE'
+        )
+            .bind('VRChat_2026-11-24_05-00-00.000_1920x1080.png')
+            .first<{ cnt: number }>();
+        expect(countRow?.cnt).toBe(1);
+
+        // 3. Agent performs HTTP sync -> bootstrap must surface device in agentsOnline while keeping wsAgentsOnline empty
+        const syncRes = await exports.default.fetch('http://example.com/api/agent/sync', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                Authorization: `Bearer ${syncKey}`
+            },
+            body: JSON.stringify({ events: [] })
+        });
+        expect(syncRes.status).toBe(200);
+
+        const bootRes = await exports.default.fetch('http://example.com/api/bootstrap');
+        expect(bootRes.status).toBe(200);
+        const bootJson = (await bootRes.json()) as {
+            ok: boolean;
+            data: {
+                totalUptimeSeconds: number;
+                agentStatus: {
+                    agentsOnline: string[];
+                    wsAgentsOnline: string[];
+                    deviceLastSeen: Record<string, number>;
+                };
+            };
+        };
+        expect(bootJson.data.agentStatus.agentsOnline).toContain(deviceId);
+        expect(bootJson.data.agentStatus.wsAgentsOnline).not.toContain(deviceId);
+        expect(typeof bootJson.data.agentStatus.deviceLastSeen[deviceId]).toBe('number');
+        expect(typeof bootJson.data.totalUptimeSeconds).toBe('number');
+
+        // 4. Simulate 90s elapsed since last watermark -> POST /api/stats/uptime accrues +90s cleanly
+        const ninetySecondsAgo = new Date(Date.now() - 90_000).toISOString();
+        await env.DB_CORE.prepare(
+            "INSERT INTO stats_counters (counter_key, row_count, updated_at) VALUES ('cloud_total_uptime_seconds', 100, ?) ON CONFLICT(counter_key) DO UPDATE SET row_count = 100, updated_at = excluded.updated_at"
+        )
+            .bind(ninetySecondsAgo)
+            .run();
+
+        const uptimeRes = await exports.default.fetch('http://example.com/api/stats/uptime', { method: 'POST' });
+        expect(uptimeRes.status).toBe(200);
+        const uptimeJson = (await uptimeRes.json()) as {
+            ok: boolean;
+            data: { totalUptimeSeconds: number; httpAgentsOnline: string[] };
+        };
+        expect(uptimeJson.data.totalUptimeSeconds).toBeGreaterThanOrEqual(189);
+        expect(uptimeJson.data.totalUptimeSeconds).toBeLessThanOrEqual(195);
+        expect(uptimeJson.data.httpAgentsOnline).toContain(deviceId);
+
+        // 5. Offline gap (> 360s) must NOT add offline hours to total uptime
+        const twoHoursAgo = new Date(Date.now() - 2 * 3600_000).toISOString();
+        await env.DB_CORE.prepare(
+            "UPDATE stats_counters SET row_count = 500, updated_at = ? WHERE counter_key = 'cloud_total_uptime_seconds'"
+        )
+            .bind(twoHoursAgo)
+            .run();
+        const afterOfflineRes = await exports.default.fetch('http://example.com/api/stats/uptime', { method: 'POST' });
+        const afterOfflineJson = (await afterOfflineRes.json()) as {
+            ok: boolean;
+            data: { totalUptimeSeconds: number };
+        };
+        expect(afterOfflineJson.data.totalUptimeSeconds).toBe(500);
+    });
 });

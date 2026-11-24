@@ -128,21 +128,26 @@ export function connectCloudHubWs() {
             }
 
             if (msg.type === 'agent.online' && msg.payload?.deviceId) {
-                if (!cloudState.agentsOnline.includes(msg.payload.deviceId)) {
-                    cloudState.agentsOnline.push(msg.payload.deviceId);
+                const deviceId = msg.payload.deviceId;
+                cloudState.deviceLastSeen[deviceId] = Date.now();
+                if (!cloudState.wsAgentsOnline.includes(deviceId)) {
+                    cloudState.wsAgentsOnline.push(deviceId);
                 }
-                if (!cloudState.wsAgentsOnline.includes(msg.payload.deviceId)) {
-                    cloudState.wsAgentsOnline.push(msg.payload.deviceId);
+                if (!cloudState.agentsOnline.includes(deviceId)) {
+                    cloudState.agentsOnline.push(deviceId);
                 }
             } else if (msg.type === 'agent.offline' && msg.payload?.deviceId) {
-                cloudState.agentsOnline = cloudState.agentsOnline.filter((id) => id !== msg.payload.deviceId);
-                cloudState.wsAgentsOnline = cloudState.wsAgentsOnline.filter((id) => id !== msg.payload.deviceId);
+                const deviceId = msg.payload.deviceId;
+                cloudState.wsAgentsOnline = cloudState.wsAgentsOnline.filter((id) => id !== deviceId);
+                delete cloudState.deviceLastSeen[deviceId];
+                cloudState.agentsOnline = cloudState.agentsOnline.filter((id) => id !== deviceId);
             } else if (msg.type === 'agent.state' && msg.payload?.deviceId) {
                 const { deviceId, ...rest } = msg.payload;
                 cloudState.deviceStates[deviceId] = {
                     state: rest,
                     updatedAt: new Date().toISOString()
                 };
+                cloudState.deviceLastSeen[deviceId] = Date.now();
                 if (!cloudState.agentsOnline.includes(deviceId)) {
                     cloudState.agentsOnline.push(deviceId);
                 }

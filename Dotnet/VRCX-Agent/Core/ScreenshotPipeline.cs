@@ -25,19 +25,157 @@ public sealed class ScreenshotPipeline
     private static readonly Logger Log = LogManager.GetCurrentClassLogger();
     private const int MaxThumbnailDimension = 1600;
     private const int WebpQuality = 80;
+    private const int MaxLedgerEntries = 30000;
 
     private readonly Func<AgentConfig> _configProvider;
     private readonly Func<HttpClient> _httpProvider;
+    private readonly string? _ledgerPath;
+    private readonly object _ledgerLock = new();
+    private readonly HashSet<string> _uploadedKeys = new(StringComparer.OrdinalIgnoreCase);
+    private readonly List<string> _uploadedOrder = new();
 
-    public ScreenshotPipeline(Func<AgentConfig> configProvider, HttpClient httpClient)
-        : this(configProvider, () => httpClient)
+    public ScreenshotPipeline(Func<AgentConfig> configProvider, HttpClient httpClient, string? stateDirectory = null)
+        : this(configProvider, () => httpClient, stateDirectory)
     {
     }
 
-    public ScreenshotPipeline(Func<AgentConfig> configProvider, Func<HttpClient> httpProvider)
+    public ScreenshotPipeline(Func<AgentConfig> configProvider, Func<HttpClient> httpProvider, string? stateDirectory = null)
     {
         _configProvider = configProvider;
         _httpProvider = httpProvider;
+        if (!string.IsNullOrWhiteSpace(stateDirectory))
+        {
+            Directory.CreateDirectory(stateDirectory);
+            _ledgerPath = Path.Combine(stateDirectory, "uploaded-screenshots.json");
+            LoadLedger();
+        }
+    }
+
+    /// <summary>
+    /// Returns true if the screenshot at <paramref name="localPath"/> (matched by full path or filename)
+    /// has already been uploaded in this or a previous agent session.
+    /// </summary>
+    public bool HasAlreadyUploaded(string? localPath)
+    {
+        if (string.IsNullOrWhiteSpace(localPath)) return false;
+        string pathKey = BuildPathKey(localPath);
+        string nameKey = BuildNameKey(localPath);
+        lock (_ledgerLock)
+        {
+            return (!string.IsNullOrEmpty(pathKey) && _uploadedKeys.Contains(pathKey))
+                || (!string.IsNullOrEmpty(nameKey) && _uploadedKeys.Contains(nameKey));
+        }
+    }
+
+    private bool HasHashUploaded(string sourceShaPrefix)
+    {
+        if (string.IsNullOrWhiteSpace(sourceShaPrefix)) return false;
+        lock (_ledgerLock)
+        {
+            return _uploadedKeys.Contains("sha:" + sourceShaPrefix);
+        }
+    }
+
+    private void MarkUploaded(string localPath, string sourceShaPrefix)
+    {
+        bool changed = false;
+        string pathKey = BuildPathKey(localPath);
+        string nameKey = BuildNameKey(localPath);
+        string shaKey = string.IsNullOrWhiteSpace(sourceShaPrefix) ? string.Empty : "sha:" + sourceShaPrefix;
+
+        lock (_ledgerLock)
+        {
+            changed |= AddLedgerKeyLocked(pathKey);
+            changed |= AddLedgerKeyLocked(nameKey);
+            changed |= AddLedgerKeyLocked(shaKey);
+            if (!changed) return;
+
+            if (_uploadedOrder.Count > MaxLedgerEntries)
+            {
+                int removeCount = _uploadedOrder.Count - MaxLedgerEntries;
+                for (int i = 0; i < removeCount; i++)
+                {
+                    _uploadedKeys.Remove(_uploadedOrder[i]);
+                }
+                _uploadedOrder.RemoveRange(0, removeCount);
+            }
+
+            SaveLedgerLocked();
+        }
+    }
+
+    private bool AddLedgerKeyLocked(string key)
+    {
+        if (string.IsNullOrEmpty(key) || !_uploadedKeys.Add(key))
+        {
+            return false;
+        }
+        _uploadedOrder.Add(key);
+        return true;
+    }
+
+    private void LoadLedger()
+    {
+        if (string.IsNullOrEmpty(_ledgerPath) || !File.Exists(_ledgerPath)) return;
+        try
+        {
+            string json = File.ReadAllText(_ledgerPath, Encoding.UTF8);
+            List<string>? items = JsonConvert.DeserializeObject<List<string>>(json);
+            if (items == null) return;
+            lock (_ledgerLock)
+            {
+                foreach (string item in items)
+                {
+                    if (!string.IsNullOrWhiteSpace(item))
+                    {
+                        AddLedgerKeyLocked(item.Trim());
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.Warn(ex, "Failed to load uploaded screenshot ledger from {Path}", _ledgerPath);
+        }
+    }
+
+    private void SaveLedgerLocked()
+    {
+        if (string.IsNullOrEmpty(_ledgerPath)) return;
+        try
+        {
+            string tmp = _ledgerPath + ".tmp";
+            File.WriteAllText(tmp, JsonConvert.SerializeObject(_uploadedOrder), Encoding.UTF8);
+            File.Move(tmp, _ledgerPath, overwrite: true);
+        }
+        catch (Exception ex)
+        {
+            Log.Warn(ex, "Failed to persist uploaded screenshot ledger to {Path}", _ledgerPath);
+        }
+    }
+
+    internal static string NormalizeScreenshotPath(string localPath)
+    {
+        try
+        {
+            return Path.GetFullPath(localPath).Trim().ToLowerInvariant();
+        }
+        catch
+        {
+            return localPath.Trim().ToLowerInvariant();
+        }
+    }
+
+    private static string BuildPathKey(string localPath)
+    {
+        string norm = NormalizeScreenshotPath(localPath);
+        return string.IsNullOrEmpty(norm) ? string.Empty : "path:" + norm;
+    }
+
+    private static string BuildNameKey(string localPath)
+    {
+        string name = Path.GetFileName(localPath)?.Trim().ToLowerInvariant() ?? string.Empty;
+        return string.IsNullOrEmpty(name) ? string.Empty : "name:" + name;
     }
 
     /// <summary>
@@ -144,7 +282,8 @@ public sealed class ScreenshotPipeline
     }
 
     /// <summary>
-    /// Uploads a queued screenshot strictly during a scheduled sync cycle when AutoUploadScreenshots is enabled.
+    /// Uploads a queued screenshot strictly once during a scheduled sync cycle when AutoUploadScreenshots is enabled.
+    /// Deduplicates by local path, filename, and source-file SHA-256 across restarts and compression-mode switches.
     /// </summary>
     public async Task<bool> UploadQueuedTaskAsync(PendingScreenshotTask task, CancellationToken ct)
     {
@@ -159,12 +298,45 @@ public sealed class ScreenshotPipeline
             return true;
         }
 
+        if (HasAlreadyUploaded(task.LocalPath))
+        {
+            Log.Debug("Skipping already-synced screenshot {Path}", task.LocalPath);
+            return true;
+        }
+
         var meta = BuildMetaPayload(task, cfg.CompressScreenshots);
         try
         {
-            var (payloadBytes, contentType) = PrepareUploadPayload(task.LocalPath, cfg.CompressScreenshots);
-            // Content-addressed SHA-256 prefix (32 hex chars) guarantees idempotent uploads.
-            string screenshotId = HmacSigner.Sha256Hex(payloadBytes).Substring(0, 32);
+            // Hash the original source file bytes so screenshotId stays stable even if compression settings change.
+            byte[] sourceBytes = await File.ReadAllBytesAsync(task.LocalPath, ct).ConfigureAwait(false);
+            string screenshotId = HmacSigner.Sha256Hex(sourceBytes).Substring(0, 32);
+
+            if (HasHashUploaded(screenshotId))
+            {
+                MarkUploaded(task.LocalPath, screenshotId);
+                Log.Debug("Skipping already-synced screenshot content {Id} ({Path})", screenshotId, task.LocalPath);
+                return true;
+            }
+
+            byte[] payloadBytes;
+            string contentType;
+            if (cfg.CompressScreenshots)
+            {
+                payloadBytes = EncodeWebpThumbnail(task.LocalPath);
+                contentType = "image/webp";
+            }
+            else
+            {
+                payloadBytes = sourceBytes;
+                string ext = Path.GetExtension(task.LocalPath).ToLowerInvariant();
+                contentType = ext switch
+                {
+                    ".jpg" or ".jpeg" => "image/jpeg",
+                    ".webp" => "image/webp",
+                    _ => "image/png"
+                };
+            }
+
             string endpoint = $"{cfg.CloudUrl.TrimEnd('/')}/api/agent/media/screenshots/{screenshotId}";
 
             using var req = new HttpRequestMessage(HttpMethod.Put, endpoint)
@@ -185,6 +357,8 @@ public sealed class ScreenshotPipeline
                 Log.Warn("Screenshot upload failed ({Status}): {Error}", (int)res.StatusCode, err);
                 return false;
             }
+
+            MarkUploaded(task.LocalPath, screenshotId);
             return true;
         }
         catch (Exception ex)

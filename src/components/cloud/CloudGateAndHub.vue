@@ -375,7 +375,7 @@
     import { useI18n } from 'vue-i18n';
     import { cloudFetch, connectCloudHubWs } from '../../ipc-web/apiClient';
     import { loadBootstrap, saveCloudSyncIntervalSeconds } from '../../ipc-web/bootstrapCache';
-    import { cloudState } from '../../ipc-web/cloudState';
+    import { applyCloudPresenceUpdate, cloudState, getAgentOnlineWindowMs } from '../../ipc-web/cloudState';
     import { links } from '../../shared/constants/link';
 
     const { t } = useI18n();
@@ -438,7 +438,7 @@
     function isRecentlySynced(lastSeenIso) {
         if (!lastSeenIso) return false;
         const ts = Date.parse(lastSeenIso);
-        return Number.isFinite(ts) && Date.now() - ts <= 5 * 60 * 1000;
+        return Number.isFinite(ts) && Date.now() - ts <= getAgentOnlineWindowMs();
     }
 
     async function copyText(text, field) {
@@ -481,7 +481,18 @@
     }
 
     async function loadDevices() {
-        devices.value = await cloudFetch('/api/agent/devices').catch(() => []);
+        const list = await cloudFetch('/api/agent/devices').catch(() => []);
+        devices.value = list;
+        const deviceLastSeen = {};
+        for (const dev of list) {
+            if (dev?.device_id && dev?.last_seen_at) {
+                const ts = Date.parse(dev.last_seen_at);
+                if (Number.isFinite(ts)) {
+                    deviceLastSeen[dev.device_id] = ts;
+                }
+            }
+        }
+        applyCloudPresenceUpdate({ deviceLastSeen, replaceDeviceMap: true });
     }
 
     async function createSyncSecret() {

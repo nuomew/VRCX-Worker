@@ -1,9 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { bootstrapCache, loadBootstrap, scheduleConfigPatch } from '../bootstrapCache.js';
-import { cloudState } from '../cloudState.js';
+import { applyCloudPresenceUpdate, cloudState, getOnlineAgentIds } from '../cloudState.js';
 import { createAppApiBridge } from '../appApiWeb.js';
 import { createWebApiBridge } from '../webApiRemote.js';
 import { createCloudDatabase } from '../../services/database/cloud/index.js';
+import { formatTotalUptime } from '../../components/statusBarUtils.js';
 
 function mockOk(data, status = 200) {
     return new Response(JSON.stringify({ ok: true, data }), {
@@ -279,5 +280,25 @@ describe('WEB cloud adapter (stateless)', () => {
         expect(fetchSpy).toHaveBeenCalledTimes(4);
         const calledUrls = fetchSpy.mock.calls.slice(1).map((c) => c[0]).sort();
         expect(calledUrls).toEqual(['/api/friend-log/current', '/api/notifications', '/api/user-profiles']);
+    });
+
+    it('reports HTTP VRCX.Agent devices as online in StatusBar without enabling WS RPC, expires stale devices, and formats multi-day total uptime', () => {
+        const baseNow = Date.now();
+        cloudState.wsAgentsOnline = [];
+        cloudState.syncIntervalSeconds = 60;
+        applyCloudPresenceUpdate({
+            deviceLastSeen: { dev_http_1: baseNow - 30_000, dev_stale: baseNow - 600_000 },
+            totalUptimeSeconds: 90_061,
+            replaceDeviceMap: true
+        });
+
+        expect(getOnlineAgentIds(baseNow)).toEqual(['dev_http_1']);
+        expect(cloudState.wsAgentsOnline).toEqual([]);
+        expect(cloudState.totalUptimeBaseSeconds).toBe(90_061);
+        // Once the active window (300s) passes without a new sync, stale HTTP agent automatically goes offline
+        expect(getOnlineAgentIds(baseNow + 280_000)).toEqual([]);
+
+        expect(formatTotalUptime(3661)).toBe('01:01:01');
+        expect(formatTotalUptime(90_061)).toBe('1d 01:01:01');
     });
 });

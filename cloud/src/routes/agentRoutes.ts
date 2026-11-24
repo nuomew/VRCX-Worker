@@ -1,7 +1,7 @@
 import { authenticateAgent, getMasterKey } from '../auth/auth';
 import { encryptAesGcm, randomHex, sha256Hex } from '../crypto/vault';
 import type { Env } from '../env';
-import { getCloudSyncIntervalSeconds } from './coreData';
+import { accrueCloudUptime, getCloudSyncIntervalSeconds } from './coreData';
 import { type GameLogIngestItem, ingestGameLogItems } from './eventsData';
 
 // Strict command allowlist (R.A.I.L.G.U.A.R.D.)
@@ -236,6 +236,31 @@ export async function handleAgentPublicRoutes(request: Request, env: Env, url: U
         }
 
         const takenAt = meta.takenAt || new Date().toISOString();
+        const localFilename = (meta.localFilename ?? '').trim();
+
+        // Strict cloud-side deduplication: skip R2 & D1 writes if this screenshot ID or filename already synced once.
+        const existing = localFilename
+            ? await env.DB_CORE.prepare(
+                  'SELECT id, r2_thumb_key FROM cloud_screenshots WHERE id = ? OR local_filename = ? COLLATE NOCASE LIMIT 1'
+              )
+                  .bind(screenshotId, localFilename)
+                  .first<{ id: string; r2_thumb_key: string }>()
+            : await env.DB_CORE.prepare('SELECT id, r2_thumb_key FROM cloud_screenshots WHERE id = ? LIMIT 1')
+                  .bind(screenshotId)
+                  .first<{ id: string; r2_thumb_key: string }>();
+
+        if (existing) {
+            return Response.json({
+                ok: true,
+                data: {
+                    id: existing.id,
+                    duplicate: true,
+                    r2Stored: Boolean(existing.r2_thumb_key),
+                    r2ThumbKey: existing.r2_thumb_key
+                }
+            });
+        }
+
         const ym = takenAt.slice(0, 7).replace(/[^0-9-]/g, '') || 'unknown';
         const rawContentType = (request.headers.get('Content-Type') || 'image/webp').split(';')[0]!.trim().toLowerCase();
         const contentType =
@@ -253,7 +278,7 @@ export async function handleAgentPublicRoutes(request: Request, env: Env, url: U
         }
 
         await env.DB_CORE.prepare(
-            `INSERT OR REPLACE INTO cloud_screenshots
+            `INSERT OR IGNORE INTO cloud_screenshots
              (id, device_id, taken_at, local_filename, world_id, world_name, instance_id, players_json, metadata_json, r2_thumb_key, thumb_bytes, created_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
         )
@@ -261,7 +286,7 @@ export async function handleAgentPublicRoutes(request: Request, env: Env, url: U
                 screenshotId,
                 auth.deviceId,
                 takenAt,
-                meta.localFilename ?? `${screenshotId}.png`,
+                localFilename || `${screenshotId}.png`,
                 meta.worldId ?? '',
                 meta.worldName ?? '',
                 meta.instanceId ?? '',
@@ -275,7 +300,7 @@ export async function handleAgentPublicRoutes(request: Request, env: Env, url: U
 
         return Response.json({
             ok: true,
-            data: { id: screenshotId, r2Stored: Boolean(r2Key), r2ThumbKey: r2Key }
+            data: { id: screenshotId, duplicate: false, r2Stored: Boolean(r2Key), r2ThumbKey: r2Key }
         });
     }
 
@@ -410,6 +435,7 @@ export async function handleAgentPublicRoutes(request: Request, env: Env, url: U
         }
 
         const syncIntervalSeconds = await getCloudSyncIntervalSeconds(env);
+        await accrueCloudUptime(env.DB_CORE, nowIso, Math.max(syncIntervalSeconds * 3, 360));
         const syncedMs = Date.parse(nowIso);
         const nextSyncAt = new Date(syncedMs + syncIntervalSeconds * 1000).toISOString();
 

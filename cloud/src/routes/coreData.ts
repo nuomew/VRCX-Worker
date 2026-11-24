@@ -88,11 +88,113 @@ export async function upsertEntityWorld(
 export const DEFAULT_CLOUD_SYNC_INTERVAL_SECONDS = 60;
 export const MIN_CLOUD_SYNC_INTERVAL_SECONDS = 30;
 export const MAX_CLOUD_SYNC_INTERVAL_SECONDS = 3600;
+export const CLOUD_TOTAL_UPTIME_COUNTER_KEY = 'cloud_total_uptime_seconds';
 
 export function parseCloudSyncIntervalSeconds(raw: unknown): number {
     const n = Number(raw);
     if (!Number.isFinite(n) || n <= 0) return DEFAULT_CLOUD_SYNC_INTERVAL_SECONDS;
     return Math.min(Math.max(Math.round(n), MIN_CLOUD_SYNC_INTERVAL_SECONDS), MAX_CLOUD_SYNC_INTERVAL_SECONDS);
+}
+
+/**
+ * Online recency window for HTTP periodic sync companions (at least 5 minutes, or 3x sync interval).
+ */
+export function getAgentOnlineWindowMs(syncIntervalSeconds: number): number {
+    return Math.max(syncIntervalSeconds * 3, 300) * 1000;
+}
+
+/**
+ * Extracts currently online HTTP-synced devices and their last-seen epoch timestamps from `cloud_devices` rows.
+ */
+export function resolveRecentHttpAgents(
+    rows: Array<{ device_id: string; last_seen_at?: string | null }>,
+    nowMs: number,
+    onlineWindowMs: number
+): { httpAgentsOnline: string[]; deviceLastSeen: Record<string, number> } {
+    const httpAgentsOnline: string[] = [];
+    const deviceLastSeen: Record<string, number> = {};
+    for (const row of rows) {
+        if (!row.device_id || !row.last_seen_at) continue;
+        const ts = Date.parse(row.last_seen_at);
+        if (!Number.isFinite(ts)) continue;
+        deviceLastSeen[row.device_id] = ts;
+        if (nowMs - ts <= onlineWindowMs) {
+            httpAgentsOnline.push(row.device_id);
+        }
+    }
+    return { httpAgentsOnline, deviceLastSeen };
+}
+
+/**
+ * Monotonically accrues persistent cloud uptime seconds in `stats_counters` (`cloud_total_uptime_seconds`).
+ * Uses a single shared `updated_at` watermark so concurrent Web heartbeats and VRCX.Agent periodic sync ticks
+ * never double-count the same wall-clock interval, while offline gaps (> maxStepSeconds) only advance the watermark.
+ */
+export async function accrueCloudUptime(
+    db: D1Database,
+    nowIso: string,
+    maxStepSeconds: number
+): Promise<number> {
+    const nowMs = Date.parse(nowIso);
+    if (!Number.isFinite(nowMs)) return 0;
+
+    const existing = await db
+        .prepare('SELECT row_count, updated_at FROM stats_counters WHERE counter_key = ? LIMIT 1')
+        .bind(CLOUD_TOTAL_UPTIME_COUNTER_KEY)
+        .first<{ row_count: number; updated_at: string }>();
+
+    if (!existing) {
+        await db
+            .prepare(
+                'INSERT OR IGNORE INTO stats_counters (counter_key, row_count, updated_at) VALUES (?, 0, ?)'
+            )
+            .bind(CLOUD_TOTAL_UPTIME_COUNTER_KEY, nowIso)
+            .run();
+        const afterInsert = await db
+            .prepare('SELECT row_count FROM stats_counters WHERE counter_key = ? LIMIT 1')
+            .bind(CLOUD_TOTAL_UPTIME_COUNTER_KEY)
+            .first<{ row_count: number }>();
+        return Math.max(0, Number(afterInsert?.row_count ?? 0));
+    }
+
+    const prevCount = Math.max(0, Number(existing.row_count ?? 0));
+    const prevMs = Date.parse(existing.updated_at);
+    if (!Number.isFinite(prevMs)) {
+        await db
+            .prepare('UPDATE stats_counters SET updated_at = ? WHERE counter_key = ?')
+            .bind(nowIso, CLOUD_TOTAL_UPTIME_COUNTER_KEY)
+            .run();
+        return prevCount;
+    }
+
+    const deltaSeconds = Math.floor((nowMs - prevMs) / 1000);
+    if (deltaSeconds <= 0) {
+        return prevCount;
+    }
+
+    if (deltaSeconds <= maxStepSeconds) {
+        const updateRes = await db
+            .prepare(
+                'UPDATE stats_counters SET row_count = row_count + ?, updated_at = ? WHERE counter_key = ? AND updated_at = ?'
+            )
+            .bind(deltaSeconds, nowIso, CLOUD_TOTAL_UPTIME_COUNTER_KEY, existing.updated_at)
+            .run();
+        if ((updateRes.meta?.changes ?? 0) > 0) {
+            return prevCount + deltaSeconds;
+        }
+        const refreshed = await db
+            .prepare('SELECT row_count FROM stats_counters WHERE counter_key = ? LIMIT 1')
+            .bind(CLOUD_TOTAL_UPTIME_COUNTER_KEY)
+            .first<{ row_count: number }>();
+        return Math.max(prevCount, Number(refreshed?.row_count ?? prevCount));
+    }
+
+    // Offline gap exceeded active step window: advance watermark without counting offline idle time.
+    await db
+        .prepare('UPDATE stats_counters SET updated_at = ? WHERE counter_key = ? AND updated_at = ?')
+        .bind(nowIso, CLOUD_TOTAL_UPTIME_COUNTER_KEY, existing.updated_at)
+        .run();
+    return prevCount;
 }
 
 /**
@@ -124,7 +226,8 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
                 env.DB_CORE.prepare('SELECT avatar_id, tag, color FROM avatar_tags'),
                 env.DB_CORE.prepare('SELECT user_id, updated_at, display_name, block, mute FROM moderation'),
                 env.DB_CORE.prepare('SELECT user_id, bio, bio_links, updated_at FROM user_profile'),
-                env.DB_CORE.prepare('SELECT counter_key, row_count FROM stats_counters')
+                env.DB_CORE.prepare('SELECT counter_key, row_count FROM stats_counters'),
+                env.DB_CORE.prepare('SELECT device_id, device_name, last_seen_at FROM cloud_devices')
             ]),
             hub.fetch(new Request('https://agent-hub.internal/status')).then((r) => r.json() as Promise<{ data?: unknown }>)
         ]);
@@ -144,6 +247,36 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
 
         const vrcxConfigs = bundles.vrcx_config ?? {};
         const syncIntervalSeconds = parseCloudSyncIntervalSeconds(vrcxConfigs['cloud:syncIntervalSeconds']);
+        const nowIso = new Date().toISOString();
+        const nowMs = Date.parse(nowIso);
+        const totalUptimeSeconds = await accrueCloudUptime(
+            env.DB_CORE,
+            nowIso,
+            Math.max(syncIntervalSeconds * 3, 360)
+        );
+        counters[CLOUD_TOTAL_UPTIME_COUNTER_KEY] = totalUptimeSeconds;
+
+        const rawHub = (hubRes?.data ?? {
+            agentsOnline: [],
+            webClientsCount: 0,
+            deviceStates: {}
+        }) as {
+            agentsOnline?: string[];
+            webClientsCount?: number;
+            deviceStates?: Record<string, unknown>;
+        };
+        const wsAgentsOnline = Array.isArray(rawHub.agentsOnline) ? rawHub.agentsOnline : [];
+        const deviceRows = (batchRes[13]?.results ?? []) as Array<{
+            device_id: string;
+            device_name: string;
+            last_seen_at: string;
+        }>;
+        const { httpAgentsOnline, deviceLastSeen } = resolveRecentHttpAgents(
+            deviceRows,
+            nowMs,
+            getAgentOnlineWindowMs(syncIntervalSeconds)
+        );
+        const mergedAgentsOnline = Array.from(new Set([...wsAgentsOnline, ...httpAgentsOnline]));
 
         return Response.json({
             ok: true,
@@ -151,6 +284,7 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
                 configs: vrcxConfigs,
                 storage: bundles.vrcx_storage ?? {},
                 syncIntervalSeconds,
+                totalUptimeSeconds,
                 memos: batchRes[1]?.results ?? [],
                 worldMemos: batchRes[2]?.results ?? [],
                 avatarMemos: batchRes[3]?.results ?? [],
@@ -163,7 +297,12 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
                 moderations: batchRes[10]?.results ?? [],
                 userProfiles: batchRes[11]?.results ?? [],
                 statsCounters: counters,
-                agentStatus: hubRes?.data ?? { agentsOnline: [], webClientsCount: 0, deviceStates: {} },
+                agentStatus: {
+                    ...rawHub,
+                    agentsOnline: mergedAgentsOnline,
+                    wsAgentsOnline,
+                    deviceLastSeen
+                },
                 r2Enabled: Boolean(env.R2_MEDIA)
             }
         });
@@ -742,7 +881,43 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
         }
     }
 
-    // 9. Zero-scan table sizes & D1 free-tier quota telemetry
+    // 9. Lightweight uptime accrual + HTTP agent presence heartbeat (pure D1, zero DO wakeups)
+    if (url.pathname === '/api/stats/uptime' && request.method === 'POST') {
+        const nowIso = new Date().toISOString();
+        const nowMs = Date.parse(nowIso);
+        const [cfgRes, devRes] = await env.DB_CORE.batch([
+            env.DB_CORE.prepare(
+                "SELECT payload_json FROM config_bundles WHERE bundle_key = 'vrcx_config' LIMIT 1"
+            ),
+            env.DB_CORE.prepare('SELECT device_id, last_seen_at FROM cloud_devices')
+        ]);
+        const cfgRow = (cfgRes?.results?.[0] ?? null) as { payload_json?: string } | null;
+        const cfg = safeJsonParse<Record<string, string>>(cfgRow?.payload_json, {});
+        const syncIntervalSeconds = parseCloudSyncIntervalSeconds(cfg['cloud:syncIntervalSeconds']);
+        const totalUptimeSeconds = await accrueCloudUptime(
+            env.DB_CORE,
+            nowIso,
+            Math.max(syncIntervalSeconds * 3, 360)
+        );
+        const deviceRows = (devRes?.results ?? []) as Array<{ device_id: string; last_seen_at: string }>;
+        const { httpAgentsOnline, deviceLastSeen } = resolveRecentHttpAgents(
+            deviceRows,
+            nowMs,
+            getAgentOnlineWindowMs(syncIntervalSeconds)
+        );
+        return Response.json({
+            ok: true,
+            data: {
+                totalUptimeSeconds,
+                httpAgentsOnline,
+                deviceLastSeen,
+                syncIntervalSeconds,
+                serverNow: nowIso
+            }
+        });
+    }
+
+    // 10. Zero-scan table sizes & D1 free-tier quota telemetry
     if (url.pathname === '/api/stats/table-sizes' && request.method === 'GET') {
         const [countersRes, maxFriendRes] = await env.DB_CORE.batch([
             env.DB_CORE.prepare('SELECT counter_key, row_count FROM stats_counters'),

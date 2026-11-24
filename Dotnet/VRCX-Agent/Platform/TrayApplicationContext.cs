@@ -34,6 +34,7 @@ public sealed class TrayApplicationContext : ApplicationContext
     private readonly RemoteCommandExecutor _commandExecutor;
     private readonly SyncScheduleGate _scheduleGate;
     private readonly Queue<PendingScreenshotTask> _pendingScreenshots = new();
+    private readonly HashSet<string> _queuedScreenshotPaths = new(StringComparer.OrdinalIgnoreCase);
     private readonly SemaphoreSlim _syncLock = new(1, 1);
     private readonly SemaphoreSlim _updateCheckLock = new(1, 1);
     private readonly CancellationTokenSource _cts = new();
@@ -77,7 +78,7 @@ public sealed class TrayApplicationContext : ApplicationContext
             () => _cloudHttp,
             () => ProxyHttpClientFactory.CreateHttpClient(_config, TimeSpan.FromMinutes(10)));
         _logCollector = new LogTailCollector(_configStore.DataDirectory);
-        _screenshotPipeline = new ScreenshotPipeline(() => _config, () => _cloudHttp);
+        _screenshotPipeline = new ScreenshotPipeline(() => _config, () => _cloudHttp, _configStore.DataDirectory);
         _processMonitor = new LocalProcessMonitor();
         _commandExecutor = new RemoteCommandExecutor(() => _config, ct => RunSyncCycleAsync(force: true, ct));
 
@@ -467,7 +468,8 @@ public sealed class TrayApplicationContext : ApplicationContext
             {
                 if (_pendingScreenshots.Count > 0)
                 {
-                    _pendingScreenshots.Dequeue();
+                    PendingScreenshotTask done = _pendingScreenshots.Dequeue();
+                    _queuedScreenshotPaths.Remove(ScreenshotPipeline.NormalizeScreenshotPath(done.LocalPath));
                 }
             }
             attempts++;
@@ -501,6 +503,17 @@ public sealed class TrayApplicationContext : ApplicationContext
     private void OnScreenshotCaptured(GameLogEventItem ev)
     {
         if (string.IsNullOrWhiteSpace(ev.LocalScreenshotPath)) return;
+        if (_screenshotPipeline.HasAlreadyUploaded(ev.LocalScreenshotPath)) return;
+
+        string normalizedPath = ScreenshotPipeline.NormalizeScreenshotPath(ev.LocalScreenshotPath);
+        lock (_pendingScreenshots)
+        {
+            if (_queuedScreenshotPaths.Contains(normalizedPath))
+            {
+                return;
+            }
+        }
+
         var task = new PendingScreenshotTask
         {
             LocalPath = ev.LocalScreenshotPath,
@@ -515,11 +528,11 @@ public sealed class TrayApplicationContext : ApplicationContext
         _ = Task.Run(async () =>
         {
             await _screenshotPipeline.EmbedLocalMetadataOnlyAsync(task, _cts.Token).ConfigureAwait(false);
-            if (_config.AutoUploadScreenshots)
+            if (_config.AutoUploadScreenshots && !_screenshotPipeline.HasAlreadyUploaded(task.LocalPath))
             {
                 lock (_pendingScreenshots)
                 {
-                    if (_pendingScreenshots.Count < 200)
+                    if (_pendingScreenshots.Count < 200 && _queuedScreenshotPaths.Add(normalizedPath))
                     {
                         _pendingScreenshots.Enqueue(task);
                     }

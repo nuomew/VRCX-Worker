@@ -888,6 +888,85 @@ public sealed class AgentCoreTests
         }
     }
 
+    [Fact]
+    public async Task ScreenshotPipeline_UploadsEachPhotoStrictlyOnceAcrossRestartsAndCompressionSwitch()
+    {
+        string tempDir = Path.Combine(Path.GetTempPath(), "vrcx-shot-dedupe-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(tempDir);
+        try
+        {
+            string pngPath = Path.Combine(tempDir, "VRChat_2026-11-24_06-00-00.000_1920x1080.png");
+            string copiedPath = Path.Combine(tempDir, "renamed_copy.png");
+            using (var img = new Image<Rgba32>(16, 16, new Rgba32(120, 180, 240, 255)))
+            {
+                img.SaveAsPng(pngPath);
+            }
+            File.Copy(pngPath, copiedPath);
+
+            var cfg = new AgentConfig
+            {
+                CloudUrl = "https://vrcx.example.workers.dev",
+                SyncSecret = "vrcx_sync_test_secret_key",
+                AutoUploadScreenshots = true,
+                CompressScreenshots = false
+            };
+
+            int uploadCount = 0;
+            string? firstUploadedUrl = null;
+            using var http = new HttpClient(new StubHttpHandler(req =>
+            {
+                Interlocked.Increment(ref uploadCount);
+                firstUploadedUrl ??= req.RequestUri?.AbsoluteUri;
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent("{\"ok\":true,\"data\":{\"duplicate\":false}}", Encoding.UTF8, "application/json")
+                });
+            }));
+
+            var task = new PendingScreenshotTask
+            {
+                LocalPath = pngPath,
+                TakenAtIso = "2026-11-24T06:00:00.000Z",
+                WorldId = "wrld_once",
+                WorldName = "Once World"
+            };
+
+            // 1. First upload sends exactly 1 PUT request and persists ledger
+            var pipeline1 = new ScreenshotPipeline(() => cfg, http, tempDir);
+            Assert.False(pipeline1.HasAlreadyUploaded(pngPath));
+            Assert.True(await pipeline1.UploadQueuedTaskAsync(task, CancellationToken.None));
+            Assert.Equal(1, uploadCount);
+            Assert.True(pipeline1.HasAlreadyUploaded(pngPath));
+
+            // 2. Immediate retry on same pipeline sends 0 extra PUT requests
+            Assert.True(await pipeline1.UploadQueuedTaskAsync(task, CancellationToken.None));
+            Assert.Equal(1, uploadCount);
+
+            // 3. New pipeline instance (simulating agent restart) + compression toggled ON still skips upload
+            cfg.CompressScreenshots = true;
+            var pipeline2 = new ScreenshotPipeline(() => cfg, http, tempDir);
+            Assert.True(pipeline2.HasAlreadyUploaded(pngPath));
+            Assert.True(await pipeline2.UploadQueuedTaskAsync(task, CancellationToken.None));
+            Assert.Equal(1, uploadCount);
+
+            // 4. Renamed copy with identical file bytes is caught by source-file SHA-256 deduplication -> 0 extra PUTs
+            var renamedTask = new PendingScreenshotTask
+            {
+                LocalPath = copiedPath,
+                TakenAtIso = "2026-11-24T06:00:00.000Z",
+                WorldId = "wrld_once",
+                WorldName = "Once World"
+            };
+            Assert.True(await pipeline2.UploadQueuedTaskAsync(renamedTask, CancellationToken.None));
+            Assert.Equal(1, uploadCount);
+            Assert.NotNull(firstUploadedUrl);
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir)) Directory.Delete(tempDir, recursive: true);
+        }
+    }
+
     private sealed class StubHttpHandler : HttpMessageHandler
     {
         private readonly Func<HttpRequestMessage, Task<HttpResponseMessage>> _responder;

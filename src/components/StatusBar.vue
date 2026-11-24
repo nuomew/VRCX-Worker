@@ -16,8 +16,8 @@
                         <TooltipWrapper
                             v-if="isWeb"
                             :content="
-                                cloudState.agentsOnline.length > 0
-                                    ? t('cloud_hub.status_bar_online', { count: cloudState.agentsOnline.length })
+                                onlineAgentCount > 0
+                                    ? t('cloud_hub.status_bar_online', { count: onlineAgentCount })
                                     : t('cloud_hub.status_bar_idle')
                             "
                             side="top">
@@ -26,12 +26,10 @@
                                 @click="cloudState.hubDialogOpen = true">
                                 <span
                                     class="inline-block size-2 rounded-full shrink-0"
-                                    :class="
-                                        cloudState.agentsOnline.length > 0 ? 'bg-status-online' : 'bg-status-offline-alt'
-                                    " />
+                                    :class="onlineAgentCount > 0 ? 'bg-status-online' : 'bg-status-offline-alt'" />
                                 <span class="text-foreground text-[11px]">
                                     {{
-                                        cloudState.agentsOnline.length > 0
+                                        onlineAgentCount > 0
                                             ? t('cloud_hub.short_label_win')
                                             : t('cloud_hub.short_label')
                                     }}
@@ -314,12 +312,32 @@
                             </div>
                         </TooltipWrapper>
 
-                        <TooltipWrapper v-if="visibility.uptime" :content="t('status_bar.app_uptime')" side="top">
-                            <div class="flex items-center gap-1 px-2 h-[22px] whitespace-nowrap border-r border-border">
-                                <span class="text-[10px] text-foreground">{{ t('status_bar.app_uptime_short') }}</span>
-                                <span class="text-[10px] text-foreground">{{ appUptimeText }}</span>
-                            </div>
-                        </TooltipWrapper>
+                        <template v-if="visibility.uptime">
+                            <template v-if="isWeb">
+                                <TooltipWrapper :content="t('cloud_hub.total_uptime_tooltip')" side="top">
+                                    <div class="flex items-center gap-1 px-2 h-[22px] whitespace-nowrap border-r border-border">
+                                        <span class="text-[10px] text-muted-foreground">{{
+                                            t('cloud_hub.total_uptime_short')
+                                        }}</span>
+                                        <span class="text-[10px] text-foreground tabular-nums">{{ totalUptimeText }}</span>
+                                    </div>
+                                </TooltipWrapper>
+                                <TooltipWrapper :content="t('cloud_hub.current_uptime_tooltip')" side="top">
+                                    <div class="flex items-center gap-1 px-2 h-[22px] whitespace-nowrap border-r border-border">
+                                        <span class="text-[10px] text-muted-foreground">{{
+                                            t('cloud_hub.current_uptime_short')
+                                        }}</span>
+                                        <span class="text-[10px] text-foreground tabular-nums">{{ appUptimeText }}</span>
+                                    </div>
+                                </TooltipWrapper>
+                            </template>
+                            <TooltipWrapper v-else :content="t('status_bar.app_uptime')" side="top">
+                                <div class="flex items-center gap-1 px-2 h-[22px] whitespace-nowrap border-r border-border">
+                                    <span class="text-[10px] text-foreground">{{ t('status_bar.app_uptime_short') }}</span>
+                                    <span class="text-[10px] text-foreground">{{ appUptimeText }}</span>
+                                </div>
+                            </TooltipWrapper>
+                        </template>
                     </div>
                 </div>
             </ContextMenuTrigger>
@@ -448,7 +466,8 @@
     import { useI18n } from 'vue-i18n';
     import { openExternalLink } from '@/shared/utils/appActions';
     import { wsState } from '@/services/websocket';
-    import { cloudState } from '@/ipc-web/cloudState';
+    import { cloudFetch } from '@/ipc-web/apiClient';
+    import { applyCloudPresenceUpdate, cloudState, getOnlineAgentIds } from '@/ipc-web/cloudState';
 
     import dayjs from 'dayjs';
     import timezone from 'dayjs/plugin/timezone';
@@ -457,6 +476,7 @@
     import {
         defaultVisibility,
         formatAppUptime,
+        formatTotalUptime,
         formatUtcHour,
         normalizeClock,
         normalizeUtcHour,
@@ -651,9 +671,24 @@
         return `WebSocket: ${state}`;
     });
 
+    const onlineAgentCount = computed(() => {
+        if (!isWeb.value) return 0;
+        return getOnlineAgentIds(now.value.getTime()).length;
+    });
+
     const appUptimeText = computed(() => {
         const elapsedSeconds = Math.floor((now.value.getTime() - vrcxStore.appStartAt) / 1000);
         return formatAppUptime(elapsedSeconds);
+    });
+
+    const totalUptimeText = computed(() => {
+        const nowMs = now.value.getTime();
+        if (cloudState.totalUptimeSyncedAt > 0) {
+            const sinceSync = Math.max(0, Math.floor((nowMs - cloudState.totalUptimeSyncedAt) / 1000));
+            return formatTotalUptime(cloudState.totalUptimeBaseSeconds + sinceSync);
+        }
+        const sessionSeconds = Math.max(0, Math.floor((nowMs - vrcxStore.appStartAt) / 1000));
+        return formatTotalUptime(sessionSeconds);
     });
 
     const CLOCKS_KEY = 'VRCX_statusBarClocks';
@@ -743,17 +778,86 @@
         }
 
         drawSparkline();
+
+        if (isWeb.value) {
+            setupCloudUptimeSync();
+        }
     });
 
     const zoomLevel = ref(100);
     const zoomEditing = ref(false);
     const zoomInputRef = ref(null);
     let cleanupWheel = null;
+    let cleanupCloudUptime = null;
+
+    function setupCloudUptimeSync() {
+        let lastPulseAt = Date.now();
+        let inFlight = false;
+
+        async function pulseUptimeAndPresence() {
+            if (inFlight || !cloudState.authenticated) return;
+            if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
+            inFlight = true;
+            try {
+                const data = await cloudFetch('/api/stats/uptime', { method: 'POST' });
+                lastPulseAt = Date.now();
+                applyCloudPresenceUpdate({
+                    deviceLastSeen: data?.deviceLastSeen,
+                    httpAgentsOnline: data?.httpAgentsOnline,
+                    totalUptimeSeconds: data?.totalUptimeSeconds,
+                    syncIntervalSeconds: data?.syncIntervalSeconds,
+                    replaceDeviceMap: true
+                });
+            } catch {
+                // Non-fatal; retry on next heartbeat
+            } finally {
+                inFlight = false;
+            }
+        }
+
+        // Pure D1 heartbeat (zero DO wakeups): refreshes HTTP VRCX.Agent online badge & saves cumulative uptime.
+        const timer = setInterval(() => {
+            const minIntervalMs = Math.max(cloudState.syncIntervalSeconds * 2, 180) * 1000;
+            if (Date.now() - lastPulseAt >= minIntervalMs) {
+                pulseUptimeAndPresence();
+            }
+        }, 60_000);
+
+        const handleVisibility = () => {
+            if (document.visibilityState === 'visible' && Date.now() - lastPulseAt >= 60_000) {
+                pulseUptimeAndPresence();
+            }
+        };
+
+        const handlePageHide = () => {
+            if (!cloudState.authenticated) return;
+            try {
+                fetch('/api/stats/uptime', {
+                    method: 'POST',
+                    credentials: 'include',
+                    keepalive: true
+                }).catch(() => {});
+            } catch {
+                // Ignore unload errors
+            }
+        };
+
+        document.addEventListener('visibilitychange', handleVisibility);
+        window.addEventListener('pagehide', handlePageHide);
+        cleanupCloudUptime = () => {
+            clearInterval(timer);
+            document.removeEventListener('visibilitychange', handleVisibility);
+            window.removeEventListener('pagehide', handlePageHide);
+        };
+    }
 
     onBeforeUnmount(() => {
         clearTimeout(serversHoverTimer);
         if (cleanupWheel) {
             cleanupWheel();
+        }
+        if (cleanupCloudUptime) {
+            cleanupCloudUptime();
         }
     });
 
