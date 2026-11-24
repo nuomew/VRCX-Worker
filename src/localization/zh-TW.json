@@ -3347,7 +3347,6 @@
         "tabs": {
             "devices": "Win 伴侶 (HTTP 同步)",
             "commands": "遠端控制",
-            "gallery": "雲端相簿 (R2)",
             "quota": "免費配額與連線檢測"
         },
         "devices": {
@@ -3393,11 +3392,12 @@
             "unknown_error": "未知錯誤"
         },
         "gallery": {
+            "tab_title": "雲相簿",
             "r2_status": "R2 物件儲存：{status}",
             "r2_enabled": "已啟用（私有儲存桶）",
             "r2_disabled": "尚未繫結（目前僅同步截圖中繼資料）",
             "refresh": "重新整理",
-            "empty": "尚無雲端同步截圖。執行 VRCX.Agent 時在 VRChat 中拍照即可定時同步至此。",
+            "empty": "尚無雲端同步照片。請在 VRCX.Agent 中開啟「同步 VRChat 照片」開關，在 VRChat 中拍照後將依同步間隔自動上傳至此。",
             "r2_setup_title": "如何繫結 Cloudflare R2 儲存桶（選用 · 免費 10 GB）",
             "r2_binding_type_label": "繫結類型：",
             "r2_binding_type_value": "R2 儲存桶繫結（Worker Bindings，非一般純文字環境變數）",
@@ -3431,7 +3431,7 @@
             "sync_interval_saved_toast": "雲端同步間隔已設為 {seconds} 秒（網頁端與 VRCX.Agent 同步生效）",
             "sync_interval_failed_toast": "儲存同步間隔失敗：{error}",
             "hub_label": "VRCX 雲端中心",
-            "hub_desc": "Windows 伴侶 HTTP 同步、遠端控制、R2 雲端相簿與免費配額監控",
+            "hub_desc": "Windows 伴侶 HTTP 同步、遠端控制與免費配額監控",
             "open_hub": "開啟雲端中心",
             "derivative_notice_prefix": "VRCX-Worker — 基於上游 ",
             "derivative_notice_suffix": " 由 nuomew（諾喵）二次開發的 Cloudflare Workers 雲端託管版本（MIT 授權）。"

@@ -311,6 +311,60 @@ public sealed class AgentCoreTests
         Assert.True(gate.IsDue(t1.AddSeconds(120)));
     }
 
+    [Fact]
+    public async Task ScreenshotSync_DefaultsOff_AndSupportsOriginalOrCompressedUpload()
+    {
+        var defaultCfg = new AgentConfig
+        {
+            CloudUrl = "https://vrcx.example.workers.dev",
+            SyncSecret = "secret"
+        };
+        Assert.False(defaultCfg.AutoUploadScreenshots);
+        Assert.False(defaultCfg.CompressScreenshots);
+
+        string tempPng = Path.Combine(Path.GetTempPath(), $"vrcx-test-shot-{Guid.NewGuid():N}.png");
+        try
+        {
+            using (var img = new SixLabors.ImageSharp.Image<SixLabors.ImageSharp.PixelFormats.Rgba32>(64, 64))
+            {
+                img.SaveAsPng(tempPng);
+            }
+            byte[] originalBytes = await File.ReadAllBytesAsync(tempPng);
+
+            // Default (AutoUploadScreenshots = false) sends zero HTTP requests
+            int requestCount = 0;
+            using var http = new HttpClient(new StubHttpHandler(_ =>
+            {
+                requestCount++;
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK));
+            }));
+            var pipeline = new ScreenshotPipeline(() => defaultCfg, http);
+            bool skipped = await pipeline.UploadQueuedTaskAsync(
+                new PendingScreenshotTask { LocalPath = tempPng, TakenAtIso = "2026-11-24T04:00:00Z" },
+                CancellationToken.None);
+            Assert.True(skipped);
+            Assert.Equal(0, requestCount);
+
+            // compress = false preserves original PNG bytes & image/png MIME
+            var (rawBytes, rawMime) = ScreenshotPipeline.PrepareUploadPayload(tempPng, compress: false);
+            Assert.Equal("image/png", rawMime);
+            Assert.Equal(originalBytes, rawBytes);
+
+            // compress = true encodes WebP & image/webp MIME
+            var (webpBytes, webpMime) = ScreenshotPipeline.PrepareUploadPayload(tempPng, compress: true);
+            Assert.Equal("image/webp", webpMime);
+            Assert.True(webpBytes.Length > 12);
+            Assert.Equal((byte)'R', webpBytes[0]);
+            Assert.Equal((byte)'I', webpBytes[1]);
+            Assert.Equal((byte)'F', webpBytes[2]);
+            Assert.Equal((byte)'F', webpBytes[3]);
+        }
+        finally
+        {
+            if (File.Exists(tempPng)) File.Delete(tempPng);
+        }
+    }
+
     private sealed class StubHttpHandler : HttpMessageHandler
     {
         private readonly Func<HttpRequestMessage, Task<HttpResponseMessage>> _responder;

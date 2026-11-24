@@ -47,11 +47,10 @@
         </div>
     </div>
 
-    <!-- 2. VRCX Cloud Hub Modal (HTTP Sync, Remote Commands, R2 Gallery, Free-Tier Quota & WAF Probe) -->
+    <!-- 2. VRCX Cloud Hub Modal (HTTP Sync, Remote Commands, Free-Tier Quota & WAF Probe) -->
     <div
         v-if="isWeb && cloudState.hubDialogOpen"
-        class="fixed inset-0 z-[9990] flex items-center justify-center bg-black/60 backdrop-blur-xs p-3"
-        @click.self="cloudState.hubDialogOpen = false">
+        class="fixed inset-0 z-[9990] flex items-center justify-center bg-black/60 backdrop-blur-xs p-3">
         <div
             class="flex max-h-[86vh] w-full max-w-3xl flex-col overflow-hidden rounded-xl border border-border bg-card text-foreground shadow-2xl">
             <div class="flex items-center justify-between border-b border-border px-5 py-3.5">
@@ -319,90 +318,7 @@
                     </div>
                 </div>
 
-                <!-- Tab 3: R2 Cloud Screenshot Gallery -->
-                <div v-if="activeTab === 'gallery'" class="space-y-3">
-                    <div class="flex items-center justify-between">
-                        <span class="text-muted-foreground">
-                            {{
-                                t('cloud_hub.gallery.r2_status', {
-                                    status: cloudState.r2Enabled
-                                        ? t('cloud_hub.gallery.r2_enabled')
-                                        : t('cloud_hub.gallery.r2_disabled')
-                                })
-                            }}
-                        </span>
-                        <button
-                            type="button"
-                            class="rounded border border-border px-2.5 py-1 hover:bg-accent"
-                            @click="loadScreenshots">
-                            {{ t('cloud_hub.gallery.refresh') }}
-                        </button>
-                    </div>
-                    <div
-                        v-if="!cloudState.r2Enabled"
-                        class="rounded-lg border border-border bg-background/50 p-3.5 space-y-2 text-[11px]">
-                        <div class="font-medium text-foreground text-xs">{{ t('cloud_hub.gallery.r2_setup_title') }}</div>
-                        <div class="space-y-1 text-muted-foreground">
-                            <div>
-                                <span class="font-medium text-foreground">{{
-                                    t('cloud_hub.gallery.r2_binding_type_label')
-                                }}</span>
-                                {{ t('cloud_hub.gallery.r2_binding_type_value') }}
-                            </div>
-                            <div class="flex flex-wrap items-center gap-2">
-                                <span class="font-medium text-foreground">{{
-                                    t('cloud_hub.gallery.r2_var_name_label')
-                                }}</span>
-                                <code class="rounded bg-muted px-1.5 py-0.5 font-mono text-primary">R2_MEDIA</code>
-                                <button
-                                    type="button"
-                                    class="rounded border border-border px-2 py-0.5 text-[11px] text-foreground hover:bg-accent"
-                                    @click="copyText('R2_MEDIA', 'r2_var')">
-                                    {{
-                                        copiedField === 'r2_var'
-                                            ? t('cloud_hub.devices.copied')
-                                            : t('cloud_hub.gallery.r2_copy_var')
-                                    }}
-                                </button>
-                            </div>
-                            <div>
-                                <span class="font-medium text-foreground">{{
-                                    t('cloud_hub.gallery.r2_bucket_name_label')
-                                }}</span>
-                                {{ t('cloud_hub.gallery.r2_bucket_name_value') }}
-                            </div>
-                        </div>
-                        <div class="space-y-1 border-t border-border/60 pt-2 text-muted-foreground leading-relaxed">
-                            <div>{{ t('cloud_hub.gallery.r2_step_dashboard') }}</div>
-                            <div>{{ t('cloud_hub.gallery.r2_step_wrangler') }}</div>
-                        </div>
-                        <pre class="overflow-x-auto rounded bg-muted/60 p-2 font-mono text-[11px] text-foreground">"r2_buckets": [{ "binding": "R2_MEDIA", "bucket_name": "vrcx-media" }]</pre>
-                    </div>
-                    <div
-                        v-if="screenshots.length === 0"
-                        class="rounded-lg border border-dashed border-border p-6 text-center text-muted-foreground">
-                        {{ t('cloud_hub.gallery.empty') }}
-                    </div>
-                    <div v-else class="grid grid-cols-2 gap-3 sm:grid-cols-3">
-                        <div
-                            v-for="shot in screenshots"
-                            :key="shot.id"
-                            class="overflow-hidden rounded-lg border border-border bg-background/60">
-                            <img
-                                v-if="shot.r2_thumb_key && cloudState.r2Enabled"
-                                :src="`/api/media/screenshots/${encodeURIComponent(shot.id)}`"
-                                :alt="shot.world_name || shot.local_filename"
-                                loading="lazy"
-                                class="aspect-video w-full object-cover bg-muted" />
-                            <div class="p-2 space-y-0.5">
-                                <div class="truncate font-medium">{{ shot.world_name || shot.local_filename }}</div>
-                                <div class="text-[11px] text-muted-foreground">{{ shot.taken_at }}</div>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-
-                <!-- Tab 4: Free-Tier Quota & VRChat WAF Diagnostics -->
+                <!-- Tab 3: Free-Tier Quota & VRChat WAF Diagnostics -->
                 <div v-if="activeTab === 'quota'" class="space-y-4">
                     <div v-if="quotaInfo" class="grid grid-cols-1 gap-3 sm:grid-cols-3">
                         <div
@@ -471,7 +387,6 @@
     const tabs = computed(() => [
         { id: 'devices', label: t('cloud_hub.tabs.devices') },
         { id: 'commands', label: t('cloud_hub.tabs.commands') },
-        { id: 'gallery', label: t('cloud_hub.tabs.gallery') },
         { id: 'quota', label: t('cloud_hub.tabs.quota') }
     ]);
     const activeTab = ref('devices');
@@ -487,7 +402,6 @@
     const launchUrlInput = ref('');
     const commandNotice = ref('');
     const commandHistory = ref([]);
-    const screenshots = ref([]);
     const quotaInfo = ref(null);
     const wafProbeResult = ref('');
 
@@ -605,10 +519,6 @@
         await loadCommands();
     }
 
-    async function loadScreenshots() {
-        screenshots.value = await cloudFetch('/api/screenshots?limit=60').catch(() => []);
-    }
-
     async function loadQuota() {
         quotaInfo.value = await cloudFetch('/api/admin/quota').catch(() => null);
     }
@@ -627,7 +537,6 @@
         activeTab.value = id;
         if (id === 'devices') loadDevices();
         else if (id === 'commands') loadCommands();
-        else if (id === 'gallery') loadScreenshots();
         else if (id === 'quota') loadQuota();
     }
 

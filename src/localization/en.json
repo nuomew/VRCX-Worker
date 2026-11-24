@@ -3684,7 +3684,6 @@
         "tabs": {
             "devices": "Win Agent (HTTP Sync)",
             "commands": "Remote Control",
-            "gallery": "Cloud Gallery (R2)",
             "quota": "Free-Tier Quota & WAF"
         },
         "devices": {
@@ -3730,11 +3729,12 @@
             "unknown_error": "Unknown error"
         },
         "gallery": {
+            "tab_title": "Cloud Gallery",
             "r2_status": "R2 Storage: {status}",
             "r2_enabled": "Enabled (Private Bucket)",
             "r2_disabled": "Not bound yet (Metadata-only mode)",
             "refresh": "Refresh",
-            "empty": "No cloud screenshots synced yet. Take a screenshot in VRChat while VRCX.Agent is running.",
+            "empty": "No cloud screenshots synced yet. Enable \"Sync VRChat Screenshots\" in VRCX.Agent, then take screenshots in VRChat to sync here on the next scheduled tick.",
             "r2_setup_title": "How to Bind Cloudflare R2 Bucket (Optional · 10 GB Free)",
             "r2_binding_type_label": "Binding Type:",
             "r2_binding_type_value": "R2 Bucket (Worker Binding, not a plain text env var)",
@@ -3768,7 +3768,7 @@
             "sync_interval_saved_toast": "Cloud sync interval set to {seconds}s (applies to Web & VRCX.Agent)",
             "sync_interval_failed_toast": "Failed to save sync interval: {error}",
             "hub_label": "VRCX Cloud Hub",
-            "hub_desc": "Win Agent HTTP sync, remote controls, R2 gallery & free-tier quota",
+            "hub_desc": "Win Agent HTTP sync, remote controls & free-tier quota",
             "open_hub": "Open Cloud Hub",
             "derivative_notice_prefix": "VRCX-Worker — Cloudflare Workers cloud edition derived from upstream ",
             "derivative_notice_suffix": " by nuomew (MIT)."

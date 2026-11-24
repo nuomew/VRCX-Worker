@@ -15,7 +15,7 @@ const ALLOWED_ACTIONS = new Set([
 ]);
 
 const VRC_LAUNCH_URL_RE = /^vrchat:\/\/launch\?id=wrld_[0-9a-f-]{36}:[A-Za-z0-9_~()\-]+$/;
-const MAX_SCREENSHOT_BYTES = 2 * 1024 * 1024; // 2 MiB ceiling for WebP thumbnail
+const MAX_SCREENSHOT_BYTES = 25 * 1024 * 1024; // 25 MiB ceiling (supports both WebP thumbnails and original PNGs)
 
 function generateSixDigitCode(): string {
     const arr = new Uint32Array(1);
@@ -212,7 +212,7 @@ export async function handleAgentPublicRoutes(request: Request, env: Env, url: U
         const bytes = new Uint8Array(await request.arrayBuffer());
         if (bytes.byteLength > MAX_SCREENSHOT_BYTES) {
             return Response.json(
-                { ok: false, error: { code: 'PAYLOAD_TOO_LARGE', message: 'Thumbnail exceeds 2 MiB ceiling' } },
+                { ok: false, error: { code: 'PAYLOAD_TOO_LARGE', message: 'Screenshot exceeds 25 MiB ceiling' } },
                 { status: 413 }
             );
         }
@@ -237,12 +237,18 @@ export async function handleAgentPublicRoutes(request: Request, env: Env, url: U
 
         const takenAt = meta.takenAt || new Date().toISOString();
         const ym = takenAt.slice(0, 7).replace(/[^0-9-]/g, '') || 'unknown';
+        const rawContentType = (request.headers.get('Content-Type') || 'image/webp').split(';')[0]!.trim().toLowerCase();
+        const contentType =
+            rawContentType === 'image/png' || rawContentType === 'image/jpeg' || rawContentType === 'image/webp'
+                ? rawContentType
+                : 'image/webp';
+        const ext = contentType === 'image/png' ? 'png' : contentType === 'image/jpeg' ? 'jpg' : 'webp';
         let r2Key = '';
 
         if (env.R2_MEDIA && bytes.byteLength > 0) {
-            r2Key = `screenshots/${ym}/${screenshotId}.webp`;
+            r2Key = `screenshots/${ym}/${screenshotId}.${ext}`;
             await env.R2_MEDIA.put(r2Key, bytes, {
-                httpMetadata: { contentType: request.headers.get('Content-Type') || 'image/webp' }
+                httpMetadata: { contentType }
             });
         }
 

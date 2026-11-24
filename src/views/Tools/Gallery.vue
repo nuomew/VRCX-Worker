@@ -16,6 +16,14 @@
                     </span>
                 </span>
             </template>
+            <template v-if="isWeb" #label-cloud-gallery>
+                <span>
+                    {{ t('cloud_hub.gallery.tab_title') }}
+                    <span class="text-xs ml-[5px]">
+                        {{ cloudScreenshots.length }}
+                    </span>
+                </span>
+            </template>
             <template #label-icons>
                 <span>
                     {{ t('dialog.gallery_icons.icons') }}
@@ -112,6 +120,116 @@
                                         <Trash2 />
                                     </Button>
                                 </ItemFooter>
+                            </div>
+                        </Item>
+                    </ItemGroup>
+                </div>
+            </template>
+
+            <template v-if="isWeb" #cloud-gallery>
+                <div class="space-y-3">
+                    <div class="flex items-center justify-between gap-2 flex-wrap">
+                        <ButtonGroup>
+                            <Button
+                                variant="outline"
+                                size="sm"
+                                :disabled="cloudScreenshotsLoading"
+                                @click="loadCloudScreenshots">
+                                <RefreshCw />
+                                {{ t('cloud_hub.gallery.refresh') }}
+                            </Button>
+                        </ButtonGroup>
+                        <span class="text-xs text-muted-foreground">
+                            {{
+                                t('cloud_hub.gallery.r2_status', {
+                                    status: cloudState.r2Enabled
+                                        ? t('cloud_hub.gallery.r2_enabled')
+                                        : t('cloud_hub.gallery.r2_disabled')
+                                })
+                            }}
+                        </span>
+                    </div>
+                    <div
+                        v-if="!cloudState.r2Enabled"
+                        class="rounded-lg border border-border bg-background/50 p-3.5 space-y-2 text-[11px]">
+                        <div class="font-medium text-foreground text-xs">
+                            {{ t('cloud_hub.gallery.r2_setup_title') }}
+                        </div>
+                        <div class="space-y-1 text-muted-foreground">
+                            <div>
+                                <span class="font-medium text-foreground">{{
+                                    t('cloud_hub.gallery.r2_binding_type_label')
+                                }}</span>
+                                {{ t('cloud_hub.gallery.r2_binding_type_value') }}
+                            </div>
+                            <div class="flex flex-wrap items-center gap-2">
+                                <span class="font-medium text-foreground">{{
+                                    t('cloud_hub.gallery.r2_var_name_label')
+                                }}</span>
+                                <code class="rounded bg-muted px-1.5 py-0.5 font-mono text-primary">R2_MEDIA</code>
+                                <button
+                                    type="button"
+                                    class="rounded border border-border px-2 py-0.5 text-[11px] text-foreground hover:bg-accent"
+                                    @click="copyR2BindingVar">
+                                    {{
+                                        copiedR2Var
+                                            ? t('cloud_hub.devices.copied')
+                                            : t('cloud_hub.gallery.r2_copy_var')
+                                    }}
+                                </button>
+                            </div>
+                            <div>
+                                <span class="font-medium text-foreground">{{
+                                    t('cloud_hub.gallery.r2_bucket_name_label')
+                                }}</span>
+                                {{ t('cloud_hub.gallery.r2_bucket_name_value') }}
+                            </div>
+                        </div>
+                        <div class="space-y-1 border-t border-border/60 pt-2 text-muted-foreground leading-relaxed">
+                            <div>{{ t('cloud_hub.gallery.r2_step_dashboard') }}</div>
+                            <div>{{ t('cloud_hub.gallery.r2_step_wrangler') }}</div>
+                        </div>
+                        <pre class="overflow-x-auto rounded bg-muted/60 p-2 font-mono text-[11px] text-foreground">"r2_buckets": [{ "binding": "R2_MEDIA", "bucket_name": "vrcx-media" }]</pre>
+                    </div>
+                    <div
+                        v-if="cloudScreenshots.length === 0"
+                        class="rounded-lg border border-dashed border-border p-8 text-center text-xs text-muted-foreground">
+                        {{ t('cloud_hub.gallery.empty') }}
+                    </div>
+                    <ItemGroup
+                        v-else
+                        class="grid gap-3"
+                        style="grid-template-columns: repeat(auto-fill, minmax(220px, 1fr))">
+                        <Item
+                            v-for="shot in cloudScreenshots"
+                            :key="shot.id"
+                            variant="outline"
+                            size="sm"
+                            class="p-0 x-hover-card hover:bg-accent hover:shadow-sm"
+                            as-child>
+                            <div class="overflow-hidden rounded-[inherit]">
+                                <ItemHeader
+                                    v-if="shot.r2_thumb_key && cloudState.r2Enabled"
+                                    class="cursor-pointer"
+                                    @click="
+                                        showFullscreenImageDialog(
+                                            `/api/media/screenshots/${encodeURIComponent(shot.id)}`
+                                        )
+                                    ">
+                                    <img
+                                        :src="`/api/media/screenshots/${encodeURIComponent(shot.id)}`"
+                                        :alt="shot.world_name || shot.local_filename"
+                                        loading="lazy"
+                                        class="aspect-video w-full rounded-t-md object-cover bg-muted" />
+                                </ItemHeader>
+                                <ItemContent class="min-w-0 px-2.5 py-2">
+                                    <ItemTitle class="truncate text-sm">
+                                        {{ shot.world_name || shot.local_filename }}
+                                    </ItemTitle>
+                                    <ItemDescription class="text-[11px] truncate font-mono">
+                                        {{ formatDateFilter(shot.taken_at, 'long') }}
+                                    </ItemDescription>
+                                </ItemContent>
                             </div>
                         </Item>
                     </ItemGroup>
@@ -639,6 +757,7 @@
     import Emoji from '../../components/Emoji.vue';
     import ImageCropDialog from '../../components/dialogs/ImageCropDialog.vue';
     import { database } from '../../services/database';
+    import { cloudState } from '../../ipc-web/cloudState';
 
     const { t } = useI18n();
     const router = useRouter();
@@ -684,14 +803,56 @@
     const { showFullscreenImageDialog } = useGalleryStore();
     const { currentUser, isLocalUserVrcPlusSupporter } = storeToRefs(useUserStore());
     const { cachedPermissions } = storeToRefs(useAuthStore());
-    const galleryTabs = computed(() => [
-        { value: 'gallery', label: t('dialog.gallery_icons.gallery') },
-        { value: 'icons', label: t('dialog.gallery_icons.icons') },
-        { value: 'emojis', label: t('dialog.gallery_icons.emojis') },
-        { value: 'stickers', label: t('dialog.gallery_icons.stickers') },
-        { value: 'prints', label: t('dialog.gallery_icons.prints') },
-        { value: 'inventory', label: t('dialog.gallery_icons.inventory') }
-    ]);
+    const isWeb = typeof WEB !== 'undefined' && WEB;
+    const cloudScreenshots = ref([]);
+    const cloudScreenshotsLoading = ref(false);
+    const copiedR2Var = ref(false);
+
+    async function loadCloudScreenshots() {
+        if (!isWeb) {
+            return;
+        }
+        cloudScreenshotsLoading.value = true;
+        try {
+            const { cloudFetch } = await import('../../ipc-web/apiClient');
+            cloudScreenshots.value = await cloudFetch('/api/screenshots?limit=120').catch(() => []);
+        } finally {
+            cloudScreenshotsLoading.value = false;
+        }
+    }
+
+    async function copyR2BindingVar() {
+        try {
+            await navigator.clipboard.writeText('R2_MEDIA');
+            copiedR2Var.value = true;
+            setTimeout(() => {
+                copiedR2Var.value = false;
+            }, 2000);
+        } catch {
+            // Clipboard permission unavailable
+        }
+    }
+
+    const galleryTabs = computed(() => {
+        const list = [{ value: 'gallery', label: t('dialog.gallery_icons.gallery') }];
+        if (isWeb) {
+            list.push({ value: 'cloud-gallery', label: t('cloud_hub.gallery.tab_title') });
+        }
+        list.push(
+            { value: 'icons', label: t('dialog.gallery_icons.icons') },
+            { value: 'emojis', label: t('dialog.gallery_icons.emojis') },
+            { value: 'stickers', label: t('dialog.gallery_icons.stickers') },
+            { value: 'prints', label: t('dialog.gallery_icons.prints') },
+            { value: 'inventory', label: t('dialog.gallery_icons.inventory') }
+        );
+        return list;
+    });
+
+    watch(activeTab, (tab) => {
+        if (isWeb && tab === 'cloud-gallery') {
+            loadCloudScreenshots();
+        }
+    });
 
     const emojiAnimFps = ref(15);
     const emojiAnimFrameCount = ref(4);
@@ -745,6 +906,9 @@
     onMounted(() => {
         galleryDialogVisible.value = true;
         loadGalleryData();
+        if (isWeb) {
+            loadCloudScreenshots();
+        }
     });
 
     onBeforeUnmount(() => {

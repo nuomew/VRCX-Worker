@@ -121,7 +121,30 @@ public sealed class ScreenshotPipeline
     }
 
     /// <summary>
-    /// Encodes and uploads a queued screenshot thumbnail strictly during a scheduled sync cycle.
+    /// Prepares screenshot upload bytes and MIME type according to the user's compression preference.
+    /// - compress = true: resizes to <= 1600px and encodes as lossy WebP.
+    /// - compress = false: preserves original image bytes and original MIME type (default).
+    /// </summary>
+    public static (byte[] Bytes, string ContentType) PrepareUploadPayload(string sourcePath, bool compress)
+    {
+        if (compress)
+        {
+            return (EncodeWebpThumbnail(sourcePath), "image/webp");
+        }
+
+        byte[] rawBytes = File.ReadAllBytes(sourcePath);
+        string ext = Path.GetExtension(sourcePath).ToLowerInvariant();
+        string contentType = ext switch
+        {
+            ".jpg" or ".jpeg" => "image/jpeg",
+            ".webp" => "image/webp",
+            _ => "image/png"
+        };
+        return (rawBytes, contentType);
+    }
+
+    /// <summary>
+    /// Uploads a queued screenshot strictly during a scheduled sync cycle when AutoUploadScreenshots is enabled.
     /// </summary>
     public async Task<bool> UploadQueuedTaskAsync(PendingScreenshotTask task, CancellationToken ct)
     {
@@ -136,19 +159,19 @@ public sealed class ScreenshotPipeline
             return true;
         }
 
-        var meta = BuildMetaPayload(task);
+        var meta = BuildMetaPayload(task, cfg.CompressScreenshots);
         try
         {
-            byte[] webpBytes = EncodeWebpThumbnail(task.LocalPath);
+            var (payloadBytes, contentType) = PrepareUploadPayload(task.LocalPath, cfg.CompressScreenshots);
             // Content-addressed SHA-256 prefix (32 hex chars) guarantees idempotent uploads.
-            string screenshotId = HmacSigner.Sha256Hex(webpBytes).Substring(0, 32);
+            string screenshotId = HmacSigner.Sha256Hex(payloadBytes).Substring(0, 32);
             string endpoint = $"{cfg.CloudUrl.TrimEnd('/')}/api/agent/media/screenshots/{screenshotId}";
 
             using var req = new HttpRequestMessage(HttpMethod.Put, endpoint)
             {
-                Content = new ByteArrayContent(webpBytes)
+                Content = new ByteArrayContent(payloadBytes)
             };
-            req.Content.Headers.ContentType = new MediaTypeHeaderValue("image/webp");
+            req.Content.Headers.ContentType = new MediaTypeHeaderValue(contentType);
 
             string metaB64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(JsonConvert.SerializeObject(meta)));
             req.Headers.Add("X-Screenshot-Meta", metaB64);
@@ -193,7 +216,7 @@ public sealed class ScreenshotPipeline
         return await UploadQueuedTaskAsync(task, ct).ConfigureAwait(false);
     }
 
-    private static ScreenshotMetaPayload BuildMetaPayload(PendingScreenshotTask task) => new()
+    private static ScreenshotMetaPayload BuildMetaPayload(PendingScreenshotTask task, bool compressed = false) => new()
     {
         TakenAt = task.TakenAtIso,
         LocalFilename = Path.GetFileName(task.LocalPath),
@@ -204,7 +227,8 @@ public sealed class ScreenshotPipeline
         Metadata = new Dictionary<string, object>
         {
             ["source"] = "vrcx-agent",
-            ["machine"] = Environment.MachineName
+            ["machine"] = Environment.MachineName,
+            ["compressed"] = compressed
         }
     };
 

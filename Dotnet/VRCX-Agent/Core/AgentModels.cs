@@ -23,7 +23,10 @@ public sealed class AgentConfig
     public bool ProxyEnabled { get; set; } = false;
     /// <summary>Optional proxy URL (http/https/socks5) when ProxyEnabled is true; empty follows Windows system proxy.</summary>
     public string ProxyAddress { get; set; } = string.Empty;
-    public bool AutoUploadScreenshots { get; set; } = true;
+    /// <summary>Whether to upload VRChat screenshots to Cloud Gallery on scheduled sync ticks (default: false / off).</summary>
+    public bool AutoUploadScreenshots { get; set; } = false;
+    /// <summary>Whether to resize & compress uploaded screenshots to WebP <=1600px (default: false / upload original).</summary>
+    public bool CompressScreenshots { get; set; } = false;
     public bool WritePngMetadata { get; set; } = true;
     public bool AutoLaunchAppsEnabled { get; set; } = true;
     public string VrChatLogDirectory { get; set; } = string.Empty;
@@ -139,7 +142,7 @@ public sealed class LiveAgentState
     public int PlayerCount { get; set; }
 
     [JsonProperty("agentVersion")]
-    public string AgentVersion { get; set; } = "1.1.0";
+    public string AgentVersion { get; set; } = "1.2.0";
 
     [JsonProperty("machineName")]
     public string MachineName { get; set; } = Environment.MachineName;

@@ -26,6 +26,7 @@ public sealed class SyncSettingsForm : Form
     private readonly RadioButton _mainlandProxyRadio;
     private readonly TextBox _proxyAddressBox;
     private readonly CheckBox _autoUploadScreenshotsCheck;
+    private readonly CheckBox _compressScreenshotsCheck;
     private readonly Label _statusLabel;
     private readonly Button _saveButton;
 
@@ -42,7 +43,7 @@ public sealed class SyncSettingsForm : Form
         MaximizeBox = false;
         MinimizeBox = false;
         StartPosition = FormStartPosition.CenterScreen;
-        ClientSize = new Size(476, 468);
+        ClientSize = new Size(476, 500);
         Font = new Font("Segoe UI", 9.5f);
 
         var urlLabel = new Label
@@ -159,15 +160,28 @@ public sealed class SyncSettingsForm : Form
 
         _autoUploadScreenshotsCheck = new CheckBox
         {
-            Text = "Queue && upload WebP screenshots on each scheduled Web sync tick",
+            Text = "Sync VRChat screenshots to Cloud Gallery (default: Off)",
             Location = new Point(20, 326),
             AutoSize = true,
             Checked = currentConfig.AutoUploadScreenshots
         };
 
+        _compressScreenshotsCheck = new CheckBox
+        {
+            Text = "Compress uploaded screenshots (WebP <=1600px; off = original PNG)",
+            Location = new Point(38, 354),
+            AutoSize = true,
+            Checked = currentConfig.CompressScreenshots,
+            Enabled = currentConfig.AutoUploadScreenshots
+        };
+        _autoUploadScreenshotsCheck.CheckedChanged += (_, _) =>
+        {
+            _compressScreenshotsCheck.Enabled = _autoUploadScreenshotsCheck.Checked;
+        };
+
         _statusLabel = new Label
         {
-            Location = new Point(20, 358),
+            Location = new Point(20, 388),
             Size = new Size(436, 48),
             ForeColor = Color.DimGray,
             Text = "Local logs & screenshots stay buffered on disk outside the Web sync interval and only upload at the next scheduled tick."
@@ -176,7 +190,7 @@ public sealed class SyncSettingsForm : Form
         _saveButton = new Button
         {
             Text = "Test && Save",
-            Location = new Point(252, 418),
+            Location = new Point(252, 448),
             Width = 112,
             Height = 32
         };
@@ -185,7 +199,7 @@ public sealed class SyncSettingsForm : Form
         var cancelButton = new Button
         {
             Text = "Cancel",
-            Location = new Point(374, 418),
+            Location = new Point(374, 448),
             Width = 82,
             Height = 32,
             DialogResult = DialogResult.Cancel
@@ -199,6 +213,7 @@ public sealed class SyncSettingsForm : Form
             scheduleTitleLabel, _webScheduleHintLabel,
             networkGroup,
             _autoUploadScreenshotsCheck,
+            _compressScreenshotsCheck,
             _statusLabel,
             _saveButton, cancelButton
         });
@@ -280,6 +295,7 @@ public sealed class SyncSettingsForm : Form
                 ProxyEnabled = proxyEnabled,
                 ProxyAddress = proxyAddress,
                 AutoUploadScreenshots = _autoUploadScreenshotsCheck.Checked,
+                CompressScreenshots = _compressScreenshotsCheck.Checked,
                 WritePngMetadata = _initialConfig.WritePngMetadata,
                 AutoLaunchAppsEnabled = _initialConfig.AutoLaunchAppsEnabled,
                 VrChatLogDirectory = _initialConfig.VrChatLogDirectory,

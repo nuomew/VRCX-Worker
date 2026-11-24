@@ -39,6 +39,8 @@ public sealed class TrayApplicationContext : ApplicationContext
     private readonly NotifyIcon _trayIcon;
     private readonly ToolStripMenuItem _statusMenuItem;
     private readonly ToolStripMenuItem _proxyModeItem;
+    private readonly ToolStripMenuItem _syncScreenshotsItem;
+    private readonly ToolStripMenuItem _compressScreenshotsItem;
     private readonly ToolStripMenuItem _autoStartItem;
 
     private AgentConfig _config;
@@ -73,6 +75,21 @@ public sealed class TrayApplicationContext : ApplicationContext
         };
         _proxyModeItem.Click += (_, _) => ToggleProxyMode(_proxyModeItem.Checked);
 
+        _syncScreenshotsItem = new ToolStripMenuItem("Sync VRChat Screenshots")
+        {
+            CheckOnClick = true,
+            Checked = _config.AutoUploadScreenshots
+        };
+        _syncScreenshotsItem.Click += (_, _) => ToggleSyncScreenshots(_syncScreenshotsItem.Checked);
+
+        _compressScreenshotsItem = new ToolStripMenuItem("Compress Screenshots (WebP <=1600px)")
+        {
+            CheckOnClick = true,
+            Checked = _config.CompressScreenshots,
+            Enabled = _config.AutoUploadScreenshots
+        };
+        _compressScreenshotsItem.Click += (_, _) => ToggleCompressScreenshots(_compressScreenshotsItem.Checked);
+
         _autoStartItem = new ToolStripMenuItem("Start with Windows")
         {
             CheckOnClick = true,
@@ -85,6 +102,8 @@ public sealed class TrayApplicationContext : ApplicationContext
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("Sync Settings (URL, Secret && Proxy)...", null, (_, _) => ShowSyncSettingsDialog());
         menu.Items.Add(_proxyModeItem);
+        menu.Items.Add(_syncScreenshotsItem);
+        menu.Items.Add(_compressScreenshotsItem);
         menu.Items.Add("Sync Now", null, (_, _) => _ = RunSyncCycleAsync(force: true, _cts.Token));
         menu.Items.Add("Open Cloud Web UI", null, (_, _) => OpenCloudWebUi());
         menu.Items.Add(_autoStartItem);
@@ -390,6 +409,9 @@ public sealed class TrayApplicationContext : ApplicationContext
             _config = dialog.SavedConfig;
             _configStore.SaveConfig(_config);
             _proxyModeItem.Checked = _config.ProxyEnabled;
+            _syncScreenshotsItem.Checked = _config.AutoUploadScreenshots;
+            _compressScreenshotsItem.Checked = _config.CompressScreenshots;
+            _compressScreenshotsItem.Enabled = _config.AutoUploadScreenshots;
             RebuildCloudHttpClient();
             _consecutiveFailures = 0;
             _lastSyncError = string.Empty;
@@ -417,6 +439,36 @@ public sealed class TrayApplicationContext : ApplicationContext
                 $"Connected ({_config.DeviceName}) · {ProxyHttpClientFactory.DescribeMode(_config)} · Web interval {_scheduleGate.IntervalSeconds}s (next {nextLocal}).",
                 ToolTipIcon.Info);
         }
+    }
+
+    private void ToggleSyncScreenshots(bool enabled)
+    {
+        _config.AutoUploadScreenshots = enabled;
+        _configStore.SaveConfig(_config);
+        _compressScreenshotsItem.Enabled = enabled;
+        UpdateTrayStatus();
+        _trayIcon.ShowBalloonTip(
+            2500,
+            "VRCX Cloud Agent",
+            enabled
+                ? (_config.CompressScreenshots
+                    ? "VRChat screenshot sync ON (WebP compression enabled)."
+                    : "VRChat screenshot sync ON (original image quality).")
+                : "VRChat screenshot sync OFF.",
+            ToolTipIcon.Info);
+    }
+
+    private void ToggleCompressScreenshots(bool compress)
+    {
+        _config.CompressScreenshots = compress;
+        _configStore.SaveConfig(_config);
+        _trayIcon.ShowBalloonTip(
+            2500,
+            "VRCX Cloud Agent",
+            compress
+                ? "Screenshot compression ON (WebP <=1600px)."
+                : "Screenshot compression OFF (upload original PNG).",
+            ToolTipIcon.Info);
     }
 
     private void ToggleProxyMode(bool enableProxy)
