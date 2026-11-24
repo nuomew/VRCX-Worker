@@ -51,11 +51,11 @@ export const useUpdateLoopStore = defineStore('UpdateLoop', () => {
         () => watchState.isLoggedIn,
         () => {
             const isWebMode = typeof WEB !== 'undefined' && WEB;
-            const minPollSec = isWebMode ? Math.max(600, cloudState.syncIntervalSeconds || 60) : 300;
+            const minPollSec = isWebMode ? Math.max(600, cloudState.webSyncIntervalSeconds || 300) : 300;
             state.nextCurrentUserRefresh = minPollSec;
             state.nextFriendsRefresh = Math.max(3600, minPollSec);
             state.nextGroupInstanceRefresh = 0;
-            state.nextBundleCheck = isWebMode ? Math.max(600, cloudState.syncIntervalSeconds || 60) : 60;
+            state.nextBundleCheck = isWebMode ? Math.max(600, cloudState.webSyncIntervalSeconds || 300) : 60;
         },
         { flush: 'sync' }
     );
@@ -74,7 +74,7 @@ export const useUpdateLoopStore = defineStore('UpdateLoop', () => {
                 const isWebMode = typeof WEB !== 'undefined' && WEB;
                 const isTabHidden =
                     isWebMode && typeof document !== 'undefined' && document.visibilityState === 'hidden';
-                const webMinIntervalSec = isWebMode ? Math.max(600, cloudState.syncIntervalSeconds || 60) : 300;
+                const webMinIntervalSec = isWebMode ? Math.max(600, cloudState.webSyncIntervalSeconds || 300) : 300;
                 if (--state.nextCurrentUserRefresh <= 0) {
                     state.nextCurrentUserRefresh = webMinIntervalSec; // >= 10min on Web (pipeline WS pushes live updates)
                     if (!isTabHidden) {

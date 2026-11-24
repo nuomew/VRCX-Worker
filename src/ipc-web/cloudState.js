@@ -3,9 +3,11 @@ import { reactive } from 'vue';
 export const DEFAULT_CLOUD_SYNC_INTERVAL_SECONDS = 60;
 export const MIN_CLOUD_SYNC_INTERVAL_SECONDS = 30;
 export const MAX_CLOUD_SYNC_INTERVAL_SECONDS = 3600;
+export const DEFAULT_WEB_SYNC_INTERVAL_SECONDS = 300;
+export const MIN_WEB_SYNC_INTERVAL_SECONDS = 60;
 
 /**
- * Normalizes a user or server-supplied sync interval into [30, 3600] seconds (default 60s).
+ * Normalizes a user or server-supplied VRCX.Agent sync interval into [30, 3600] seconds (default 60s).
  *
  * @param {unknown} raw
  * @returns {number}
@@ -16,6 +18,20 @@ export function clampSyncIntervalSeconds(raw) {
         return DEFAULT_CLOUD_SYNC_INTERVAL_SECONDS;
     }
     return Math.min(Math.max(Math.round(n), MIN_CLOUD_SYNC_INTERVAL_SECONDS), MAX_CLOUD_SYNC_INTERVAL_SECONDS);
+}
+
+/**
+ * Normalizes a user or server-supplied Cloud/Web sync interval into [60, 3600] seconds (default 300s = 5 min).
+ *
+ * @param {unknown} raw
+ * @returns {number}
+ */
+export function clampWebSyncIntervalSeconds(raw) {
+    const n = Number(raw);
+    if (!Number.isFinite(n) || n <= 0) {
+        return DEFAULT_WEB_SYNC_INTERVAL_SECONDS;
+    }
+    return Math.min(Math.max(Math.round(n), MIN_WEB_SYNC_INTERVAL_SECONDS), MAX_CLOUD_SYNC_INTERVAL_SECONDS);
 }
 
 /**
@@ -31,8 +47,13 @@ export const cloudState = reactive({
     wsConnected: false,
     r2Enabled: false,
     cloudFallbackAllowed: true,
-    /** Authoritative sync interval in seconds (default 60s), shared by Web polling/caching and VRCX.Agent. */
+    /** Authoritative VRCX.Agent periodic upload interval in seconds (default 60s). */
     syncIntervalSeconds: DEFAULT_CLOUD_SYNC_INTERVAL_SECONDS,
+    /**
+     * Authoritative Cloud/Web sync interval in seconds (default 300s = 5 min) for Web throttling and offline Cron Feed
+     * sync.
+     */
+    webSyncIntervalSeconds: DEFAULT_WEB_SYNC_INTERVAL_SECONDS,
     /** @type {'agent_residential_ip' | 'cloud_direct' | 'offline' | ''} */
     lastVrcRoute: '',
     /** @type {string[]} All active/known companion devices (WS + HTTP sync). */
@@ -165,6 +186,7 @@ export function syncGameRunningBridge(nowMs = Date.now()) {
  *     deviceStates?: Record<string, { state: Record<string, any>; updatedAt: string }>;
  *     totalUptimeSeconds?: number;
  *     syncIntervalSeconds?: number;
+ *     webSyncIntervalSeconds?: number;
  *     replaceDeviceMap?: boolean;
  * }} payload
  */
@@ -173,6 +195,9 @@ export function applyCloudPresenceUpdate(payload) {
     const nowMs = Date.now();
     if (payload.syncIntervalSeconds !== undefined) {
         cloudState.syncIntervalSeconds = clampSyncIntervalSeconds(payload.syncIntervalSeconds);
+    }
+    if (payload.webSyncIntervalSeconds !== undefined) {
+        cloudState.webSyncIntervalSeconds = clampWebSyncIntervalSeconds(payload.webSyncIntervalSeconds);
     }
     if (payload.deviceLastSeen && typeof payload.deviceLastSeen === 'object') {
         if (payload.replaceDeviceMap) {

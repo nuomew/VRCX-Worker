@@ -1,5 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { bootstrapCache, loadBootstrap, scheduleConfigPatch } from '../bootstrapCache.js';
+import {
+    bootstrapCache,
+    loadBootstrap,
+    saveCloudSyncIntervalSeconds,
+    saveWebSyncIntervalSeconds,
+    scheduleConfigPatch
+} from '../bootstrapCache.js';
 import {
     applyCloudPresenceUpdate,
     cloudState,
@@ -43,6 +49,8 @@ describe('WEB cloud adapter (stateless)', () => {
         cloudState.wsAgentsOnline = [];
         cloudState.deviceStates = {};
         cloudState.lastVrcRoute = '';
+        cloudState.syncIntervalSeconds = 60;
+        cloudState.webSyncIntervalSeconds = 300;
         fetchSpy = vi.spyOn(globalThis, 'fetch');
     });
 
@@ -190,8 +198,32 @@ describe('WEB cloud adapter (stateless)', () => {
         expect(fetchSpy.mock.calls[2][0]).toContain('/api/gamelog/search?q=Shrine');
     });
 
-    it('throttles repetitive api.vrchat.cloud GET sync calls within cloudState.syncIntervalSeconds and invalidates volatile cache on writes', async () => {
+    it('throttles repetitive api.vrchat.cloud GET sync calls using independent cloudState.webSyncIntervalSeconds (default 300s) and invalidates volatile cache on writes', async () => {
+        // Default webSyncIntervalSeconds is 300s even when VRCX.Agent syncIntervalSeconds is 60s
         cloudState.syncIntervalSeconds = 60;
+        expect(cloudState.webSyncIntervalSeconds).toBe(300);
+
+        // Saving webSyncIntervalSeconds writes cloud:webSyncIntervalSeconds without altering VRCX.Agent syncIntervalSeconds
+        fetchSpy.mockResolvedValueOnce(mockOk({ saved: true }));
+        expect(await saveWebSyncIntervalSeconds(60)).toBe(60);
+        expect(cloudState.webSyncIntervalSeconds).toBe(60);
+        expect(cloudState.syncIntervalSeconds).toBe(60);
+        expect(JSON.parse(fetchSpy.mock.calls[0][1].body)).toEqual({
+            bundleKey: 'vrcx_config',
+            patch: { 'cloud:webSyncIntervalSeconds': '60' }
+        });
+
+        // Saving VRCX.Agent syncIntervalSeconds writes cloud:syncIntervalSeconds without altering webSyncIntervalSeconds
+        fetchSpy.mockResolvedValueOnce(mockOk({ saved: true }));
+        expect(await saveCloudSyncIntervalSeconds(180)).toBe(180);
+        expect(cloudState.syncIntervalSeconds).toBe(180);
+        expect(cloudState.webSyncIntervalSeconds).toBe(60);
+        expect(JSON.parse(fetchSpy.mock.calls[1][1].body)).toEqual({
+            bundleKey: 'vrcx_config',
+            patch: { 'cloud:syncIntervalSeconds': '180' }
+        });
+
+        fetchSpy.mockClear();
         const webApi = createWebApiBridge();
         const friendsUrl = 'https://api.vrchat.cloud/api/1/auth/user/friends?offline=false&n=50&offset=0';
 
@@ -201,13 +233,13 @@ describe('WEB cloud adapter (stateless)', () => {
         expect(first.status).toBe(200);
         expect(fetchSpy).toHaveBeenCalledTimes(1);
 
-        // Within 60s sync interval -> served from cache with 0 extra Worker / api.vrchat.cloud calls
+        // Within 60s webSyncIntervalSeconds -> served from cache with 0 extra Worker / api.vrchat.cloud calls
         await vi.advanceTimersByTimeAsync(30_000);
         const second = JSON.parse(await webApi.ExecuteJson(JSON.stringify({ url: friendsUrl, method: 'GET' })));
         expect(second).toEqual(first);
         expect(fetchSpy).toHaveBeenCalledTimes(1);
 
-        // After 60s window expires -> fetches fresh data
+        // After 60s webSyncIntervalSeconds window expires (even while Agent syncIntervalSeconds=180s) -> fetches fresh data
         await vi.advanceTimersByTimeAsync(31_000);
         fetchSpy.mockResolvedValueOnce(mockOk({ status: 200, data: '[{"id":"usr_f2"}]', route: 'cloud_direct' }));
         const third = JSON.parse(await webApi.ExecuteJson(JSON.stringify({ url: friendsUrl, method: 'GET' })));
@@ -226,7 +258,7 @@ describe('WEB cloud adapter (stateless)', () => {
     });
 
     it('coalesces concurrent read GETs into one /api/vrc/execute-batch call and preserves stable entity cache across unrelated writes', async () => {
-        cloudState.syncIntervalSeconds = 60;
+        cloudState.webSyncIntervalSeconds = 60;
         const webApi = createWebApiBridge();
         const worldUrl = 'https://api.vrchat.cloud/api/1/worlds/wrld_abc';
         const instanceUrl = 'https://api.vrchat.cloud/api/1/instances/wrld_abc:12345';

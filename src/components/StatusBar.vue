@@ -887,6 +887,7 @@
                     deviceStates: data?.deviceStates,
                     totalUptimeSeconds: data?.totalUptimeSeconds,
                     syncIntervalSeconds: data?.syncIntervalSeconds,
+                    webSyncIntervalSeconds: data?.webSyncIntervalSeconds,
                     replaceDeviceMap: true
                 });
             } catch {

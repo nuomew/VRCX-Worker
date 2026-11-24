@@ -237,7 +237,7 @@
                                             t('cloud_hub.bg_feed.desc', {
                                                 seconds:
                                                     bgSyncStatus?.effectiveCronIntervalSeconds ??
-                                                    Math.max(syncIntervalInput || 60, 60)
+                                                    Math.max(cloudState.webSyncIntervalSeconds || 300, 60)
                                             })
                                         }}
                                     </div>

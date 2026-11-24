@@ -1,5 +1,10 @@
 import type { Env } from '../env';
-import { incrementCounter, parseCloudSyncIntervalSeconds, upsertEntityWorld } from '../routes/coreData';
+import {
+    incrementCounter,
+    parseCloudSyncIntervalSeconds,
+    parseWebSyncIntervalSeconds,
+    upsertEntityWorld
+} from '../routes/coreData';
 import { ingestFeedItems } from '../routes/eventsData';
 import { buildCookieHeader, loadCookieJar, mergeSetCookies, saveCookieJar, VRC_USER_AGENT } from '../routes/vrcProxy';
 
@@ -282,7 +287,8 @@ export function diffFriendSnapshot(
 async function readPollerState(env: Env): Promise<{
     meta: PollerMeta;
     snapshot: FriendSnapshotMap | null;
-    syncIntervalSeconds: number;
+    agentSyncIntervalSeconds: number;
+    webSyncIntervalSeconds: number;
     enabled: boolean;
     cookieUpdatedAt: string;
 }> {
@@ -297,7 +303,8 @@ async function readPollerState(env: Env): Promise<{
 
     const cfgRow = (cfgRes?.results?.[0] ?? null) as { payload_json?: string } | null;
     const cfg = safeJsonParse<Record<string, string>>(cfgRow?.payload_json, {});
-    const syncIntervalSeconds = parseCloudSyncIntervalSeconds(cfg['cloud:syncIntervalSeconds']);
+    const agentSyncIntervalSeconds = parseCloudSyncIntervalSeconds(cfg['cloud:syncIntervalSeconds']);
+    const webSyncIntervalSeconds = parseWebSyncIntervalSeconds(cfg['cloud:webSyncIntervalSeconds']);
     // Default enabled so closing the browser tab automatically continues recording Feed & Notifications.
     const enabled = cfg[BG_FEED_SYNC_CONFIG_KEY] !== 'false';
 
@@ -316,7 +323,14 @@ async function readPollerState(env: Env): Promise<{
     }
 
     const vaultRow = (vaultRes?.results?.[0] ?? null) as { updated_at?: string } | null;
-    return { meta, snapshot, syncIntervalSeconds, enabled, cookieUpdatedAt: vaultRow?.updated_at ?? '' };
+    return {
+        meta,
+        snapshot,
+        agentSyncIntervalSeconds,
+        webSyncIntervalSeconds,
+        enabled,
+        cookieUpdatedAt: vaultRow?.updated_at ?? ''
+    };
 }
 
 async function writePollerMeta(env: Env, meta: PollerMeta, nowIso: string): Promise<void> {
@@ -372,16 +386,19 @@ export async function clearBgSyncBackoff(env: Env): Promise<void> {
 
 export async function getBackgroundFeedSyncStatus(env: Env): Promise<{
     enabled: boolean;
-    syncIntervalSeconds: number;
+    webSyncIntervalSeconds: number;
     effectiveCronIntervalSeconds: number;
     hasVrcSession: boolean;
     meta: PollerMeta;
 }> {
-    const [{ meta, syncIntervalSeconds, enabled }, jar] = await Promise.all([readPollerState(env), loadCookieJar(env)]);
+    const [{ meta, webSyncIntervalSeconds, enabled }, jar] = await Promise.all([
+        readPollerState(env),
+        loadCookieJar(env)
+    ]);
     return {
         enabled,
-        syncIntervalSeconds,
-        effectiveCronIntervalSeconds: Math.max(syncIntervalSeconds, 60),
+        webSyncIntervalSeconds,
+        effectiveCronIntervalSeconds: Math.max(webSyncIntervalSeconds, 60),
         hasVrcSession: Boolean(jar.auth?.trim()),
         meta
     };
@@ -730,7 +747,7 @@ async function pollNotifications(
 
 /**
  * Executes one scheduled or manual cloud-side VRChat Feed & Notification sync cycle.
- * Strictly obeys the Web-configured `syncIntervalSeconds` (min 60s on Cloudflare Cron),
+ * Strictly obeys the independent Web/Cloud `webSyncIntervalSeconds` (default 300s = 5 min, min 60s on Cloudflare Cron),
  * skips external VRChat API requests when a browser tab is actively connected (unless `force` is true),
  * and stays well within Cloudflare Free Tier Worker/D1/subrequest guardrails with zero DO wakeups.
  */
@@ -742,7 +759,8 @@ export async function runBackgroundFeedSync(
     const nowMs = Date.now();
     const nowIso = new Date(nowMs).toISOString();
 
-    const { meta, snapshot, syncIntervalSeconds, enabled, cookieUpdatedAt } = await readPollerState(env);
+    const { meta, snapshot, agentSyncIntervalSeconds, webSyncIntervalSeconds, enabled, cookieUpdatedAt } =
+        await readPollerState(env);
 
     if (!force && !enabled) {
         return {
@@ -756,10 +774,10 @@ export async function runBackgroundFeedSync(
     }
 
     // Defer to live browser WebSocket while a Web tab is actively open (unless manually triggered).
-    // StatusBar sends heartbeats every max(syncInterval*2, 180)s, and tab close fires ?closing=1 to clear webLastActiveAt immediately.
+    // StatusBar sends heartbeats every max(agentSyncInterval*2, 180)s, and tab close fires ?closing=1 to clear webLastActiveAt immediately.
     if (!force && meta.webLastActiveAt) {
         const webActiveMs = Date.parse(meta.webLastActiveAt);
-        const activeWindowMs = (Math.max(syncIntervalSeconds * 2, 180) + 45) * 1000;
+        const activeWindowMs = (Math.max(agentSyncIntervalSeconds * 2, 180) + 45) * 1000;
         if (Number.isFinite(webActiveMs) && nowMs - webActiveMs <= activeWindowMs) {
             return {
                 ran: false,
@@ -793,7 +811,7 @@ export async function runBackgroundFeedSync(
 
     if (!force && meta.lastRunAt) {
         const lastRunMs = Date.parse(meta.lastRunAt);
-        const minIntervalMs = Math.max(syncIntervalSeconds, 60) * 1000 - 3_000; // 3s cron jitter tolerance
+        const minIntervalMs = Math.max(webSyncIntervalSeconds, 60) * 1000 - 3_000; // 3s cron jitter tolerance
         if (Number.isFinite(lastRunMs) && nowMs - lastRunMs < minIntervalMs) {
             return {
                 ran: false,

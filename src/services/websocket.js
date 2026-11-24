@@ -115,7 +115,7 @@ function connectWebSocketUrl(wsUrl) {
         if (!webSocketClosedGracefully && watchState.isLoggedIn && watchState.isFriendsLoaded) {
             console.warn('WebSocket reconnected after unexpected closure');
             webSocketClosedGracefully = true;
-            const cooldownMs = isWebMode ? Math.max(60, cloudState.syncIntervalSeconds || 60) * 1000 : 0;
+            const cooldownMs = isWebMode ? Math.max(60, cloudState.webSyncIntervalSeconds || 300) * 1000 : 0;
             if (!isWebMode || Date.now() - lastWsReconnectRefreshAt >= cooldownMs) {
                 lastWsReconnectRefreshAt = Date.now();
                 notificationStore.refreshNotifications();

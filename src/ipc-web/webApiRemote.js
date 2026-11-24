@@ -1,5 +1,5 @@
 import { cloudFetch } from './apiClient.js';
-import { clampSyncIntervalSeconds, cloudState } from './cloudState.js';
+import { clampWebSyncIntervalSeconds, cloudState } from './cloudState.js';
 
 const MAX_CACHE_ENTRIES = 800;
 const MAX_BATCH_SIZE = 12;
@@ -70,13 +70,13 @@ function classifyThrottleableReadGet(options) {
 }
 
 /**
- * Computes tiered TTL in milliseconds respecting the user's authoritative cloud sync interval.
+ * Computes tiered TTL in milliseconds respecting the user's independent Web/Cloud sync interval.
  *
  * @param {'static' | 'entity' | 'dynamic' | 'volatile'} tier
  * @returns {number}
  */
 function getTierTtlMs(tier) {
-    const baseSec = clampSyncIntervalSeconds(cloudState.syncIntervalSeconds);
+    const baseSec = clampWebSyncIntervalSeconds(cloudState.webSyncIntervalSeconds);
     if (tier === 'static') return Math.max(600, baseSec) * 1000;
     if (tier === 'entity') return Math.max(300, baseSec) * 1000;
     if (tier === 'dynamic') return Math.max(120, baseSec) * 1000;
@@ -92,11 +92,23 @@ function getTierTtlMs(tier) {
  * 4. Bypassing AgentHubDO whenever no WebSocket RPC agent is connected (`preferCloudDirect: true`)
  */
 export function createWebApiBridge() {
-    /** @type {Map<string, { expiresAt: number; responseJson: string; tier: 'static' | 'entity' | 'dynamic' | 'volatile' }>} */
+    /**
+     * @type {Map<
+     *     string,
+     *     { expiresAt: number; responseJson: string; tier: 'static' | 'entity' | 'dynamic' | 'volatile' }
+     * >}
+     */
     const getCache = new Map();
     /** @type {Map<string, Promise<string>>} */
     const inflightGets = new Map();
-    /** @type {Array<{ options: Record<string, any>; cacheKey: string; tier: 'static' | 'entity' | 'dynamic' | 'volatile'; resolve: (val: string) => void }>} */
+    /**
+     * @type {{
+     *     options: Record<string, any>;
+     *     cacheKey: string;
+     *     tier: 'static' | 'entity' | 'dynamic' | 'volatile';
+     *     resolve: (val: string) => void;
+     * }[]}
+     */
     let pendingBatch = [];
     let batchScheduled = false;
 
@@ -149,10 +161,10 @@ export function createWebApiBridge() {
     function shouldPreferCloudDirect(options) {
         return Boolean(
             options &&
-                typeof options === 'object' &&
-                cloudState.wsAgentsOnline.length === 0 &&
-                cloudState.cloudFallbackAllowed &&
-                options.preferCloudDirect === undefined
+            typeof options === 'object' &&
+            cloudState.wsAgentsOnline.length === 0 &&
+            cloudState.cloudFallbackAllowed &&
+            options.preferCloudDirect === undefined
         );
     }
 

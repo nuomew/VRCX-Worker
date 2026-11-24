@@ -34,7 +34,10 @@
                 </div>
             </div>
 
-            <div v-if="!isWeb" class="flex flex-col gap-0.5 px-1 py-1 cursor-pointer" @click="openExternalLink(links.discord)">
+            <div
+                v-if="!isWeb"
+                class="flex flex-col gap-0.5 px-1 py-1 cursor-pointer"
+                @click="openExternalLink(links.discord)">
                 <div class="flex-1">
                     <span class="block truncate font-medium text-sm leading-[18px]">{{
                         t('view.settings.general.general.support')
@@ -48,7 +51,7 @@
                 :label="t('cloud_hub.settings.sync_interval_label')"
                 :description="t('cloud_hub.settings.sync_interval_desc')">
                 <Select
-                    :model-value="String(cloudState.syncIntervalSeconds)"
+                    :model-value="String(cloudState.webSyncIntervalSeconds)"
                     @update:model-value="onSelectCloudSyncInterval">
                     <SelectTrigger size="sm" class="min-w-[165px]">
                         <SelectValue />
@@ -224,7 +227,7 @@
     import { useGeneralSettingsStore, useVRCXUpdaterStore } from '@/stores';
     import { links } from '@/shared/constants';
     import { openExternalLink } from '@/shared/utils';
-    import { saveCloudSyncIntervalSeconds } from '@/ipc-web/bootstrapCache';
+    import { saveWebSyncIntervalSeconds } from '@/ipc-web/bootstrapCache';
     import { cloudState } from '@/ipc-web/cloudState';
 
     import SettingsGroup from '../SettingsGroup.vue';
@@ -272,7 +275,7 @@
 
     async function onSelectCloudSyncInterval(val) {
         try {
-            const saved = await saveCloudSyncIntervalSeconds(val);
+            const saved = await saveWebSyncIntervalSeconds(val);
             toast.success(t('cloud_hub.settings.sync_interval_saved_toast', { seconds: saved }));
         } catch (err) {
             toast.error(t('cloud_hub.settings.sync_interval_failed_toast', { error: err?.message || err }));

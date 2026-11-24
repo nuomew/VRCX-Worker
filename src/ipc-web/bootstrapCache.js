@@ -1,5 +1,10 @@
 import { cloudFetch } from './apiClient.js';
-import { applyCloudPresenceUpdate, clampSyncIntervalSeconds, cloudState } from './cloudState.js';
+import {
+    applyCloudPresenceUpdate,
+    clampSyncIntervalSeconds,
+    clampWebSyncIntervalSeconds,
+    cloudState
+} from './cloudState.js';
 
 /**
  * Pure in-memory session cache hydrated by a single GET /api/bootstrap request.
@@ -19,17 +24,22 @@ export const bootstrapCache = {
     avatarMemos: new Map(),
     /** @type {Map<string, { userId: string; displayName: string; note: string; createdAt: string }>} */
     notes: new Map(),
-    /** @type {Array<{ id: number; created_at: string; user_id: string; group_name: string }>} */
+    /** @type {{ id: number; created_at: string; user_id: string; group_name: string }[]} */
     favoriteFriends: [],
-    /** @type {Array<{ id: number; created_at: string; world_id: string; group_name: string }>} */
+    /** @type {{ id: number; created_at: string; world_id: string; group_name: string }[]} */
     favoriteWorlds: [],
-    /** @type {Array<{ id: number; created_at: string; avatar_id: string; group_name: string }>} */
+    /** @type {{ id: number; created_at: string; avatar_id: string; group_name: string }[]} */
     favoriteAvatars: [],
-    /** @type {Array<{ id: number; print_id: string; created_at: string }>} */
+    /** @type {{ id: number; print_id: string; created_at: string }[]} */
     favoritePrints: [],
-    /** @type {Array<{ avatar_id: string; tag: string; color: string | null }>} */
+    /** @type {{ avatar_id: string; tag: string; color: string | null }[]} */
     avatarTags: [],
-    /** @type {Map<string, { userId: string; updatedAt: string; displayName: string; block: boolean; mute: boolean }>} */
+    /**
+     * @type {Map<
+     *     string,
+     *     { userId: string; updatedAt: string; displayName: string; block: boolean; mute: boolean }
+     * >}
+     */
     moderations: new Map(),
     /** @type {Map<string, { userId: string; bio: string; bioLinks: any[]; updatedAt: string }>} */
     userProfiles: new Map(),
@@ -111,6 +121,9 @@ export async function loadBootstrap() {
     cloudState.syncIntervalSeconds = clampSyncIntervalSeconds(
         data.syncIntervalSeconds ?? bootstrapCache.configs['cloud:syncIntervalSeconds']
     );
+    cloudState.webSyncIntervalSeconds = clampWebSyncIntervalSeconds(
+        data.webSyncIntervalSeconds ?? bootstrapCache.configs['cloud:webSyncIntervalSeconds']
+    );
 
     if (data.agentStatus) {
         const wsOnline = Array.isArray(data.agentStatus.wsAgentsOnline)
@@ -175,10 +188,9 @@ if (typeof window !== 'undefined' && typeof window.addEventListener === 'functio
 }
 
 /**
- * Updates and immediately persists the authoritative cloud sync interval (in seconds)
- * so both Web throttling and connected Windows VRCX.Agent pick up the new schedule.
+ * Updates and immediately persists the Windows VRCX.Agent periodic upload interval (in seconds, default 60s).
  *
- * @param {number|string} rawSeconds
+ * @param {number | string} rawSeconds
  * @returns {Promise<number>}
  */
 export async function saveCloudSyncIntervalSeconds(rawSeconds) {
@@ -190,6 +202,27 @@ export async function saveCloudSyncIntervalSeconds(rawSeconds) {
         json: {
             bundleKey: 'vrcx_config',
             patch: { 'cloud:syncIntervalSeconds': String(clamped) }
+        }
+    });
+    return clamped;
+}
+
+/**
+ * Updates and immediately persists the independent Web/Cloud sync interval (in seconds, default 300s = 5 min),
+ * controlling Web VRChat API throttling and Cloudflare Cron offline background Feed/Notification sync.
+ *
+ * @param {number | string} rawSeconds
+ * @returns {Promise<number>}
+ */
+export async function saveWebSyncIntervalSeconds(rawSeconds) {
+    const clamped = clampWebSyncIntervalSeconds(rawSeconds);
+    cloudState.webSyncIntervalSeconds = clamped;
+    bootstrapCache.configs['cloud:webSyncIntervalSeconds'] = String(clamped);
+    await cloudFetch('/api/config/bundle', {
+        method: 'PUT',
+        json: {
+            bundleKey: 'vrcx_config',
+            patch: { 'cloud:webSyncIntervalSeconds': String(clamped) }
         }
     });
     return clamped;

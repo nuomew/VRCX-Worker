@@ -971,7 +971,15 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
 
         try {
             // 1. While Web tab is active (bootstrap just ran), scheduled Cron defers cleanly without calling VRChat API
-            await exports.default.fetch('http://example.com/api/bootstrap');
+            // Also verify bootstrap reports independent webSyncIntervalSeconds (default 300s) even though agent syncIntervalSeconds is 180s
+            const bootRes = await exports.default.fetch('http://example.com/api/bootstrap');
+            const bootJson = (await bootRes.json()) as {
+                ok: boolean;
+                data: { syncIntervalSeconds: number; webSyncIntervalSeconds: number };
+            };
+            expect(bootJson.data.syncIntervalSeconds).toBe(180);
+            expect(bootJson.data.webSyncIntervalSeconds).toBe(300);
+
             const deferred = await runBackgroundFeedSync(env, { trigger: 'cron' });
             expect(deferred.ran).toBe(false);
             expect(deferred.status).toBe('skipped_web_active');
@@ -990,20 +998,21 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
             expect(r1.feedInserted).toBe(0);
             expect(r1.bioChecked).toBe(2);
 
-            // Immediate second cron tick before syncIntervalSeconds elapses is gated without VRChat calls
+            // Immediate second cron tick before webSyncIntervalSeconds elapses is gated without VRChat calls
             const gated = await runBackgroundFeedSync(env, { trigger: 'cron' });
             expect(gated.ran).toBe(false);
             expect(gated.status).toBe('skipped_interval');
 
-            // Earlier test configured syncIntervalSeconds = 180s: backdating only 120s must still gate (strictly obeys Web interval)
-            const twoMinAgo = new Date(Date.now() - 120_000).toISOString();
+            // Earlier test configured VRCX.Agent syncIntervalSeconds = 180s, while independent Cloud/Web webSyncIntervalSeconds defaults to 300s (5m):
+            // backdating 240s (> 180s agent interval, < 300s cloud interval) MUST still gate!
             const fourMinAgo = new Date(Date.now() - 240_000).toISOString();
+            const sixMinAgo = new Date(Date.now() - 360_000).toISOString();
             const fifteenMinAgo = new Date(Date.now() - 15 * 60_000).toISOString();
             const metaRow = await env.DB_CORE.prepare(
                 "SELECT payload_json FROM cloud_bg_sync_state WHERE state_key = 'poller_meta'"
             ).first<{ payload_json: string }>();
             const metaObj = JSON.parse(metaRow!.payload_json) as Record<string, unknown>;
-            metaObj.lastRunAt = twoMinAgo;
+            metaObj.lastRunAt = fourMinAgo;
             await env.DB_CORE.prepare("UPDATE cloud_bg_sync_state SET payload_json = ? WHERE state_key = 'poller_meta'")
                 .bind(JSON.stringify(metaObj))
                 .run();
@@ -1011,8 +1020,8 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
             expect(stillGated.ran).toBe(false);
             expect(stillGated.status).toBe('skipped_interval');
 
-            // Backdate past 180s (240s) and Alice's cached profile past 10m (15m) -> next scheduled tick executes
-            metaObj.lastRunAt = fourMinAgo;
+            // Backdate past 300s (360s) and Alice's cached profile past 10m (15m) -> next scheduled tick executes
+            metaObj.lastRunAt = sixMinAgo;
             await env.DB_CORE.batch([
                 env.DB_CORE.prepare(
                     "UPDATE cloud_bg_sync_state SET payload_json = ? WHERE state_key = 'poller_meta'"

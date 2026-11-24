@@ -81,12 +81,23 @@ export async function upsertEntityWorld(db: D1Database, worldId: string, worldNa
 export const DEFAULT_CLOUD_SYNC_INTERVAL_SECONDS = 60;
 export const MIN_CLOUD_SYNC_INTERVAL_SECONDS = 30;
 export const MAX_CLOUD_SYNC_INTERVAL_SECONDS = 3600;
+export const DEFAULT_WEB_SYNC_INTERVAL_SECONDS = 300;
+export const MIN_WEB_SYNC_INTERVAL_SECONDS = 60;
 export const CLOUD_TOTAL_UPTIME_COUNTER_KEY = 'cloud_total_uptime_seconds';
 
 export function parseCloudSyncIntervalSeconds(raw: unknown): number {
     const n = Number(raw);
     if (!Number.isFinite(n) || n <= 0) return DEFAULT_CLOUD_SYNC_INTERVAL_SECONDS;
     return Math.min(Math.max(Math.round(n), MIN_CLOUD_SYNC_INTERVAL_SECONDS), MAX_CLOUD_SYNC_INTERVAL_SECONDS);
+}
+
+/**
+ * Parses the independent Web / Cloud background sync interval (default 300s = 5 minutes, range [60, 3600]s).
+ */
+export function parseWebSyncIntervalSeconds(raw: unknown): number {
+    const n = Number(raw);
+    if (!Number.isFinite(n) || n <= 0) return DEFAULT_WEB_SYNC_INTERVAL_SECONDS;
+    return Math.min(Math.max(Math.round(n), MIN_WEB_SYNC_INTERVAL_SECONDS), MAX_CLOUD_SYNC_INTERVAL_SECONDS);
 }
 
 /**
@@ -238,6 +249,7 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
 
         const vrcxConfigs = bundles.vrcx_config ?? {};
         const syncIntervalSeconds = parseCloudSyncIntervalSeconds(vrcxConfigs['cloud:syncIntervalSeconds']);
+        const webSyncIntervalSeconds = parseWebSyncIntervalSeconds(vrcxConfigs['cloud:webSyncIntervalSeconds']);
         const nowIso = new Date().toISOString();
         const nowMs = Date.parse(nowIso);
         const totalUptimeSeconds = await accrueCloudUptime(env.DB_CORE, nowIso, Math.max(syncIntervalSeconds * 3, 360));
@@ -294,6 +306,7 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
                 configs: vrcxConfigs,
                 storage: bundles.vrcx_storage ?? {},
                 syncIntervalSeconds,
+                webSyncIntervalSeconds,
                 totalUptimeSeconds,
                 memos: batchRes[1]?.results ?? [],
                 worldMemos: batchRes[2]?.results ?? [],
@@ -904,6 +917,7 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
         const cfgRow = (cfgRes?.results?.[0] ?? null) as { payload_json?: string } | null;
         const cfg = safeJsonParse<Record<string, string>>(cfgRow?.payload_json, {});
         const syncIntervalSeconds = parseCloudSyncIntervalSeconds(cfg['cloud:syncIntervalSeconds']);
+        const webSyncIntervalSeconds = parseWebSyncIntervalSeconds(cfg['cloud:webSyncIntervalSeconds']);
         const totalUptimeSeconds = await accrueCloudUptime(env.DB_CORE, nowIso, Math.max(syncIntervalSeconds * 3, 360));
         const isClosing = url.searchParams.get('closing') === '1';
         await markWebClientActive(env, nowIso, isClosing).catch(() => {});
@@ -933,6 +947,7 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
                 deviceLastSeen,
                 deviceStates,
                 syncIntervalSeconds,
+                webSyncIntervalSeconds,
                 serverNow: nowIso
             }
         });
