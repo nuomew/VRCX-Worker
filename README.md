@@ -1,143 +1,90 @@
 <div align="center">
 
-# <img src="https://raw.githubusercontent.com/vrcx-team/VRCX/master/images/VRCX.ico" width="64" height="64"> </img> VRCX
+# <img src="./images/VRCX.png" width="64" height="64" alt="VRCX-Worker Logo" /> VRCX-Worker
 
-[![GitHub release](https://img.shields.io/github/release/vrcx-team/VRCX.svg)](https://github.com/vrcx-team/VRCX/releases/latest)
-[![Downloads](https://img.shields.io/github/downloads/vrcx-team/VRCX/total?color=6451f1)](https://github.com/vrcx-team/VRCX/releases/latest)
-[![GitHub Workflow Status](https://github.com/vrcx-team/VRCX/actions/workflows/github_actions.yml/badge.svg)](https://github.com/vrcx-team/VRCX/actions/workflows/github_actions.yml)
-[![VRCX Discord Invite](https://img.shields.io/discord/854071236363550763?color=%237289DA&logo=discord&logoColor=white&label=discord)](https://vrcx.app/discord)
+**Pure Stateless Cloud-Hosted Edition of VRCX on Cloudflare Workers (Free Tier)**
 
-| **English** | [Français](./README/README.fr.md) | [日本語](./README/README.jp.md) | [简体中文](./README/README.zh_CN.md) | [Italiano](./README/README.it.md) | [Русский](./README/README.ru_RU.md) | [Español](./README/README.es.md) | [Polski](./README/README.pl.md) | [ภาษาไทย](./README/README.th.md) | [Magyar](./README/README.hu.md)
+*Derived from upstream [vrcx-team/VRCX](https://github.com/vrcx-team/VRCX) (MIT License)*
 
-VRCX is an assistant/companion application for VRChat that provides information about and helps you accomplish various things related to VRChat in a more convenient fashion than relying on the plain VRChat client (desktop or VR), or website alone. It also includes some other neat features outlined below.
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/nuomew/VRCX-Worker)
+[![GitHub Repository](https://img.shields.io/badge/GitHub-nuomew%2FVRCX--Worker-181717?logo=github)](https://github.com/nuomew/VRCX-Worker)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
 
-# Getting Started
-
-<div align="center">
-
-Download and install the latest installer (`VRCX_Setup.exe`) from [here](https://github.com/vrcx-team/VRCX/releases/latest).
-
-For macOS and Linux check [here](https://github.com/vrcx-team/VRCX/wiki/Running-VRCX-on-Linux) for more info.
-
-Beta/nightly build available [here](https://vrcx.app/github/nightly) or in-app `Settings -> General -> Change build`.
-
-# Features
-
-<div align="left">
-
-- :family: Friend, world, and avatar list management
-  - Manage your friends list, world/group/avatar lists outside of VRChat.
-  - Monitor the activity of your friends and track their online status, locations, and avatars.
-  - Track friendship history including add dates, time spent together, and name changes.
-  - Save notes and memos to help remember how you met.
-- :bar_chart: Customizable Dashboard with widgets
-  - Build personalized multi-panel layouts with Feed, GameLog, and Instance widgets.
-  - Create multiple dashboards, each with configurable event filters and column visibility.
-- :mag: Powerful search across all entities
-  - Search for users, worlds, avatars, and groups, or paste IDs and URLs for direct access.
-  - Quick Search provides instant client-side fuzzy search across your friends, avatars, worlds, and groups.
-- :chart_with_upwards_trend: Activity Heatmap
-  - Visualize a user's online activity patterns with a day-of-week × hour-of-day heatmap, including peak stats.
-- :camera: Store world data in the pictures you take in-game, so you can remember that one world you took those cool pictures in like... 6 months ago!
-- :bell: Monitor/respond to notifications
-  - You can send/receive invites and friend requests from VRCX as well as see the instance info of invites that you receive.
-- :scroll: See stats/players for your current instance
-- :tv: See the links to videos that are playing in the world you're in, as well as various other logged data.
-- :performing_arts: Social Status Presets
-  - Save and quickly apply status + status description combinations from the sidebar or user dialog.
-- :rotating_light: VRChat Server Status
-  - A status bar indicator and login page alert inform you of VRChat server issues and outages in real time.
-- :bar_chart: Improved Discord Rich Presence
-  - Display detailed instance information in Discord, including world thumbnail, name, player count, and a join button for public lobbies.
-- :crystal_ball: VR Overlay with configurable live feed of all supported events/notifications
-- :outbox_tray: Upload and manage avatar/world images and details without Unity
-- :electric_plug: Automatically launch apps when you start VRChat
-- :skull: Automatically restart and join last instance when VRC crashes
-- :left_right_arrow: Export/import data
-  - Export friends list, avatar list, Discord names, notes, and favorite groups. Import favorite groups and group moderation bans.
-
-## Miscellaneous
-
-- Want a new look for VRCX? Check out [Themes](https://github.com/vrcx-team/VRCX/wiki/Themes)
-- See [Building from source](https://github.com/vrcx-team/VRCX/wiki/Building-from-source) for instructions on how to build VRCX from source.
-- For a guide on how to run VRCX on Linux, see [here](https://github.com/vrcx-team/VRCX/wiki/Running-VRCX-on-Linux)
-- Interested in contributing? See [CONTRIBUTING.md](.github/CONTRIBUTING.md) for guidelines.
-
-# Screenshots
-
-<div align="center">
-
-<h3>Login</h3>
-
-<table>
-  <tr>
-    <td align="center"><img src="https://github-production-user-asset-6210df.s3.amazonaws.com/82102170/251994190-5e6a961e-b2fe-4d3b-bf66-455d8626b8bf.png" alt="login"></td>
-    <td align="center"><img src="https://github-production-user-asset-6210df.s3.amazonaws.com/82102170/251994414-a21faf59-6199-45de-94e7-a093a6b8c0ac.png" alt="2fa"></td>
-  </tr>
-</table>
-
-<h3>Feed</h3>
-
-<img src="https://github-production-user-asset-6210df.s3.amazonaws.com/82102170/251987020-9839a2c9-47db-4271-b1bf-8e07669a7056.png" alt="feed">
-
-<h3>GameLog</h3>
-
-<img src="https://github-production-user-asset-6210df.s3.amazonaws.com/82102170/251987498-b82266ed-131d-42ad-be2f-b167f24acf9f.png" alt="gamelog">
-
-<h3>UserInfo</h3>
-
-<h4>Me</h4>
-
-<img src="https://github-production-user-asset-6210df.s3.amazonaws.com/82102170/251990237-0c863d27-141c-4447-82de-4279ab8973ea.png" alt="me">
-
-<h4>Friend</h4>
-
-<img src="https://github-production-user-asset-6210df.s3.amazonaws.com/82102170/251989666-8f918786-e632-451d-be29-f92d2c681b80.png" alt="friend">
-
-<h3>World</h3>
-
-<table>
-  <tr>
-    <td align="center"><img src="https://github-production-user-asset-6210df.s3.amazonaws.com/82102170/251991003-37a986bb-470c-442b-8ada-31918f7b2017.png" alt="instance"></td>
-    <td align="center"><img src="https://github-production-user-asset-6210df.s3.amazonaws.com/82102170/251991217-0d40846f-ac08-48c0-8e4d-18c35fe0999b.png" alt="info"></td>
-  </tr>
-</table>
-
-<h3>Favorite</h3>
-
-<h4>Friend</h4>
-
-<img src="https://github-production-user-asset-6210df.s3.amazonaws.com/82102170/251992424-ba406d0f-787e-4e2d-89bd-4caa0a05d31f.png" alt="friend">
-
-<h4>World</h4>
-
-<img src="https://github-production-user-asset-6210df.s3.amazonaws.com/82102170/251992950-8f2c6cdc-dc9a-4a60-b59f-9fa80d071359.png" alt="world">
-
-<h4>Avatar</h4>
-
-<img src="https://github-production-user-asset-6210df.s3.amazonaws.com/82102170/251993408-66d11100-15a8-484f-b9fd-82be1516c9be.png" alt="avatar">
-
-<h3>Friend Log</h3>
-
-<img src="https://github-production-user-asset-6210df.s3.amazonaws.com/82102170/251993741-e2033095-4ceb-4552-8b79-9285325c1e49.png" alt="friendlog">
-
-<h3>Discord Rich Presence</h3>
-
-<img src="https://github-production-user-asset-6210df.s3.amazonaws.com/82102170/251997318-5a71249c-59fc-4ad6-9194-d6b1d4165600.png" alt="discord">
-
-<!-- The other images will be similar to this -->
 </div>
-
-## Is VRCX against VRChat's TOS?
-
-**No.**
-
-VRCX is an external tool that uses the VRChat API to provide the features it does.
-
-It does not modify the game in any way, only using the API responsibly to provide the features it does. It is not a mod, or a cheat, or any other form of modification to the game.
-
-To see VRChat's stance on API usage, see the #faq channel in the VRChat Discord.
 
 ---
 
-VRCX is not endorsed by VRChat and does not reflect the views or opinions of VRChat or anyone officially involved in producing or managing VRChat properties. VRChat and all associated properties are trademarks or registered trademarks of VRChat Inc. VRChat © VRChat Inc.
+## About This Derivative Project
+
+**VRCX-Worker** is a secondary development built on top of [vrcx-team/VRCX](https://github.com/vrcx-team/VRCX) (baseline `2026.11.14`). It transforms the full VRCX Vue interface into a **100% stateless personal cloud web app** running on **Cloudflare Workers + Sharded D1 + SQLite Durable Objects (WebSocket Hibernation) + optional R2**, paired with an optional lightweight Windows system-tray companion (`Dotnet/VRCX-Agent/`).
+
+- **True Cloud Hosting (Zero Browser Storage Dependency)**: No OPFS or IndexedDB primary database. Clearing browser cache, using incognito mode, or switching between desktop and mobile browsers recovers all settings, notes, memos, favorites, friend history, and encrypted VRChat sessions directly from Cloudflare D1.
+- **Full Upstream VRCX Web Experience**: Reuses the original VRCX Vue 3 UI, stores, charts, search, feeds, notifications, and multi-language packs behind explicit `WEB` mode guards—showing only Web-applicable settings and tools in browser builds while preserving **100% zero regression** for original Windows (CEF) and Linux/macOS (Electron) desktop builds.
+- **Cloudflare Free-Tier Architecture**:
+  - **One-Click Deployment**: Single Worker (`wrangler.jsonc`) serves both the compiled Vue SPA (`./build/web`) and cloud APIs. Automatic Resource Provisioning creates all 3 D1 shards (`DB_CORE`, `DB_GAMELOG`, `DB_FEED`) and `AgentHubDO` automatically, with idempotent cold-start DDL bootstrap (`cloud/src/db/schemaBootstrap.ts`).
+  - **Sharded D1 + FTS5 `trigram` Entity Dictionary**: Avoids 500 MB single-DB caps, unindexed `LIKE '%term%'` scans, and full-table `COUNT(*)` queries to stay comfortably inside Free-tier `rows_read` / `rows_written` ceilings.
+  - **WebSocket Hibernation**: `AgentHubDO` uses `ctx.acceptWebSocket` and zero-cost `ping`/`pong` auto-responses so idle connections consume zero compute duration.
+- **Lightweight Windows Companion Agent (`Dotnet/VRCX-Agent/`, zero CEF/Electron)**:
+  - Incremental VRChat `output_log_*.txt` GameLog sync with persisted byte-offset cursor & offline queue
+  - Residential-IP VRChat API relay over `AgentHubDO` WebSocket RPC
+  - Local PNG metadata embedding (`Dotnet/ScreenshotMetadata`) + ≤1600px WebP thumbnail upload to optional private R2 gallery
+  - Discord Rich Presence, VRChat/SteamVR process monitoring, AutoAppLaunch, XSOverlay / OVRToolkit VR notifications
+  - Strict 6-action allowlisted remote commands (`launch_vrc`, `quit_vrc`, `clear_cache`, `send_vr_notify`, `discord_update`, `sync_now`)
+
+---
+
+## One-Click Deployment (Cloudflare Workers Free Tier)
+
+1. Click **Deploy to Cloudflare** above, or in the Cloudflare Dashboard go to **Workers & Pages -> Create -> Import a repository** and select **`nuomew/VRCX-Worker`**.
+2. Keep the repository root (`.`) and default deploy command `npx wrangler deploy`.
+   - Root [`wrangler.jsonc`](./wrangler.jsonc) includes `"build": { "command": "npm run build:web" }`, so the full Web SPA builds automatically even if the Dashboard Build command is left blank.
+   - Cloudflare automatically provisions `vrcx-core`, `vrcx-gamelog`, `vrcx-feed` D1 databases and `AgentHubDO`, and initializes all tables on the first request.
+3. For personal use, configure optional access protection and encryption secrets (`ADMIN_PASSCODE`, `ADMIN_TOTP_SECRET`, `COOKIE_MASTER_KEY`, or Cloudflare Access) in **Worker -> Settings -> Variables and Secrets**.
+
+See the full deployment, security secret, R2 gallery, and Windows companion pairing guide in **[`docs/cloud-architecture/DEPLOY.md`](./docs/cloud-architecture/DEPLOY.md)** and the architecture specification in **[`docs/cloud-architecture/Tech-Spec.md`](./docs/cloud-architecture/Tech-Spec.md)**.
+
+---
+
+## Repository Structure
+
+| Path | Description |
+|---|---|
+| `src/` | Upstream VRCX Vue 3 frontend with guarded `WEB` mode adapters (`src/ipc-web/`, `src/services/database/cloud/`, `src/components/cloud/`) |
+| `cloud/` | Cloudflare Worker backend (`src/auth/`, `src/crypto/`, `src/db/`, `src/hub/AgentHubDO.ts`, `src/routes/`, `src/search/`, `migrations/`, `test/`) |
+| `Dotnet/VRCX-Agent/` | Lightweight .NET 10 Windows tray companion reusing upstream `Dotnet/Discord.cs` & `Dotnet/ScreenshotMetadata/` |
+| `Dotnet/VRCX-Agent.Tests/` | Cross-platform xUnit tests for Agent HMAC signing, command/SSRF allowlist, log parser, offline queue, and PNG/WebP pipeline |
+| `Dotnet/` & `src-electron/` | Original upstream desktop CEF and Electron shells (preserved unmodified in behavior) |
+| `docs/cloud-architecture/` | Technical specification (`Tech-Spec.md`) and deployment/pairing guide (`DEPLOY.md`) |
+
+---
+
+## Local Development & Verification
+
+```bash
+# 1. Frontend Web build (outputs ./build/web)
+npm ci
+npm run build:web
+npm run lint
+npm run test
+
+# 2. Cloudflare Worker backend typecheck & workerd tests
+cd cloud
+npm ci
+npm run typecheck
+npm test
+
+# 3. Windows Companion Agent build & tests (.NET 10 SDK)
+dotnet build Dotnet/VRCX-Agent/VRCX-Agent.csproj -c Release -r win-x64
+dotnet test Dotnet/VRCX-Agent.Tests/VRCX-Agent.Tests.csproj
+
+# 4. Upstream Desktop build (zero-regression check)
+npm run prod
+```
+
+---
+
+## Upstream Attribution & VRChat TOS Notice
+
+- **Upstream Project**: This project is derived from **[vrcx-team/VRCX](https://github.com/vrcx-team/VRCX)** (`© 2019-2026 pypy, Natsumi, Map1en & VRCX Contributors`), distributed under the [MIT License](./LICENSE).
+- **VRChat TOS**: Like upstream VRCX, VRCX-Worker is an external companion tool that interacts exclusively with official VRChat APIs and local game logs. It does not modify the VRChat client.
+- VRCX-Worker is not endorsed by VRChat and does not reflect the views or opinions of VRChat Inc. VRChat and all associated properties are trademarks or registered trademarks of VRChat Inc.

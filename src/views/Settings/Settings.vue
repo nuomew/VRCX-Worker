@@ -49,16 +49,20 @@
     import VrTab from './components/Tabs/VrTab.vue';
 
     const { t } = useI18n();
-    const settingsTabs = computed(() => [
-        { value: 'system', label: t('view.settings.category.system') },
-        { value: 'interface', label: t('view.settings.category.interface') },
-        { value: 'social', label: t('view.settings.category.social') },
-        { value: 'notifications', label: t('view.settings.category.notifications') },
-        { value: 'vr', label: t('view.settings.category.vr') },
-        { value: 'media', label: t('view.settings.category.media') },
-        { value: 'integrations', label: t('view.settings.category.integrations') },
-        { value: 'advanced', label: t('view.settings.category.advanced') }
-    ]);
+    const isWeb = typeof WEB !== 'undefined' && WEB;
+    const settingsTabs = computed(() => {
+        const tabs = [
+            { value: 'system', label: t('view.settings.category.system') },
+            { value: 'interface', label: t('view.settings.category.interface') },
+            { value: 'social', label: t('view.settings.category.social') },
+            { value: 'notifications', label: t('view.settings.category.notifications') },
+            { value: 'vr', label: t('view.settings.category.vr') },
+            { value: 'media', label: t('view.settings.category.media') },
+            { value: 'integrations', label: t('view.settings.category.integrations') },
+            { value: 'advanced', label: t('view.settings.category.advanced') }
+        ];
+        return isWeb ? tabs.filter((tab) => tab.value !== 'vr' && tab.value !== 'media') : tabs;
+    });
 
     onBeforeMount(() => {
         const menuItem = document.querySelector('li[role="menuitem"].is-active');

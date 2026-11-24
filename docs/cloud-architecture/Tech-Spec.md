@@ -1,6 +1,6 @@
 # VRCX Cloud Hosting Technical Specification (v3.0)
 
-- **Baseline**: `nuomew/VRCX` `master` (`2026.11.14`)
+- **Repository**: `https://github.com/nuomew/VRCX-Worker` (secondary development derived from `vrcx-team/VRCX`, baseline `2026.11.14`)
 - **Scope**: Personal single-user cloud deployment on Cloudflare Free Tier (Pages + Workers + Sharded D1 + SQLite Durable Objects + optional R2) paired with a lightweight Windows companion tray agent (`VRCX.Agent`).
 - **Non-Negotiables**:
   1. **100% Stateless Browser**: No primary data stored in OPFS/IndexedDB; clearing browser cache or using incognito mode preserves all data and loads cleanly from cloud.

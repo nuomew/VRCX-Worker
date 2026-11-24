@@ -1,6 +1,6 @@
 <template>
     <div class="flex flex-col gap-10 py-2">
-        <SettingsGroup :title="t('view.settings.advanced.advanced.vrchat_settings.header')">
+        <SettingsGroup v-if="!isWeb" :title="t('view.settings.advanced.advanced.vrchat_settings.header')">
             <SettingsItem
                 :label="t('view.settings.advanced.advanced.relaunch_vrchat.header')"
                 :description="t('view.settings.advanced.advanced.relaunch_vrchat.description')"
@@ -42,7 +42,7 @@
             </SettingsItem>
         </SettingsGroup>
 
-        <SettingsGroup :title="t('view.settings.advanced_groups.security.header')">
+        <SettingsGroup v-if="!isWeb" :title="t('view.settings.advanced_groups.security.header')">
             <SettingsItem
                 :label="t('view.settings.advanced.advanced.primary_password.header')"
                 :description="t('view.settings.advanced.advanced.primary_password.description')"
@@ -55,7 +55,7 @@
             </SettingsItem>
         </SettingsGroup>
 
-        <SettingsGroup :title="t('view.settings.general.logging.header')">
+        <SettingsGroup v-if="!isWeb" :title="t('view.settings.general.logging.header')">
             <SettingsItem :label="t('view.settings.advanced.advanced.cache_debug.udon_exception_logging')" toggle>
                 <Switch
                     :model-value="udonExceptionLogging"
@@ -86,7 +86,7 @@
             </SettingsItem>
         </SettingsGroup>
 
-        <template v-if="!isLinux">
+        <template v-if="!isLinux && !isWeb">
             <SettingsGroup :title="t('view.settings.advanced.advanced.app_launcher.header')">
                 <SettingsItem :label="t('view.settings.advanced.advanced.app_launcher.folder')">
                     <Button size="sm" variant="outline" @click="openShortcutFolder()">{{
@@ -120,7 +120,7 @@
             </SettingsGroup>
         </template>
 
-        <SettingsGroup :title="t('view.settings.advanced.advanced.launch_commands.header')">
+        <SettingsGroup v-if="!isWeb" :title="t('view.settings.advanced.advanced.launch_commands.header')">
             <SettingsItem
                 :label="t('view.settings.advanced.advanced.launch_commands.show_confirmation_on_switch_avatar_enable')"
                 class="mb-2"
@@ -154,10 +154,10 @@
 
         <SettingsGroup :title="t('view.settings.advanced.advanced.cache_debug.header')">
             <div class="flex gap-2 flex-wrap">
-                <Button size="sm" variant="outline" @click="clearVRCXCache">{{
+                <Button v-if="!isWeb" size="sm" variant="outline" @click="clearVRCXCache">{{
                     t('view.settings.advanced.advanced.cache_debug.clear_cache')
                 }}</Button>
-                <Button size="sm" variant="outline" @click="promptAutoClearVRCXCacheFrequency">{{
+                <Button v-if="!isWeb" size="sm" variant="outline" @click="promptAutoClearVRCXCacheFrequency">{{
                     t('view.settings.advanced.advanced.cache_debug.auto_clear_cache')
                 }}</Button>
                 <Button size="sm" variant="outline" @click="refreshCacheSize">{{
@@ -166,6 +166,7 @@
             </div>
 
             <SettingsItem
+                v-if="!isWeb"
                 :label="`${t('view.settings.advanced.advanced.cache_debug.disable_gamelog')} ${t('view.settings.advanced.advanced.cache_debug.disable_gamelog_notice')}`"
                 class="my-2"
                 toggle>
@@ -202,7 +203,7 @@
                 ></span>
             </div>
 
-            <SettingsItem :label="t('view.settings.advanced.advanced.cache_debug.show_console')">
+            <SettingsItem v-if="!isWeb" :label="t('view.settings.advanced.advanced.cache_debug.show_console')">
                 <Button size="sm" variant="outline" @click="showConsole">{{
                     t('view.settings.advanced.advanced.cache_debug.show_console')
                 }}</Button>
@@ -531,6 +532,7 @@
         cachedInstances: 0
     });
 
+    const isWeb = computed(() => typeof WEB !== 'undefined' && WEB);
     const isLinux = computed(() => LINUX);
 
     function handlePurge() {

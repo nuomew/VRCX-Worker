@@ -1,7 +1,7 @@
 <template>
     <div class="flex flex-col gap-10 py-2">
         <!-- Discord Rich Presence -->
-        <SettingsGroup :title="t('view.settings.discord_presence.discord_presence.header')">
+        <SettingsGroup v-if="!isWeb" :title="t('view.settings.discord_presence.discord_presence.header')">
             <template #description>
                 <p class="m-0">{{ t('view.settings.discord_presence.discord_presence.description') }}</p>
                 <p class="m-0 cursor-pointer hover:text-foreground transition-colors" @click="showVRChatConfig">
@@ -212,6 +212,7 @@
     import SettingsItem from '../SettingsItem.vue';
 
     const { t } = useI18n();
+    const isWeb = typeof WEB !== 'undefined' && WEB;
 
     const advancedSettingsStore = useAdvancedSettingsStore();
     const { updateVRLastLocation, updateOpenVR } = useVrStore();

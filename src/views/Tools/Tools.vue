@@ -96,10 +96,25 @@
     const { pinToolToNav, pinnedToolKeys, refreshPinnedState, unpinToolFromNav } = useToolNavPinning();
     const toolsCategoryCollapsedConfigKey = 'VRCX_toolsCategoryCollapsed';
 
-    const categories = toolCategories.map((category) => ({
-        ...category,
-        tools: getToolsByCategory(category.key)
-    }));
+    const isWeb = typeof WEB !== 'undefined' && WEB;
+    const desktopOnlyToolKeys = new Set([
+        'screenshot-metadata',
+        'vrc-photos',
+        'steam-screenshots',
+        'vrcx-data',
+        'vrchat-data',
+        'crash-dumps',
+        'vrchat-config',
+        'launch-options',
+        'registry-backup'
+    ]);
+
+    const categories = toolCategories
+        .map((category) => ({
+            ...category,
+            tools: getToolsByCategory(category.key).filter((tool) => !isWeb || !desktopOnlyToolKeys.has(tool.key))
+        }))
+        .filter((category) => category.tools.length > 0);
 
     const categoryCollapsed = ref({
         group: false,

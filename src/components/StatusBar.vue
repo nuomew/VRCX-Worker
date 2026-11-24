@@ -278,7 +278,7 @@
                         </template>
 
                         <TooltipWrapper
-                            v-if="visibility.zoom"
+                            v-if="!isWeb && visibility.zoom"
                             :content="t('status_bar.zoom_tooltip')"
                             side="top"
                             :disabled="zoomEditing">

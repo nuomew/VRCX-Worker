@@ -6,15 +6,15 @@
     "keywords": [
         "vrchat"
     ],
-    "homepage": "https://github.com/vrcx-team/VRCX#readme",
+    "homepage": "https://github.com/nuomew/VRCX-Worker#readme",
     "bugs": {
-        "url": "https://github.com/vrcx-team/VRCX/issues"
+        "url": "https://github.com/nuomew/VRCX-Worker/issues"
     },
     "license": "MIT",
-    "author": "VRCX Team",
+    "author": "VRCX Team & nuomew (VRCX-Worker Cloud Edition)",
     "repository": {
         "type": "git",
-        "url": "git+https://github.com/vrcx-team/VRCX.git"
+        "url": "git+https://github.com/nuomew/VRCX-Worker.git"
     },
     "main": "src-electron/main.js",
     "scripts": {

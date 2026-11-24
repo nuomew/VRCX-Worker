@@ -1,14 +1,15 @@
-# VRCX Cloud Deployment & Windows Agent Guide
+# VRCX-Worker Deployment & Windows Agent Guide
+
+> Based on upstream [vrcx-team/VRCX](https://github.com/vrcx-team/VRCX) (MIT). Repository: [https://github.com/nuomew/VRCX-Worker](https://github.com/nuomew/VRCX-Worker).
 
 ## 1. One-Click Cloudflare Workers Deployment (Free Tier)
 
-VRCX Cloud runs as a single Cloudflare Worker serving both the complete original VRCX Vue SPA (`./build/web`) and the cloud API/WebSocket backend (`cloud/src/index.ts`), backed by 3 auto-provisioned D1 shards (`DB_CORE`, `DB_GAMELOG`, `DB_FEED`) and a SQLite-backed Hibernation Durable Object (`AgentHubDO`).
+VRCX-Worker runs as a single Cloudflare Worker serving both the complete VRCX Vue SPA (`./build/web`) and the cloud API/WebSocket backend (`cloud/src/index.ts`), backed by 3 auto-provisioned D1 shards (`DB_CORE`, `DB_GAMELOG`, `DB_FEED`) and a SQLite-backed Hibernation Durable Object (`AgentHubDO`).
 
 ### Option A: Cloudflare Dashboard Git Integration (Recommended)
-1. In the Cloudflare Dashboard, go to **Workers & Pages -> Create -> Import a repository** and select this repository.
-2. Keep the default root directory (`.`):
-   - **Build command**: `npm run build`
-   - **Deploy command**: `npx wrangler deploy`
+1. Click [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/nuomew/VRCX-Worker), or in the Cloudflare Dashboard go to **Workers & Pages -> Create -> Import a repository** and select **`nuomew/VRCX-Worker`**.
+2. Keep the default root directory (`.`) and default **Deploy command** `npx wrangler deploy`:
+   - Root `wrangler.jsonc` defines `"build": { "command": "npm run build:web" }`, so the frontend builds automatically even if the Dashboard **Build command** is left blank.
 3. Deploy. Cloudflare Automatic Resource Provisioning creates `vrcx-core`, `vrcx-gamelog`, and `vrcx-feed` D1 databases and `AgentHubDO` automatically on first deploy.
 4. On the first HTTP request, `cloud/src/db/schemaBootstrap.ts` automatically creates all tables, indexes, and FTS5 `trigram` dictionaries idempotently (no manual CLI migrations required).
 

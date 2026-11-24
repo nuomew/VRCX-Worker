@@ -71,7 +71,7 @@
                 </Dialog>
             </SettingsItem>
 
-            <SettingsItem v-if="!isLinux" :label="t('view.settings.appearance.appearance.zoom')">
+            <SettingsItem v-if="!isLinux && !isWeb" :label="t('view.settings.appearance.appearance.zoom')">
                 <NumberField
                     v-model="zoomLevel"
                     :step="1"
@@ -86,7 +86,7 @@
                 </NumberField>
             </SettingsItem>
 
-            <SettingsItem :label="t('view.settings.appearance.appearance.show_notification_icon_dot')" toggle>
+            <SettingsItem v-if="!isWeb" :label="t('view.settings.appearance.appearance.show_notification_icon_dot')" toggle>
                 <Switch
                     :model-value="notificationIconDot"
                     :ariaLabel="t('view.settings.appearance.appearance.show_notification_icon_dot')"
@@ -680,6 +680,7 @@
     }
 
     const zoomLevel = ref(100);
+    const isWeb = computed(() => typeof WEB !== 'undefined' && WEB);
     const isLinux = computed(() => LINUX);
     let cleanupWheel = null;
 

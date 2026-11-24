@@ -10,7 +10,7 @@
                 <DialogTitle>{{ t('view.login.settings') }}</DialogTitle>
             </DialogHeader>
             <FieldGroup class="gap-3">
-                <template v-if="!isLinux">
+                <template v-if="!isLinux && !isWeb">
                     <Field>
                         <FieldLabel for="login-settings-proxy">{{ t('view.login.proxy_settings') }}</FieldLabel>
                         <FieldContent>
@@ -92,6 +92,7 @@
 
     const open = ref(false);
     const proxyServerLocal = ref('');
+    const isWeb = computed(() => typeof WEB !== 'undefined' && WEB);
     const isLinux = computed(() => LINUX);
 
     watch(open, (isOpen) => {

@@ -10,7 +10,7 @@
                 </div>
             </div>
 
-            <div class="flex flex-col gap-0.5 px-1 py-1 cursor-pointer" @click="checkForVRCXUpdate">
+            <div v-if="!isWeb" class="flex flex-col gap-0.5 px-1 py-1 cursor-pointer" @click="checkForVRCXUpdate">
                 <div class="flex-1">
                     <span class="block truncate font-medium text-sm leading-[18px]">{{
                         t('view.settings.general.general.latest_app_version')
@@ -34,7 +34,7 @@
                 </div>
             </div>
 
-            <div class="flex flex-col gap-0.5 px-1 py-1 cursor-pointer" @click="openExternalLink(links.discord)">
+            <div v-if="!isWeb" class="flex flex-col gap-0.5 px-1 py-1 cursor-pointer" @click="openExternalLink(links.discord)">
                 <div class="flex-1">
                     <span class="block truncate font-medium text-sm leading-[18px]">{{
                         t('view.settings.general.general.support')
@@ -42,9 +42,15 @@
                     <span v-once class="block truncate text-xs text-muted-foreground">{{ links.discord }}</span>
                 </div>
             </div>
+
+            <SettingsItem v-if="isWeb" label="VRCX Cloud Hub" description="Win Agent pairing, remote controls, R2 gallery & free-tier quota">
+                <Button size="sm" variant="outline" @click="cloudState.hubDialogOpen = true">
+                    Open Cloud Hub
+                </Button>
+            </SettingsItem>
         </SettingsGroup>
 
-        <SettingsGroup :title="t('view.settings.general.vrcx_updater.header')">
+        <SettingsGroup v-if="!isWeb" :title="t('view.settings.general.vrcx_updater.header')">
             <div class="flex gap-2">
                 <Button size="sm" variant="outline" @click="showChangeLogDialog">{{
                     t('view.settings.general.vrcx_updater.change_log')
@@ -79,7 +85,7 @@
             </div>
         </SettingsGroup>
 
-        <SettingsGroup :title="t('view.settings.general.application.header')">
+        <SettingsGroup v-if="!isWeb" :title="t('view.settings.general.application.header')">
             <SettingsItem v-if="!isLinux" :label="t('view.settings.general.application.startup')" toggle>
                 <Switch
                     :model-value="isStartAtWindowsStartup"
@@ -129,6 +135,7 @@
                 toggle>
                 <Switch
                     :model-value="disableVrOverlayGpuAcceleration"
+                    :ariaLabel="t('view.settings.general.application.disable_vr_overlay_gpu_acceleration')"
                     @update:modelValue="setDisableVrOverlayGpuAcceleration" />
             </SettingsItem>
 
@@ -143,7 +150,7 @@
             <div>
                 <img
                     src="https://contrib.rocks/image?repo=vrcx-team/VRCX"
-                    alt="Contributors"
+                    alt="Upstream VRCX Contributors"
                     class="cursor-pointer"
                     @click="openExternalLink('https://github.com/vrcx-team/VRCX/graphs/contributors')" />
             </div>
@@ -151,6 +158,13 @@
 
         <SettingsGroup :title="t('view.settings.general.legal_notice.header')">
             <div class="flex flex-col gap-2 text-sm text-muted-foreground mb-2">
+                <p v-if="isWeb" class="m-0">
+                    VRCX-Worker — Cloudflare Workers cloud edition derived from upstream
+                    <a class="cursor-pointer underline" @click="openExternalLink('https://github.com/vrcx-team/VRCX')"
+                        >vrcx-team/VRCX</a
+                    >
+                    (MIT).
+                </p>
                 <p class="m-0">
                     &copy; 2019-2026
                     <a class="cursor-pointer" @click="openExternalLink('https://github.com/pypy-vrc')">pypy</a> &amp;
@@ -185,11 +199,13 @@
     import { useGeneralSettingsStore, useVRCXUpdaterStore } from '@/stores';
     import { links } from '@/shared/constants';
     import { openExternalLink } from '@/shared/utils';
+    import { cloudState } from '@/ipc-web/cloudState';
 
     import SettingsGroup from '../SettingsGroup.vue';
     import SettingsItem from '../SettingsItem.vue';
 
     const { t } = useI18n();
+    const isWeb = computed(() => typeof WEB !== 'undefined' && WEB);
 
     const generalSettingsStore = useGeneralSettingsStore();
     const vrcxUpdaterStore = useVRCXUpdaterStore();
