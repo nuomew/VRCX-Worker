@@ -1,3 +1,11 @@
+import {
+    classifyVrcCacheUrl,
+    getCachedVrcResponses,
+    pruneExpiredVrcCache,
+    putCachedVrcResponses,
+    readRssSnapshot,
+    writeRssSnapshot
+} from '../cache/vrcCache';
 import type { Env } from '../env';
 import {
     incrementCounter,
@@ -13,11 +21,11 @@ const STATE_KEY_SNAPSHOT = 'friends_snapshot';
 const STATE_KEY_META = 'poller_meta';
 export const BG_FEED_SYNC_CONFIG_KEY = 'cloud:bgFeedSyncEnabled';
 
-// Strict Cloudflare Workers Free-tier subrequest guardrails (max 50 external fetch/invocation; keep <= 14 here).
+// Strict Cloudflare Workers Free-tier subrequest guardrails (max 50 external fetch/invocation; keep <= 16 here).
 const MAX_FRIEND_PAGES = 5;
 const FRIEND_PAGE_SIZE = 100;
 const MAX_WORLD_LOOKUPS_PER_TICK = 4;
-const MAX_BIO_PROFILES_PER_TICK = 3;
+const MAX_BIO_PROFILES_PER_TICK = 5;
 const BIO_RECHECK_COOLDOWN_MS = 10 * 60_000; // Recheck each online friend's bio at most once per 10 minutes
 const AUTH_EXPIRED_BACKOFF_MS = 30 * 60_000;
 const RATE_LIMIT_BACKOFF_MS = 10 * 60_000;
@@ -428,7 +436,7 @@ export async function setBackgroundFeedSyncEnabled(env: Env, enabled: boolean): 
 async function fetchVrcJson(
     pathWithQuery: string,
     jar: Record<string, string>
-): Promise<{ status: number; data: unknown; cookieChanged: boolean }> {
+): Promise<{ status: number; data: unknown; rawText: string; cookieChanged: boolean }> {
     const headers = new Headers();
     headers.set('User-Agent', VRC_USER_AGENT);
     headers.set('Accept', 'application/json');
@@ -442,14 +450,14 @@ async function fetchVrcJson(
         headers
     });
     const cookieChanged = mergeSetCookies(jar, res.headers);
-    const text = await res.text();
+    const rawText = await res.text();
     let data: unknown = null;
     try {
-        data = text ? JSON.parse(text) : null;
+        data = rawText ? JSON.parse(rawText) : null;
     } catch {
         data = null;
     }
-    return { status: res.status, data, cookieChanged };
+    return { status: res.status, data, rawText, cookieChanged };
 }
 
 async function resolveWorldNames(
@@ -479,14 +487,40 @@ async function resolveWorldNames(
         }
     }
 
-    // 2. Fetch at most MAX_WORLD_LOOKUPS_PER_TICK missing worlds from VRChat API and cache them
+    // 2. Check dedicated DB_CACHE for any remaining world JSON before hitting api.vrchat.cloud
+    const missingForCache = unique.filter((id) => !names.has(id));
+    if (missingForCache.length > 0) {
+        const cacheUrls = missingForCache.map((id) => `${VRC_API_BASE}/worlds/${encodeURIComponent(id)}`);
+        const cachedWorlds = await getCachedVrcResponses(env, cacheUrls).catch(() => new Map());
+        for (let i = 0; i < missingForCache.length; i++) {
+            const worldId = missingForCache[i]!;
+            const hit = cachedWorlds.get(cacheUrls[i]!);
+            if (!hit?.bodyText) continue;
+            const parsed = safeJsonParse<{ name?: unknown }>(hit.bodyText, {});
+            const name = String(parsed.name ?? '').trim();
+            if (name) {
+                names.set(worldId, name);
+                await upsertEntityWorld(env.DB_CORE, worldId, name).catch(() => {});
+            }
+        }
+    }
+
+    // 3. Fetch at most MAX_WORLD_LOOKUPS_PER_TICK missing worlds from VRChat API and cache in both DB_CORE & DB_CACHE
     let cookieChanged = false;
     let fetched = 0;
+    const cacheWrites: Array<{
+        url: string;
+        tier: 'world';
+        status: number;
+        bodyText: string;
+        ttlMs: number;
+    }> = [];
     for (const worldId of unique) {
         if (names.has(worldId) || fetched >= MAX_WORLD_LOOKUPS_PER_TICK) continue;
         fetched++;
         try {
-            const res = await fetchVrcJson(`worlds/${encodeURIComponent(worldId)}`, jar);
+            const path = `worlds/${encodeURIComponent(worldId)}`;
+            const res = await fetchVrcJson(path, jar);
             if (res.cookieChanged) cookieChanged = true;
             if (res.status === 200 && res.data && typeof res.data === 'object') {
                 const name = String((res.data as { name?: unknown }).name ?? '').trim();
@@ -494,10 +528,22 @@ async function resolveWorldNames(
                     names.set(worldId, name);
                     await upsertEntityWorld(env.DB_CORE, worldId, name);
                 }
+                if (res.rawText) {
+                    cacheWrites.push({
+                        url: `${VRC_API_BASE}/${path}`,
+                        tier: 'world',
+                        status: 200,
+                        bodyText: res.rawText,
+                        ttlMs: 6 * 3600 * 1000
+                    });
+                }
             }
         } catch {
             // Non-fatal: leave worldName blank if lookup transiently fails
         }
+    }
+    if (cacheWrites.length > 0) {
+        await putCachedVrcResponses(env, cacheWrites).catch(() => {});
     }
 
     return { names, cookieChanged };
@@ -508,7 +554,8 @@ async function pollRotatingFriendBios(
     onlineFriends: VrcFriendApiRecord[],
     jar: Record<string, string>,
     nowIso: string,
-    nowMs: number
+    nowMs: number,
+    webSyncIntervalSeconds: number
 ): Promise<{ bioFeeds: Array<Record<string, unknown>>; bioChecked: number; cookieChanged: boolean }> {
     const bioFeeds: Array<Record<string, unknown>> = [];
     const candidates = onlineFriends
@@ -552,16 +599,34 @@ async function pollRotatingFriendBios(
     let bioChecked = 0;
     let cookieChanged = false;
     const profileWrites: D1PreparedStatement[] = [];
+    const cacheWrites: Array<{
+        url: string;
+        tier: 'dynamic';
+        status: number;
+        bodyText: string;
+        ttlMs: number;
+    }> = [];
+    const userTtlMs = Math.max(300, webSyncIntervalSeconds) * 1000;
 
     for (const target of due) {
         try {
-            const res = await fetchVrcJson(`users/${encodeURIComponent(target.id)}`, jar);
+            const path = `users/${encodeURIComponent(target.id)}`;
+            const res = await fetchVrcJson(path, jar);
             if (res.cookieChanged) cookieChanged = true;
             if (res.status === 429 || res.status === 401 || res.status === 403) {
                 break;
             }
             if (res.status !== 200 || !res.data || typeof res.data !== 'object') {
                 continue;
+            }
+            if (res.rawText) {
+                cacheWrites.push({
+                    url: `${VRC_API_BASE}/${path}`,
+                    tier: 'dynamic',
+                    status: 200,
+                    bodyText: res.rawText,
+                    ttlMs: userTtlMs
+                });
             }
             const user = res.data as { displayName?: unknown; bio?: unknown; bioLinks?: unknown };
             if (typeof user.bio !== 'string') {
@@ -610,6 +675,9 @@ async function pollRotatingFriendBios(
     if (profileWrites.length > 0) {
         await env.DB_CORE.batch(profileWrites);
     }
+    if (cacheWrites.length > 0) {
+        await putCachedVrcResponses(env, cacheWrites, nowMs).catch(() => {});
+    }
 
     return { bioFeeds, bioChecked, cookieChanged };
 }
@@ -617,16 +685,35 @@ async function pollRotatingFriendBios(
 async function pollNotifications(
     env: Env,
     jar: Record<string, string>,
-    nowIso: string
+    nowIso: string,
+    webSyncIntervalSeconds: number
 ): Promise<{ inserted: number; cookieChanged: boolean }> {
     let inserted = 0;
     let cookieChanged = false;
+    const notifCacheWrites: Array<{
+        url: string;
+        tier: 'notifications';
+        status: number;
+        bodyText: string;
+        ttlMs: number;
+    }> = [];
+    const notifTtlMs = Math.max(60, webSyncIntervalSeconds) * 1000;
 
     // 1. Notifications v1 (invites, requestInvite, inviteResponse, etc.)
     try {
-        const resV1 = await fetchVrcJson('auth/user/notifications?n=60', jar);
+        const v1Path = 'auth/user/notifications?n=60';
+        const resV1 = await fetchVrcJson(v1Path, jar);
         if (resV1.cookieChanged) cookieChanged = true;
         if (resV1.status === 200 && Array.isArray(resV1.data)) {
+            if (resV1.rawText) {
+                notifCacheWrites.push({
+                    url: `${VRC_API_BASE}/${v1Path}`,
+                    tier: 'notifications',
+                    status: 200,
+                    bodyText: resV1.rawText,
+                    ttlMs: notifTtlMs
+                });
+            }
             const stmts: D1PreparedStatement[] = [];
             for (const raw of resV1.data as Array<Record<string, unknown>>) {
                 const id = typeof raw.id === 'string' ? raw.id.trim() : '';
@@ -682,9 +769,19 @@ async function pollNotifications(
 
     // 2. Notifications v2 (group announcements, boops, invites v2)
     try {
-        const resV2 = await fetchVrcJson('notifications?n=60', jar);
+        const v2Path = 'notifications?n=60';
+        const resV2 = await fetchVrcJson(v2Path, jar);
         if (resV2.cookieChanged) cookieChanged = true;
         if (resV2.status === 200 && Array.isArray(resV2.data)) {
+            if (resV2.rawText) {
+                notifCacheWrites.push({
+                    url: `${VRC_API_BASE}/${v2Path}`,
+                    tier: 'notifications',
+                    status: 200,
+                    bodyText: resV2.rawText,
+                    ttlMs: notifTtlMs
+                });
+            }
             const items = (resV2.data as Array<Record<string, unknown>>).filter(
                 (raw) => typeof raw.id === 'string' && raw.id.trim().length > 0
             );
@@ -742,14 +839,19 @@ async function pollNotifications(
         // Non-fatal
     }
 
+    if (notifCacheWrites.length > 0) {
+        await putCachedVrcResponses(env, notifCacheWrites).catch(() => {});
+    }
+
     return { inserted, cookieChanged };
 }
 
 /**
- * Executes one scheduled or manual cloud-side VRChat Feed & Notification sync cycle.
- * Strictly obeys the independent Web/Cloud `webSyncIntervalSeconds` (default 300s = 5 min, min 60s on Cloudflare Cron),
- * skips external VRChat API requests when a browser tab is actively connected (unless `force` is true),
- * and stays well within Cloudflare Free Tier Worker/D1/subrequest guardrails with zero DO wakeups.
+ * Executes one scheduled or manual cloud-side RSS-style VRChat Feed, Online Friends & Notification sync cycle. Strictly
+ * obeys the independent Web/Cloud `webSyncIntervalSeconds` (default 300s = 5 min, min 60s on Cloudflare Cron)
+ * regardless of whether a Web tab is open or closed, prewarms dedicated `DB_CACHE` (`vrc_api_cache` +
+ * `cloud_rss_snapshot`), and stays well within Cloudflare Free Tier Worker/D1/subrequest guardrails with zero DO
+ * wakeups.
  */
 export async function runBackgroundFeedSync(
     env: Env,
@@ -759,8 +861,7 @@ export async function runBackgroundFeedSync(
     const nowMs = Date.now();
     const nowIso = new Date(nowMs).toISOString();
 
-    const { meta, snapshot, agentSyncIntervalSeconds, webSyncIntervalSeconds, enabled, cookieUpdatedAt } =
-        await readPollerState(env);
+    const { meta, snapshot, webSyncIntervalSeconds, enabled, cookieUpdatedAt } = await readPollerState(env);
 
     if (!force && !enabled) {
         return {
@@ -771,23 +872,6 @@ export async function runBackgroundFeedSync(
             notificationsInserted: 0,
             bioChecked: 0
         };
-    }
-
-    // Defer to live browser WebSocket while a Web tab is actively open (unless manually triggered).
-    // StatusBar sends heartbeats every max(agentSyncInterval*2, 180)s, and tab close fires ?closing=1 to clear webLastActiveAt immediately.
-    if (!force && meta.webLastActiveAt) {
-        const webActiveMs = Date.parse(meta.webLastActiveAt);
-        const activeWindowMs = (Math.max(agentSyncIntervalSeconds * 2, 180) + 45) * 1000;
-        if (Number.isFinite(webActiveMs) && nowMs - webActiveMs <= activeWindowMs) {
-            return {
-                ran: false,
-                status: 'skipped_web_active',
-                onlineCount: meta.lastOnlineCount,
-                feedInserted: 0,
-                notificationsInserted: 0,
-                bioChecked: 0
-            };
-        }
     }
 
     if (!force && meta.nextAllowedAt) {
@@ -843,15 +927,22 @@ export async function runBackgroundFeedSync(
 
     let cookieDirty = false;
     const onlineFriends: VrcFriendApiRecord[] = [];
+    const rawOnlineFriendRecords: Array<Record<string, unknown>> = [];
     const seenIds = new Set<string>();
+    const friendsCacheWrites: Array<{
+        url: string;
+        tier: 'friends_online';
+        status: number;
+        bodyText: string;
+        ttlMs: number;
+    }> = [];
+    const friendsTtlMs = Math.max(60, webSyncIntervalSeconds) * 1000;
 
     try {
         for (let page = 0; page < MAX_FRIEND_PAGES; page++) {
             const offset = page * FRIEND_PAGE_SIZE;
-            const res = await fetchVrcJson(
-                `auth/user/friends?offline=false&n=${FRIEND_PAGE_SIZE}&offset=${offset}`,
-                jar
-            );
+            const pathWithQuery = `auth/user/friends?offline=false&n=${FRIEND_PAGE_SIZE}&offset=${offset}`;
+            const res = await fetchVrcJson(pathWithQuery, jar);
             if (res.cookieChanged) cookieDirty = true;
 
             if (res.status === 401) {
@@ -892,19 +983,36 @@ export async function runBackgroundFeedSync(
                 throw new Error(`VRChat friends endpoint returned HTTP ${res.status}`);
             }
 
-            const batch = res.data as VrcFriendApiRecord[];
+            if (res.rawText) {
+                const fullUrl = `${VRC_API_BASE}/${pathWithQuery}`;
+                const plan = classifyVrcCacheUrl(fullUrl, webSyncIntervalSeconds);
+                friendsCacheWrites.push({
+                    url: fullUrl,
+                    tier: 'friends_online',
+                    status: 200,
+                    bodyText: res.rawText,
+                    ttlMs: plan?.ttlMs ?? friendsTtlMs
+                });
+            }
+
+            const batch = res.data as Array<Record<string, unknown>>;
             for (const item of batch) {
                 const id = typeof item.id === 'string' ? item.id.trim() : '';
                 if (!id || seenIds.has(id)) continue;
                 seenIds.add(id);
-                onlineFriends.push(item);
+                onlineFriends.push(item as VrcFriendApiRecord);
+                rawOnlineFriendRecords.push(item);
             }
             if (batch.length < FRIEND_PAGE_SIZE) {
                 break;
             }
         }
 
-        // Resolve world names for online friends' current worlds (DB cache first, <=4 API fetches)
+        if (friendsCacheWrites.length > 0) {
+            await putCachedVrcResponses(env, friendsCacheWrites, nowMs).catch(() => {});
+        }
+
+        // Resolve world names for online friends' current worlds (DB_CORE + DB_CACHE first, <=4 API fetches)
         const worldIdsToResolve: string[] = [];
         for (const f of onlineFriends) {
             const loc = typeof f.location === 'string' ? f.location.trim() : '';
@@ -925,8 +1033,8 @@ export async function runBackgroundFeedSync(
             worldRes.names
         );
 
-        // Rotate bio checks across online friends (<=3 per tick, >=10m per friend)
-        const bioRes = await pollRotatingFriendBios(env, onlineFriends, jar, nowIso, nowMs);
+        // Rotate bio checks across online friends (<=5 per tick, >=10m per friend)
+        const bioRes = await pollRotatingFriendBios(env, onlineFriends, jar, nowIso, nowMs, webSyncIntervalSeconds);
         if (bioRes.cookieChanged) cookieDirty = true;
         if (bioRes.bioFeeds.length > 0) {
             feedItems.push(...bioRes.bioFeeds);
@@ -939,8 +1047,8 @@ export async function runBackgroundFeedSync(
             feedInserted = ingestRes.inserted;
         }
 
-        // Poll v1 + v2 notifications
-        const notifRes = await pollNotifications(env, jar, nowIso);
+        // Poll v1 + v2 notifications and prewarm DB_CACHE
+        const notifRes = await pollNotifications(env, jar, nowIso, webSyncIntervalSeconds);
         if (notifRes.cookieChanged) cookieDirty = true;
 
         if (cookieDirty) {
@@ -958,21 +1066,32 @@ export async function runBackgroundFeedSync(
         meta.lastNotificationsInserted = notifRes.inserted;
         meta.lastBioChecked = bioRes.bioChecked;
 
-        await env.DB_CORE.batch([
-            env.DB_CORE.prepare(
-                `INSERT INTO cloud_bg_sync_state (state_key, payload_json, updated_at)
-                 VALUES (?, ?, ?)
-                 ON CONFLICT(state_key) DO UPDATE SET
-                    payload_json = excluded.payload_json,
-                    updated_at = excluded.updated_at`
-            ).bind(STATE_KEY_SNAPSHOT, JSON.stringify(nextSnapshot), nowIso),
-            env.DB_CORE.prepare(
-                `INSERT INTO cloud_bg_sync_state (state_key, payload_json, updated_at)
-                 VALUES (?, ?, ?)
-                 ON CONFLICT(state_key) DO UPDATE SET
-                    payload_json = excluded.payload_json,
-                    updated_at = excluded.updated_at`
-            ).bind(STATE_KEY_META, JSON.stringify(meta), nowIso)
+        await Promise.all([
+            env.DB_CORE.batch([
+                env.DB_CORE.prepare(
+                    `INSERT INTO cloud_bg_sync_state (state_key, payload_json, updated_at)
+                     VALUES (?, ?, ?)
+                     ON CONFLICT(state_key) DO UPDATE SET
+                        payload_json = excluded.payload_json,
+                        updated_at = excluded.updated_at`
+                ).bind(STATE_KEY_SNAPSHOT, JSON.stringify(nextSnapshot), nowIso),
+                env.DB_CORE.prepare(
+                    `INSERT INTO cloud_bg_sync_state (state_key, payload_json, updated_at)
+                     VALUES (?, ?, ?)
+                     ON CONFLICT(state_key) DO UPDATE SET
+                        payload_json = excluded.payload_json,
+                        updated_at = excluded.updated_at`
+                ).bind(STATE_KEY_META, JSON.stringify(meta), nowIso)
+            ]),
+            writeRssSnapshot(env, {
+                syncedAt: nowIso,
+                onlineCount: inGameCount,
+                feedInserted,
+                notificationsInserted: notifRes.inserted,
+                bioChecked: bioRes.bioChecked,
+                onlineFriends: rawOnlineFriendRecords
+            }).catch(() => {}),
+            pruneExpiredVrcCache(env, nowMs).catch(() => {})
         ]);
 
         return {
@@ -999,4 +1118,172 @@ export async function runBackgroundFeedSync(
             error: meta.lastError
         };
     }
+}
+
+export interface RssAggregatedFeedResponse {
+    changed: boolean;
+    syncedAt: string;
+    webSyncIntervalSeconds: number;
+    hasVrcSession: boolean;
+    onlineCount: number;
+    feedInserted: number;
+    notificationsInserted: number;
+    bioChecked: number;
+    onlineFriends: Array<Record<string, unknown>>;
+    recentFeeds: Array<Record<string, unknown>>;
+    notificationsV1: Array<Record<string, unknown>>;
+    notificationsV2: Array<Record<string, unknown>>;
+    syncResult?: BackgroundFeedSyncResult;
+}
+
+/**
+ * Returns the latest RSS-style aggregated snapshot from dedicated DB_CACHE + D1 Feed/Notifications.
+ * Makes 0 api.vrchat.cloud calls unless `forceSync` is requested or DB_CACHE has no initial snapshot yet.
+ */
+export async function getRssAggregatedFeed(
+    env: Env,
+    options: { since?: string; forceSync?: boolean } = {}
+): Promise<RssAggregatedFeedResponse> {
+    const since = (options.since ?? '').trim();
+    const [{ webSyncIntervalSeconds }, jar] = await Promise.all([readPollerState(env), loadCookieJar(env)]);
+    const hasVrcSession = Boolean(jar.auth?.trim());
+
+    let syncResult: BackgroundFeedSyncResult | undefined;
+    if (options.forceSync && hasVrcSession) {
+        syncResult = await runBackgroundFeedSync(env, { force: true, trigger: 'manual' });
+    }
+
+    let snapshot = await readRssSnapshot(env);
+    if (!snapshot && hasVrcSession && !options.forceSync) {
+        syncResult = await runBackgroundFeedSync(env, { force: true, trigger: 'manual' });
+        snapshot = await readRssSnapshot(env);
+    }
+
+    if (!snapshot) {
+        return {
+            changed: false,
+            syncedAt: '',
+            webSyncIntervalSeconds,
+            hasVrcSession,
+            onlineCount: 0,
+            feedInserted: 0,
+            notificationsInserted: 0,
+            bioChecked: 0,
+            onlineFriends: [],
+            recentFeeds: [],
+            notificationsV1: [],
+            notificationsV2: [],
+            ...(syncResult ? { syncResult } : {})
+        };
+    }
+
+    const changed = Boolean(options.forceSync || !since || snapshot.syncedAt > since);
+    if (!changed) {
+        return {
+            changed: false,
+            syncedAt: snapshot.syncedAt,
+            webSyncIntervalSeconds,
+            hasVrcSession,
+            onlineCount: snapshot.onlineCount,
+            feedInserted: snapshot.feedInserted,
+            notificationsInserted: snapshot.notificationsInserted,
+            bioChecked: snapshot.bioChecked,
+            onlineFriends: [],
+            recentFeeds: [],
+            notificationsV1: [],
+            notificationsV2: []
+        };
+    }
+
+    const [feedResults, notifResults] = await Promise.all([
+        env.DB_FEED.batch([
+            env.DB_FEED.prepare('SELECT * FROM feed_gps ORDER BY id DESC LIMIT 30'),
+            env.DB_FEED.prepare('SELECT * FROM feed_online_offline ORDER BY id DESC LIMIT 30'),
+            env.DB_FEED.prepare('SELECT * FROM feed_status ORDER BY id DESC LIMIT 30'),
+            env.DB_FEED.prepare('SELECT * FROM feed_bio ORDER BY id DESC LIMIT 30')
+        ]),
+        env.DB_CORE.batch([
+            env.DB_CORE.prepare('SELECT * FROM notifications ORDER BY created_at DESC LIMIT 50'),
+            env.DB_CORE.prepare('SELECT * FROM notifications_v2 ORDER BY created_at DESC LIMIT 50')
+        ])
+    ]);
+
+    const recentFeeds: Array<Record<string, unknown>> = [];
+    const [gps, onoff, status, bio] = feedResults as D1Result<Record<string, unknown>>[];
+    for (const r of gps?.results ?? []) {
+        recentFeeds.push({
+            rowId: r.id,
+            created_at: r.created_at,
+            type: 'GPS',
+            userId: r.user_id,
+            displayName: r.display_name,
+            location: r.location,
+            worldName: r.world_name,
+            previousLocation: r.previous_location,
+            time: r.time,
+            groupName: r.group_name
+        });
+    }
+    for (const r of onoff?.results ?? []) {
+        recentFeeds.push({
+            rowId: r.id,
+            created_at: r.created_at,
+            type: r.type,
+            userId: r.user_id,
+            displayName: r.display_name,
+            location: r.location,
+            worldName: r.world_name,
+            time: r.time,
+            groupName: r.group_name
+        });
+    }
+    for (const r of status?.results ?? []) {
+        recentFeeds.push({
+            rowId: r.id,
+            created_at: r.created_at,
+            type: 'Status',
+            userId: r.user_id,
+            displayName: r.display_name,
+            status: r.status,
+            statusDescription: r.status_description,
+            previousStatus: r.previous_status,
+            previousStatusDescription: r.previous_status_description
+        });
+    }
+    for (const r of bio?.results ?? []) {
+        recentFeeds.push({
+            rowId: r.id,
+            created_at: r.created_at,
+            type: 'Bio',
+            userId: r.user_id,
+            displayName: r.display_name,
+            bio: r.bio,
+            previousBio: r.previous_bio,
+            bioLinks: safeJsonParse<string[]>(typeof r.bio_links === 'string' ? r.bio_links : null, []),
+            previousBioLinks: safeJsonParse<string[]>(
+                typeof r.previous_bio_links === 'string' ? r.previous_bio_links : null,
+                []
+            )
+        });
+    }
+    recentFeeds.sort((a, b) => String(b.created_at ?? '').localeCompare(String(a.created_at ?? '')));
+    const filteredFeeds = since
+        ? recentFeeds.filter((f) => String(f.created_at ?? '') > since).slice(0, 60)
+        : recentFeeds.slice(0, 60);
+
+    return {
+        changed: true,
+        syncedAt: snapshot.syncedAt,
+        webSyncIntervalSeconds,
+        hasVrcSession,
+        onlineCount: snapshot.onlineCount,
+        feedInserted: snapshot.feedInserted,
+        notificationsInserted: snapshot.notificationsInserted,
+        bioChecked: snapshot.bioChecked,
+        onlineFriends: snapshot.onlineFriends,
+        recentFeeds: filteredFeeds,
+        notificationsV1: (notifResults[0] as D1Result<Record<string, unknown>> | undefined)?.results ?? [],
+        notificationsV2: (notifResults[1] as D1Result<Record<string, unknown>> | undefined)?.results ?? [],
+        ...(syncResult ? { syncResult } : {})
+    };
 }

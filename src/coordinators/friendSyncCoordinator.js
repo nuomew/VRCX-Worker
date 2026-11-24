@@ -12,6 +12,7 @@ import { getCurrentUser } from './userCoordinator';
 import { watchState } from '../services/watchState';
 
 import configRepository from '../services/config';
+import { pollCloudRssFeed } from '../ipc-web/cloudRssSync';
 
 /**
  * Runs friend list refresh orchestration.
@@ -19,6 +20,16 @@ import configRepository from '../services/config';
 export async function runRefreshFriendsListFlow() {
     const updateLoopStore = useUpdateLoopStore();
     const friendStore = useFriendStore();
+
+    if (typeof WEB !== 'undefined' && WEB) {
+        friendStore.setIsRefreshFriendsLoading(true);
+        try {
+            await pollCloudRssFeed({ forceSync: true });
+        } finally {
+            friendStore.setIsRefreshFriendsLoading(false);
+        }
+        return;
+    }
 
     // If we just got user less then 2 min before code call, don't call it again
     if (updateLoopStore.nextCurrentUserRefresh < 300) {

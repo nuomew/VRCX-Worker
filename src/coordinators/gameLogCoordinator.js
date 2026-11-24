@@ -127,16 +127,18 @@ export async function tryLoadPlayerList() {
                     }
                 }
             }
-            locationStore.lastLocation.playerList.forEach((ref1) => {
-                if (ref1.userId && typeof ref1.userId === 'string') {
-                    if (!userStore.cachedUsers.has(ref1.userId)) {
-                        userRequest.getUser({ userId: ref1.userId });
+            if (typeof WEB === 'undefined' || !WEB) {
+                locationStore.lastLocation.playerList.forEach((ref1) => {
+                    if (ref1.userId && typeof ref1.userId === 'string') {
+                        if (!userStore.cachedUsers.has(ref1.userId)) {
+                            userRequest.getUser({ userId: ref1.userId });
+                        }
+                        if (!userStore.cachedProfiles.has(ref1.userId)) {
+                            userRequest.getPublicProfile({ userId: ref1.userId });
+                        }
                     }
-                    if (!userStore.cachedProfiles.has(ref1.userId)) {
-                        userRequest.getPublicProfile({ userId: ref1.userId });
-                    }
-                }
-            });
+                });
+            }
 
             runUpdateCurrentUserLocationFlow();
             instanceStore.updateCurrentInstanceWorld();

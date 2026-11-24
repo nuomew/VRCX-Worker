@@ -969,10 +969,11 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
     }
 
     if (url.pathname === '/api/admin/quota' && request.method === 'GET') {
-        const [coreProbe, gameProbe, feedProbe, countersRes, devicesRes] = await Promise.all([
+        const [coreProbe, gameProbe, feedProbe, cacheProbe, countersRes, devicesRes] = await Promise.all([
             env.DB_CORE.prepare('SELECT 1 AS ok').all(),
             env.DB_GAMELOG.prepare('SELECT 1 AS ok').all(),
             env.DB_FEED.prepare('SELECT 1 AS ok').all(),
+            env.DB_CACHE ? env.DB_CACHE.prepare('SELECT 1 AS ok').all() : Promise.resolve(null),
             env.DB_CORE.prepare('SELECT counter_key, row_count, updated_at FROM stats_counters').all(),
             env.DB_CORE.prepare('SELECT COUNT(*) AS cnt FROM cloud_devices').first<{ cnt: number }>()
         ]);
@@ -980,11 +981,14 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
         const sizeCore = coreProbe.meta?.size_after ?? 0;
         const sizeGame = gameProbe.meta?.size_after ?? 0;
         const sizeFeed = feedProbe.meta?.size_after ?? 0;
+        const sizeCache = cacheProbe?.meta?.size_after ?? 0;
 
         return Response.json({
             ok: true,
             data: {
-                healthy: Boolean(coreProbe.success && gameProbe.success && feedProbe.success),
+                healthy: Boolean(
+                    coreProbe.success && gameProbe.success && feedProbe.success && (!cacheProbe || cacheProbe.success)
+                ),
                 freeSingleDbLimitBytes: freeDbCapBytes,
                 databases: {
                     core: {
@@ -998,10 +1002,19 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
                     feed: {
                         bytes: sizeFeed,
                         percentOfFreeLimit: Number(((sizeFeed / freeDbCapBytes) * 100).toFixed(2))
-                    }
+                    },
+                    ...(env.DB_CACHE
+                        ? {
+                              cache: {
+                                  bytes: sizeCache,
+                                  percentOfFreeLimit: Number(((sizeCache / freeDbCapBytes) * 100).toFixed(2))
+                              }
+                          }
+                        : {})
                 },
                 pairedDevicesCount: devicesRes?.cnt ?? 0,
                 r2Enabled: Boolean(env.R2_MEDIA),
+                cacheDbDedicated: Boolean(env.DB_CACHE),
                 counters: countersRes.results ?? []
             }
         });

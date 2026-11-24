@@ -222,7 +222,7 @@
                             </HoverCardContent>
                         </HoverCard>
 
-                        <TooltipWrapper v-if="visibility.ws" :content="wsTooltip" side="top">
+                        <TooltipWrapper v-if="!isWeb && visibility.ws" :content="wsTooltip" side="top">
                             <div class="flex items-center gap-1 px-2 h-[22px] whitespace-nowrap border-r border-border">
                                 <span
                                     class="inline-block size-2 rounded-full shrink-0"
@@ -420,6 +420,7 @@
                     {{ t('status_bar.proxy') }}
                 </ContextMenuCheckboxItem>
                 <ContextMenuCheckboxItem
+                    v-if="!isWeb"
                     :model-value="visibility.ws"
                     @select.prevent
                     @update:model-value="toggleVisibility('ws')">

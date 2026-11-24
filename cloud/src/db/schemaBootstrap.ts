@@ -400,6 +400,30 @@ const FEED_STATEMENTS: readonly string[] = [
     `CREATE INDEX IF NOT EXISTS idx_activity_sessions_user_start ON activity_sessions_v2 (user_id, start_at DESC)`
 ];
 
+const CACHE_STATEMENTS: readonly string[] = [
+    `CREATE TABLE IF NOT EXISTS vrc_api_cache (
+        cache_key TEXT PRIMARY KEY,
+        tier TEXT NOT NULL DEFAULT 'dynamic',
+        status INTEGER NOT NULL DEFAULT 200,
+        body_text TEXT NOT NULL DEFAULT '',
+        updated_at TEXT NOT NULL,
+        expires_at INTEGER NOT NULL
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_vrc_api_cache_expires ON vrc_api_cache (expires_at)`,
+    `CREATE TABLE IF NOT EXISTS cloud_rss_snapshot (
+        snapshot_key TEXT PRIMARY KEY,
+        payload_json TEXT NOT NULL DEFAULT '{}',
+        synced_at TEXT NOT NULL
+    )`
+];
+
+/**
+ * Returns the dedicated DB_CACHE shard when bound, falling back gracefully to DB_CORE.
+ */
+export function getCacheDb(env: Env): D1Database {
+    return env.DB_CACHE ?? env.DB_CORE;
+}
+
 async function initCoreIfNeeded(db: D1Database): Promise<void> {
     try {
         const meta = await db
@@ -436,7 +460,8 @@ async function initShardIfNeeded(db: D1Database, markerTable: string, statements
 }
 
 /**
- * Ensures all 3 sharded D1 databases have their latest schema applied idempotently.
+ * Ensures all sharded D1 databases (core, gamelog, feed, and dedicated cache) have their latest schema applied
+ * idempotently.
  */
 export async function ensureSchemaReady(env: Env): Promise<void> {
     if (schemaInitialized) {
@@ -446,7 +471,8 @@ export async function ensureSchemaReady(env: Env): Promise<void> {
         initPromise = Promise.all([
             initCoreIfNeeded(env.DB_CORE),
             initShardIfNeeded(env.DB_GAMELOG, 'gamelog_external', GAMELOG_STATEMENTS),
-            initShardIfNeeded(env.DB_FEED, 'activity_sessions_v2', FEED_STATEMENTS)
+            initShardIfNeeded(env.DB_FEED, 'activity_sessions_v2', FEED_STATEMENTS),
+            initShardIfNeeded(getCacheDb(env), 'cloud_rss_snapshot', CACHE_STATEMENTS)
         ])
             .then(() => {
                 schemaInitialized = true;

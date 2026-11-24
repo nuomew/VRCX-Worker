@@ -49,12 +49,10 @@ export const wsState = reactive({
 });
 
 export function initWebsocket() {
-    if (!watchState.isFriendsLoaded || webSocket !== null) {
+    if (isWebMode) {
         return;
     }
-    if (isWebMode && typeof window !== 'undefined') {
-        const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        connectWebSocketUrl(`${wsProtocol}//${window.location.host}/api/vrc/pipeline`);
+    if (!watchState.isFriendsLoaded || webSocket !== null) {
         return;
     }
     return request('auth', {
@@ -237,6 +235,9 @@ export function closeWebSocket() {
  * @returns {void}
  */
 export function reconnectWebSocket() {
+    if (isWebMode) {
+        return;
+    }
     if (!watchState.isLoggedIn || !watchState.isFriendsLoaded) {
         return;
     }

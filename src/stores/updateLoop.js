@@ -20,6 +20,7 @@ import { useVrStore } from './vr';
 import { useVrcxStore } from './vrcx';
 import { watchState } from '../services/watchState';
 import { cloudState } from '../ipc-web/cloudState';
+import { pollCloudRssFeed, resetCloudRssSyncState } from '../ipc-web/cloudRssSync';
 
 import * as workerTimers from 'worker-timers';
 
@@ -36,6 +37,7 @@ export const useUpdateLoopStore = defineStore('UpdateLoop', () => {
         nextCurrentUserRefresh: 300,
         nextFriendsRefresh: 3600,
         nextGroupInstanceRefresh: 0,
+        nextCloudRssRefresh: 300,
         nextAppUpdateCheck: 3600,
         ipcTimeout: 0,
         nextClearVRCXCacheCheck: 86400,
@@ -49,13 +51,17 @@ export const useUpdateLoopStore = defineStore('UpdateLoop', () => {
 
     watch(
         () => watchState.isLoggedIn,
-        () => {
+        (loggedIn) => {
             const isWebMode = typeof WEB !== 'undefined' && WEB;
-            const minPollSec = isWebMode ? Math.max(600, cloudState.webSyncIntervalSeconds || 300) : 300;
-            state.nextCurrentUserRefresh = minPollSec;
-            state.nextFriendsRefresh = Math.max(3600, minPollSec);
+            if (isWebMode && !loggedIn) {
+                resetCloudRssSyncState();
+            }
+            const rssIntervalSec = isWebMode ? Math.max(60, cloudState.webSyncIntervalSeconds || 300) : 300;
+            state.nextCurrentUserRefresh = 300;
+            state.nextFriendsRefresh = 3600;
             state.nextGroupInstanceRefresh = 0;
-            state.nextBundleCheck = isWebMode ? Math.max(600, cloudState.webSyncIntervalSeconds || 300) : 60;
+            state.nextCloudRssRefresh = rssIntervalSec;
+            state.nextBundleCheck = 60;
         },
         { flush: 'sync' }
     );
@@ -74,31 +80,39 @@ export const useUpdateLoopStore = defineStore('UpdateLoop', () => {
                 const isWebMode = typeof WEB !== 'undefined' && WEB;
                 const isTabHidden =
                     isWebMode && typeof document !== 'undefined' && document.visibilityState === 'hidden';
-                const webMinIntervalSec = isWebMode ? Math.max(600, cloudState.webSyncIntervalSeconds || 300) : 300;
-                if (--state.nextCurrentUserRefresh <= 0) {
-                    state.nextCurrentUserRefresh = webMinIntervalSec; // >= 10min on Web (pipeline WS pushes live updates)
-                    if (!isTabHidden) {
-                        getCurrentUser();
+                const webRssIntervalSec = isWebMode ? Math.max(60, cloudState.webSyncIntervalSeconds || 300) : 300;
+
+                if (isWebMode) {
+                    if (state.nextCloudRssRefresh > webRssIntervalSec) {
+                        state.nextCloudRssRefresh = webRssIntervalSec;
+                    }
+                    if (--state.nextCloudRssRefresh <= 0) {
+                        state.nextCloudRssRefresh = webRssIntervalSec;
+                        if (!isTabHidden && watchState.isFriendsLoaded) {
+                            pollCloudRssFeed({ forceSync: false }).catch(console.error);
+                        }
                     }
                 }
-                if (--state.nextFriendsRefresh <= 0) {
-                    state.nextFriendsRefresh = Math.max(3600, webMinIntervalSec); // >= 1hour
-                    if (!isTabHidden) {
-                        runRefreshFriendsListFlow();
-                        authStore.updateStoredUser(userStore.currentUser);
-                        if (
-                            userStore.currentUser.last_activity &&
-                            new Date(userStore.currentUser.last_activity) > new Date(Date.now() - 3600 * 1000) // 1hour
-                        ) {
-                            runRefreshPlayerModerationsFlow();
-                            userStore.getAllProductPurchases();
-                        }
+                if (!isWebMode && --state.nextCurrentUserRefresh <= 0) {
+                    state.nextCurrentUserRefresh = 300; // 5min
+                    getCurrentUser();
+                }
+                if (!isWebMode && --state.nextFriendsRefresh <= 0) {
+                    state.nextFriendsRefresh = 3600; // 1hour
+                    runRefreshFriendsListFlow();
+                    authStore.updateStoredUser(userStore.currentUser);
+                    if (
+                        userStore.currentUser.last_activity &&
+                        new Date(userStore.currentUser.last_activity) > new Date(Date.now() - 3600 * 1000) // 1hour
+                    ) {
+                        runRefreshPlayerModerationsFlow();
+                        userStore.getAllProductPurchases();
                     }
                 }
                 if (--state.nextGroupInstanceRefresh <= 0) {
                     if (watchState.isFriendsLoaded) {
-                        state.nextGroupInstanceRefresh = webMinIntervalSec;
-                        if (!isTabHidden) {
+                        state.nextGroupInstanceRefresh = isWebMode ? webRssIntervalSec : 300;
+                        if (!isWebMode) {
                             const args = await groupRequest.getUsersGroupInstances();
                             handleGroupUserInstances(args);
                         }
@@ -145,7 +159,7 @@ export const useUpdateLoopStore = defineStore('UpdateLoop', () => {
                     state.nextDatabaseOptimize = 86400; // 1 day
                     database.optimize().catch(console.error);
                 }
-                if (--state.nextBundleCheck <= 0) {
+                if (!isWebMode && --state.nextBundleCheck <= 0) {
                     state.nextBundleCheck = 10800; // 3hours
                     notificationStore.checkInventoryBundles();
                     notificationStore.checkFreeStoreItems();

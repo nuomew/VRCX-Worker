@@ -608,4 +608,47 @@ describe('WEB cloud adapter (stateless)', () => {
             delete (/** @type {any} */ (globalThis).window);
         }
     });
+
+    it('caches offline friends and favorites in long-lived tiers and throttles non-forced cloud RSS feed reads', async () => {
+        cloudState.webSyncIntervalSeconds = 60;
+        const webApi = createWebApiBridge();
+        const offlineFriendsUrl = 'https://api.vrchat.cloud/api/1/auth/user/friends?n=100&offset=0&offline=true';
+        const favoritesUrl = 'https://api.vrchat.cloud/api/1/favorites?n=100&offset=0';
+
+        fetchSpy.mockResolvedValueOnce(
+            mockOk({
+                route: 'cloud_cache',
+                results: [
+                    { status: 200, data: '[{"id":"usr_off_1"}]' },
+                    { status: 200, data: '[{"id":"fvrt_1"}]' }
+                ]
+            })
+        );
+        const [offRes1, favRes1] = await Promise.all([
+            webApi.ExecuteJson(JSON.stringify({ url: offlineFriendsUrl, method: 'GET' })),
+            webApi.ExecuteJson(JSON.stringify({ url: favoritesUrl, method: 'GET' }))
+        ]);
+        expect(JSON.parse(offRes1).message).toContain('usr_off_1');
+        expect(JSON.parse(favRes1).message).toContain('fvrt_1');
+        expect(fetchSpy).toHaveBeenCalledTimes(1);
+
+        // Advance 3 minutes (> 60s webSyncIntervalSeconds, < 15m entity / 30m static TTL) -> both remain cached locally
+        await vi.advanceTimersByTimeAsync(180_000);
+        const [offRes2, favRes2] = await Promise.all([
+            webApi.ExecuteJson(JSON.stringify({ url: offlineFriendsUrl, method: 'GET' })),
+            webApi.ExecuteJson(JSON.stringify({ url: favoritesUrl, method: 'GET' }))
+        ]);
+        expect(JSON.parse(offRes2).message).toContain('usr_off_1');
+        expect(JSON.parse(favRes2).message).toContain('fvrt_1');
+        expect(fetchSpy).toHaveBeenCalledTimes(1);
+
+        // Unrelated user PUT must NOT evict static offline friends cache
+        fetchSpy.mockResolvedValueOnce(mockOk({ status: 200, data: '{"ok":true}', route: 'cloud_direct' }));
+        await webApi.ExecuteJson(
+            JSON.stringify({ url: 'https://api.vrchat.cloud/api/1/users/usr_me', method: 'PUT', body: '{}' })
+        );
+        const offRes3 = await webApi.ExecuteJson(JSON.stringify({ url: offlineFriendsUrl, method: 'GET' }));
+        expect(JSON.parse(offRes3).message).toContain('usr_off_1');
+        expect(fetchSpy).toHaveBeenCalledTimes(2);
+    });
 });

@@ -970,8 +970,7 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
         });
 
         try {
-            // 1. While Web tab is active (bootstrap just ran), scheduled Cron defers cleanly without calling VRChat API
-            // Also verify bootstrap reports independent webSyncIntervalSeconds (default 300s) even though agent syncIntervalSeconds is 180s
+            // 1. Verify bootstrap reports independent webSyncIntervalSeconds (default 300s) even though agent syncIntervalSeconds is 180s
             const bootRes = await exports.default.fetch('http://example.com/api/bootstrap');
             const bootJson = (await bootRes.json()) as {
                 ok: boolean;
@@ -980,16 +979,7 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
             expect(bootJson.data.syncIntervalSeconds).toBe(180);
             expect(bootJson.data.webSyncIntervalSeconds).toBe(300);
 
-            const deferred = await runBackgroundFeedSync(env, { trigger: 'cron' });
-            expect(deferred.ran).toBe(false);
-            expect(deferred.status).toBe('skipped_web_active');
-
-            // 2. Closing the Web tab (?closing=1) clears webLastActiveAt so Cron immediately takes over
-            const closeRes = await exports.default.fetch('http://example.com/api/stats/uptime?closing=1', {
-                method: 'POST'
-            });
-            expect(closeRes.status).toBe(200);
-
+            // 2. Pure RSS mode: even right after /api/bootstrap (Web tab open), Cron executes on schedule instead of deferring
             // Round 1 establishes baseline snapshot & initial bios without emitting false Online events
             const r1 = await runBackgroundFeedSync(env, { trigger: 'cron' });
             expect(r1.ran).toBe(true);
@@ -1230,5 +1220,213 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
         expect(snapJson.data[0]?.location).toBe(v105Room);
         expect(snapJson.data[0]?.worldName).toBe('Moonlight Cafe');
         expect(snapJson.data.slice(1).map((r) => r.userId)).toEqual(['usr_miku', 'usr_rin']);
+    });
+
+    it('isolates VRChat API response cache and RSS snapshots in dedicated DB_CACHE and serves /api/rss/feed + /api/rss/sync', async () => {
+        // 1. /health and /api/admin/quota both confirm dedicated DB_CACHE binding
+        const healthRes = await exports.default.fetch('http://example.com/health');
+        expect(healthRes.status).toBe(200);
+        const healthJson = (await healthRes.json()) as {
+            ok: boolean;
+            data: {
+                schemaReady: boolean;
+                cacheDbDedicated: boolean;
+            };
+        };
+        expect(healthJson.ok).toBe(true);
+        expect(healthJson.data.schemaReady).toBe(true);
+        expect(healthJson.data.cacheDbDedicated).toBe(true);
+
+        const quotaRes = await exports.default.fetch('http://example.com/api/admin/quota');
+        expect(quotaRes.status).toBe(200);
+        const quotaJson = (await quotaRes.json()) as {
+            ok: boolean;
+            data: {
+                freeSingleDbLimitBytes: number;
+                cacheDbDedicated: boolean;
+                databases: { cache?: { bytes: number; percentOfFreeLimit: number } };
+            };
+        };
+        expect(quotaJson.data.cacheDbDedicated).toBe(true);
+        expect(quotaJson.data.freeSingleDbLimitBytes).toBeGreaterThan(0);
+        expect(typeof quotaJson.data.databases.cache?.bytes).toBe('number');
+
+        // Re-enable background sync after test #7 toggled it off
+        const enableRes = await exports.default.fetch('http://example.com/api/bg-sync/config', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ enabled: true })
+        });
+        expect(enableRes.status).toBe(200);
+
+        let upstreamCalls = 0;
+        const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+            const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+            upstreamCalls += 1;
+            if (url.includes('/api/1/worlds/wrld_cache_test')) {
+                return Response.json({ id: 'wrld_cache_test', name: 'Cached Sakura Shrine' });
+            }
+            if (url.includes('/api/1/users/usr_cache_target')) {
+                return Response.json({ id: 'usr_cache_target', displayName: 'Cached User' });
+            }
+            if (url.includes('/api/1/users/usr_me')) {
+                return Response.json({ id: 'usr_me', status: 'active' });
+            }
+            if (url.includes('/api/1/auth/user/friends')) {
+                return Response.json([
+                    {
+                        id: 'usr_rss_1',
+                        displayName: 'RssFriend',
+                        location: 'wrld_cache_test:999',
+                        status: 'join me',
+                        statusDescription: 'RSS Live'
+                    }
+                ]);
+            }
+            if (url.includes('/api/1/users/usr_rss_1')) {
+                return Response.json({ id: 'usr_rss_1', displayName: 'RssFriend', bio: 'RSS Bio', bioLinks: [] });
+            }
+            if (url.includes('/api/1/auth/user/notifications')) {
+                return Response.json([]);
+            }
+            if (url.includes('/api/1/notifications')) {
+                return Response.json([]);
+            }
+            return new Response('Not Found', { status: 404 });
+        });
+
+        try {
+            // 2. First GET populates DB_CACHE (1 upstream hit); second GET with reordered query params hits DB_CACHE (0 upstream hits)
+            const exec1 = await exports.default.fetch('http://example.com/api/vrc/execute', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    url: 'https://api.vrchat.cloud/api/1/worlds/wrld_cache_test?b=2&a=1',
+                    method: 'GET'
+                })
+            });
+            expect(exec1.status).toBe(200);
+            const exec1Json = (await exec1.json()) as {
+                ok: boolean;
+                data: { status: number; route: string; data: string };
+            };
+            expect(exec1Json.data.status).toBe(200);
+            expect(exec1Json.data.route).toBe('cloud_direct');
+            expect(upstreamCalls).toBe(1);
+
+            const exec2 = await exports.default.fetch('http://example.com/api/vrc/execute', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    url: 'https://api.vrchat.cloud/api/1/worlds/wrld_cache_test?a=1&b=2',
+                    method: 'GET'
+                })
+            });
+            const exec2Json = (await exec2.json()) as {
+                ok: boolean;
+                data: { status: number; route: string; data: string };
+            };
+            expect(exec2Json.data.route).toBe('cloud_cache');
+            expect(exec2Json.data.data).toContain('Cached Sakura Shrine');
+            expect(upstreamCalls).toBe(1);
+
+            // Confirm cached entry lives in dedicated DB_CACHE, not DB_CORE
+            const cacheRow = await env.DB_CACHE?.prepare(
+                "SELECT cache_key, tier FROM vrc_api_cache WHERE cache_key LIKE '%wrld_cache_test%'"
+            ).first<{ cache_key: string; tier: string }>();
+            expect(cacheRow?.tier).toBe('world');
+
+            // 3. /api/vrc/execute-batch serves cached world from DB_CACHE and only calls upstream for uncached user
+            const batch1 = await exports.default.fetch('http://example.com/api/vrc/execute-batch', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    requests: [
+                        { url: 'https://api.vrchat.cloud/api/1/worlds/wrld_cache_test?a=1&b=2', method: 'GET' },
+                        { url: 'https://api.vrchat.cloud/api/1/users/usr_cache_target', method: 'GET' }
+                    ]
+                })
+            });
+            const batch1Json = (await batch1.json()) as {
+                ok: boolean;
+                data: { results: Array<{ status: number; data: string }> };
+            };
+            expect(batch1Json.data.results[0]?.data).toContain('Cached Sakura Shrine');
+            expect(batch1Json.data.results[1]?.data).toContain('Cached User');
+            expect(upstreamCalls).toBe(2);
+
+            // Repeat same batch -> 100% cloud_cache with 0 upstream calls
+            const batch2 = await exports.default.fetch('http://example.com/api/vrc/execute-batch', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    requests: [
+                        { url: 'https://api.vrchat.cloud/api/1/worlds/wrld_cache_test?a=1&b=2', method: 'GET' },
+                        { url: 'https://api.vrchat.cloud/api/1/users/usr_cache_target', method: 'GET' }
+                    ]
+                })
+            });
+            const batch2Json = (await batch2.json()) as { ok: boolean; data: { route: string } };
+            expect(batch2Json.data.route).toBe('cloud_cache');
+            expect(upstreamCalls).toBe(2);
+
+            // 4. Write to /api/1/users/usr_me does not wipe unrelated world cache
+            await exports.default.fetch('http://example.com/api/vrc/execute', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    url: 'https://api.vrchat.cloud/api/1/users/usr_me',
+                    method: 'PUT',
+                    body: '{}'
+                })
+            });
+            expect(upstreamCalls).toBe(3);
+
+            const afterWriteWorld = await exports.default.fetch('http://example.com/api/vrc/execute', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    url: 'https://api.vrchat.cloud/api/1/worlds/wrld_cache_test?a=1&b=2',
+                    method: 'GET'
+                })
+            });
+            const afterWriteJson = (await afterWriteWorld.json()) as { ok: boolean; data: { route: string } };
+            expect(afterWriteJson.data.route).toBe('cloud_cache');
+            expect(upstreamCalls).toBe(3);
+
+            // 5. GET /api/rss/feed reads pre-aggregated snapshot from DB_CACHE with 0 upstream VRChat calls
+            const callsBeforeRssRead = upstreamCalls;
+            const rss1 = await exports.default.fetch('http://example.com/api/rss/feed');
+            expect(rss1.status).toBe(200);
+            const rss1Json = (await rss1.json()) as {
+                ok: boolean;
+                data: { changed: boolean; syncedAt: string; onlineFriends: Array<{ id: string }> };
+            };
+            expect(rss1Json.data.changed).toBe(true);
+            expect(rss1Json.data.syncedAt).toBeTruthy();
+            expect(rss1Json.data.onlineFriends.length).toBeGreaterThan(0);
+            expect(upstreamCalls).toBe(callsBeforeRssRead);
+
+            // Watermark match returns changed: false with 0 upstream calls
+            const rssUnchanged = await exports.default.fetch(
+                `http://example.com/api/rss/feed?since=${encodeURIComponent(rss1Json.data.syncedAt)}`
+            );
+            const rssUnchangedJson = (await rssUnchanged.json()) as { ok: boolean; data: { changed: boolean } };
+            expect(rssUnchangedJson.data.changed).toBe(false);
+            expect(upstreamCalls).toBe(callsBeforeRssRead);
+
+            // 6. POST /api/rss/sync triggers on-demand cloud aggregation and updates snapshot in DB_CACHE
+            const rssForce = await exports.default.fetch('http://example.com/api/rss/sync', { method: 'POST' });
+            expect(rssForce.status).toBe(200);
+            const rssForceJson = (await rssForce.json()) as {
+                ok: boolean;
+                data: { changed: boolean; syncedAt: string; onlineFriends: Array<{ id: string }> };
+            };
+            expect(rssForceJson.data.changed).toBe(true);
+            expect(rssForceJson.data.onlineFriends.some((f) => f.id === 'usr_rss_1')).toBe(true);
+            expect(upstreamCalls).toBeGreaterThan(callsBeforeRssRead);
+        } finally {
+            fetchSpy.mockRestore();
+        }
     });
 });

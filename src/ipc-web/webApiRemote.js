@@ -44,6 +44,17 @@ function classifyThrottleableReadGet(options) {
     if (p === '/api/1/config' || p === '/api/1/auth/permissions') {
         return 'static';
     }
+    if (p === '/api/1/auth/user/friends' && parsed.searchParams.get('offline') === 'true') {
+        return 'static';
+    }
+    if (
+        p.startsWith('/api/1/favorites') ||
+        p.startsWith('/api/1/favorite/') ||
+        p.startsWith('/api/1/worlds/favorites') ||
+        p.startsWith('/api/1/avatars/favorites')
+    ) {
+        return 'entity';
+    }
     if (
         p.startsWith('/api/1/worlds/') ||
         p.startsWith('/api/1/avatars/') ||
@@ -58,7 +69,6 @@ function classifyThrottleableReadGet(options) {
     }
     if (
         p.startsWith('/api/1/auth/user/') ||
-        p.startsWith('/api/1/favorites') ||
         p.startsWith('/api/1/notifications') ||
         p.startsWith('/api/1/inventory') ||
         p.startsWith('/api/1/user/') ||
@@ -77,9 +87,9 @@ function classifyThrottleableReadGet(options) {
  */
 function getTierTtlMs(tier) {
     const baseSec = clampWebSyncIntervalSeconds(cloudState.webSyncIntervalSeconds);
-    if (tier === 'static') return Math.max(600, baseSec) * 1000;
-    if (tier === 'entity') return Math.max(300, baseSec) * 1000;
-    if (tier === 'dynamic') return Math.max(120, baseSec) * 1000;
+    if (tier === 'static') return Math.max(1800, baseSec) * 1000;
+    if (tier === 'entity') return Math.max(900, baseSec) * 1000;
+    if (tier === 'dynamic') return Math.max(300, baseSec) * 1000;
     return baseSec * 1000;
 }
 

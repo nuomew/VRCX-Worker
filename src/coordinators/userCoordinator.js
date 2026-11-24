@@ -258,7 +258,8 @@ export function applyUser(json) {
         ref.$location = parseLocation(ref.location);
         currentTravelers.delete(ref.id);
     }
-    if (!instanceStore.cachedInstances.has(ref.$location.tag) && isRealInstance(ref.location)) {
+    const isWebMode = typeof WEB !== 'undefined' && WEB;
+    if (!isWebMode && !instanceStore.cachedInstances.has(ref.$location.tag) && isRealInstance(ref.location)) {
         instanceRequest.getInstance({
             worldId: ref.$location.worldId,
             instanceId: ref.$location.instanceId

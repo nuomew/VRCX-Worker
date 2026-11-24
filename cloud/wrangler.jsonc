@@ -26,6 +26,11 @@
             "binding": "DB_FEED",
             "database_name": "vrcx-feed",
             "migrations_dir": "migrations/feed"
+        },
+        {
+            "binding": "DB_CACHE",
+            "database_name": "vrcx-cache",
+            "migrations_dir": "migrations/cache"
         }
     ],
     "durable_objects": {

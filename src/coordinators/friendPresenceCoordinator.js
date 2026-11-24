@@ -154,6 +154,7 @@ export async function runUpdateFriendFlow(
     const isVIP = localFavoriteFriends.has(id);
     let location = '';
     let $location_at = undefined;
+    const isWebMode = typeof WEB !== 'undefined' && WEB;
     if (typeof ref !== 'undefined') {
         location = ref.location;
         $location_at = ref.$location_at;
@@ -161,6 +162,7 @@ export async function runUpdateFriendFlow(
         const currentState = stateInput || ctx.state;
         // wtf, fetch user if offline in an instance
         if (
+            !isWebMode &&
             currentState !== 'online' &&
             isRealInstance(ref.location) &&
             ref.$lastFetch < now() - 10000 // 10 seconds
@@ -170,6 +172,7 @@ export async function runUpdateFriendFlow(
         }
         // wtf, fetch user if online in an offline location
         if (
+            !isWebMode &&
             currentState === 'online' &&
             ref.location === 'offline' &&
             ref.$lastFetch < now() - 10000 // 10 seconds
@@ -185,7 +188,7 @@ export async function runUpdateFriendFlow(
             // NOTE
             // AddFriend (CurrentUser) 이후,
             // 서버에서 오는 순서라고 보면 될 듯.
-            if (ctx.state === 'online') {
+            if (!isWebMode && ctx.state === 'online') {
                 if (watchState.isFriendsLoaded) {
                     userRequest.getUser({ userId: id });
                 }

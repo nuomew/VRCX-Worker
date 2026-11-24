@@ -2,6 +2,8 @@ export interface Env {
     DB_CORE: D1Database;
     DB_GAMELOG: D1Database;
     DB_FEED: D1Database;
+    /** Dedicated cache D1 shard (vrcx-cache) for VRChat API response cache and RSS aggregated snapshots. */
+    DB_CACHE?: D1Database;
     AGENT_HUB: DurableObjectNamespace;
     R2_MEDIA?: R2Bucket;
     /** Optional bearer token for API/POC access. */

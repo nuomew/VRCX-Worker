@@ -540,6 +540,7 @@ export const useFriendStore = defineStore('Friend', () => {
      */
     async function refreshFriends() {
         isRefreshFriendsLoading.value = true;
+        const isWebMode = typeof WEB !== 'undefined' && WEB;
         try {
             const onlineFriends = await bulkRefreshFriends({
                 offline: false
@@ -548,9 +549,11 @@ export const useFriendStore = defineStore('Friend', () => {
                 offline: true
             });
             var friends = onlineFriends.concat(offlineFriends);
-            friends = await refetchBrokenFriends(friends);
-            if (!watchState.isFriendsLoaded) {
-                friends = await refreshRemainingFriends(friends);
+            if (!isWebMode) {
+                friends = await refetchBrokenFriends(friends);
+                if (!watchState.isFriendsLoaded) {
+                    friends = await refreshRemainingFriends(friends);
+                }
             }
 
             isRefreshFriendsLoading.value = false;
@@ -568,9 +571,10 @@ export const useFriendStore = defineStore('Friend', () => {
     async function bulkRefreshFriends(args) {
         // API offset limit *was* 5000
         // it is now 7500
+        const isWebMode = typeof WEB !== 'undefined' && WEB;
         const MAX_OFFSET = 7500;
-        const PAGE_SIZE = 50;
-        const CONCURRENCY = 5;
+        const PAGE_SIZE = isWebMode ? 100 : 50;
+        const CONCURRENCY = isWebMode ? 1 : 5;
         const RATE_PER_MINUTE = 60;
         const MAX_RETRY = 5;
         const RETRY_BASE_DELAY = 1000;
@@ -627,6 +631,10 @@ export const useFriendStore = defineStore('Friend', () => {
                     break;
                 }
                 friends.push(...page);
+                if (isWebMode && page.length < PAGE_SIZE) {
+                    stopFlag = true;
+                    break;
+                }
             }
         }
 

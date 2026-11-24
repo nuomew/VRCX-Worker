@@ -9,6 +9,7 @@ import { handleVrcProxyRoutes } from './routes/vrcProxy';
 import { searchGameLogByEntity } from './search/entityFts';
 import {
     getBackgroundFeedSyncStatus,
+    getRssAggregatedFeed,
     runBackgroundFeedSync,
     setBackgroundFeedSyncEnabled
 } from './sync/backgroundFeedSync';
@@ -99,6 +100,7 @@ export default {
                         version: '2026.11',
                         schemaReady: true,
                         r2Enabled: Boolean(env.R2_MEDIA),
+                        cacheDbDedicated: Boolean(env.DB_CACHE),
                         timestamp: new Date().toISOString()
                     }
                 });
@@ -173,6 +175,18 @@ export default {
                 const body = (await request.json().catch(() => ({}))) as { enabled?: unknown };
                 const enabled = await setBackgroundFeedSyncEnabled(env, body.enabled !== false);
                 return Response.json({ ok: true, data: { enabled } });
+            }
+
+            if (url.pathname === '/api/rss/feed' && request.method === 'GET') {
+                const since = url.searchParams.get('since') ?? '';
+                const data = await getRssAggregatedFeed(env, { since });
+                return Response.json({ ok: true, data }, { headers: { 'Cache-Control': 'no-store' } });
+            }
+
+            if (url.pathname === '/api/rss/sync' && request.method === 'POST') {
+                const since = url.searchParams.get('since') ?? '';
+                const data = await getRssAggregatedFeed(env, { since, forceSync: true });
+                return Response.json({ ok: true, data }, { headers: { 'Cache-Control': 'no-store' } });
             }
 
             const vrcResp = await handleVrcProxyRoutes(request, env, url);

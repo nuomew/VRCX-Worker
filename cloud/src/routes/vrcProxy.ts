@@ -1,6 +1,13 @@
 import { getMasterKey } from '../auth/auth';
+import {
+    classifyVrcCacheUrl,
+    getCachedVrcResponses,
+    invalidateVrcCacheOnWrite,
+    putCachedVrcResponses
+} from '../cache/vrcCache';
 import { decryptAesGcm, encryptAesGcm } from '../crypto/vault';
 import type { Env } from '../env';
+import { parseWebSyncIntervalSeconds } from './coreData';
 
 export const VRC_USER_AGENT = 'VRCX-Cloud/2026.11 (personal-self-hosted-vrcx)';
 
@@ -33,6 +40,7 @@ interface WebApiExecutePayload {
     fileMIME?: string;
     fileMD5?: string;
     preferCloudDirect?: boolean;
+    bypassCache?: boolean;
 }
 
 function isAllowedTargetUrl(rawUrl: string): boolean {
@@ -284,6 +292,35 @@ export async function handleVrcProxyRoutes(request: Request, env: Env, url: URL)
             );
         }
 
+        const method = (payload.method || 'GET').toUpperCase();
+        const isMutation = method !== 'GET';
+        const hasAuthHeader = Boolean(payload.headers?.Authorization || payload.headers?.authorization);
+        const isUpload = Boolean(
+            payload.uploadImage || payload.uploadImageLegacy || payload.uploadFilePUT || payload.uploadPrintImage
+        );
+        const canUseServerCache = !isMutation && !isUpload && !hasAuthHeader && !payload.bypassCache;
+
+        let cacheMeta: ReturnType<typeof classifyVrcCacheUrl> = null;
+        if (canUseServerCache) {
+            const webSyncSec = await getConfiguredWebSyncSeconds(env);
+            cacheMeta = classifyVrcCacheUrl(payload.url, webSyncSec);
+            if (cacheMeta) {
+                const hitMap = await getCachedVrcResponses(env, [payload.url]);
+                const hit = hitMap.get(payload.url);
+                if (hit) {
+                    return Response.json({
+                        ok: true,
+                        data: {
+                            status: hit.status,
+                            data: hit.bodyText,
+                            route: 'cloud_cache',
+                            cached: true
+                        }
+                    });
+                }
+            }
+        }
+
         // Strategy 1: Prefer online Windows VRCX.Agent residential-IP relay
         if (!payload.preferCloudDirect) {
             const hub = env.AGENT_HUB.get(env.AGENT_HUB.idFromName('primary'));
@@ -306,11 +343,20 @@ export async function handleVrcProxyRoutes(request: Request, env: Env, url: URL)
                             { status: 502 }
                         );
                     }
+                    const status = rpcJson.data.status ?? 200;
+                    const bodyText = rpcJson.data.data ?? '';
+                    if (isMutation && status >= 200 && status < 300) {
+                        await invalidateVrcCacheOnWrite(env, payload.url).catch(() => {});
+                    } else if (cacheMeta && status >= 200 && status < 300) {
+                        await putCachedVrcResponses(env, [
+                            { url: payload.url, tier: cacheMeta.tier, status, bodyText, ttlMs: cacheMeta.ttlMs }
+                        ]).catch(() => {});
+                    }
                     return Response.json({
                         ok: true,
                         data: {
-                            status: rpcJson.data.status ?? 200,
-                            data: rpcJson.data.data ?? '',
+                            status,
+                            data: bodyText,
                             route: 'agent_residential_ip'
                         }
                     });
@@ -350,6 +396,20 @@ export async function handleVrcProxyRoutes(request: Request, env: Env, url: URL)
             const wafBlocked =
                 upstream.status === 403 && (upstream.headers.has('cf-mitigated') || text.includes('Just a moment'));
 
+            if (isMutation && upstream.status >= 200 && upstream.status < 300) {
+                await invalidateVrcCacheOnWrite(env, payload.url).catch(() => {});
+            } else if (cacheMeta && upstream.status >= 200 && upstream.status < 300) {
+                await putCachedVrcResponses(env, [
+                    {
+                        url: payload.url,
+                        tier: cacheMeta.tier,
+                        status: upstream.status,
+                        bodyText: text,
+                        ttlMs: cacheMeta.ttlMs
+                    }
+                ]).catch(() => {});
+            }
+
             return Response.json({
                 ok: true,
                 data: {
@@ -373,8 +433,8 @@ export async function handleVrcProxyRoutes(request: Request, env: Env, url: URL)
         }
     }
 
-    // Batched read-only VRChat GET proxy: executes up to 12 concurrent GETs in a single Worker invocation
-    // with only 1 D1 cookie vault read, dramatically reducing Cloudflare Workers Free-tier request usage.
+    // Batched read-only VRChat GET proxy backed by dedicated DB_CACHE:
+    // serves cache hits with 0 upstream VRChat API calls and only fetches true misses.
     if (url.pathname === '/api/vrc/execute-batch' && request.method === 'POST') {
         if (env.VRC_ALLOW_CLOUD_FALLBACK === 'false') {
             return Response.json(
@@ -401,29 +461,76 @@ export async function handleVrcProxyRoutes(request: Request, env: Env, url: URL)
 
         const items = Array.isArray(body?.requests) ? body.requests.slice(0, 12) : [];
         if (items.length === 0) {
-            return Response.json({ ok: true, data: { results: [], route: 'cloud_direct' } });
+            return Response.json({ ok: true, data: { results: [], route: 'cloud_cache' } });
         }
 
-        const needsAuthCookie = items.some((item) => {
-            const u = typeof item?.url === 'string' ? item.url : '';
-            return (
-                Boolean(u) &&
-                !u.startsWith('https://status.vrchat.com/') &&
-                u !== 'https://api.vrchat.cloud/api/1/config'
-            );
+        const webSyncSec = await getConfiguredWebSyncSeconds(env);
+        const cachePlans = items.map((item) => {
+            const method = (item?.method || 'GET').toUpperCase();
+            const hasAuthHeader = Boolean(item?.headers?.Authorization || item?.headers?.authorization);
+            if (method !== 'GET' || !item?.url || !isAllowedTargetUrl(item.url) || hasAuthHeader || item.bypassCache) {
+                return null;
+            }
+            return classifyVrcCacheUrl(item.url, webSyncSec);
         });
-        const jar = needsAuthCookie ? await loadCookieJar(env) : {};
-        const cookieHeader = needsAuthCookie ? buildCookieHeader(jar) : '';
+        const lookupUrls = items.map((item, idx) => (cachePlans[idx] ? item.url : '')).filter(Boolean);
+        const cacheHits = await getCachedVrcResponses(env, lookupUrls);
+
+        const missIndexes: number[] = [];
+        for (let i = 0; i < items.length; i++) {
+            const item = items[i];
+            const method = (item?.method || 'GET').toUpperCase();
+            if (method !== 'GET' || !item?.url || !isAllowedTargetUrl(item.url)) {
+                continue;
+            }
+            if (!cachePlans[i] || !cacheHits.has(item.url)) {
+                missIndexes.push(i);
+            }
+        }
+
+        let jar: Record<string, string> = {};
+        let cookieHeader = '';
         let cookieChanged = false;
+        if (missIndexes.length > 0) {
+            const needsAuthCookie = missIndexes.some((idx) => {
+                const u = items[idx]?.url ?? '';
+                return (
+                    Boolean(u) &&
+                    !u.startsWith('https://status.vrchat.com/') &&
+                    u !== 'https://api.vrchat.cloud/api/1/config'
+                );
+            });
+            if (needsAuthCookie) {
+                jar = await loadCookieJar(env);
+                cookieHeader = buildCookieHeader(jar);
+            }
+        }
+
+        const toWriteCache: Array<{
+            url: string;
+            tier: NonNullable<ReturnType<typeof classifyVrcCacheUrl>>['tier'];
+            status: number;
+            bodyText: string;
+            ttlMs: number;
+        }> = [];
 
         const results = await Promise.all(
-            items.map(async (item) => {
+            items.map(async (item, idx) => {
                 const method = (item?.method || 'GET').toUpperCase();
                 if (method !== 'GET' || !item?.url || !isAllowedTargetUrl(item.url)) {
                     return {
                         status: 403,
                         data: '',
                         error: 'Batch only allows read-only GET requests on VRChat allowlist'
+                    };
+                }
+                const plan = cachePlans[idx];
+                const hit = plan ? cacheHits.get(item.url) : undefined;
+                if (hit) {
+                    return {
+                        status: hit.status,
+                        data: hit.bodyText,
+                        cached: true
                     };
                 }
                 const isPublicTarget =
@@ -436,6 +543,15 @@ export async function handleVrcProxyRoutes(request: Request, env: Env, url: URL)
                         cookieChanged = true;
                     }
                     const text = await upstream.text();
+                    if (plan && upstream.status >= 200 && upstream.status < 300) {
+                        toWriteCache.push({
+                            url: item.url,
+                            tier: plan.tier,
+                            status: upstream.status,
+                            bodyText: text,
+                            ttlMs: plan.ttlMs
+                        });
+                    }
                     return {
                         status: upstream.status,
                         data: text
@@ -450,6 +566,9 @@ export async function handleVrcProxyRoutes(request: Request, env: Env, url: URL)
             })
         );
 
+        if (toWriteCache.length > 0) {
+            await putCachedVrcResponses(env, toWriteCache).catch(() => {});
+        }
         if (cookieChanged) {
             await saveCookieJar(env, jar);
         }
@@ -458,10 +577,25 @@ export async function handleVrcProxyRoutes(request: Request, env: Env, url: URL)
             ok: true,
             data: {
                 results,
-                route: 'cloud_direct'
+                route: missIndexes.length === 0 ? 'cloud_cache' : 'cloud_direct'
             }
         });
     }
 
     return null;
+}
+
+async function getConfiguredWebSyncSeconds(env: Env): Promise<number> {
+    try {
+        const row = await env.DB_CORE.prepare(
+            "SELECT payload_json FROM config_bundles WHERE bundle_key = 'vrcx_config' LIMIT 1"
+        ).first<{ payload_json?: string }>();
+        if (row?.payload_json) {
+            const cfg = JSON.parse(row.payload_json) as Record<string, unknown>;
+            return parseWebSyncIntervalSeconds(cfg['cloud:webSyncIntervalSeconds']);
+        }
+    } catch {
+        // Fallback to default 300s
+    }
+    return 300;
 }
