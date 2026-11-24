@@ -3373,7 +3373,7 @@
             "save_interval": "儲存間隔",
             "saved_interval": "已儲存 ({seconds} 秒)",
             "save_failed": "儲存失敗：{error}",
-            "sync_interval_hint": "僅控制 Windows 端 VRCX.Agent 的定時上傳間隔，與網頁端「雲端同步間隔」相互獨立。",
+            "sync_interval_hint": "僅控制 Windows 端 VRCX.Agent 的定時上傳間隔",
             "static_secret_tip_prefix": "提示：也可以直接在 Cloudflare Worker Secrets 中設定固定環境變數 ",
             "static_secret_tip_suffix": "，無須在此逐台產生裝置金鑰。",
             "configured_list": "已設定同步裝置 ({count})",
@@ -3428,7 +3428,7 @@
         },
         "settings": {
             "sync_interval_label": "雲端同步間隔（網頁端與背景動態）",
-            "sync_interval_desc": "控制網頁端 api.vrchat.cloud 同步節流及關閉網頁後的雲端背景好友動態同步間隔（預設 5 分鐘，與 VRCX.Agent 同步間隔獨立）",
+            "sync_interval_desc": "控制網頁端同步節流及關閉網頁後的雲端背景好友動態取得間隔（預設 5 分鐘）",
             "interval_60": "1 分鐘（60 秒）",
             "interval_120": "2 分鐘（120 秒）",
             "interval_300": "5 分鐘（300 秒 · 預設）",

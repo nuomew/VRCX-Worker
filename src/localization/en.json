@@ -3710,7 +3710,7 @@
             "save_interval": "Save Interval",
             "saved_interval": "Saved ({seconds}s)",
             "save_failed": "Failed: {error}",
-            "sync_interval_hint": "Controls only Windows VRCX.Agent scheduled uploads, independent of the Web Cloud Sync Interval.",
+            "sync_interval_hint": "Controls only Windows VRCX.Agent scheduled uploads.",
             "static_secret_tip_prefix": "Tip: You can also configure a static ",
             "static_secret_tip_suffix": " in Cloudflare Worker Secrets instead of generating per-device keys here.",
             "configured_list": "Configured Sync Devices ({count})",
@@ -3765,7 +3765,7 @@
         },
         "settings": {
             "sync_interval_label": "Cloud Sync Interval (Web & Background Feed)",
-            "sync_interval_desc": "Controls Web api.vrchat.cloud sync throttling and offline cloud background feed sync cadence (default 5 min, independent of VRCX.Agent)",
+            "sync_interval_desc": "Controls Web sync throttling and offline cloud background feed fetch interval (default 5 min)",
             "interval_60": "1 min (60s)",
             "interval_120": "2 min (120s)",
             "interval_300": "5 min (300s · Default)",
