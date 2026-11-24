@@ -450,7 +450,8 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
             };
         };
         expect(syncJson.data.deviceId).toBe(deviceId);
-        expect(syncJson.data.deviceName).toBe('Office-Win11-Renamed');
+        // Web-configured Sync Key deviceName stays authoritative even if an older client sends another name.
+        expect(syncJson.data.deviceName).toBe('Office-Win11');
         expect(syncJson.data.ingest.inserted).toBe(1);
         expect(syncJson.data.pendingCommands).toHaveLength(1);
         expect(syncJson.data.pendingCommands[0]!.cmdId).toBe(queueJson.data.cmdId);

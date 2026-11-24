@@ -54,6 +54,9 @@ public sealed class TrayApplicationContext : ApplicationContext
     private SyncSettingsForm? _activeSettingsDialog;
     private UpdateProgressForm? _activeUpdateDialog;
     private AgentReleaseInfo? _availableUpdate;
+    private volatile bool _isAutoUpdating;
+    private string _autoUpdatingTag = string.Empty;
+    private string _failedAutoUpdateTag = string.Empty;
     private string _lastNotifiedUpdateTag = string.Empty;
     private bool _balloonPointsToUpdate;
     private DateTimeOffset _lastDoubleClickAtUtc = DateTimeOffset.MinValue;
@@ -115,9 +118,25 @@ public sealed class TrayApplicationContext : ApplicationContext
         _checkUpdateItem = new ToolStripMenuItem(AgentStrings.FormatMenuCheckUpdate(AgentMetadata.Version));
         _checkUpdateItem.Click += (_, _) =>
         {
+            if (_activeUpdateDialog != null && !_activeUpdateDialog.IsDisposed)
+            {
+                if (_activeUpdateDialog.WindowState == FormWindowState.Minimized)
+                {
+                    _activeUpdateDialog.WindowState = FormWindowState.Normal;
+                }
+                _activeUpdateDialog.BringToFront();
+                _activeUpdateDialog.Activate();
+                return;
+            }
+            if (_isAutoUpdating)
+            {
+                string tag = string.IsNullOrWhiteSpace(_autoUpdatingTag) ? "latest" : _autoUpdatingTag;
+                ShowNoticeMessage(AgentStrings.FormatDialogAutoDownloadingUpdate(tag), MessageBoxIcon.Information);
+                return;
+            }
             if (_availableUpdate != null && _availableUpdate.IsUpdateAvailable)
             {
-                ShowUpdateDialog(_availableUpdate);
+                ShowUpdateDialog(_availableUpdate, autoStart: true);
             }
             else
             {
@@ -178,9 +197,9 @@ public sealed class TrayApplicationContext : ApplicationContext
         };
         _trayIcon.BalloonTipClicked += (_, _) =>
         {
-            if (_balloonPointsToUpdate && _availableUpdate != null && _availableUpdate.IsUpdateAvailable)
+            if (_balloonPointsToUpdate && !_isAutoUpdating && _availableUpdate != null && _availableUpdate.IsUpdateAvailable)
             {
-                ShowUpdateDialog(_availableUpdate);
+                ShowUpdateDialog(_availableUpdate, autoStart: true);
             }
         };
 
@@ -351,13 +370,24 @@ public sealed class TrayApplicationContext : ApplicationContext
                 }
             }
 
-            // Apply the authoritative Web-configured sync interval and lock the next scheduled upload window.
+            // Apply the authoritative Web-configured sync interval and device name from the server.
             if (lastResponse != null)
             {
                 int webInterval = _scheduleGate.ApplyServerSchedule(lastResponse, DateTimeOffset.UtcNow);
+                bool configDirty = false;
                 if (cfg.SyncIntervalSeconds != webInterval)
                 {
                     cfg.SyncIntervalSeconds = webInterval;
+                    configDirty = true;
+                }
+                string webDeviceName = (lastResponse.DeviceName ?? string.Empty).Trim();
+                if (!string.IsNullOrEmpty(webDeviceName) && !string.Equals(cfg.DeviceName, webDeviceName, StringComparison.Ordinal))
+                {
+                    cfg.DeviceName = webDeviceName;
+                    configDirty = true;
+                }
+                if (configDirty)
+                {
                     _configStore.SaveConfig(cfg);
                 }
             }
@@ -547,12 +577,13 @@ public sealed class TrayApplicationContext : ApplicationContext
                     ? AgentStrings.NextSyncNowLabel
                     : _scheduleGate.NextSyncAtUtc.ToLocalTime().ToString("HH:mm:ss");
 
+                string displayDevice = string.IsNullOrWhiteSpace(_config.DeviceName) ? "Windows PC" : _config.DeviceName;
                 _balloonPointsToUpdate = false;
                 _trayIcon.ShowBalloonTip(
                     3500,
                     AgentStrings.AppTitle,
                     AgentStrings.FormatBalloonConnected(
-                        _config.DeviceName,
+                        displayDevice,
                         ProxyHttpClientFactory.DescribeMode(_config),
                         _scheduleGate.IntervalSeconds,
                         nextLocal),
@@ -742,8 +773,35 @@ public sealed class TrayApplicationContext : ApplicationContext
 
     private async Task CheckForUpdatesAsync(bool manual, CancellationToken ct)
     {
-        if (!await _updateCheckLock.WaitAsync(0, ct).ConfigureAwait(false))
+        if (manual && _isAutoUpdating)
         {
+            string tag = string.IsNullOrWhiteSpace(_autoUpdatingTag) ? "latest" : _autoUpdatingTag;
+            RunOnUiThread(() => ShowNoticeMessage(AgentStrings.FormatDialogAutoDownloadingUpdate(tag), MessageBoxIcon.Information));
+            return;
+        }
+
+        // For manual clicks, wait briefly if a lightweight background check is already in flight
+        // instead of silently dropping the user's request.
+        bool lockAcquired = manual
+            ? await _updateCheckLock.WaitAsync(TimeSpan.FromSeconds(5), ct).ConfigureAwait(false)
+            : await _updateCheckLock.WaitAsync(0, ct).ConfigureAwait(false);
+        if (!lockAcquired)
+        {
+            if (manual)
+            {
+                RunOnUiThread(() =>
+                {
+                    if (_isAutoUpdating)
+                    {
+                        string tag = string.IsNullOrWhiteSpace(_autoUpdatingTag) ? "latest" : _autoUpdatingTag;
+                        ShowNoticeMessage(AgentStrings.FormatDialogAutoDownloadingUpdate(tag), MessageBoxIcon.Information);
+                    }
+                    else
+                    {
+                        ShowNoticeMessage(AgentStrings.MenuCheckingUpdate, MessageBoxIcon.Information);
+                    }
+                });
+            }
             return;
         }
 
@@ -756,6 +814,7 @@ public sealed class TrayApplicationContext : ApplicationContext
             });
         }
 
+        AgentReleaseInfo? autoUpdateTarget = null;
         try
         {
             using var checkCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
@@ -765,25 +824,39 @@ public sealed class TrayApplicationContext : ApplicationContext
             if (release.IsUpdateAvailable)
             {
                 _availableUpdate = release;
-                RunOnUiThread(() =>
+                if (manual)
                 {
-                    _checkUpdateItem.Enabled = true;
-                    _checkUpdateItem.Text = AgentStrings.FormatMenuUpdateAvailable(release.TagName);
-                    if (manual)
+                    RunOnUiThread(() =>
                     {
-                        ShowUpdateDialog(release);
-                    }
-                    else if (!string.Equals(_lastNotifiedUpdateTag, release.TagName, StringComparison.OrdinalIgnoreCase))
+                        _checkUpdateItem.Enabled = true;
+                        _checkUpdateItem.Text = AgentStrings.FormatMenuUpdateAvailable(release.TagName);
+                        ShowUpdateDialog(release, autoStart: true);
+                    });
+                }
+                else if (_config.AutoCheckUpdates &&
+                         !string.IsNullOrWhiteSpace(release.SetupDownloadUrl) &&
+                         !string.Equals(_failedAutoUpdateTag, release.TagName, StringComparison.OrdinalIgnoreCase))
+                {
+                    autoUpdateTarget = release;
+                }
+                else
+                {
+                    RunOnUiThread(() =>
                     {
-                        _lastNotifiedUpdateTag = release.TagName;
-                        _balloonPointsToUpdate = true;
-                        _trayIcon.ShowBalloonTip(
-                            6000,
-                            AgentStrings.AppTitle,
-                            AgentStrings.FormatBalloonUpdateAvailable(release.TagName, AgentMetadata.Version),
-                            ToolTipIcon.Info);
-                    }
-                });
+                        _checkUpdateItem.Enabled = true;
+                        _checkUpdateItem.Text = AgentStrings.FormatMenuUpdateAvailable(release.TagName);
+                        if (!string.Equals(_lastNotifiedUpdateTag, release.TagName, StringComparison.OrdinalIgnoreCase))
+                        {
+                            _lastNotifiedUpdateTag = release.TagName;
+                            _balloonPointsToUpdate = true;
+                            _trayIcon.ShowBalloonTip(
+                                6000,
+                                AgentStrings.AppTitle,
+                                AgentStrings.FormatBalloonUpdateAvailable(release.TagName, AgentMetadata.Version),
+                                ToolTipIcon.Info);
+                        }
+                    });
+                }
             }
             else
             {
@@ -795,11 +868,10 @@ public sealed class TrayApplicationContext : ApplicationContext
                     if (manual)
                     {
                         _balloonPointsToUpdate = false;
-                        _trayIcon.ShowBalloonTip(
-                            3000,
-                            AgentStrings.AppTitle,
+                        // Show a topmost modal confirmation so Windows Focus Assist / DND cannot hide it.
+                        ShowNoticeMessage(
                             AgentStrings.FormatBalloonAlreadyLatest(AgentMetadata.Version),
-                            ToolTipIcon.Info);
+                            MessageBoxIcon.Information);
                     }
                 });
             }
@@ -820,11 +892,9 @@ public sealed class TrayApplicationContext : ApplicationContext
                 if (manual)
                 {
                     _balloonPointsToUpdate = false;
-                    _trayIcon.ShowBalloonTip(
-                        4000,
-                        AgentStrings.AppTitle,
+                    ShowNoticeMessage(
                         AgentStrings.FormatBalloonUpdateCheckFailed(ex.Message),
-                        ToolTipIcon.Warning);
+                        MessageBoxIcon.Warning);
                 }
             });
         }
@@ -832,9 +902,92 @@ public sealed class TrayApplicationContext : ApplicationContext
         {
             _updateCheckLock.Release();
         }
+
+        if (autoUpdateTarget != null && !ct.IsCancellationRequested)
+        {
+            await AutoDownloadAndInstallAsync(autoUpdateTarget, ct).ConfigureAwait(false);
+        }
     }
 
-    private void ShowUpdateDialog(AgentReleaseInfo release)
+    /// <summary>
+    /// Automatically downloads, SHA-256 verifies, and silently launches the official installer
+    /// in the background when a newer GitHub Release is detected.
+    /// </summary>
+    private async Task AutoDownloadAndInstallAsync(AgentReleaseInfo release, CancellationToken ct)
+    {
+        if (_isAutoUpdating)
+        {
+            return;
+        }
+
+        _isAutoUpdating = true;
+        _autoUpdatingTag = release.TagName;
+        RunOnUiThread(() =>
+        {
+            _checkUpdateItem.Enabled = true;
+            _checkUpdateItem.Text = AgentStrings.FormatMenuAutoDownloadingUpdate(release.TagName);
+            if (!string.Equals(_lastNotifiedUpdateTag, release.TagName, StringComparison.OrdinalIgnoreCase))
+            {
+                _lastNotifiedUpdateTag = release.TagName;
+                _balloonPointsToUpdate = false;
+                _trayIcon.ShowBalloonTip(
+                    4500,
+                    AgentStrings.AppTitle,
+                    AgentStrings.FormatBalloonUpdateAvailable(release.TagName, AgentMetadata.Version),
+                    ToolTipIcon.Info);
+            }
+        });
+
+        try
+        {
+            string updatesDir = Path.Combine(_configStore.DataDirectory, "updates");
+            using var downloadCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            downloadCts.CancelAfter(TimeSpan.FromMinutes(10));
+
+            string installerPath = await _updater.DownloadAndVerifyInstallerAsync(
+                release,
+                updatesDir,
+                progress: null,
+                downloadCts.Token).ConfigureAwait(false);
+
+            if (ct.IsCancellationRequested || !File.Exists(installerPath))
+            {
+                return;
+            }
+
+            RunOnUiThread(() =>
+            {
+                _balloonPointsToUpdate = false;
+                _trayIcon.ShowBalloonTip(
+                    3500,
+                    AgentStrings.AppTitle,
+                    AgentStrings.FormatBalloonAutoInstallingUpdate(release.TagName),
+                    ToolTipIcon.Info);
+                LaunchDownloadedInstallerAndExit(installerPath);
+            });
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            // Shutting down
+        }
+        catch (Exception ex)
+        {
+            _failedAutoUpdateTag = release.TagName;
+            Log.Warn(ex, "Background auto-update download failed for {Tag}.", release.TagName);
+            RunOnUiThread(() =>
+            {
+                _checkUpdateItem.Enabled = true;
+                _checkUpdateItem.Text = AgentStrings.FormatMenuUpdateAvailable(release.TagName);
+            });
+        }
+        finally
+        {
+            _isAutoUpdating = false;
+            _autoUpdatingTag = string.Empty;
+        }
+    }
+
+    private void ShowUpdateDialog(AgentReleaseInfo release, bool autoStart = false)
     {
         if (_activeUpdateDialog != null && !_activeUpdateDialog.IsDisposed)
         {
@@ -848,7 +1001,7 @@ public sealed class TrayApplicationContext : ApplicationContext
         }
 
         string updatesDir = Path.Combine(_configStore.DataDirectory, "updates");
-        using var dialog = new UpdateProgressForm(release, _updater, updatesDir, _trayIcon.Icon);
+        using var dialog = new UpdateProgressForm(release, _updater, updatesDir, _trayIcon.Icon, autoStart);
         _activeUpdateDialog = dialog;
         try
         {
@@ -884,12 +1037,23 @@ public sealed class TrayApplicationContext : ApplicationContext
         {
             Log.Warn(ex, "Failed to launch downloaded VRCX.Agent installer {Path}.", installerPath);
             _balloonPointsToUpdate = false;
-            _trayIcon.ShowBalloonTip(
-                4500,
-                AgentStrings.AppTitle,
-                AgentStrings.FormatUpdateFailed(ex.Message),
-                ToolTipIcon.Error);
+            ShowNoticeMessage(AgentStrings.FormatUpdateFailed(ex.Message), MessageBoxIcon.Error);
         }
+    }
+
+    /// <summary>
+    /// Displays a topmost modal message box from the headless tray context so manual user actions
+    /// always provide visible feedback even when Windows Focus Assist suppresses balloon tips.
+    /// </summary>
+    private static void ShowNoticeMessage(string message, MessageBoxIcon icon)
+    {
+        using var owner = new Form
+        {
+            TopMost = true,
+            StartPosition = FormStartPosition.CenterScreen,
+            ShowInTaskbar = false
+        };
+        MessageBox.Show(owner, message, AgentStrings.AppTitle, MessageBoxButtons.OK, icon);
     }
 
     private void RunOnUiThread(Action action)

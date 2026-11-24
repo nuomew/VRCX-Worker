@@ -20,8 +20,7 @@ public sealed class SyncSettingsForm : Form
     private readonly TextBox _urlBox;
     private readonly TextBox _secretBox;
     private readonly CheckBox _showSecretCheck;
-    private readonly TextBox _deviceNameBox;
-    private readonly Label _webScheduleHintLabel;
+    private readonly Label _webInfoLabel;
     private readonly RadioButton _overseasDirectRadio;
     private readonly RadioButton _mainlandProxyRadio;
     private readonly TextBox _proxyAddressBox;
@@ -50,7 +49,7 @@ public sealed class SyncSettingsForm : Form
         MaximizeBox = false;
         MinimizeBox = false;
         StartPosition = FormStartPosition.CenterScreen;
-        ClientSize = new Size(504, 574);
+        ClientSize = new Size(504, 532);
         Font = new Font(AgentStrings.UiFontFamily, 9.5f);
 
         var urlLabel = new Label
@@ -90,37 +89,19 @@ public sealed class SyncSettingsForm : Form
             _secretBox.UseSystemPasswordChar = !_showSecretCheck.Checked;
         };
 
-        var deviceLabel = new Label
+        // Device name & sync interval are both managed authoritatively on the Web Cloud Hub.
+        _webInfoLabel = new Label
         {
-            Text = AgentStrings.DeviceNameLabel,
-            Location = new Point(20, 130),
-            AutoSize = true
-        };
-        _deviceNameBox = new TextBox
-        {
-            Location = new Point(20, 152),
-            Width = 220,
-            Text = string.IsNullOrWhiteSpace(currentConfig.DeviceName) ? Environment.MachineName : currentConfig.DeviceName
-        };
-
-        var scheduleTitleLabel = new Label
-        {
-            Text = AgentStrings.SyncScheduleTitle,
-            Location = new Point(258, 130),
-            AutoSize = true
-        };
-        _webScheduleHintLabel = new Label
-        {
-            Text = AgentStrings.FormatWebScheduleHint(currentConfig.EffectiveSyncIntervalSeconds),
-            Location = new Point(258, 155),
-            Size = new Size(226, 24),
+            Text = AgentStrings.FormatWebDeviceAndScheduleHint(currentConfig.DeviceName, currentConfig.EffectiveSyncIntervalSeconds),
+            Location = new Point(20, 128),
+            Size = new Size(464, 22),
             ForeColor = Color.SteelBlue
         };
 
         var networkGroup = new GroupBox
         {
             Text = AgentStrings.NetworkGroupTitle,
-            Location = new Point(20, 190),
+            Location = new Point(20, 158),
             Size = new Size(464, 126)
         };
 
@@ -165,10 +146,11 @@ public sealed class SyncSettingsForm : Form
             _proxyAddressBox
         });
 
+        // Keep all option checkboxes strictly left-aligned at X = 20 with uniform 30px vertical rhythm.
         _autoUploadScreenshotsCheck = new CheckBox
         {
             Text = AgentStrings.SyncScreenshotsCheckbox,
-            Location = new Point(20, 328),
+            Location = new Point(20, 298),
             AutoSize = true,
             Checked = currentConfig.AutoUploadScreenshots
         };
@@ -176,7 +158,7 @@ public sealed class SyncSettingsForm : Form
         _compressScreenshotsCheck = new CheckBox
         {
             Text = AgentStrings.CompressScreenshotsCheckbox,
-            Location = new Point(38, 358),
+            Location = new Point(20, 328),
             AutoSize = true,
             Checked = currentConfig.CompressScreenshots,
             Enabled = currentConfig.AutoUploadScreenshots
@@ -189,7 +171,7 @@ public sealed class SyncSettingsForm : Form
         _autoStartCheck = new CheckBox
         {
             Text = AgentStrings.AutoStartCheckbox,
-            Location = new Point(20, 390),
+            Location = new Point(20, 358),
             AutoSize = true,
             Checked = autoStartEnabled
         };
@@ -197,15 +179,15 @@ public sealed class SyncSettingsForm : Form
         _autoCheckUpdatesCheck = new CheckBox
         {
             Text = AgentStrings.AutoCheckUpdatesCheckbox,
-            Location = new Point(20, 420),
+            Location = new Point(20, 388),
             AutoSize = true,
             Checked = currentConfig.AutoCheckUpdates
         };
 
         _statusLabel = new Label
         {
-            Location = new Point(20, 456),
-            Size = new Size(464, 52),
+            Location = new Point(20, 422),
+            Size = new Size(464, 48),
             ForeColor = Color.DimGray,
             Text = AgentStrings.SettingsDefaultHint
         };
@@ -213,7 +195,7 @@ public sealed class SyncSettingsForm : Form
         _saveButton = new Button
         {
             Text = AgentStrings.TestAndSaveButton,
-            Location = new Point(252, 522),
+            Location = new Point(252, 482),
             Width = 134,
             Height = 34
         };
@@ -222,7 +204,7 @@ public sealed class SyncSettingsForm : Form
         var cancelButton = new Button
         {
             Text = AgentStrings.CancelButton,
-            Location = new Point(396, 522),
+            Location = new Point(396, 482),
             Width = 88,
             Height = 34,
             DialogResult = DialogResult.Cancel
@@ -232,8 +214,7 @@ public sealed class SyncSettingsForm : Form
         {
             urlLabel, _urlBox,
             secretLabel, _secretBox, _showSecretCheck,
-            deviceLabel, _deviceNameBox,
-            scheduleTitleLabel, _webScheduleHintLabel,
+            _webInfoLabel,
             networkGroup,
             _autoUploadScreenshotsCheck,
             _compressScreenshotsCheck,
@@ -255,9 +236,6 @@ public sealed class SyncSettingsForm : Form
     {
         string cloudUrl = _urlBox.Text.Trim().TrimEnd('/');
         string syncSecret = _secretBox.Text.Trim();
-        string deviceName = string.IsNullOrWhiteSpace(_deviceNameBox.Text)
-            ? Environment.MachineName
-            : _deviceNameBox.Text.Trim();
         bool proxyEnabled = _mainlandProxyRadio.Checked;
         string proxyAddress = _proxyAddressBox.Text.Trim();
 
@@ -294,7 +272,7 @@ public sealed class SyncSettingsForm : Form
                 cloudUrl,
                 syncSecret,
                 localDeviceId,
-                deviceName,
+                string.Empty,
                 proxyEnabled,
                 proxyAddress,
                 cts.Token);
@@ -307,7 +285,8 @@ public sealed class SyncSettingsForm : Form
             }
 
             int authoritativeInterval = SyncScheduleGate.ClampInterval(syncResponse.SyncIntervalSeconds);
-            _webScheduleHintLabel.Text = AgentStrings.FormatWebScheduleHint(authoritativeInterval);
+            string authoritativeDeviceName = (syncResponse.DeviceName ?? string.Empty).Trim();
+            _webInfoLabel.Text = AgentStrings.FormatWebDeviceAndScheduleHint(authoritativeDeviceName, authoritativeInterval);
             InitialSyncResponse = syncResponse;
 
             SavedConfig = new AgentConfig
@@ -315,7 +294,7 @@ public sealed class SyncSettingsForm : Form
                 CloudUrl = cloudUrl,
                 SyncSecret = syncSecret,
                 DeviceId = string.IsNullOrWhiteSpace(syncResponse.DeviceId) ? localDeviceId : syncResponse.DeviceId,
-                DeviceName = deviceName,
+                DeviceName = authoritativeDeviceName,
                 SyncIntervalSeconds = authoritativeInterval,
                 ProxyEnabled = proxyEnabled,
                 ProxyAddress = proxyAddress,

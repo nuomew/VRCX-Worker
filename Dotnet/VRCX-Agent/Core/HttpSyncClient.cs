@@ -66,7 +66,7 @@ public sealed class HttpSyncClient
             CloudUrl = normalizedUrl,
             SyncSecret = (syncSecret ?? string.Empty).Trim(),
             DeviceId = deviceId,
-            DeviceName = string.IsNullOrWhiteSpace(deviceName) ? Environment.MachineName : deviceName.Trim(),
+            DeviceName = (deviceName ?? string.Empty).Trim(),
             ProxyEnabled = proxyEnabled,
             ProxyAddress = (proxyAddress ?? string.Empty).Trim()
         };
@@ -116,10 +116,13 @@ public sealed class HttpSyncClient
         string endpoint = config.CloudUrl.Trim().TrimEnd('/') + "/api/agent/sync";
         var payload = new Dictionary<string, object?>
         {
-            ["deviceName"] = string.IsNullOrWhiteSpace(config.DeviceName) ? Environment.MachineName : config.DeviceName.Trim(),
             ["agentVersion"] = AgentVersion,
             ["events"] = events
         };
+        if (!string.IsNullOrWhiteSpace(config.DeviceName))
+        {
+            payload["deviceName"] = config.DeviceName.Trim();
+        }
         if (cursor != null && !string.IsNullOrWhiteSpace(cursor.FileName))
         {
             payload["cursor"] = new

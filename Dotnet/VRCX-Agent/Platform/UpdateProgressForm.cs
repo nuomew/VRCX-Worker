@@ -34,7 +34,8 @@ public sealed class UpdateProgressForm : Form
         AgentReleaseInfo release,
         AgentUpdater updater,
         string updatesDir,
-        Icon? windowIcon = null)
+        Icon? windowIcon = null,
+        bool autoStart = false)
     {
         _release = release;
         _updater = updater;
@@ -126,6 +127,11 @@ public sealed class UpdateProgressForm : Form
         });
         AcceptButton = _updateButton;
         CancelButton = _cancelButton;
+
+        if (autoStart)
+        {
+            Shown += async (_, _) => await StartDownloadAsync();
+        }
     }
 
     protected override void OnFormClosing(FormClosingEventArgs e)

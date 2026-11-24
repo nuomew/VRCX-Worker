@@ -65,6 +65,21 @@ public static class AgentStrings
         ? $"每 {seconds} 秒同步一次（跟随网页端）"
         : $"Every {seconds}s (synced from Web)";
 
+    public static string FormatWebDeviceAndScheduleHint(string? deviceName, int seconds)
+    {
+        string trimmed = (deviceName ?? string.Empty).Trim();
+        if (!string.IsNullOrEmpty(trimmed))
+        {
+            return IsChinese
+                ? $"网页端设备：{trimmed} · 每 {seconds} 秒同步一次（跟随网页端）"
+                : $"Web Device: {trimmed} · Sync every {seconds}s (from Web)";
+        }
+
+        return IsChinese
+            ? $"设备名称与同步间隔均由网页端统一控制（默认每 {seconds} 秒同步一次）"
+            : $"Device name && sync interval follow Web Cloud Hub (default every {seconds}s)";
+    }
+
     public static string NetworkGroupTitle => IsChinese
         ? "网络与代理模式（海外直连 / 中国大陆代理）"
         : "Network && Proxy Mode (Overseas / Mainland China)";
@@ -260,8 +275,8 @@ public static class AgentStrings
 
     // Online updater strings
     public static string AutoCheckUpdatesCheckbox => IsChinese
-        ? "自动检测 GitHub 新版本更新（nuomew/VRCX-Worker）"
-        : "Automatically check GitHub Releases for updates";
+        ? "自动检测并自动更新 GitHub 新版本（nuomew/VRCX-Worker）"
+        : "Automatically check && install updates from GitHub Releases";
 
     public static string FormatMenuCheckUpdate(string currentVersion) => IsChinese
         ? $"检查更新（当前 v{currentVersion}）…"
@@ -271,13 +286,25 @@ public static class AgentStrings
         ? $"发现新版本 {latestTag} — 立即更新…"
         : $"Update Available ({latestTag}) — Install...";
 
+    public static string FormatMenuAutoDownloadingUpdate(string latestTag) => IsChinese
+        ? $"正在自动下载更新 {latestTag}…"
+        : $"Downloading update {latestTag}...";
+
     public static string MenuCheckingUpdate => IsChinese
         ? "正在检查更新…"
         : "Checking for updates...";
 
     public static string FormatBalloonUpdateAvailable(string latestTag, string currentVersion) => IsChinese
-        ? $"发现新版本 {latestTag}（当前 v{currentVersion}）。点击此通知或右键托盘菜单「立即更新」即可在线自动升级。"
-        : $"New version {latestTag} is available (current v{currentVersion}). Click here or use the tray menu to update.";
+        ? $"发现新版本 {latestTag}（当前 v{currentVersion}），正在后台自动下载更新…"
+        : $"New version {latestTag} found (current v{currentVersion}). Downloading update automatically...";
+
+    public static string FormatBalloonAutoInstallingUpdate(string latestTag) => IsChinese
+        ? $"已下载新版本 {latestTag} 并通过 SHA-256 校验，正在自动安装并重启…"
+        : $"Downloaded && verified {latestTag}. Installing update && restarting automatically...";
+
+    public static string FormatDialogAutoDownloadingUpdate(string latestTag) => IsChinese
+        ? $"正在后台自动下载新版本 {latestTag}，下载校验完成后将自动安装并重启，请稍候。"
+        : $"Downloading update {latestTag} in the background. It will install && restart automatically once verified.";
 
     public static string FormatBalloonAlreadyLatest(string currentVersion) => IsChinese
         ? $"当前已是最新版本（v{currentVersion}）。"

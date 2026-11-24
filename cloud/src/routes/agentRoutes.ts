@@ -316,7 +316,8 @@ export async function handleAgentPublicRoutes(request: Request, env: Env, url: U
         const events = (body.events ?? []).slice(0, 100);
         const ingest = events.length > 0 ? await ingestGameLogItems(env, events) : { inserted: 0, skipped: 0 };
         const nowIso = new Date().toISOString();
-        const deviceName = (body.deviceName || auth.deviceName || 'Windows PC').slice(0, 64);
+        // Always prefer the authoritative Web-configured deviceName bound to the Sync Key.
+        const deviceName = (auth.deviceName || body.deviceName || 'Windows PC').slice(0, 64);
         const agentVersion = (body.agentVersion || '1.0.0').slice(0, 32);
 
         const coreWrites: D1PreparedStatement[] = [

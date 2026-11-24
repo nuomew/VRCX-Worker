@@ -673,6 +673,55 @@ public sealed class AgentCoreTests
         Assert.Contains("GET /ping HTTP/1.1", capturedHttpReq);
     }
 
+    [Fact]
+    public async Task HttpSyncClient_OmitsDeviceNameWhenBlank_AndUsesWebAuthoritativeDeviceName()
+    {
+        var defaultCfg = new AgentConfig();
+        Assert.Equal(string.Empty, defaultCfg.DeviceName);
+
+        string? capturedBody = null;
+        using var handler = new StubHttpHandler(async (req) =>
+        {
+            capturedBody = await req.Content!.ReadAsStringAsync();
+            return new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(
+                    "{\"ok\":true,\"data\":{\"deviceId\":\"win-web-01\",\"deviceName\":\"网页端设置的电脑\",\"syncIntervalSeconds\":90,\"syncedAt\":\"2026-11-24T01:05:00Z\",\"ingest\":{\"inserted\":0,\"skipped\":0},\"pendingCommands\":[]}}",
+                    Encoding.UTF8,
+                    "application/json")
+            };
+        });
+        using var http = new HttpClient(handler);
+        var client = new HttpSyncClient(http);
+
+        var (ok, _, res) = await client.TestConnectionAsync(
+            "https://vrcx-cloud.example.workers.dev",
+            "vrcx_sync_key_abc",
+            "win-local-id",
+            string.Empty,
+            proxyEnabled: false,
+            proxyAddress: string.Empty,
+            CancellationToken.None);
+
+        Assert.True(ok);
+        Assert.NotNull(res);
+        Assert.Equal("网页端设置的电脑", res!.DeviceName);
+        Assert.NotNull(capturedBody);
+        Assert.DoesNotContain("\"deviceName\"", capturedBody);
+
+        string? prevLang = AgentStrings.LanguageOverride;
+        try
+        {
+            AgentStrings.LanguageOverride = "zh-CN";
+            Assert.Contains("网页端设置的电脑", AgentStrings.FormatWebDeviceAndScheduleHint(res.DeviceName, 90));
+            Assert.Contains("网页端统一控制", AgentStrings.FormatWebDeviceAndScheduleHint(string.Empty, 60));
+        }
+        finally
+        {
+            AgentStrings.LanguageOverride = prevLang;
+        }
+    }
+
     private sealed class StubHttpHandler : HttpMessageHandler
     {
         private readonly Func<HttpRequestMessage, Task<HttpResponseMessage>> _responder;

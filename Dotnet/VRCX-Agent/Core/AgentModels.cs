@@ -9,7 +9,7 @@ namespace VRCX.Agent.Core;
 /// </summary>
 public static class AgentMetadata
 {
-    public const string Version = "1.6.0";
+    public const string Version = "1.7.0";
 }
 
 /// <summary>
@@ -25,7 +25,8 @@ public sealed class AgentConfig
     public string CloudUrl { get; set; } = string.Empty;
     public string SyncSecret { get; set; } = string.Empty;
     public string DeviceId { get; set; } = string.Empty;
-    public string DeviceName { get; set; } = Environment.MachineName;
+    /// <summary>Cached read-only device name returned by the Web Cloud Hub; empty until synced.</summary>
+    public string DeviceName { get; set; } = string.Empty;
     public int SyncIntervalSeconds { get; set; } = DefaultSyncIntervalSeconds;
     /// <summary>False = Overseas (Direct / Proxy Off), True = Mainland China (Proxy On).</summary>
     public bool ProxyEnabled { get; set; } = false;
