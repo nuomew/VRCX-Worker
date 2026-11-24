@@ -21,6 +21,7 @@ import { request } from './request';
 import { runUpdateFriendFlow } from '../coordinators/friendPresenceCoordinator';
 import { runSetCurrentUserLocationFlow } from '../coordinators/locationCoordinator';
 import { watchState } from './watchState';
+import { cloudState } from '../ipc-web/cloudState';
 
 import * as workerTimers from 'worker-timers';
 
@@ -31,6 +32,7 @@ let wsReconnectDelayMs = 5000;
 let wsStableTimer = null;
 let wsAuthMismatchCount = 0;
 let wsLastErrorWasAuthMismatch = false;
+let lastWsReconnectRefreshAt = 0;
 const isWebMode = typeof WEB !== 'undefined' && WEB;
 
 const refreshOwnedItems = debounce(() => useUserStore().getAllProductPurchases(), 5000);
@@ -113,8 +115,12 @@ function connectWebSocketUrl(wsUrl) {
         if (!webSocketClosedGracefully && watchState.isLoggedIn && watchState.isFriendsLoaded) {
             console.warn('WebSocket reconnected after unexpected closure');
             webSocketClosedGracefully = true;
-            notificationStore.refreshNotifications();
-            friendStore.refreshFriends();
+            const cooldownMs = isWebMode ? Math.max(60, cloudState.syncIntervalSeconds || 60) * 1000 : 0;
+            if (!isWebMode || Date.now() - lastWsReconnectRefreshAt >= cooldownMs) {
+                lastWsReconnectRefreshAt = Date.now();
+                notificationStore.refreshNotifications();
+                friendStore.refreshFriends();
+            }
         }
         if (AppDebug.debugWebSocket) {
             console.log('WebSocket connected');

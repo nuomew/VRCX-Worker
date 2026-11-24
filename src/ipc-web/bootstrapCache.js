@@ -1,5 +1,5 @@
 import { cloudFetch } from './apiClient.js';
-import { cloudState } from './cloudState.js';
+import { clampSyncIntervalSeconds, cloudState } from './cloudState.js';
 
 /**
  * Pure in-memory session cache hydrated by a single GET /api/bootstrap request.
@@ -108,6 +108,9 @@ export async function loadBootstrap() {
 
     bootstrapCache.statsCounters = { ...(data.statsCounters || {}) };
     cloudState.r2Enabled = Boolean(data.r2Enabled);
+    cloudState.syncIntervalSeconds = clampSyncIntervalSeconds(
+        data.syncIntervalSeconds ?? bootstrapCache.configs['cloud:syncIntervalSeconds']
+    );
 
     if (data.agentStatus) {
         cloudState.agentsOnline = Array.isArray(data.agentStatus.agentsOnline) ? data.agentStatus.agentsOnline : [];
@@ -115,6 +118,27 @@ export async function loadBootstrap() {
     }
 
     bootstrapCache.loaded = true;
+}
+
+/**
+ * Updates and immediately persists the authoritative cloud sync interval (in seconds)
+ * so both Web throttling and connected Windows VRCX.Agent pick up the new schedule.
+ *
+ * @param {number|string} rawSeconds
+ * @returns {Promise<number>}
+ */
+export async function saveCloudSyncIntervalSeconds(rawSeconds) {
+    const clamped = clampSyncIntervalSeconds(rawSeconds);
+    cloudState.syncIntervalSeconds = clamped;
+    bootstrapCache.configs['cloud:syncIntervalSeconds'] = String(clamped);
+    await cloudFetch('/api/config/bundle', {
+        method: 'PUT',
+        json: {
+            bundleKey: 'vrcx_config',
+            patch: { 'cloud:syncIntervalSeconds': String(clamped) }
+        }
+    });
+    return clamped;
 }
 
 export function scheduleConfigPatch(key, value) {

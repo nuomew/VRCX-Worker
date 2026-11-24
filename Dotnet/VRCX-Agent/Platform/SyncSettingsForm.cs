@@ -9,8 +9,8 @@ namespace VRCX.Agent.Platform;
 
 /// <summary>
 /// Configuration dialog where users enter their VRCX Cloud URL, Sync Secret, Device Name,
-/// periodic upload interval, and switch between Overseas (Direct / Proxy Off) and
-/// Mainland China (Proxy On) network modes with live connectivity testing before saving.
+/// and switch between Overseas (Direct / Proxy Off) and Mainland China (Proxy On) network modes.
+/// Sync interval is controlled authoritatively by Web Cloud Settings and retrieved on connect.
 /// </summary>
 public sealed class SyncSettingsForm : Form
 {
@@ -21,7 +21,7 @@ public sealed class SyncSettingsForm : Form
     private readonly TextBox _secretBox;
     private readonly CheckBox _showSecretCheck;
     private readonly TextBox _deviceNameBox;
-    private readonly NumericUpDown _intervalInput;
+    private readonly Label _webScheduleHintLabel;
     private readonly RadioButton _overseasDirectRadio;
     private readonly RadioButton _mainlandProxyRadio;
     private readonly TextBox _proxyAddressBox;
@@ -30,6 +30,7 @@ public sealed class SyncSettingsForm : Form
     private readonly Button _saveButton;
 
     public AgentConfig? SavedConfig { get; private set; }
+    public AgentSyncResponse? InitialSyncResponse { get; private set; }
 
     public SyncSettingsForm(AgentConfig currentConfig, HttpSyncClient syncClient)
     {
@@ -90,24 +91,22 @@ public sealed class SyncSettingsForm : Form
         _deviceNameBox = new TextBox
         {
             Location = new Point(20, 150),
-            Width = 240,
+            Width = 220,
             Text = string.IsNullOrWhiteSpace(currentConfig.DeviceName) ? Environment.MachineName : currentConfig.DeviceName
         };
 
-        var intervalLabel = new Label
+        var scheduleTitleLabel = new Label
         {
-            Text = "Sync Interval (seconds):",
-            Location = new Point(276, 128),
+            Text = "Sync Schedule (Controlled by Web):",
+            Location = new Point(256, 128),
             AutoSize = true
         };
-        _intervalInput = new NumericUpDown
+        _webScheduleHintLabel = new Label
         {
-            Location = new Point(276, 150),
-            Width = 180,
-            Minimum = AgentConfig.MinSyncIntervalSeconds,
-            Maximum = AgentConfig.MaxSyncIntervalSeconds,
-            Increment = 15,
-            Value = currentConfig.EffectiveSyncIntervalSeconds
+            Text = $"Every {currentConfig.EffectiveSyncIntervalSeconds}s (synced from Web)",
+            Location = new Point(256, 153),
+            Size = new Size(200, 22),
+            ForeColor = Color.SteelBlue
         };
 
         var networkGroup = new GroupBox
@@ -160,7 +159,7 @@ public sealed class SyncSettingsForm : Form
 
         _autoUploadScreenshotsCheck = new CheckBox
         {
-            Text = "Automatically embed VRCX metadata && upload WebP screenshots",
+            Text = "Queue && upload WebP screenshots on each scheduled Web sync tick",
             Location = new Point(20, 326),
             AutoSize = true,
             Checked = currentConfig.AutoUploadScreenshots
@@ -171,7 +170,7 @@ public sealed class SyncSettingsForm : Form
             Location = new Point(20, 358),
             Size = new Size(436, 48),
             ForeColor = Color.DimGray,
-            Text = "Overseas mode connects directly; Mainland China mode routes uploads via system or custom HTTP/SOCKS5 proxy."
+            Text = "Local logs & screenshots stay buffered on disk outside the Web sync interval and only upload at the next scheduled tick."
         };
 
         _saveButton = new Button
@@ -197,7 +196,7 @@ public sealed class SyncSettingsForm : Form
             urlLabel, _urlBox,
             secretLabel, _secretBox, _showSecretCheck,
             deviceLabel, _deviceNameBox,
-            intervalLabel, _intervalInput,
+            scheduleTitleLabel, _webScheduleHintLabel,
             networkGroup,
             _autoUploadScreenshotsCheck,
             _statusLabel,
@@ -219,7 +218,6 @@ public sealed class SyncSettingsForm : Form
         string deviceName = string.IsNullOrWhiteSpace(_deviceNameBox.Text)
             ? Environment.MachineName
             : _deviceNameBox.Text.Trim();
-        int intervalSec = (int)_intervalInput.Value;
         bool proxyEnabled = _mainlandProxyRadio.Checked;
         string proxyAddress = _proxyAddressBox.Text.Trim();
 
@@ -245,14 +243,14 @@ public sealed class SyncSettingsForm : Form
         _saveButton.Enabled = false;
         _statusLabel.ForeColor = Color.SteelBlue;
         _statusLabel.Text = proxyEnabled
-            ? "Testing connection via proxy to /api/agent/sync ..."
-            : "Testing direct connection to /api/agent/sync ...";
+            ? "Testing connection via proxy & fetching Web sync schedule ..."
+            : "Testing direct connection & fetching Web sync schedule ...";
 
         try
         {
             string localDeviceId = _initialConfig.EnsureDeviceId();
             using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
-            var (ok, message, assignedDeviceId) = await _syncClient.TestConnectionAsync(
+            var (ok, message, syncResponse) = await _syncClient.TestConnectionAsync(
                 cloudUrl,
                 syncSecret,
                 localDeviceId,
@@ -261,20 +259,24 @@ public sealed class SyncSettingsForm : Form
                 proxyAddress,
                 cts.Token);
 
-            if (!ok)
+            if (!ok || syncResponse == null)
             {
                 _statusLabel.ForeColor = Color.Firebrick;
                 _statusLabel.Text = message;
                 return;
             }
 
+            int authoritativeInterval = SyncScheduleGate.ClampInterval(syncResponse.SyncIntervalSeconds);
+            _webScheduleHintLabel.Text = $"Every {authoritativeInterval}s (synced from Web)";
+            InitialSyncResponse = syncResponse;
+
             SavedConfig = new AgentConfig
             {
                 CloudUrl = cloudUrl,
                 SyncSecret = syncSecret,
-                DeviceId = string.IsNullOrWhiteSpace(assignedDeviceId) ? localDeviceId : assignedDeviceId,
+                DeviceId = string.IsNullOrWhiteSpace(syncResponse.DeviceId) ? localDeviceId : syncResponse.DeviceId,
                 DeviceName = deviceName,
-                SyncIntervalSeconds = intervalSec,
+                SyncIntervalSeconds = authoritativeInterval,
                 ProxyEnabled = proxyEnabled,
                 ProxyAddress = proxyAddress,
                 AutoUploadScreenshots = _autoUploadScreenshotsCheck.Checked,

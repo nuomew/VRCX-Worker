@@ -25,7 +25,7 @@
   - **Sharded D1 + FTS5 `trigram` Entity Dictionary**: Avoids 500 MB single-DB caps, unindexed `LIKE '%term%'` scans, and full-table `COUNT(*)` queries to stay comfortably inside Free-tier `rows_read` / `rows_written` ceilings.
   - **WebSocket Hibernation**: `AgentHubDO` uses `ctx.acceptWebSocket` and zero-cost `ping`/`pong` auto-responses so idle connections consume zero compute duration.
 - **Lightweight Windows Companion Agent (`Dotnet/VRCX-Agent/`, zero CEF/Electron)**:
-  - Simple **Cloud URL + Sync Secret** configuration with configurable periodic HTTPS upload interval (default 60s, no persistent WebSocket needed)
+  - Simple **Cloud URL + Sync Secret** configuration driven strictly by the **Web Cloud Sync Interval** setting (default `60s` / 1 min): local logs & screenshots stay buffered on disk outside the window and only upload on the next scheduled tick (no persistent WebSocket needed)
   - Built-in **Overseas (Direct / Proxy Off)** vs **Mainland China (Proxy On)** network switch supporting Windows system proxy and custom HTTP/HTTPS/SOCKS5 proxies (instant toggle from tray menu or settings dialog)
   - Incremental VRChat `output_log_*.txt` GameLog sync with persisted byte-offset cursor & durable offline JSONL queue (`POST /api/agent/sync`)
   - Local PNG metadata embedding (`Dotnet/ScreenshotMetadata`) + ≤1600px WebP thumbnail upload to optional private R2 gallery

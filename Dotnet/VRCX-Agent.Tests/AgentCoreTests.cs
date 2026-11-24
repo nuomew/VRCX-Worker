@@ -275,6 +275,42 @@ public sealed class AgentCoreTests
         Assert.False(ProxyHttpClientFactory.NormalizeAndValidateProxyUri("file:///etc/passwd").Ok);
     }
 
+    [Fact]
+    public void SyncScheduleGate_StrictlyFollowsWebIntervalAndBlocksEarlySync()
+    {
+        var gate = new SyncScheduleGate();
+        var t0 = new DateTimeOffset(2026, 11, 24, 3, 0, 0, TimeSpan.Zero);
+
+        // Initial handshake is due immediately upon startup
+        Assert.True(gate.IsDue(t0));
+        Assert.False(gate.HasSyncedWithWeb);
+
+        // Web instructs a 120s (2 min) sync interval
+        int applied = gate.ApplyServerSchedule(new AgentSyncResponse { SyncIntervalSeconds = 120 }, t0);
+        Assert.Equal(120, applied);
+        Assert.True(gate.HasSyncedWithWeb);
+        Assert.Equal(t0.AddSeconds(120), gate.NextSyncAtUtc);
+
+        // Strictly blocked during the entire 120s window (no early uploads even if local logs arrive)
+        Assert.False(gate.IsDue(t0));
+        Assert.False(gate.IsDue(t0.AddSeconds(30)));
+        Assert.False(gate.IsDue(t0.AddSeconds(119)));
+
+        // Permitted only once the scheduled Web sync timestamp arrives
+        Assert.True(gate.IsDue(t0.AddSeconds(120)));
+
+        // Web updates interval to 60s -> next cycle immediately follows 60s
+        var t1 = t0.AddSeconds(120);
+        Assert.Equal(60, gate.ApplyServerSchedule(new AgentSyncResponse { SyncIntervalSeconds = 60 }, t1));
+        Assert.False(gate.IsDue(t1.AddSeconds(59)));
+        Assert.True(gate.IsDue(t1.AddSeconds(60)));
+
+        // Transient failure backoff never accelerates faster than the Web-configured interval
+        gate.ApplyFailureBackoff(consecutiveFailures: 1, t1.AddSeconds(60));
+        Assert.False(gate.IsDue(t1.AddSeconds(119)));
+        Assert.True(gate.IsDue(t1.AddSeconds(120)));
+    }
+
     private sealed class StubHttpHandler : HttpMessageHandler
     {
         private readonly Func<HttpRequestMessage, Task<HttpResponseMessage>> _responder;

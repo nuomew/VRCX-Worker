@@ -19,6 +19,7 @@ import { useVRCXUpdaterStore } from './vrcxUpdater';
 import { useVrStore } from './vr';
 import { useVrcxStore } from './vrcx';
 import { watchState } from '../services/watchState';
+import { cloudState } from '../ipc-web/cloudState';
 
 import * as workerTimers from 'worker-timers';
 
@@ -49,10 +50,12 @@ export const useUpdateLoopStore = defineStore('UpdateLoop', () => {
     watch(
         () => watchState.isLoggedIn,
         () => {
-            state.nextCurrentUserRefresh = 300;
-            state.nextFriendsRefresh = 3600;
+            const isWebMode = typeof WEB !== 'undefined' && WEB;
+            const minPollSec = isWebMode ? Math.max(300, cloudState.syncIntervalSeconds || 60) : 300;
+            state.nextCurrentUserRefresh = minPollSec;
+            state.nextFriendsRefresh = Math.max(3600, minPollSec);
             state.nextGroupInstanceRefresh = 0;
-            state.nextBundleCheck = 60;
+            state.nextBundleCheck = isWebMode ? Math.max(300, cloudState.syncIntervalSeconds || 60) : 60;
         },
         { flush: 'sync' }
     );
@@ -68,12 +71,14 @@ export const useUpdateLoopStore = defineStore('UpdateLoop', () => {
     async function updateLoop() {
         try {
             if (watchState.isLoggedIn) {
+                const isWebMode = typeof WEB !== 'undefined' && WEB;
+                const webMinIntervalSec = isWebMode ? Math.max(300, cloudState.syncIntervalSeconds || 60) : 300;
                 if (--state.nextCurrentUserRefresh <= 0) {
-                    state.nextCurrentUserRefresh = 300; // 5min
+                    state.nextCurrentUserRefresh = webMinIntervalSec; // >= 5min (scales with Web sync interval)
                     getCurrentUser();
                 }
                 if (--state.nextFriendsRefresh <= 0) {
-                    state.nextFriendsRefresh = 3600; // 1hour
+                    state.nextFriendsRefresh = Math.max(3600, webMinIntervalSec); // >= 1hour
                     runRefreshFriendsListFlow();
                     authStore.updateStoredUser(userStore.currentUser);
                     if (
@@ -86,13 +91,12 @@ export const useUpdateLoopStore = defineStore('UpdateLoop', () => {
                 }
                 if (--state.nextGroupInstanceRefresh <= 0) {
                     if (watchState.isFriendsLoaded) {
-                        state.nextGroupInstanceRefresh = 300; // 5min
+                        state.nextGroupInstanceRefresh = webMinIntervalSec; // >= 5min (scales with Web sync interval)
                         const args = await groupRequest.getUsersGroupInstances();
                         handleGroupUserInstances(args);
                     }
                     AppApi.CheckGameRunning();
                 }
-                const isWebMode = typeof WEB !== 'undefined' && WEB;
                 if (!isWebMode && --state.nextAppUpdateCheck <= 0) {
                     state.nextAppUpdateCheck = 3600; // 1hour
                     if (vrcxUpdaterStore.autoUpdateVRCX !== 'Off') {

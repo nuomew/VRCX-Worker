@@ -13,18 +13,17 @@ using VRCX.Agent.Core;
 namespace VRCX.Agent.Platform;
 
 /// <summary>
-/// Headless Windows system tray application context performing pure periodic HTTP API sync:
+/// Headless Windows system tray application context performing strict Web-scheduled HTTP API sync:
 /// - Tails VRChat `output_log_*.txt` locally with durable byte cursor + offline JSONL queue (`LogTailCollector`)
-/// - Uploads incremental GameLog batches + live state on a configurable interval (`HttpSyncClient` -> `POST /api/agent/sync`)
-/// - Pulls and executes queued allowlisted remote commands and reports results over HTTPS
-/// - Embeds VRCX PNG metadata and uploads WebP thumbnails (`ScreenshotPipeline`)
-/// - Monitors VRChat/SteamVR processes, AutoAppLaunch, and Discord Rich Presence locally.
+/// - Embeds VRCX PNG metadata locally and queues screenshots without pushing outside the scheduled window
+/// - Strictly obeys the Web-configured sync interval via `SyncScheduleGate`: outside the window, zero data is
+///   uploaded; only when the next scheduled sync tick arrives are buffered logs & screenshots pushed together
+/// - Supports Overseas (Direct / Proxy Off) vs Mainland China (Proxy On) hot switching.
 /// </summary>
 public sealed class TrayApplicationContext : ApplicationContext
 {
     private static readonly Logger Log = LogManager.GetCurrentClassLogger();
     private const int BatchUploadLimit = 50;
-    private const int ImmediateFlushThreshold = 30;
 
     private readonly AgentConfigStore _configStore;
     private readonly HttpSyncClient _syncClient;
@@ -32,6 +31,8 @@ public sealed class TrayApplicationContext : ApplicationContext
     private readonly ScreenshotPipeline _screenshotPipeline;
     private readonly LocalProcessMonitor _processMonitor;
     private readonly RemoteCommandExecutor _commandExecutor;
+    private readonly SyncScheduleGate _scheduleGate;
+    private readonly Queue<PendingScreenshotTask> _pendingScreenshots = new();
     private readonly SemaphoreSlim _syncLock = new(1, 1);
     private readonly CancellationTokenSource _cts = new();
 
@@ -42,9 +43,7 @@ public sealed class TrayApplicationContext : ApplicationContext
 
     private AgentConfig _config;
     private volatile HttpClient _cloudHttp;
-    private DateTimeOffset _lastSyncAttemptAt = DateTimeOffset.MinValue;
     private DateTimeOffset _lastSyncSuccessAt = DateTimeOffset.MinValue;
-    private DateTimeOffset _nextRetryAllowedAt = DateTimeOffset.MinValue;
     private int _consecutiveFailures;
     private string _lastSyncError = string.Empty;
     private string _lastSentStateSignature = string.Empty;
@@ -54,6 +53,7 @@ public sealed class TrayApplicationContext : ApplicationContext
         _configStore = new AgentConfigStore();
         _config = _configStore.LoadConfig();
 
+        _scheduleGate = new SyncScheduleGate(_config.EffectiveSyncIntervalSeconds);
         _cloudHttp = ProxyHttpClientFactory.CreateHttpClient(_config);
         _syncClient = new HttpSyncClient(() => _cloudHttp);
         _logCollector = new LogTailCollector(_configStore.DataDirectory);
@@ -128,24 +128,25 @@ public sealed class TrayApplicationContext : ApplicationContext
                     ? LogTailCollector.ResolveDefaultVrChatLogDirectory()
                     : _config.VrChatLogDirectory;
 
-                _logCollector.PollLogDirectory(logDir);
+                // Always tail local VRChat logs and persist to local offline queue (zero network requests).
+                int newlyParsed = _logCollector.PollLogDirectory(logDir);
 
-                // Refresh local process & AutoAppLaunch monitor every 4 seconds (tick runs every 2s)
+                // Refresh local process & AutoAppLaunch monitor every 4 seconds (zero network requests).
+                bool procChanged = false;
                 if (tick % 2 == 0)
                 {
-                    _processMonitor.Refresh(_config);
+                    procChanged = _processMonitor.Refresh(_config);
                 }
 
-                if (_config.IsConfigured)
+                if (newlyParsed > 0 || procChanged)
                 {
-                    DateTimeOffset now = DateTimeOffset.UtcNow;
-                    bool intervalElapsed = (now - _lastSyncAttemptAt) >= TimeSpan.FromSeconds(_config.EffectiveSyncIntervalSeconds);
-                    bool queueThresholdHit = _logCollector.OfflineQueueCount >= ImmediateFlushThreshold && now >= _nextRetryAllowedAt;
+                    UpdateTrayStatus();
+                }
 
-                    if ((intervalElapsed && now >= _nextRetryAllowedAt) || queueThresholdHit)
-                    {
-                        await RunSyncCycleAsync(force: false, ct).ConfigureAwait(false);
-                    }
+                // STRICT Web-scheduled upload: never push outside the scheduled Web sync window.
+                if (_config.IsConfigured && _scheduleGate.IsDue(DateTimeOffset.UtcNow))
+                {
+                    await RunSyncCycleAsync(force: false, ct).ConfigureAwait(false);
                 }
 
                 tick++;
@@ -194,10 +195,10 @@ public sealed class TrayApplicationContext : ApplicationContext
                 _processMonitor.Refresh(cfg);
             }
 
-            _lastSyncAttemptAt = DateTimeOffset.UtcNow;
             var commandsToExecute = new List<PendingRemoteCommand>();
+            AgentSyncResponse? lastResponse = null;
 
-            // Drain up to 5 batches per cycle so large offline backlogs catch up smoothly without hammering Workers
+            // Drain up to 5 batches within this scheduled sync window so buffered offline events catch up cleanly.
             for (int round = 0; round < 5 && !ct.IsCancellationRequested; round++)
             {
                 List<GameLogEventItem> batch = _logCollector.PeekBatch(BatchUploadLimit);
@@ -211,6 +212,8 @@ public sealed class TrayApplicationContext : ApplicationContext
                     stateToSend,
                     ct).ConfigureAwait(false);
 
+                lastResponse = response;
+
                 if (batch.Count > 0)
                 {
                     _logCollector.AcknowledgeBatch(batch.Count);
@@ -222,7 +225,6 @@ public sealed class TrayApplicationContext : ApplicationContext
                 }
 
                 _consecutiveFailures = 0;
-                _nextRetryAllowedAt = DateTimeOffset.MinValue;
                 _lastSyncError = string.Empty;
                 _lastSyncSuccessAt = DateTimeOffset.UtcNow;
 
@@ -232,9 +234,23 @@ public sealed class TrayApplicationContext : ApplicationContext
                 }
             }
 
+            // Apply the authoritative Web-configured sync interval and lock the next scheduled upload window.
+            if (lastResponse != null)
+            {
+                int webInterval = _scheduleGate.ApplyServerSchedule(lastResponse, DateTimeOffset.UtcNow);
+                if (cfg.SyncIntervalSeconds != webInterval)
+                {
+                    cfg.SyncIntervalSeconds = webInterval;
+                    _configStore.SaveConfig(cfg);
+                }
+            }
+
+            // Upload any locally queued screenshots strictly inside this scheduled sync window.
+            await FlushQueuedScreenshotsAsync(ct).ConfigureAwait(false);
+
             UpdateTrayStatus();
 
-            // Execute any remote commands pulled during sync and report outcomes via HTTP
+            // Execute any remote commands pulled during sync and report outcomes via HTTP.
             foreach (PendingRemoteCommand cmd in commandsToExecute)
             {
                 if (ct.IsCancellationRequested) break;
@@ -246,7 +262,7 @@ public sealed class TrayApplicationContext : ApplicationContext
                         {
                             CmdId = cmd.CmdId,
                             Status = "succeeded",
-                            Message = "Periodic HTTP sync already completed"
+                            Message = "Scheduled HTTP sync already completed"
                         },
                         ct).ConfigureAwait(false);
                     continue;
@@ -268,15 +284,46 @@ public sealed class TrayApplicationContext : ApplicationContext
         catch (Exception ex)
         {
             _consecutiveFailures = Math.Min(_consecutiveFailures + 1, 6);
-            int backoffSec = Math.Min(300, (int)Math.Pow(2, _consecutiveFailures) * 5);
-            _nextRetryAllowedAt = DateTimeOffset.UtcNow.AddSeconds(backoffSec);
+            _scheduleGate.ApplyFailureBackoff(_consecutiveFailures, DateTimeOffset.UtcNow);
             _lastSyncError = ex.Message;
-            Log.Warn(ex, "Periodic HTTP sync failed (retry in {Sec}s).", backoffSec);
+            Log.Warn(ex, "Scheduled HTTP sync failed. Next retry at {NextAt}.", _scheduleGate.NextSyncAtUtc);
             UpdateTrayStatus();
         }
         finally
         {
             _syncLock.Release();
+        }
+    }
+
+    private async Task FlushQueuedScreenshotsAsync(CancellationToken ct)
+    {
+        if (!_config.AutoUploadScreenshots) return;
+
+        int attempts = 0;
+        while (attempts < 10 && !ct.IsCancellationRequested)
+        {
+            PendingScreenshotTask? task;
+            lock (_pendingScreenshots)
+            {
+                if (_pendingScreenshots.Count == 0) break;
+                task = _pendingScreenshots.Peek();
+            }
+
+            bool uploaded = await _screenshotPipeline.UploadQueuedTaskAsync(task, ct).ConfigureAwait(false);
+            if (!uploaded)
+            {
+                // Keep queued for the next scheduled sync tick
+                break;
+            }
+
+            lock (_pendingScreenshots)
+            {
+                if (_pendingScreenshots.Count > 0)
+                {
+                    _pendingScreenshots.Dequeue();
+                }
+            }
+            attempts++;
         }
     }
 
@@ -307,17 +354,31 @@ public sealed class TrayApplicationContext : ApplicationContext
     private void OnScreenshotCaptured(GameLogEventItem ev)
     {
         if (string.IsNullOrWhiteSpace(ev.LocalScreenshotPath)) return;
-        string path = ev.LocalScreenshotPath;
-        string takenAt = ev.CreatedAt;
-        string worldId = _logCollector.Parser.CurrentWorldId;
-        string worldName = _logCollector.Parser.CurrentWorldName;
-        string instanceId = VrcLogParser.ExtractInstanceId(_logCollector.Parser.CurrentLocation);
-        var players = _logCollector.Parser.SnapshotCurrentPlayers();
+        var task = new PendingScreenshotTask
+        {
+            LocalPath = ev.LocalScreenshotPath,
+            TakenAtIso = ev.CreatedAt,
+            WorldId = _logCollector.Parser.CurrentWorldId,
+            WorldName = _logCollector.Parser.CurrentWorldName,
+            InstanceId = VrcLogParser.ExtractInstanceId(_logCollector.Parser.CurrentLocation),
+            Players = new List<Dictionary<string, string>>(_logCollector.Parser.SnapshotCurrentPlayers())
+        };
 
+        // Only write local PNG metadata immediately; defer network upload until next Web-scheduled sync tick.
         _ = Task.Run(async () =>
         {
-            await _screenshotPipeline.ProcessAndUploadAsync(
-                path, takenAt, worldId, worldName, instanceId, players, _cts.Token).ConfigureAwait(false);
+            await _screenshotPipeline.EmbedLocalMetadataOnlyAsync(task, _cts.Token).ConfigureAwait(false);
+            if (_config.AutoUploadScreenshots)
+            {
+                lock (_pendingScreenshots)
+                {
+                    if (_pendingScreenshots.Count < 200)
+                    {
+                        _pendingScreenshots.Enqueue(task);
+                    }
+                }
+                UpdateTrayStatus();
+            }
         });
     }
 
@@ -331,18 +392,30 @@ public sealed class TrayApplicationContext : ApplicationContext
             _proxyModeItem.Checked = _config.ProxyEnabled;
             RebuildCloudHttpClient();
             _consecutiveFailures = 0;
-            _nextRetryAllowedAt = DateTimeOffset.MinValue;
             _lastSyncError = string.Empty;
             _lastSentStateSignature = string.Empty;
+
+            if (dialog.InitialSyncResponse != null)
+            {
+                _lastSyncSuccessAt = DateTimeOffset.UtcNow;
+                _scheduleGate.ApplyServerSchedule(dialog.InitialSyncResponse, _lastSyncSuccessAt);
+            }
+            else
+            {
+                _scheduleGate.ResetForImmediateHandshake();
+            }
+
             UpdateTrayStatus();
 
-            _trayIcon.ShowBalloonTip(
-                3000,
-                "VRCX Cloud Agent",
-                $"Saved ({_config.DeviceName}) · {ProxyHttpClientFactory.DescribeMode(_config)} · Every {_config.EffectiveSyncIntervalSeconds}s.",
-                ToolTipIcon.Info);
+            string nextLocal = _scheduleGate.NextSyncAtUtc == DateTimeOffset.MinValue
+                ? "now"
+                : _scheduleGate.NextSyncAtUtc.ToLocalTime().ToString("HH:mm:ss");
 
-            _ = Task.Run(() => RunSyncCycleAsync(force: true, _cts.Token));
+            _trayIcon.ShowBalloonTip(
+                3500,
+                "VRCX Cloud Agent",
+                $"Connected ({_config.DeviceName}) · {ProxyHttpClientFactory.DescribeMode(_config)} · Web interval {_scheduleGate.IntervalSeconds}s (next {nextLocal}).",
+                ToolTipIcon.Info);
         }
     }
 
@@ -352,20 +425,14 @@ public sealed class TrayApplicationContext : ApplicationContext
         _configStore.SaveConfig(_config);
         RebuildCloudHttpClient();
         _consecutiveFailures = 0;
-        _nextRetryAllowedAt = DateTimeOffset.MinValue;
         _lastSyncError = string.Empty;
         UpdateTrayStatus();
 
         _trayIcon.ShowBalloonTip(
             3000,
             "VRCX Cloud Agent",
-            $"Switched network mode to: {ProxyHttpClientFactory.DescribeMode(_config)}",
+            $"Switched network mode to: {ProxyHttpClientFactory.DescribeMode(_config)} (applies on next scheduled sync)",
             ToolTipIcon.Info);
-
-        if (_config.IsConfigured)
-        {
-            _ = Task.Run(() => RunSyncCycleAsync(force: true, _cts.Token));
-        }
     }
 
     private void RebuildCloudHttpClient()
@@ -418,15 +485,22 @@ public sealed class TrayApplicationContext : ApplicationContext
         }
         else
         {
-            syncText = "Waiting First Sync";
+            syncText = "Waiting Handshake";
         }
 
         string vrc = _processMonitor.IsVrcRunning ? "VRChat Running" : "VRChat Idle";
         string netTag = _config.ProxyEnabled ? "Proxy" : "Direct";
-        int pending = _logCollector.OfflineQueueCount;
-        string intervalPart = _config.IsConfigured ? $" · Every {_config.EffectiveSyncIntervalSeconds}s" : string.Empty;
-        string queuePart = pending > 0 ? $" · Queue {pending}" : string.Empty;
-        string summary = $"Status: {syncText} · {netTag}{intervalPart} · {vrc}{queuePart}";
+        int pendingLogs = _logCollector.OfflineQueueCount;
+        int pendingShots;
+        lock (_pendingScreenshots) pendingShots = _pendingScreenshots.Count;
+
+        string nextPart = _config.IsConfigured && _scheduleGate.NextSyncAtUtc != DateTimeOffset.MinValue
+            ? $" · Next {_scheduleGate.NextSyncAtUtc.ToLocalTime():HH:mm:ss} ({_scheduleGate.IntervalSeconds}s Web)"
+            : string.Empty;
+        string queuePart = (pendingLogs > 0 || pendingShots > 0)
+            ? $" · Buffered {pendingLogs}L/{pendingShots}S"
+            : string.Empty;
+        string summary = $"Status: {syncText}{nextPart} · {netTag} · {vrc}{queuePart}";
         string tip = TruncateNotifyText($"VRCX Agent ({syncText}/{netTag}) - {vrc}");
 
         if (_trayIcon.ContextMenuStrip?.InvokeRequired == true)

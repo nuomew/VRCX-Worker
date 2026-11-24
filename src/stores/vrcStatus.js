@@ -5,6 +5,7 @@ import { useVrcxStore } from './vrcx';
 import { openExternalLink } from '../shared/utils';
 
 import webApiService from '../services/webapi';
+import { cloudState } from '../ipc-web/cloudState';
 
 import * as workerTimers from 'worker-timers';
 
@@ -104,7 +105,9 @@ export const useVrcStatusStore = defineStore('VrcStatus', () => {
         () => vrcxStore.isBrowserFocused,
         (newValue) => {
             if (newValue) {
-                if (Date.now() - lastTimeFetched.value > 60 * 1000) {
+                const isWebMode = typeof WEB !== 'undefined' && WEB;
+                const minCooldownMs = isWebMode ? Math.max(60, cloudState.syncIntervalSeconds || 60) * 1000 : 60 * 1000;
+                if (Date.now() - lastTimeFetched.value > minCooldownMs) {
                     getVrcStatus();
                 }
             }
@@ -117,7 +120,11 @@ export const useVrcStatusStore = defineStore('VrcStatus', () => {
     function init() {
         getVrcStatus();
         workerTimers.setInterval(() => {
-            const interval = vrcxStore.isBrowserFocused ? pollingInterval.value : slowPollingInterval.value;
+            const isWebMode = typeof WEB !== 'undefined' && WEB;
+            const baseInterval = vrcxStore.isBrowserFocused ? pollingInterval.value : slowPollingInterval.value;
+            const interval = isWebMode
+                ? Math.max(baseInterval, (cloudState.syncIntervalSeconds || 60) * 1000)
+                : baseInterval;
             if (Date.now() - lastTimeFetched.value > interval) {
                 getVrcStatus();
             }

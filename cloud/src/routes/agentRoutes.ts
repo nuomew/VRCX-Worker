@@ -1,6 +1,7 @@
 import { authenticateAgent, getMasterKey } from '../auth/auth';
 import { encryptAesGcm, randomHex, sha256Hex } from '../crypto/vault';
 import type { Env } from '../env';
+import { getCloudSyncIntervalSeconds } from './coreData';
 import { type GameLogIngestItem, ingestGameLogItems } from './eventsData';
 
 // Strict command allowlist (R.A.I.L.G.U.A.R.D.)
@@ -405,12 +406,18 @@ export async function handleAgentPublicRoutes(request: Request, env: Env, url: U
             }
         }
 
+        const syncIntervalSeconds = await getCloudSyncIntervalSeconds(env);
+        const syncedMs = Date.parse(nowIso);
+        const nextSyncAt = new Date(syncedMs + syncIntervalSeconds * 1000).toISOString();
+
         return Response.json({
             ok: true,
             data: {
                 deviceId: auth.deviceId,
                 deviceName,
                 syncedAt: nowIso,
+                syncIntervalSeconds,
+                nextSyncAt,
                 ingest,
                 pendingCommands
             }

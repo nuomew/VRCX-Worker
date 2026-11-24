@@ -85,6 +85,27 @@ export async function upsertEntityWorld(
     }
 }
 
+export const DEFAULT_CLOUD_SYNC_INTERVAL_SECONDS = 60;
+export const MIN_CLOUD_SYNC_INTERVAL_SECONDS = 30;
+export const MAX_CLOUD_SYNC_INTERVAL_SECONDS = 3600;
+
+export function parseCloudSyncIntervalSeconds(raw: unknown): number {
+    const n = Number(raw);
+    if (!Number.isFinite(n) || n <= 0) return DEFAULT_CLOUD_SYNC_INTERVAL_SECONDS;
+    return Math.min(Math.max(Math.round(n), MIN_CLOUD_SYNC_INTERVAL_SECONDS), MAX_CLOUD_SYNC_INTERVAL_SECONDS);
+}
+
+/**
+ * Reads the authoritative Web-configured sync interval (in seconds, default 60s) from DB_CORE.
+ * Used by both Web bootstrap and Windows VRCX.Agent periodic HTTP sync responses.
+ */
+export async function getCloudSyncIntervalSeconds(env: Env): Promise<number> {
+    const row = await env.DB_CORE.prepare("SELECT payload_json FROM config_bundles WHERE bundle_key = 'vrcx_config' LIMIT 1")
+        .first<{ payload_json: string }>();
+    const cfg = safeJsonParse<Record<string, string>>(row?.payload_json, {});
+    return parseCloudSyncIntervalSeconds(cfg['cloud:syncIntervalSeconds']);
+}
+
 export async function handleCoreDataRoutes(request: Request, env: Env, url: URL): Promise<Response | null> {
     // 1. Single-request bootstrap: replaces ~400 startup SQLite queries on Web mode
     if (url.pathname === '/api/bootstrap' && request.method === 'GET') {
@@ -121,11 +142,15 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
             counters[row.counter_key] = row.row_count;
         }
 
+        const vrcxConfigs = bundles.vrcx_config ?? {};
+        const syncIntervalSeconds = parseCloudSyncIntervalSeconds(vrcxConfigs['cloud:syncIntervalSeconds']);
+
         return Response.json({
             ok: true,
             data: {
-                configs: bundles.vrcx_config ?? {},
+                configs: vrcxConfigs,
                 storage: bundles.vrcx_storage ?? {},
+                syncIntervalSeconds,
                 memos: batchRes[1]?.results ?? [],
                 worldMemos: batchRes[2]?.results ?? [],
                 avatarMemos: batchRes[3]?.results ?? [],

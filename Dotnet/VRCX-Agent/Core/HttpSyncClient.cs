@@ -33,9 +33,10 @@ public sealed class HttpSyncClient
     }
 
     /// <summary>
-    /// Validates Cloud URL + Sync Secret + selected proxy mode by sending a lightweight empty sync request.
+    /// Validates Cloud URL + Sync Secret + selected proxy mode by sending a lightweight empty sync request
+    /// and returns the authoritative Web sync schedule from the server.
     /// </summary>
-    public async Task<(bool Ok, string Message, string? AssignedDeviceId)> TestConnectionAsync(
+    public async Task<(bool Ok, string Message, AgentSyncResponse? Response)> TestConnectionAsync(
         string cloudUrl,
         string syncSecret,
         string deviceId,
@@ -83,7 +84,8 @@ public sealed class HttpSyncClient
                 var probeClient = new HttpSyncClient(probeHttp);
                 res = await probeClient.SyncOnceAsync(probeCfg, Array.Empty<GameLogEventItem>(), null, null, ct).ConfigureAwait(false);
             }
-            return (true, $"Connected ({res.DeviceName})", res.DeviceId);
+            int webInterval = SyncScheduleGate.ClampInterval(res.SyncIntervalSeconds);
+            return (true, $"Connected ({res.DeviceName}) · Web interval {webInterval}s", res);
         }
         catch (HttpRequestException ex)
         {

@@ -43,7 +43,32 @@
                 </div>
             </div>
 
-            <SettingsItem v-if="isWeb" label="VRCX Cloud Hub" description="Win Agent pairing, remote controls, R2 gallery & free-tier quota">
+            <SettingsItem
+                v-if="isWeb"
+                label="Cloud Sync Interval (Web & VRCX.Agent)"
+                description="Controls both Web api.vrchat.cloud sync throttling and Windows VRCX.Agent scheduled upload interval (default 1 min)">
+                <Select
+                    :model-value="String(cloudState.syncIntervalSeconds)"
+                    @update:model-value="onSelectCloudSyncInterval">
+                    <SelectTrigger size="sm" class="min-w-[155px]">
+                        <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                        <SelectItem value="60">1 min (60s · Default)</SelectItem>
+                        <SelectItem value="120">2 min (120s)</SelectItem>
+                        <SelectItem value="300">5 min (300s)</SelectItem>
+                        <SelectItem value="600">10 min (600s)</SelectItem>
+                        <SelectItem value="900">15 min (900s)</SelectItem>
+                        <SelectItem value="1800">30 min (1800s)</SelectItem>
+                        <SelectItem value="3600">60 min (3600s)</SelectItem>
+                    </SelectContent>
+                </Select>
+            </SettingsItem>
+
+            <SettingsItem
+                v-if="isWeb"
+                label="VRCX Cloud Hub"
+                description="Win Agent HTTP sync, remote controls, R2 gallery & free-tier quota">
                 <Button size="sm" variant="outline" @click="cloudState.hubDialogOpen = true">
                     Open Cloud Hub
                 </Button>
@@ -196,9 +221,11 @@
     import { useI18n } from 'vue-i18n';
 
     import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+    import { toast } from 'vue-sonner';
     import { useGeneralSettingsStore, useVRCXUpdaterStore } from '@/stores';
     import { links } from '@/shared/constants';
     import { openExternalLink } from '@/shared/utils';
+    import { saveCloudSyncIntervalSeconds } from '@/ipc-web/bootstrapCache';
     import { cloudState } from '@/ipc-web/cloudState';
 
     import SettingsGroup from '../SettingsGroup.vue';
@@ -242,5 +269,14 @@
 
     function openOSSDialog() {
         ossDialog.value = true;
+    }
+
+    async function onSelectCloudSyncInterval(val) {
+        try {
+            const saved = await saveCloudSyncIntervalSeconds(val);
+            toast.success(`Cloud sync interval set to ${saved}s (applies to Web & VRCX.Agent)`);
+        } catch (err) {
+            toast.error(`Failed to save sync interval: ${err?.message || err}`);
+        }
     }
 </script>

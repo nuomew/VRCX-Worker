@@ -502,8 +502,42 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
             envKeyEnv
         );
         expect(envOk.status).toBe(200);
-        const envOkJson = (await envOk.json()) as { ok: boolean; data: { deviceId: string; deviceName: string } };
+        const envOkJson = (await envOk.json()) as {
+            ok: boolean;
+            data: { deviceId: string; deviceName: string; syncIntervalSeconds: number; syncedAt: string; nextSyncAt: string };
+        };
         expect(envOkJson.data.deviceId).toBe('win-home-pc');
         expect(envOkJson.data.deviceName).toBe('Home-Gaming-PC');
+        expect(envOkJson.data.syncIntervalSeconds).toBe(60);
+
+        // 6. Updating cloud:syncIntervalSeconds on Web propagates immediately to /api/agent/sync schedule
+        const setIntervalRes = await exports.default.fetch('http://example.com/api/config/bundle', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                bundleKey: 'vrcx_config',
+                patch: { 'cloud:syncIntervalSeconds': '180' }
+            })
+        });
+        expect(setIntervalRes.status).toBe(200);
+
+        const nextSyncRes = await worker.fetch(
+            new Request('http://example.com/api/agent/sync', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    Authorization: 'Bearer princess-shared-secret-key',
+                    'X-Device-Id': 'win-home-pc'
+                },
+                body: JSON.stringify({ events: [] })
+            }),
+            envKeyEnv
+        );
+        const nextSyncJson = (await nextSyncRes.json()) as {
+            ok: boolean;
+            data: { syncIntervalSeconds: number; syncedAt: string; nextSyncAt: string };
+        };
+        expect(nextSyncJson.data.syncIntervalSeconds).toBe(180);
+        expect(Date.parse(nextSyncJson.data.nextSyncAt) - Date.parse(nextSyncJson.data.syncedAt)).toBe(180_000);
     });
 });

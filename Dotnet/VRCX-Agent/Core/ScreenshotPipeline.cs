@@ -93,59 +93,53 @@ public sealed class ScreenshotPipeline
         return ms.ToArray();
     }
 
-    public async Task<bool> ProcessAndUploadAsync(
-        string localPath,
-        string takenAtIso,
-        string worldId,
-        string worldName,
-        string instanceId,
-        IReadOnlyList<Dictionary<string, string>> players,
-        CancellationToken ct)
+    /// <summary>
+    /// Writes VRCX PNG metadata locally without making any network requests.
+    /// Used immediately upon screenshot capture while deferring cloud upload until the next Web sync tick.
+    /// </summary>
+    public async Task EmbedLocalMetadataOnlyAsync(PendingScreenshotTask task, CancellationToken ct)
     {
-        if (string.IsNullOrWhiteSpace(localPath) || !File.Exists(localPath))
+        if (string.IsNullOrWhiteSpace(task.LocalPath) || !File.Exists(task.LocalPath))
         {
-            return false;
+            return;
         }
-
-        // Wait briefly for VRChat to finish flushing the PNG file handle.
-        await WaitForFileReadyAsync(localPath, ct).ConfigureAwait(false);
+        await WaitForFileReadyAsync(task.LocalPath, ct).ConfigureAwait(false);
 
         AgentConfig cfg = _configProvider();
-        var meta = new ScreenshotMetaPayload
+        if (!cfg.WritePngMetadata)
         {
-            TakenAt = takenAtIso,
-            LocalFilename = Path.GetFileName(localPath),
-            WorldId = worldId,
-            WorldName = worldName,
-            InstanceId = instanceId,
-            Players = new List<Dictionary<string, string>>(players),
-            Metadata = new Dictionary<string, object>
-            {
-                ["source"] = "vrcx-agent",
-                ["machine"] = Environment.MachineName
-            }
-        };
+            return;
+        }
+        try
+        {
+            WriteVrcxPngMetadata(task.LocalPath, BuildMetaPayload(task));
+        }
+        catch (Exception ex)
+        {
+            Log.Warn(ex, "Failed to embed VRCX PNG metadata in {Path}", task.LocalPath);
+        }
+    }
 
-        if (cfg.WritePngMetadata)
+    /// <summary>
+    /// Encodes and uploads a queued screenshot thumbnail strictly during a scheduled sync cycle.
+    /// </summary>
+    public async Task<bool> UploadQueuedTaskAsync(PendingScreenshotTask task, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(task.LocalPath) || !File.Exists(task.LocalPath))
         {
-            try
-            {
-                WriteVrcxPngMetadata(localPath, meta);
-            }
-            catch (Exception ex)
-            {
-                Log.Warn(ex, "Failed to embed VRCX PNG metadata in {Path}", localPath);
-            }
+            return true;
         }
 
+        AgentConfig cfg = _configProvider();
         if (!cfg.IsConfigured || !cfg.AutoUploadScreenshots)
         {
             return true;
         }
 
+        var meta = BuildMetaPayload(task);
         try
         {
-            byte[] webpBytes = EncodeWebpThumbnail(localPath);
+            byte[] webpBytes = EncodeWebpThumbnail(task.LocalPath);
             // Content-addressed SHA-256 prefix (32 hex chars) guarantees idempotent uploads.
             string screenshotId = HmacSigner.Sha256Hex(webpBytes).Substring(0, 32);
             string endpoint = $"{cfg.CloudUrl.TrimEnd('/')}/api/agent/media/screenshots/{screenshotId}";
@@ -172,10 +166,47 @@ public sealed class ScreenshotPipeline
         }
         catch (Exception ex)
         {
-            Log.Warn(ex, "Screenshot pipeline failed for {Path}", localPath);
+            Log.Warn(ex, "Screenshot upload failed for {Path}", task.LocalPath);
             return false;
         }
     }
+
+    public async Task<bool> ProcessAndUploadAsync(
+        string localPath,
+        string takenAtIso,
+        string worldId,
+        string worldName,
+        string instanceId,
+        IReadOnlyList<Dictionary<string, string>> players,
+        CancellationToken ct)
+    {
+        var task = new PendingScreenshotTask
+        {
+            LocalPath = localPath,
+            TakenAtIso = takenAtIso,
+            WorldId = worldId,
+            WorldName = worldName,
+            InstanceId = instanceId,
+            Players = new List<Dictionary<string, string>>(players)
+        };
+        await EmbedLocalMetadataOnlyAsync(task, ct).ConfigureAwait(false);
+        return await UploadQueuedTaskAsync(task, ct).ConfigureAwait(false);
+    }
+
+    private static ScreenshotMetaPayload BuildMetaPayload(PendingScreenshotTask task) => new()
+    {
+        TakenAt = task.TakenAtIso,
+        LocalFilename = Path.GetFileName(task.LocalPath),
+        WorldId = task.WorldId,
+        WorldName = task.WorldName,
+        InstanceId = task.InstanceId,
+        Players = new List<Dictionary<string, string>>(task.Players),
+        Metadata = new Dictionary<string, object>
+        {
+            ["source"] = "vrcx-agent",
+            ["machine"] = Environment.MachineName
+        }
+    };
 
     private static async Task WaitForFileReadyAsync(string path, CancellationToken ct)
     {

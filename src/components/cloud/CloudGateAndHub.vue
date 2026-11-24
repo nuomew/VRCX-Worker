@@ -160,6 +160,34 @@
                             </div>
                         </div>
 
+                        <div class="space-y-1.5 pt-1">
+                            <div class="text-[11px] font-medium text-muted-foreground">
+                                Sync Interval (Web &amp; VRCX.Agent, seconds · default 60s)
+                            </div>
+                            <div class="flex flex-wrap items-center gap-2">
+                                <input
+                                    v-model.number="syncIntervalInput"
+                                    type="number"
+                                    min="30"
+                                    max="3600"
+                                    step="30"
+                                    class="w-28 rounded-md border border-input bg-background px-3 py-1.5 font-mono text-xs text-foreground" />
+                                <button
+                                    type="button"
+                                    class="rounded-md border border-border px-3 py-1.5 font-medium hover:bg-accent"
+                                    :disabled="savingSyncInterval"
+                                    @click="saveSyncInterval">
+                                    {{ savingSyncInterval ? 'Saving...' : 'Save Interval' }}
+                                </button>
+                                <span v-if="syncIntervalNotice" class="text-[11px] text-primary">
+                                    {{ syncIntervalNotice }}
+                                </span>
+                                <span v-else class="text-[11px] text-muted-foreground">
+                                    VRCX.Agent follows this schedule strictly and only uploads at each scheduled tick.
+                                </span>
+                            </div>
+                        </div>
+
                         <div class="text-[11px] text-muted-foreground">
                             Tip: You can also configure a static <code class="font-mono">AGENT_SYNC_KEY</code> in Cloudflare
                             Worker Secrets instead of generating per-device keys here.
@@ -338,7 +366,7 @@
 <script setup>
     import { computed, ref, watch } from 'vue';
     import { cloudFetch, connectCloudHubWs } from '../../ipc-web/apiClient';
-    import { loadBootstrap } from '../../ipc-web/bootstrapCache';
+    import { loadBootstrap, saveCloudSyncIntervalSeconds } from '../../ipc-web/bootstrapCache';
     import { cloudState } from '../../ipc-web/cloudState';
 
     const isWeb = typeof WEB !== 'undefined' && WEB;
@@ -361,6 +389,9 @@
     const createdSyncKey = ref('');
     const createdDeviceName = ref('');
     const copiedField = ref('');
+    const syncIntervalInput = ref(cloudState.syncIntervalSeconds || 60);
+    const savingSyncInterval = ref(false);
+    const syncIntervalNotice = ref('');
     const devices = ref([]);
     const launchUrlInput = ref('');
     const commandNotice = ref('');
@@ -368,6 +399,30 @@
     const screenshots = ref([]);
     const quotaInfo = ref(null);
     const wafProbeResult = ref('');
+
+    watch(
+        () => cloudState.syncIntervalSeconds,
+        (val) => {
+            syncIntervalInput.value = val || 60;
+        }
+    );
+
+    async function saveSyncInterval() {
+        savingSyncInterval.value = true;
+        syncIntervalNotice.value = '';
+        try {
+            const saved = await saveCloudSyncIntervalSeconds(syncIntervalInput.value);
+            syncIntervalInput.value = saved;
+            syncIntervalNotice.value = `Saved (${saved}s)`;
+            setTimeout(() => {
+                syncIntervalNotice.value = '';
+            }, 3000);
+        } catch (err) {
+            syncIntervalNotice.value = `Failed: ${err?.message || err}`;
+        } finally {
+            savingSyncInterval.value = false;
+        }
+    }
 
     const recentSyncedCount = computed(() => devices.value.filter((d) => isRecentlySynced(d.last_seen_at)).length);
 

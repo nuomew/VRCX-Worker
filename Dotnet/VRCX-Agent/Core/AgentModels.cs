@@ -11,7 +11,7 @@ namespace VRCX.Agent.Core;
 public sealed class AgentConfig
 {
     public const int DefaultSyncIntervalSeconds = 60;
-    public const int MinSyncIntervalSeconds = 15;
+    public const int MinSyncIntervalSeconds = 30;
     public const int MaxSyncIntervalSeconds = 3600;
 
     public string CloudUrl { get; set; } = string.Empty;
@@ -183,11 +183,27 @@ public sealed class AgentSyncResponse
     [JsonProperty("syncedAt")]
     public string SyncedAt { get; set; } = string.Empty;
 
+    [JsonProperty("syncIntervalSeconds")]
+    public int SyncIntervalSeconds { get; set; } = AgentConfig.DefaultSyncIntervalSeconds;
+
+    [JsonProperty("nextSyncAt")]
+    public string NextSyncAt { get; set; } = string.Empty;
+
     [JsonProperty("ingest")]
     public AgentSyncIngestResult Ingest { get; set; } = new();
 
     [JsonProperty("pendingCommands")]
     public List<PendingRemoteCommand> PendingCommands { get; set; } = new();
+}
+
+public sealed class PendingScreenshotTask
+{
+    public string LocalPath { get; set; } = string.Empty;
+    public string TakenAtIso { get; set; } = string.Empty;
+    public string WorldId { get; set; } = string.Empty;
+    public string WorldName { get; set; } = string.Empty;
+    public string InstanceId { get; set; } = string.Empty;
+    public List<Dictionary<string, string>> Players { get; set; } = new();
 }
 
 public sealed class CommandExecutionResult
