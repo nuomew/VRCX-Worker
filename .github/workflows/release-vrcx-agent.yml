@@ -40,6 +40,7 @@ jobs:
           echo "ver=$ver" >> $env:GITHUB_OUTPUT
 
       - name: Publish VRCX.Agent (standalone + portable)
+        id: publish
         shell: pwsh
         run: |
           $tag = "${{ steps.meta.outputs.tag }}"
@@ -107,9 +108,9 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $tag = "${{ steps.meta.outputs.tag }}"
-          $stage = "${{ steps.meta.outputs.stage }}"
-          $standaloneZip = "${{ steps.meta.outputs.standalone_zip }}"
-          $portableZip = "${{ steps.meta.outputs.portable_zip }}"
+          $stage = "${{ steps.publish.outputs.stage }}"
+          $standaloneZip = "${{ steps.publish.outputs.standalone_zip }}"
+          $portableZip = "${{ steps.publish.outputs.portable_zip }}"
           $notes = "$stage\notes.md"
 
           gh release view $tag *> $null
