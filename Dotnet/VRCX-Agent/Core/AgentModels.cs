@@ -142,7 +142,7 @@ public sealed class LiveAgentState
     public int PlayerCount { get; set; }
 
     [JsonProperty("agentVersion")]
-    public string AgentVersion { get; set; } = "1.2.0";
+    public string AgentVersion { get; set; } = "1.3.0";
 
     [JsonProperty("machineName")]
     public string MachineName { get; set; } = Environment.MachineName;

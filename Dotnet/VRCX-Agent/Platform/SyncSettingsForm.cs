@@ -27,55 +27,61 @@ public sealed class SyncSettingsForm : Form
     private readonly TextBox _proxyAddressBox;
     private readonly CheckBox _autoUploadScreenshotsCheck;
     private readonly CheckBox _compressScreenshotsCheck;
+    private readonly CheckBox _autoStartCheck;
     private readonly Label _statusLabel;
     private readonly Button _saveButton;
 
     public AgentConfig? SavedConfig { get; private set; }
     public AgentSyncResponse? InitialSyncResponse { get; private set; }
+    public bool AutoStartEnabled => _autoStartCheck.Checked;
 
-    public SyncSettingsForm(AgentConfig currentConfig, HttpSyncClient syncClient)
+    public SyncSettingsForm(AgentConfig currentConfig, HttpSyncClient syncClient, bool autoStartEnabled = false, Icon? windowIcon = null)
     {
         _initialConfig = currentConfig;
         _syncClient = syncClient;
 
-        Text = "VRCX Cloud Agent — HTTP Sync & Proxy Settings";
+        Text = AgentStrings.SettingsWindowTitle;
+        if (windowIcon != null)
+        {
+            Icon = windowIcon;
+        }
         FormBorderStyle = FormBorderStyle.FixedDialog;
         MaximizeBox = false;
         MinimizeBox = false;
         StartPosition = FormStartPosition.CenterScreen;
-        ClientSize = new Size(476, 500);
-        Font = new Font("Segoe UI", 9.5f);
+        ClientSize = new Size(504, 544);
+        Font = new Font(AgentStrings.UiFontFamily, 9.5f);
 
         var urlLabel = new Label
         {
-            Text = "Cloud URL (e.g. https://vrcx.your-domain.workers.dev):",
+            Text = AgentStrings.CloudUrlLabel,
             Location = new Point(20, 14),
             AutoSize = true
         };
         _urlBox = new TextBox
         {
             Location = new Point(20, 36),
-            Width = 436,
+            Width = 464,
             Text = string.IsNullOrWhiteSpace(currentConfig.CloudUrl) ? "https://" : currentConfig.CloudUrl
         };
 
         var secretLabel = new Label
         {
-            Text = "Sync Secret (from Cloud Hub -> Create Sync Secret, or AGENT_SYNC_KEY):",
-            Location = new Point(20, 70),
+            Text = AgentStrings.SyncSecretLabel,
+            Location = new Point(20, 72),
             AutoSize = true
         };
         _secretBox = new TextBox
         {
-            Location = new Point(20, 92),
-            Width = 352,
+            Location = new Point(20, 94),
+            Width = 388,
             UseSystemPasswordChar = true,
             Text = currentConfig.SyncSecret ?? string.Empty
         };
         _showSecretCheck = new CheckBox
         {
-            Text = "Show",
-            Location = new Point(382, 94),
+            Text = AgentStrings.ShowSecretCheckbox,
+            Location = new Point(418, 96),
             AutoSize = true
         };
         _showSecretCheck.CheckedChanged += (_, _) =>
@@ -85,64 +91,64 @@ public sealed class SyncSettingsForm : Form
 
         var deviceLabel = new Label
         {
-            Text = "Device Name:",
-            Location = new Point(20, 128),
+            Text = AgentStrings.DeviceNameLabel,
+            Location = new Point(20, 130),
             AutoSize = true
         };
         _deviceNameBox = new TextBox
         {
-            Location = new Point(20, 150),
+            Location = new Point(20, 152),
             Width = 220,
             Text = string.IsNullOrWhiteSpace(currentConfig.DeviceName) ? Environment.MachineName : currentConfig.DeviceName
         };
 
         var scheduleTitleLabel = new Label
         {
-            Text = "Sync Schedule (Controlled by Web):",
-            Location = new Point(256, 128),
+            Text = AgentStrings.SyncScheduleTitle,
+            Location = new Point(258, 130),
             AutoSize = true
         };
         _webScheduleHintLabel = new Label
         {
-            Text = $"Every {currentConfig.EffectiveSyncIntervalSeconds}s (synced from Web)",
-            Location = new Point(256, 153),
-            Size = new Size(200, 22),
+            Text = AgentStrings.FormatWebScheduleHint(currentConfig.EffectiveSyncIntervalSeconds),
+            Location = new Point(258, 155),
+            Size = new Size(226, 24),
             ForeColor = Color.SteelBlue
         };
 
         var networkGroup = new GroupBox
         {
-            Text = "Network & Proxy Mode (Overseas / Mainland China)",
-            Location = new Point(20, 188),
-            Size = new Size(436, 126)
+            Text = AgentStrings.NetworkGroupTitle,
+            Location = new Point(20, 190),
+            Size = new Size(464, 126)
         };
 
         _overseasDirectRadio = new RadioButton
         {
-            Text = "Overseas (Direct / Proxy Off)",
+            Text = AgentStrings.OverseasDirectRadio,
             Location = new Point(14, 24),
             AutoSize = true,
             Checked = !currentConfig.ProxyEnabled
         };
         _mainlandProxyRadio = new RadioButton
         {
-            Text = "Mainland China (Proxy On)",
-            Location = new Point(220, 24),
+            Text = AgentStrings.MainlandProxyRadio,
+            Location = new Point(230, 24),
             AutoSize = true,
             Checked = currentConfig.ProxyEnabled
         };
 
         var proxyLabel = new Label
         {
-            Text = "Proxy URL (leave empty to follow Windows system proxy):",
+            Text = AgentStrings.ProxyAddressLabel,
             Location = new Point(14, 54),
             AutoSize = true
         };
         _proxyAddressBox = new TextBox
         {
-            Location = new Point(14, 76),
-            Width = 408,
-            PlaceholderText = "http://127.0.0.1:7890 or socks5://127.0.0.1:7891",
+            Location = new Point(14, 78),
+            Width = 436,
+            PlaceholderText = AgentStrings.ProxyAddressPlaceholder,
             Text = currentConfig.ProxyAddress ?? string.Empty,
             Enabled = currentConfig.ProxyEnabled
         };
@@ -160,16 +166,16 @@ public sealed class SyncSettingsForm : Form
 
         _autoUploadScreenshotsCheck = new CheckBox
         {
-            Text = "Sync VRChat screenshots to Cloud Gallery (default: Off)",
-            Location = new Point(20, 326),
+            Text = AgentStrings.SyncScreenshotsCheckbox,
+            Location = new Point(20, 328),
             AutoSize = true,
             Checked = currentConfig.AutoUploadScreenshots
         };
 
         _compressScreenshotsCheck = new CheckBox
         {
-            Text = "Compress uploaded screenshots (WebP <=1600px; off = original PNG)",
-            Location = new Point(38, 354),
+            Text = AgentStrings.CompressScreenshotsCheckbox,
+            Location = new Point(38, 358),
             AutoSize = true,
             Checked = currentConfig.CompressScreenshots,
             Enabled = currentConfig.AutoUploadScreenshots
@@ -179,29 +185,37 @@ public sealed class SyncSettingsForm : Form
             _compressScreenshotsCheck.Enabled = _autoUploadScreenshotsCheck.Checked;
         };
 
+        _autoStartCheck = new CheckBox
+        {
+            Text = AgentStrings.AutoStartCheckbox,
+            Location = new Point(20, 390),
+            AutoSize = true,
+            Checked = autoStartEnabled
+        };
+
         _statusLabel = new Label
         {
-            Location = new Point(20, 388),
-            Size = new Size(436, 48),
+            Location = new Point(20, 426),
+            Size = new Size(464, 52),
             ForeColor = Color.DimGray,
-            Text = "Local logs & screenshots stay buffered on disk outside the Web sync interval and only upload at the next scheduled tick."
+            Text = AgentStrings.SettingsDefaultHint
         };
 
         _saveButton = new Button
         {
-            Text = "Test && Save",
-            Location = new Point(252, 448),
-            Width = 112,
-            Height = 32
+            Text = AgentStrings.TestAndSaveButton,
+            Location = new Point(252, 492),
+            Width = 134,
+            Height = 34
         };
         _saveButton.Click += async (_, _) => await TestAndSaveAsync();
 
         var cancelButton = new Button
         {
-            Text = "Cancel",
-            Location = new Point(374, 448),
-            Width = 82,
-            Height = 32,
+            Text = AgentStrings.CancelButton,
+            Location = new Point(396, 492),
+            Width = 88,
+            Height = 34,
             DialogResult = DialogResult.Cancel
         };
 
@@ -214,6 +228,7 @@ public sealed class SyncSettingsForm : Form
             networkGroup,
             _autoUploadScreenshotsCheck,
             _compressScreenshotsCheck,
+            _autoStartCheck,
             _statusLabel,
             _saveButton, cancelButton
         });
@@ -240,7 +255,7 @@ public sealed class SyncSettingsForm : Form
             (uri.Scheme != Uri.UriSchemeHttps && uri.Scheme != Uri.UriSchemeHttp))
         {
             _statusLabel.ForeColor = Color.Firebrick;
-            _statusLabel.Text = "Please enter a valid https:// Cloud URL.";
+            _statusLabel.Text = AgentStrings.InvalidCloudUrlMessage;
             return;
         }
 
@@ -258,8 +273,8 @@ public sealed class SyncSettingsForm : Form
         _saveButton.Enabled = false;
         _statusLabel.ForeColor = Color.SteelBlue;
         _statusLabel.Text = proxyEnabled
-            ? "Testing connection via proxy & fetching Web sync schedule ..."
-            : "Testing direct connection & fetching Web sync schedule ...";
+            ? AgentStrings.TestingViaProxyMessage
+            : AgentStrings.TestingDirectMessage;
 
         try
         {
@@ -282,7 +297,7 @@ public sealed class SyncSettingsForm : Form
             }
 
             int authoritativeInterval = SyncScheduleGate.ClampInterval(syncResponse.SyncIntervalSeconds);
-            _webScheduleHintLabel.Text = $"Every {authoritativeInterval}s (synced from Web)";
+            _webScheduleHintLabel.Text = AgentStrings.FormatWebScheduleHint(authoritativeInterval);
             InitialSyncResponse = syncResponse;
 
             SavedConfig = new AgentConfig

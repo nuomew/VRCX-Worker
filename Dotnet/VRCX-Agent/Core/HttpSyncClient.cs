@@ -16,7 +16,7 @@ namespace VRCX.Agent.Core;
 /// </summary>
 public sealed class HttpSyncClient
 {
-    private const string AgentVersion = "1.2.0";
+    private const string AgentVersion = "1.3.0";
     private readonly Func<HttpClient> _httpProvider;
     private readonly bool _usesInjectedClient;
 
@@ -49,7 +49,7 @@ public sealed class HttpSyncClient
         if (!Uri.TryCreate(normalizedUrl, UriKind.Absolute, out Uri? uri) ||
             (uri.Scheme != Uri.UriSchemeHttps && uri.Scheme != Uri.UriSchemeHttp))
         {
-            return (false, "Cloud URL must start with https:// or http://", null);
+            return (false, AgentStrings.InvalidCloudUrlMessage, null);
         }
 
         if (proxyEnabled)
@@ -85,7 +85,7 @@ public sealed class HttpSyncClient
                 res = await probeClient.SyncOnceAsync(probeCfg, Array.Empty<GameLogEventItem>(), null, null, ct).ConfigureAwait(false);
             }
             int webInterval = SyncScheduleGate.ClampInterval(res.SyncIntervalSeconds);
-            return (true, $"Connected ({res.DeviceName}) · Web interval {webInterval}s", res);
+            return (true, AgentStrings.FormatTestConnected(res.DeviceName, webInterval), res);
         }
         catch (HttpRequestException ex)
         {
@@ -146,13 +146,13 @@ public sealed class HttpSyncClient
         if (!res.IsSuccessStatusCode)
         {
             string errDetail = ExtractErrorMessage(raw, $"HTTP {(int)res.StatusCode}");
-            throw new HttpRequestException($"Sync rejected ({(int)res.StatusCode}): {errDetail}", null, res.StatusCode);
+            throw new HttpRequestException(AgentStrings.FormatSyncRejected((int)res.StatusCode, errDetail), null, res.StatusCode);
         }
 
         JObject root = JObject.Parse(raw);
         if (root["ok"]?.Value<bool>() != true)
         {
-            string errDetail = root["error"]?["message"]?.Value<string>() ?? "Unknown sync error";
+            string errDetail = root["error"]?["message"]?.Value<string>() ?? AgentStrings.UnknownSyncError;
             throw new HttpRequestException(errDetail);
         }
 

@@ -12,19 +12,40 @@ namespace VRCX.Agent;
 internal static class Program
 {
     private const string SingleInstanceMutexName = @"Local\VRCX.CloudAgent.SingleInstance";
+    private const string ShowSettingsEventName = @"Local\VRCX.CloudAgent.ShowSettings";
 
     [STAThread]
-    private static void Main()
+    private static void Main(string[] args)
     {
+        bool isAutoStart = false;
+        foreach (string arg in args)
+        {
+            if (string.Equals(arg, "--autostart", StringComparison.OrdinalIgnoreCase))
+            {
+                isAutoStart = true;
+                break;
+            }
+        }
+
         using var mutex = new Mutex(initiallyOwned: true, SingleInstanceMutexName, out bool createdNew);
         if (!createdNew)
         {
+            // When the user manually clicks the Desktop / Start Menu shortcut while already running
+            // in the tray, wake the background instance so it brings the settings dialog to front.
+            if (!isAutoStart && EventWaitHandle.TryOpenExisting(ShowSettingsEventName, out EventWaitHandle? showEvent))
+            {
+                using (showEvent)
+                {
+                    showEvent.Set();
+                }
+            }
             return;
         }
 
+        using var showSettingsEvent = new EventWaitHandle(false, EventResetMode.AutoReset, ShowSettingsEventName);
         ConfigureLogging();
         ApplicationConfiguration.Initialize();
-        Application.Run(new TrayApplicationContext());
+        Application.Run(new TrayApplicationContext(isAutoStart, showSettingsEvent));
     }
 
     private static void ConfigureLogging()

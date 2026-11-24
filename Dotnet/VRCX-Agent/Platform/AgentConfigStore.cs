@@ -85,7 +85,7 @@ public sealed class AgentConfigStore
                 string? exePath = Environment.ProcessPath;
                 if (!string.IsNullOrWhiteSpace(exePath))
                 {
-                    key.SetValue(RunRegistryValueName, $"\"{exePath}\"");
+                    key.SetValue(RunRegistryValueName, $"\"{exePath}\" --autostart");
                 }
             }
             else

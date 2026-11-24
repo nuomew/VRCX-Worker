@@ -35,7 +35,7 @@ public static class ProxyHttpClientFactory
         string candidate = trimmed.Contains("://", StringComparison.Ordinal) ? trimmed : $"http://{trimmed}";
         if (!Uri.TryCreate(candidate, UriKind.Absolute, out Uri? uri) || string.IsNullOrWhiteSpace(uri.Host))
         {
-            return (false, null, "Invalid proxy URL. Example: http://127.0.0.1:7890 or socks5://127.0.0.1:7891");
+            return (false, null, AgentStrings.InvalidProxyUrlMessage);
         }
 
         bool schemeAllowed = false;
@@ -49,12 +49,12 @@ public static class ProxyHttpClientFactory
         }
         if (!schemeAllowed)
         {
-            return (false, null, $"Unsupported proxy scheme '{uri.Scheme}'. Use http, https, socks4, or socks5.");
+            return (false, null, AgentStrings.FormatUnsupportedProxyScheme(uri.Scheme));
         }
 
         if (uri.Port <= 0 || uri.Port > 65535)
         {
-            return (false, null, "Proxy URL must include a valid port (1-65535).");
+            return (false, null, AgentStrings.InvalidProxyPortMessage);
         }
 
         return (true, uri, string.Empty);
@@ -118,9 +118,11 @@ public static class ProxyHttpClientFactory
     {
         if (!config.ProxyEnabled)
         {
-            return "Overseas (Direct)";
+            return AgentStrings.NetModeOverseasDirect;
         }
         string addr = (config.ProxyAddress ?? string.Empty).Trim();
-        return string.IsNullOrEmpty(addr) ? "Mainland (System Proxy)" : "Mainland (Custom Proxy)";
+        return string.IsNullOrEmpty(addr)
+            ? AgentStrings.NetModeMainlandSystemProxy
+            : AgentStrings.NetModeMainlandCustomProxy;
     }
 }

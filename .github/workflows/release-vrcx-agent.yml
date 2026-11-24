@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag (e.g. v1.1.0)'
+        description: 'Release tag (e.g. v1.3.0)'
         required: true
-        default: 'v1.1.0'
+        default: 'v1.3.0'
   push:
     tags:
       - 'v*'
@@ -35,18 +35,19 @@ jobs:
         run: |
           $tag = if ("${{ github.event_name }}" -eq "workflow_dispatch") { "${{ inputs.tag }}" } else { "${{ github.ref_name }}" }
           $ver = $tag.TrimStart('v')
-          if ($ver -notmatch '^\d+\.\d+\.\d+') { $ver = '1.1.0' }
+          if ($ver -notmatch '^\d+\.\d+\.\d+') { $ver = '1.3.0' }
           echo "tag=$tag" >> $env:GITHUB_OUTPUT
           echo "ver=$ver" >> $env:GITHUB_OUTPUT
 
-      - name: Publish VRCX.Agent (standalone + portable)
+      - name: Publish VRCX.Agent (Setup installer + standalone + portable)
         id: publish
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
           $tag = "${{ steps.meta.outputs.tag }}"
           $ver = "${{ steps.meta.outputs.ver }}"
           $stage = Join-Path $env:RUNNER_TEMP "vrcx-agent-release"
-          New-Item -ItemType Directory -Force -Path "$stage\standalone", "$stage\portable" | Out-Null
+          New-Item -ItemType Directory -Force -Path "$stage\standalone", "$stage\portable", "$stage\installer" | Out-Null
 
           dotnet publish Dotnet/VRCX-Agent/VRCX-Agent.csproj `
             -c Release -r win-x64 --self-contained true `
@@ -64,41 +65,117 @@ jobs:
             -p:Version=$ver `
             -o "$stage\portable"
 
+          # Locate or install/upgrade Inno Setup 6 compiler (ISCC.exe)
+          $isccCandidates = @(
+            "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+            "$env:ProgramFiles\Inno Setup 6\ISCC.exe"
+          )
+          $iscc = $isccCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $iscc) {
+            $cmd = Get-Command iscc -ErrorAction SilentlyContinue
+            if ($cmd) { $iscc = $cmd.Source }
+          }
+          if (-not $iscc) {
+            choco install innosetup -y --no-progress
+            $iscc = $isccCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          }
+          if (-not $iscc -or -not (Test-Path $iscc)) {
+            throw "Could not locate Inno Setup 6 ISCC.exe"
+          }
+
+          # Prepare Simplified Chinese language file matching installed Inno Setup version
+          $innoDir = Split-Path -Parent $iscc
+          $localCnIsl = Join-Path $innoDir "Languages\ChineseSimplified.isl"
+          if (-not (Test-Path $localCnIsl)) {
+            choco upgrade innosetup -y --no-progress
+            $iscc = $isccCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+            $innoDir = Split-Path -Parent $iscc
+            $localCnIsl = Join-Path $innoDir "Languages\ChineseSimplified.isl"
+          }
+          Write-Host "Using Inno Setup compiler: $iscc"
+
+          $cnIslPath = Join-Path $stage "ChineseSimplified.isl"
+          if (Test-Path $localCnIsl) {
+            Copy-Item $localCnIsl $cnIslPath -Force
+          } else {
+            Invoke-WebRequest `
+              -Uri "https://raw.githubusercontent.com/jrsoftware/issrc/main/Files/Languages/ChineseSimplified.isl" `
+              -OutFile $cnIslPath `
+              -UseBasicParsing
+          }
+          if (-not (Test-Path $cnIslPath) -or (Get-Item $cnIslPath).Length -lt 1024) {
+            throw "Failed to obtain valid ChineseSimplified.isl for Inno Setup"
+          }
+          # Ensure UTF-8 BOM on .isl so Inno Setup parses Chinese cleanly on English Windows runners
+          $islBytes = [System.IO.File]::ReadAllBytes($cnIslPath)
+          if ($islBytes.Length -lt 3 -or $islBytes[0] -ne 0xEF -or $islBytes[1] -ne 0xBB -or $islBytes[2] -ne 0xBF) {
+            $islText = [System.Text.Encoding]::UTF8.GetString($islBytes)
+            $utf8Bom = New-Object System.Text.UTF8Encoding($true)
+            [System.IO.File]::WriteAllText($cnIslPath, $islText, $utf8Bom)
+          }
+
+          $setupBase = "VRCX.Agent-$tag-Setup-win-x64"
+          $issPath = (Resolve-Path "Dotnet\VRCX-Agent\Installer\VRCX-Agent.iss").Path
+          $iconPath = (Resolve-Path "images\VRCX.ico").Path
+
+          & $iscc `
+            "/DAppVersion=$ver" `
+            "/DSourceDir=$stage\standalone" `
+            "/DOutputDir=$stage\installer" `
+            "/DOutputBaseFilename=$setupBase" `
+            "/DIconPath=$iconPath" `
+            "/DChineseIslPath=$cnIslPath" `
+            $issPath
+          if ($LASTEXITCODE -ne 0) {
+            throw "ISCC failed with exit code $LASTEXITCODE"
+          }
+
+          $setupExe = Join-Path "$stage\installer" "$setupBase.exe"
+          if (-not (Test-Path $setupExe)) {
+            throw "Installer output not found: $setupExe"
+          }
+
           $standaloneZip = Join-Path $stage "VRCX.Agent-$tag-win-x64-standalone.zip"
           $portableZip = Join-Path $stage "VRCX.Agent-$tag-win-x64-portable.zip"
           Compress-Archive -Path "$stage\standalone\*" -DestinationPath $standaloneZip -Force
           Compress-Archive -Path "$stage\portable\*" -DestinationPath $portableZip -Force
 
+          $shaSetup = (Get-FileHash $setupExe -Algorithm SHA256).Hash.ToLower()
           $shaStandalone = (Get-FileHash $standaloneZip -Algorithm SHA256).Hash.ToLower()
           $shaPortable = (Get-FileHash $portableZip -Algorithm SHA256).Hash.ToLower()
 
           $bt = [char]96
           $notesLines = @(
-            "## VRCX.Agent $tag (Windows Companion for VRCX-Worker)",
+            "## VRCX.Agent $tag (Windows 桌面伴侣安装版 / Companion for VRCX-Worker)",
             "",
-            "Lightweight Windows system-tray companion for [VRCX-Worker](https://github.com/nuomew/VRCX-Worker) (zero CEF, zero Electron).",
+            "轻量级 Windows 系统托盘伴侣程序（零 CEF、零 Electron），支持简体中文 / English 自动跟随系统语言，后台静默运行与开机自启动。",
             "",
-            "### Downloads",
-            "- **${bt}VRCX.Agent-$tag-win-x64-standalone.zip${bt} (Recommended / 推荐独立免装版)**: Self-contained single-file Windows x64 build with .NET 10 Desktop Runtime bundled. Extract and double-click ${bt}VRCX.Agent.exe${bt} directly.",
-            "- **${bt}VRCX.Agent-$tag-win-x64-portable.zip${bt} (Lightweight / 轻量版)**: Framework-dependent build (~1.5 MB). Requires [.NET 10 Windows Desktop Runtime (x64)](https://dotnet.microsoft.com/download/dotnet/10.0).",
+            "### 下载 / Downloads",
+            "- **${bt}VRCX.Agent-$tag-Setup-win-x64.exe${bt}（推荐标准安装版 / Recommended Installer）**：双击安装，内置 .NET 10 运行时，无需管理员权限，默认勾选**开机自动后台启动**并驻留系统托盘，支持一键覆盖升级与系统应用列表卸载。",
+            "- **${bt}VRCX.Agent-$tag-win-x64-standalone.zip${bt}（免安装独立绿色版 / Standalone ZIP）**：内置 .NET 10 运行时，解压后直接双击 ${bt}VRCX.Agent.exe${bt} 运行。",
+            "- **${bt}VRCX.Agent-$tag-win-x64-portable.zip${bt}（轻量版 / Lightweight ZIP）**：体积约 1.5 MB，需电脑已安装 [.NET 10 Windows Desktop Runtime (x64)](https://dotnet.microsoft.com/download/dotnet/10.0)。",
             "",
-            "### Key Features",
-            "- Periodic HTTPS API sync (${bt}POST /api/agent/sync${bt}) strictly controlled by Web **Cloud Sync Interval** (default 60s; buffers locally outside the scheduled window)",
-            "- Overseas (Direct / Proxy Off) vs Mainland China (Proxy On: Windows system proxy or HTTP/HTTPS/SOCKS4/SOCKS5) quick toggle in tray menu & settings",
-            "- Incremental VRChat ${bt}output_log_*.txt${bt} tailing, PNG metadata embedding + <=1600px WebP thumbnail upload to Cloudflare R2 (${bt}R2_MEDIA${bt}), Discord RPC, VR notifications, and allowlisted remote commands",
+            "### 主要功能 / Key Features",
+            "- 全界面简体中文 / English 自动适配（中文系统默认全中文界面与托盘菜单）",
+            "- 后台系统托盘运行与开机自启动（安装向导、设置窗口、托盘菜单均可随时开关）",
+            "- 定时 HTTPS 同步（${bt}POST /api/agent/sync${bt}），严格遵循网页端 **云端同步间隔**（默认 60 秒）",
+            "- 海外直连 / 中国大陆代理一键切换（支持自动跟随 Windows 系统代理或自定义 HTTP/HTTPS/SOCKS5）",
+            "- VRChat 本地日志增量采集、照片同步开关与可选 WebP 压缩（默认关闭）、Discord RPC 与允许列表远程指令",
             "",
-            "### Quick Setup",
-            "1. Open your VRCX-Worker web app -> **Cloud Hub** -> **Win Agent (HTTP Sync)** -> copy **Cloud URL** and create a **Sync Secret**.",
-            "2. Extract the zip and launch ${bt}VRCX.Agent.exe${bt}.",
-            "3. Right-click the tray icon -> **Sync Settings (URL, Secret & Proxy)...**, paste Cloud URL & Sync Secret, select Overseas or Mainland China mode, and click **Test & Save**.",
+            "### 快速开始 / Quick Setup",
+            "1. 打开你的 VRCX-Worker 网页端 → 点击底部 **云端** 打开 **云端中心 → Windows 伴侣 (HTTP 同步)**，复制 **云端连接地址** 并创建 **同步密钥**。",
+            "2. 下载并运行 ${bt}VRCX.Agent-$tag-Setup-win-x64.exe${bt} 完成安装（默认勾选开机后台自启动）。",
+            "3. 首次启动会自动打开设置窗口，粘贴云端地址与同步密钥，选择海外直连或中国大陆代理，点击 **测试连接并保存** 后即自动最小化到右下角系统托盘后台运行。",
             "",
             "### SHA-256 Checksums",
+            "- ${bt}VRCX.Agent-$tag-Setup-win-x64.exe${bt}: ${bt}$shaSetup${bt}",
             "- ${bt}VRCX.Agent-$tag-win-x64-standalone.zip${bt}: ${bt}$shaStandalone${bt}",
             "- ${bt}VRCX.Agent-$tag-win-x64-portable.zip${bt}: ${bt}$shaPortable${bt}"
           )
           $notesLines -join "`n" | Set-Content -Path "$stage\notes.md" -Encoding UTF8
 
           echo "stage=$stage" >> $env:GITHUB_OUTPUT
+          echo "setup_exe=$setupExe" >> $env:GITHUB_OUTPUT
           echo "standalone_zip=$standaloneZip" >> $env:GITHUB_OUTPUT
           echo "portable_zip=$portableZip" >> $env:GITHUB_OUTPUT
 
@@ -109,16 +186,17 @@ jobs:
         run: |
           $tag = "${{ steps.meta.outputs.tag }}"
           $stage = "${{ steps.publish.outputs.stage }}"
+          $setupExe = "${{ steps.publish.outputs.setup_exe }}"
           $standaloneZip = "${{ steps.publish.outputs.standalone_zip }}"
           $portableZip = "${{ steps.publish.outputs.portable_zip }}"
           $notes = "$stage\notes.md"
 
           gh release view $tag *> $null
           if ($LASTEXITCODE -eq 0) {
-            gh release upload $tag $standaloneZip $portableZip --clobber
+            gh release upload $tag $setupExe $standaloneZip $portableZip --clobber
             gh release edit $tag --title "VRCX.Agent $tag (Windows x64)" --notes-file $notes
           } else {
-            gh release create $tag $standaloneZip $portableZip `
+            gh release create $tag $setupExe $standaloneZip $portableZip `
               --title "VRCX.Agent $tag (Windows x64)" `
               --notes-file $notes `
               --target "${{ github.sha }}"

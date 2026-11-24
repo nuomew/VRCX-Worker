@@ -365,6 +365,41 @@ public sealed class AgentCoreTests
         }
     }
 
+    [Fact]
+    public void AgentStrings_SupportsSimplifiedChineseAndEnglishFallback()
+    {
+        string? previous = AgentStrings.LanguageOverride;
+        try
+        {
+            AgentStrings.LanguageOverride = "zh-CN";
+            Assert.True(AgentStrings.IsChinese);
+            Assert.Equal("Microsoft YaHei UI", AgentStrings.UiFontFamily);
+            Assert.Equal("VRCX 云端伴侣", AgentStrings.AppTitle);
+            Assert.Contains("同步与代理设置", AgentStrings.SettingsWindowTitle);
+            Assert.Contains("开机自动后台运行", AgentStrings.AutoStartCheckbox);
+            Assert.DoesNotContain("&", AgentStrings.NetworkGroupTitle);
+            Assert.DoesNotContain("&", AgentStrings.SettingsDefaultHint);
+            Assert.Equal("海外直连", ProxyHttpClientFactory.DescribeMode(new AgentConfig { ProxyEnabled = false }));
+            Assert.Equal("中国大陆（系统代理）", ProxyHttpClientFactory.DescribeMode(new AgentConfig { ProxyEnabled = true, ProxyAddress = "" }));
+            Assert.Equal("中国大陆（自定义代理）", ProxyHttpClientFactory.DescribeMode(new AgentConfig { ProxyEnabled = true, ProxyAddress = "127.0.0.1:7890" }));
+
+            AgentStrings.LanguageOverride = "en-US";
+            Assert.False(AgentStrings.IsChinese);
+            Assert.Equal("Segoe UI", AgentStrings.UiFontFamily);
+            Assert.Equal("VRCX Cloud Agent", AgentStrings.AppTitle);
+            // WinForms control labels must escape '&' as '&&' so no mnemonic underscore is rendered
+            Assert.Contains("&&", AgentStrings.NetworkGroupTitle);
+            Assert.Contains("&&", AgentStrings.SettingsDefaultHint);
+            Assert.Equal("Overseas (Direct)", ProxyHttpClientFactory.DescribeMode(new AgentConfig { ProxyEnabled = false }));
+            Assert.Equal("Mainland (System Proxy)", ProxyHttpClientFactory.DescribeMode(new AgentConfig { ProxyEnabled = true, ProxyAddress = "" }));
+            Assert.Equal("Mainland (Custom Proxy)", ProxyHttpClientFactory.DescribeMode(new AgentConfig { ProxyEnabled = true, ProxyAddress = "127.0.0.1:7890" }));
+        }
+        finally
+        {
+            AgentStrings.LanguageOverride = previous;
+        }
+    }
+
     private sealed class StubHttpHandler : HttpMessageHandler
     {
         private readonly Func<HttpRequestMessage, Task<HttpResponseMessage>> _responder;

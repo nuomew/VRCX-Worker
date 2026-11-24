@@ -49,24 +49,25 @@ To store compressed WebP screenshot thumbnails in Cloudflare R2 (10 GB/month Fre
 
 Without `R2_MEDIA` bound, screenshot metadata still syncs to D1 cleanly.
 
-## 3. Building & Configuring the Windows Companion Tray Agent (`Dotnet/VRCX-Agent`)
+## 3. Installing & Configuring the Windows Companion Tray Agent (`Dotnet/VRCX-Agent`)
 
-`VRCX.Agent` is a lightweight .NET 10 Windows Forms tray companion (zero CEF, zero Electron) using a simple **periodic HTTPS upload** model:
+`VRCX.Agent` is a lightweight .NET 10 Windows Forms system-tray companion (zero CEF, zero Electron) that auto-detects Simplified Chinese / English from Windows OS locale and runs silently in the background with optional Windows startup:
+- **Recommended Windows Installer (`VRCX.Agent-v*-Setup-win-x64.exe`)**: Download from [GitHub Releases](https://github.com/nuomew/VRCX-Worker/releases). Bundles .NET 10 Desktop Runtime, installs per-user into `%LocalAppData%\Programs\VRCX.Agent` (no admin elevation required), enables **Start with Windows in background** by default, supports in-place upgrades, and registers a standard Windows uninstaller.
 - Incremental VRChat `output_log_*.txt` GameLog tailing with persisted byte-offset cursor & durable offline JSONL queue
-- Periodic HTTPS upload (`POST /api/agent/sync`, default every 60 seconds, configurable 15–3600s) using only **Cloud URL + Sync Secret**
-- Local PNG VRCX metadata embedding + ≤1600px WebP thumbnail upload (`PUT /api/agent/media/screenshots/{sha256}`)
+- Periodic HTTPS upload (`POST /api/agent/sync`, default every 60 seconds, configurable 30–3600s) using only **Cloud URL + Sync Secret**
+- Optional VRChat screenshot upload (default off) with original PNG or ≤1600px WebP compression toggle (`PUT /api/agent/media/screenshots/{sha256}`)
 - Discord Rich Presence, VRChat/SteamVR process monitoring, AutoAppLaunch, XSOverlay/OVRToolkit notifications
 - Strict 6-action allowlisted remote commands (`launch_vrc`, `quit_vrc`, `clear_cache`, `send_vr_notify`, `discord_update`, `sync_now`) queued in D1 and executed on the next sync interval
 
-### Build on Windows (requires .NET 10 SDK)
+### Build from Source on Windows (requires .NET 10 SDK)
 ```powershell
 dotnet publish Dotnet/VRCX-Agent/VRCX-Agent.csproj -c Release -r win-x64 --self-contained false
 ```
-The compiled executable is written to `build/VRCX-Agent/VRCX.Agent.exe`.
+The compiled executable is written to `build/VRCX-Agent/VRCX.Agent.exe`. To build the Windows installer locally, compile `Dotnet/VRCX-Agent/Installer/VRCX-Agent.iss` with Inno Setup 6 (`ISCC.exe`).
 
 ### Setup with Cloud URL, Sync Secret & Network Mode (Overseas / Mainland China)
 1. Open your deployed VRCX Cloud Web URL and click **Cloud** in the bottom status bar to open **Cloud Hub -> Win Agent (HTTP Sync)** (or **Settings -> System -> Cloud Sync Interval**).
 2. Configure your preferred **Cloud Sync Interval** (default `60s` / 1 min, range `30–3600s`). This single setting throttles Web `api.vrchat.cloud` sync requests and controls the exact upload schedule of connected `VRCX.Agent` instances.
 3. Copy the **Cloud URL**, enter a device name, and click **Create Sync Secret** to generate a persistent `vrcx_sync_...` secret (stored SHA-256 hashed in D1, revocable anytime). Alternatively, set a static `AGENT_SYNC_KEY` in Cloudflare Worker Secrets.
-4. Launch `VRCX.Agent.exe` on your Windows PC, right-click the tray icon -> **Sync Settings (URL, Secret & Proxy)...**, paste the **Cloud URL** and **Sync Secret**, choose **Overseas (Direct / Proxy Off)** or **Mainland China (Proxy On)** (leave proxy URL blank to follow Windows system proxy, or enter `http://127.0.0.1:7890` / `socks5://127.0.0.1:7891`), and click **Test & Save**.
-5. Once connected, `VRCX.Agent` strictly follows the Web sync interval: local logs and screenshots stay buffered on disk outside the window and are pushed together only at each scheduled sync tick. You can toggle **Mainland China Mode (Proxy On)** directly from the tray right-click menu at any time.
+4. Run `VRCX.Agent-v*-Setup-win-x64.exe` (or `VRCX.Agent.exe`). On first launch, the localized settings window opens automatically; paste the **Cloud URL** and **Sync Secret**, choose **Overseas (Direct)** or **Mainland China (Proxy On)** (leave proxy URL blank to follow Windows system proxy, or enter `http://127.0.0.1:7890` / `socks5://127.0.0.1:7891`), confirm **Start with Windows**, and click **Test & Save**.
+5. Once connected, `VRCX.Agent` stays minimized in the Windows system tray and strictly follows the Web sync interval. Re-opening the desktop/Start Menu shortcut brings the settings dialog back to front without launching duplicate tray instances.

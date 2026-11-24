@@ -42,15 +42,18 @@ public sealed class TrayApplicationContext : ApplicationContext
     private readonly ToolStripMenuItem _syncScreenshotsItem;
     private readonly ToolStripMenuItem _compressScreenshotsItem;
     private readonly ToolStripMenuItem _autoStartItem;
+    private readonly SynchronizationContext? _uiSyncContext;
+    private readonly RegisteredWaitHandle? _wakeWaitHandle;
 
     private AgentConfig _config;
     private volatile HttpClient _cloudHttp;
+    private SyncSettingsForm? _activeSettingsDialog;
     private DateTimeOffset _lastSyncSuccessAt = DateTimeOffset.MinValue;
     private int _consecutiveFailures;
     private string _lastSyncError = string.Empty;
     private string _lastSentStateSignature = string.Empty;
 
-    public TrayApplicationContext()
+    public TrayApplicationContext(bool startedByAutoStart = false, EventWaitHandle? showSettingsEvent = null)
     {
         _configStore = new AgentConfigStore();
         _config = _configStore.LoadConfig();
@@ -67,22 +70,22 @@ public sealed class TrayApplicationContext : ApplicationContext
 
         _logCollector.ScreenshotCaptured += OnScreenshotCaptured;
 
-        _statusMenuItem = new ToolStripMenuItem("Status: Starting...") { Enabled = false };
-        _proxyModeItem = new ToolStripMenuItem("Mainland China Mode (Proxy On)")
+        _statusMenuItem = new ToolStripMenuItem(AgentStrings.TrayStatusStarting) { Enabled = false };
+        _proxyModeItem = new ToolStripMenuItem(AgentStrings.MenuMainlandProxyMode)
         {
             CheckOnClick = true,
             Checked = _config.ProxyEnabled
         };
         _proxyModeItem.Click += (_, _) => ToggleProxyMode(_proxyModeItem.Checked);
 
-        _syncScreenshotsItem = new ToolStripMenuItem("Sync VRChat Screenshots")
+        _syncScreenshotsItem = new ToolStripMenuItem(AgentStrings.MenuSyncScreenshots)
         {
             CheckOnClick = true,
             Checked = _config.AutoUploadScreenshots
         };
         _syncScreenshotsItem.Click += (_, _) => ToggleSyncScreenshots(_syncScreenshotsItem.Checked);
 
-        _compressScreenshotsItem = new ToolStripMenuItem("Compress Screenshots (WebP <=1600px)")
+        _compressScreenshotsItem = new ToolStripMenuItem(AgentStrings.MenuCompressScreenshots)
         {
             CheckOnClick = true,
             Checked = _config.CompressScreenshots,
@@ -90,38 +93,61 @@ public sealed class TrayApplicationContext : ApplicationContext
         };
         _compressScreenshotsItem.Click += (_, _) => ToggleCompressScreenshots(_compressScreenshotsItem.Checked);
 
-        _autoStartItem = new ToolStripMenuItem("Start with Windows")
+        _autoStartItem = new ToolStripMenuItem(AgentStrings.MenuAutoStart)
         {
             CheckOnClick = true,
             Checked = AgentConfigStore.IsAutoStartEnabled()
         };
-        _autoStartItem.Click += (_, _) => AgentConfigStore.SetAutoStartEnabled(_autoStartItem.Checked);
+        _autoStartItem.Click += (_, _) => ToggleAutoStart(_autoStartItem.Checked);
 
-        var menu = new ContextMenuStrip();
+        var menu = new ContextMenuStrip
+        {
+            Font = new Font(AgentStrings.UiFontFamily, 9.5f)
+        };
         menu.Items.Add(_statusMenuItem);
         menu.Items.Add(new ToolStripSeparator());
-        menu.Items.Add("Sync Settings (URL, Secret && Proxy)...", null, (_, _) => ShowSyncSettingsDialog());
+        menu.Items.Add(AgentStrings.MenuSyncSettings, null, (_, _) => ShowSyncSettingsDialog());
         menu.Items.Add(_proxyModeItem);
         menu.Items.Add(_syncScreenshotsItem);
         menu.Items.Add(_compressScreenshotsItem);
-        menu.Items.Add("Sync Now", null, (_, _) => _ = RunSyncCycleAsync(force: true, _cts.Token));
-        menu.Items.Add("Open Cloud Web UI", null, (_, _) => OpenCloudWebUi());
+        menu.Items.Add(AgentStrings.MenuSyncNow, null, (_, _) => _ = RunSyncCycleAsync(force: true, _cts.Token));
+        menu.Items.Add(AgentStrings.MenuOpenWebUi, null, (_, _) => OpenCloudWebUi());
         menu.Items.Add(_autoStartItem);
         menu.Items.Add(new ToolStripSeparator());
-        menu.Items.Add("Exit", null, (_, _) => ShutdownAndExit());
+        menu.Items.Add(AgentStrings.MenuExit, null, (_, _) => ShutdownAndExit());
 
         _trayIcon = new NotifyIcon
         {
             Icon = LoadTrayIcon(),
             ContextMenuStrip = menu,
             Visible = true,
-            Text = "VRCX Cloud Agent"
+            Text = AgentStrings.AppTitle
         };
         _trayIcon.DoubleClick += (_, _) =>
         {
             if (!_config.IsConfigured) ShowSyncSettingsDialog();
             else OpenCloudWebUi();
         };
+
+        // Ensure a WinForms SynchronizationContext is captured after control creation
+        _uiSyncContext = SynchronizationContext.Current ?? new WindowsFormsSynchronizationContext();
+        if (showSettingsEvent != null)
+        {
+            _wakeWaitHandle = ThreadPool.RegisterWaitForSingleObject(
+                showSettingsEvent,
+                (_, timedOut) =>
+                {
+                    if (timedOut || _cts.IsCancellationRequested) return;
+                    _uiSyncContext?.Post(_ =>
+                    {
+                        if (_cts.IsCancellationRequested) return;
+                        ShowSyncSettingsDialog();
+                    }, null);
+                },
+                state: null,
+                millisecondsTimeOutInterval: Timeout.Infinite,
+                executeOnlyOnce: false);
+        }
 
         UpdateTrayStatus();
         _ = Task.Run(() => BackgroundSyncLoopAsync(_cts.Token));
@@ -130,9 +156,24 @@ public sealed class TrayApplicationContext : ApplicationContext
         {
             _trayIcon.ShowBalloonTip(
                 4500,
-                "VRCX Cloud Agent",
-                "Double-click or right-click the tray icon -> 'Sync Settings (URL, Secret & Proxy)...' to configure.",
+                AgentStrings.AppTitle,
+                AgentStrings.BalloonNotConfigured,
                 ToolTipIcon.Info);
+
+            // On first manual launch (e.g. right after installation), open the settings dialog directly
+            // once the message loop starts so the user does not have to hunt for the tray icon.
+            if (!startedByAutoStart)
+            {
+                void OpenInitialSettings(object? sender, EventArgs e)
+                {
+                    Application.Idle -= OpenInitialSettings;
+                    if (!_cts.IsCancellationRequested && !_config.IsConfigured)
+                    {
+                        ShowSyncSettingsDialog();
+                    }
+                }
+                Application.Idle += OpenInitialSettings;
+            }
         }
     }
 
@@ -403,41 +444,66 @@ public sealed class TrayApplicationContext : ApplicationContext
 
     private void ShowSyncSettingsDialog()
     {
-        using var dialog = new SyncSettingsForm(_config, _syncClient);
-        if (dialog.ShowDialog() == DialogResult.OK && dialog.SavedConfig != null)
+        if (_activeSettingsDialog != null && !_activeSettingsDialog.IsDisposed)
         {
-            _config = dialog.SavedConfig;
-            _configStore.SaveConfig(_config);
-            _proxyModeItem.Checked = _config.ProxyEnabled;
-            _syncScreenshotsItem.Checked = _config.AutoUploadScreenshots;
-            _compressScreenshotsItem.Checked = _config.CompressScreenshots;
-            _compressScreenshotsItem.Enabled = _config.AutoUploadScreenshots;
-            RebuildCloudHttpClient();
-            _consecutiveFailures = 0;
-            _lastSyncError = string.Empty;
-            _lastSentStateSignature = string.Empty;
-
-            if (dialog.InitialSyncResponse != null)
+            if (_activeSettingsDialog.WindowState == FormWindowState.Minimized)
             {
-                _lastSyncSuccessAt = DateTimeOffset.UtcNow;
-                _scheduleGate.ApplyServerSchedule(dialog.InitialSyncResponse, _lastSyncSuccessAt);
+                _activeSettingsDialog.WindowState = FormWindowState.Normal;
             }
-            else
+            _activeSettingsDialog.BringToFront();
+            _activeSettingsDialog.Activate();
+            return;
+        }
+
+        using var dialog = new SyncSettingsForm(_config, _syncClient, AgentConfigStore.IsAutoStartEnabled(), _trayIcon.Icon);
+        _activeSettingsDialog = dialog;
+        try
+        {
+            if (dialog.ShowDialog() == DialogResult.OK && dialog.SavedConfig != null)
             {
-                _scheduleGate.ResetForImmediateHandshake();
+                _config = dialog.SavedConfig;
+                _configStore.SaveConfig(_config);
+                AgentConfigStore.SetAutoStartEnabled(dialog.AutoStartEnabled);
+                _autoStartItem.Checked = dialog.AutoStartEnabled;
+                _proxyModeItem.Checked = _config.ProxyEnabled;
+                _syncScreenshotsItem.Checked = _config.AutoUploadScreenshots;
+                _compressScreenshotsItem.Checked = _config.CompressScreenshots;
+                _compressScreenshotsItem.Enabled = _config.AutoUploadScreenshots;
+                RebuildCloudHttpClient();
+                _consecutiveFailures = 0;
+                _lastSyncError = string.Empty;
+                _lastSentStateSignature = string.Empty;
+
+                if (dialog.InitialSyncResponse != null)
+                {
+                    _lastSyncSuccessAt = DateTimeOffset.UtcNow;
+                    _scheduleGate.ApplyServerSchedule(dialog.InitialSyncResponse, _lastSyncSuccessAt);
+                }
+                else
+                {
+                    _scheduleGate.ResetForImmediateHandshake();
+                }
+
+                UpdateTrayStatus();
+
+                string nextLocal = _scheduleGate.NextSyncAtUtc == DateTimeOffset.MinValue
+                    ? AgentStrings.NextSyncNowLabel
+                    : _scheduleGate.NextSyncAtUtc.ToLocalTime().ToString("HH:mm:ss");
+
+                _trayIcon.ShowBalloonTip(
+                    3500,
+                    AgentStrings.AppTitle,
+                    AgentStrings.FormatBalloonConnected(
+                        _config.DeviceName,
+                        ProxyHttpClientFactory.DescribeMode(_config),
+                        _scheduleGate.IntervalSeconds,
+                        nextLocal),
+                    ToolTipIcon.Info);
             }
-
-            UpdateTrayStatus();
-
-            string nextLocal = _scheduleGate.NextSyncAtUtc == DateTimeOffset.MinValue
-                ? "now"
-                : _scheduleGate.NextSyncAtUtc.ToLocalTime().ToString("HH:mm:ss");
-
-            _trayIcon.ShowBalloonTip(
-                3500,
-                "VRCX Cloud Agent",
-                $"Connected ({_config.DeviceName}) · {ProxyHttpClientFactory.DescribeMode(_config)} · Web interval {_scheduleGate.IntervalSeconds}s (next {nextLocal}).",
-                ToolTipIcon.Info);
+        }
+        finally
+        {
+            _activeSettingsDialog = null;
         }
     }
 
@@ -449,12 +515,12 @@ public sealed class TrayApplicationContext : ApplicationContext
         UpdateTrayStatus();
         _trayIcon.ShowBalloonTip(
             2500,
-            "VRCX Cloud Agent",
+            AgentStrings.AppTitle,
             enabled
                 ? (_config.CompressScreenshots
-                    ? "VRChat screenshot sync ON (WebP compression enabled)."
-                    : "VRChat screenshot sync ON (original image quality).")
-                : "VRChat screenshot sync OFF.",
+                    ? AgentStrings.BalloonScreenshotSyncOnCompressed
+                    : AgentStrings.BalloonScreenshotSyncOnOriginal)
+                : AgentStrings.BalloonScreenshotSyncOff,
             ToolTipIcon.Info);
     }
 
@@ -464,10 +530,20 @@ public sealed class TrayApplicationContext : ApplicationContext
         _configStore.SaveConfig(_config);
         _trayIcon.ShowBalloonTip(
             2500,
-            "VRCX Cloud Agent",
+            AgentStrings.AppTitle,
             compress
-                ? "Screenshot compression ON (WebP <=1600px)."
-                : "Screenshot compression OFF (upload original PNG).",
+                ? AgentStrings.BalloonCompressOn
+                : AgentStrings.BalloonCompressOff,
+            ToolTipIcon.Info);
+    }
+
+    private void ToggleAutoStart(bool enabled)
+    {
+        AgentConfigStore.SetAutoStartEnabled(enabled);
+        _trayIcon.ShowBalloonTip(
+            2500,
+            AgentStrings.AppTitle,
+            enabled ? AgentStrings.BalloonAutoStartOn : AgentStrings.BalloonAutoStartOff,
             ToolTipIcon.Info);
     }
 
@@ -482,8 +558,8 @@ public sealed class TrayApplicationContext : ApplicationContext
 
         _trayIcon.ShowBalloonTip(
             3000,
-            "VRCX Cloud Agent",
-            $"Switched network mode to: {ProxyHttpClientFactory.DescribeMode(_config)} (applies on next scheduled sync)",
+            AgentStrings.AppTitle,
+            AgentStrings.FormatBalloonProxySwitched(ProxyHttpClientFactory.DescribeMode(_config)),
             ToolTipIcon.Info);
     }
 
@@ -525,35 +601,35 @@ public sealed class TrayApplicationContext : ApplicationContext
         string syncText;
         if (!_config.IsConfigured)
         {
-            syncText = "Not Configured";
+            syncText = AgentStrings.StatusNotConfigured;
         }
         else if (!string.IsNullOrEmpty(_lastSyncError))
         {
-            syncText = "Sync Error";
+            syncText = AgentStrings.StatusSyncError;
         }
         else if (_lastSyncSuccessAt != DateTimeOffset.MinValue)
         {
-            syncText = $"Synced {_lastSyncSuccessAt.ToLocalTime():HH:mm:ss}";
+            syncText = AgentStrings.FormatStatusSynced(_lastSyncSuccessAt.ToLocalTime().ToString("HH:mm:ss"));
         }
         else
         {
-            syncText = "Waiting Handshake";
+            syncText = AgentStrings.StatusWaitingHandshake;
         }
 
-        string vrc = _processMonitor.IsVrcRunning ? "VRChat Running" : "VRChat Idle";
-        string netTag = _config.ProxyEnabled ? "Proxy" : "Direct";
+        string vrc = _processMonitor.IsVrcRunning ? AgentStrings.StatusVrcRunning : AgentStrings.StatusVrcIdle;
+        string netTag = _config.ProxyEnabled ? AgentStrings.NetTagProxy : AgentStrings.NetTagDirect;
         int pendingLogs = _logCollector.OfflineQueueCount;
         int pendingShots;
         lock (_pendingScreenshots) pendingShots = _pendingScreenshots.Count;
 
         string nextPart = _config.IsConfigured && _scheduleGate.NextSyncAtUtc != DateTimeOffset.MinValue
-            ? $" · Next {_scheduleGate.NextSyncAtUtc.ToLocalTime():HH:mm:ss} ({_scheduleGate.IntervalSeconds}s Web)"
+            ? AgentStrings.FormatNextSyncPart(_scheduleGate.NextSyncAtUtc.ToLocalTime().ToString("HH:mm:ss"), _scheduleGate.IntervalSeconds)
             : string.Empty;
         string queuePart = (pendingLogs > 0 || pendingShots > 0)
-            ? $" · Buffered {pendingLogs}L/{pendingShots}S"
+            ? AgentStrings.FormatQueuePart(pendingLogs, pendingShots)
             : string.Empty;
-        string summary = $"Status: {syncText}{nextPart} · {netTag} · {vrc}{queuePart}";
-        string tip = TruncateNotifyText($"VRCX Agent ({syncText}/{netTag}) - {vrc}");
+        string summary = AgentStrings.FormatTrayMenuStatus(syncText, nextPart, netTag, vrc, queuePart);
+        string tip = TruncateNotifyText(AgentStrings.FormatTrayTooltip(syncText, netTag, vrc));
 
         if (_trayIcon.ContextMenuStrip?.InvokeRequired == true)
         {
@@ -586,6 +662,15 @@ public sealed class TrayApplicationContext : ApplicationContext
             {
                 return new Icon(icoPath);
             }
+            string? exePath = Environment.ProcessPath;
+            if (!string.IsNullOrWhiteSpace(exePath) && File.Exists(exePath))
+            {
+                Icon? associated = Icon.ExtractAssociatedIcon(exePath);
+                if (associated != null)
+                {
+                    return associated;
+                }
+            }
         }
         catch
         {
@@ -597,6 +682,7 @@ public sealed class TrayApplicationContext : ApplicationContext
     private void ShutdownAndExit()
     {
         _cts.Cancel();
+        _wakeWaitHandle?.Unregister(null);
         VRCX.Discord.Instance.Exit();
         _trayIcon.Visible = false;
         _trayIcon.Dispose();
