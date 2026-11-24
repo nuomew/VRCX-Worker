@@ -107,8 +107,8 @@ public static class ProxyHttpClientFactory
         var (ok, proxyUri, _) = NormalizeAndValidateProxyUri(trimmed);
         if (!ok || proxyUri == null)
         {
-            // Empty proxy address -> follow Windows system proxy (Clash/v2rayN/WinINET)
-            handler.Proxy = WebRequest.GetSystemWebProxy();
+            // Empty proxy address -> let SocketsHttpHandler follow live Windows system proxy (HttpClient.DefaultProxy).
+            handler.Proxy = HttpClient.DefaultProxy;
             return handler;
         }
 

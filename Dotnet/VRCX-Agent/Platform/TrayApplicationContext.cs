@@ -729,6 +729,9 @@ public sealed class TrayApplicationContext : ApplicationContext
     {
         HttpClient oldClient = _cloudHttp;
         _cloudHttp = ProxyHttpClientFactory.CreateHttpClient(_config);
+        // Clear cached failed-update/stale-release state so switching proxy immediately retries fresh release checks.
+        _failedAutoUpdateTag = string.Empty;
+        _availableUpdate = null;
         // Delay disposal briefly so any in-flight HTTP request finishes cleanly without ObjectDisposedException.
         _ = Task.Delay(TimeSpan.FromSeconds(25)).ContinueWith(_ => oldClient.Dispose());
     }
@@ -896,7 +899,7 @@ public sealed class TrayApplicationContext : ApplicationContext
         try
         {
             using var checkCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-            checkCts.CancelAfter(TimeSpan.FromSeconds(25));
+            checkCts.CancelAfter(TimeSpan.FromSeconds(35));
             AgentReleaseInfo release = await _updater.CheckForUpdateAsync(AgentMetadata.Version, checkCts.Token).ConfigureAwait(false);
 
             if (release.IsUpdateAvailable)
@@ -970,8 +973,9 @@ public sealed class TrayApplicationContext : ApplicationContext
                 if (manual)
                 {
                     _balloonPointsToUpdate = false;
+                    string mode = ProxyHttpClientFactory.DescribeMode(_config);
                     ShowNoticeMessage(
-                        AgentStrings.FormatBalloonUpdateCheckFailed(ex.Message),
+                        AgentStrings.FormatBalloonUpdateCheckFailed($"{ex.Message} [{mode}]"),
                         MessageBoxIcon.Warning);
                 }
             });

@@ -264,14 +264,16 @@ public sealed class AgentUpdater
 
         try
         {
+            using var apiCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            apiCts.CancelAfter(TimeSpan.FromSeconds(10));
             using var apiReq = new HttpRequestMessage(HttpMethod.Get, LatestApiUrl);
             apiReq.Headers.TryAddWithoutValidation("User-Agent", userAgent);
             apiReq.Headers.TryAddWithoutValidation("Accept", "application/vnd.github+json");
 
-            using HttpResponseMessage apiRes = await http.SendAsync(apiReq, ct).ConfigureAwait(false);
+            using HttpResponseMessage apiRes = await http.SendAsync(apiReq, apiCts.Token).ConfigureAwait(false);
             if (apiRes.IsSuccessStatusCode)
             {
-                string json = await apiRes.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+                string json = await apiRes.Content.ReadAsStringAsync(apiCts.Token).ConfigureAwait(false);
                 AgentReleaseInfo? parsed = ParseReleaseApiJson(json, currentVersion);
                 if (parsed != null)
                 {
@@ -285,7 +287,7 @@ public sealed class AgentUpdater
         }
         catch
         {
-            // Fall through to web redirect check (handles shared proxy IP rate limits or API errors)
+            // Fall through to web redirect check (handles shared proxy IP rate limits, slow API, or 403/429)
         }
 
         // Fallback: follow github.com/nuomew/VRCX-Worker/releases/latest -> /releases/tag/vX.Y.Z
@@ -293,7 +295,7 @@ public sealed class AgentUpdater
         webReq.Headers.TryAddWithoutValidation("User-Agent", userAgent);
         webReq.Headers.TryAddWithoutValidation("Accept", "text/html");
 
-        using HttpResponseMessage webRes = await http.SendAsync(webReq, ct).ConfigureAwait(false);
+        using HttpResponseMessage webRes = await http.SendAsync(webReq, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
         string resolvedUrl = webRes.Headers.Location?.ToString()
             ?? webRes.RequestMessage?.RequestUri?.AbsoluteUri
             ?? string.Empty;

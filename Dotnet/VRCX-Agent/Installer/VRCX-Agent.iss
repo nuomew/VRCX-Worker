@@ -3,7 +3,7 @@
 ; with default-enabled background auto-start (HKCU Run) and clean upgrade/uninstall.
 
 #ifndef AppVersion
-  #define AppVersion "1.10.1"
+  #define AppVersion "1.10.2"
 #endif
 #ifndef SourceDir
   #define SourceDir "..\..\..\build\VRCX-Agent"
