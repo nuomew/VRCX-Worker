@@ -745,8 +745,17 @@ public sealed class TrayApplicationContext : ApplicationContext
     {
         try
         {
-            // Wait 20s after startup so initial UI & first sync finish cleanly without contention.
-            await Task.Delay(TimeSpan.FromSeconds(20), ct).ConfigureAwait(false);
+            // Clean up any installer .exe left behind by a completed upgrade once Setup has exited.
+            await Task.Delay(TimeSpan.FromSeconds(5), ct).ConfigureAwait(false);
+            string updatesDir = Path.Combine(_configStore.DataDirectory, "updates");
+            int cleaned = AgentUpdater.CleanupOldInstallers(updatesDir);
+            if (cleaned > 0)
+            {
+                Log.Info("Cleaned up {Count} old installer file(s) in {Dir}.", cleaned, updatesDir);
+            }
+
+            // Wait another 15s so initial UI & first sync finish cleanly without contention.
+            await Task.Delay(TimeSpan.FromSeconds(15), ct).ConfigureAwait(false);
         }
         catch (OperationCanceledException)
         {

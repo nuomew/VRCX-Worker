@@ -3681,6 +3681,7 @@
         },
         "tabs": {
             "devices": "Win 伴侣 (HTTP 同步)",
+            "synced_devices": "同步设备",
             "commands": "远程控制",
             "quota": "免费配额与连通检测"
         },

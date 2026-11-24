@@ -357,6 +357,8 @@ public sealed class AgentUpdater
         }
 
         Directory.CreateDirectory(destinationDirectory);
+        // Remove any previously downloaded installers or stale temporary files before downloading a new version.
+        CleanupOldInstallers(destinationDirectory);
         string finalPath = Path.Combine(destinationDirectory, fileName);
         string partPath = finalPath + ".part";
 
@@ -428,15 +430,61 @@ public sealed class AgentUpdater
         }
     }
 
-    private static void TryDeleteFile(string path)
+    /// <summary>
+    /// Removes previously downloaded setup executables and partial files from the updates cache directory
+    /// so completed upgrades never leave ~35MB installer files behind on disk.
+    /// </summary>
+    public static int CleanupOldInstallers(string updatesDirectory, string? keepFilePath = null)
     {
+        if (string.IsNullOrWhiteSpace(updatesDirectory) || !Directory.Exists(updatesDirectory))
+        {
+            return 0;
+        }
+
+        string? keepFull = string.IsNullOrWhiteSpace(keepFilePath) ? null : Path.GetFullPath(keepFilePath);
+        int deleted = 0;
         try
         {
-            if (File.Exists(path)) File.Delete(path);
+            foreach (string file in Directory.EnumerateFiles(updatesDirectory))
+            {
+                string ext = Path.GetExtension(file);
+                if (!string.Equals(ext, ".exe", StringComparison.OrdinalIgnoreCase) &&
+                    !string.Equals(ext, ".part", StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+                if (keepFull != null &&
+                    string.Equals(Path.GetFullPath(file), keepFull, StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+                if (TryDeleteFile(file))
+                {
+                    deleted++;
+                }
+            }
         }
         catch
         {
-            // Ignore cleanup failure
+            // Directory enumeration failures are non-fatal
         }
+        return deleted;
+    }
+
+    private static bool TryDeleteFile(string path)
+    {
+        try
+        {
+            if (File.Exists(path))
+            {
+                File.Delete(path);
+                return true;
+            }
+        }
+        catch
+        {
+            // Ignore cleanup failure (e.g., installer still exiting)
+        }
+        return false;
     }
 }

@@ -40,7 +40,7 @@ public sealed class SyncSettingsForm : Form
         _initialConfig = currentConfig;
         _syncClient = syncClient;
 
-        Text = $"{AgentStrings.SettingsWindowTitle} (v{AgentMetadata.Version})";
+        Text = AgentStrings.SettingsWindowTitle;
         if (windowIcon != null)
         {
             Icon = windowIcon;
@@ -62,6 +62,7 @@ public sealed class SyncSettingsForm : Form
         {
             Location = new Point(20, 36),
             Width = 464,
+            PlaceholderText = AgentStrings.CloudUrlPlaceholder,
             Text = string.IsNullOrWhiteSpace(currentConfig.CloudUrl) ? "https://" : currentConfig.CloudUrl
         };
 

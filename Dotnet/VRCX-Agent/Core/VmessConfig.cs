@@ -25,21 +25,30 @@ public sealed class VmessConfig
     public bool UseTls { get; init; }
     public string Sni { get; init; } = string.Empty;
     public string Alpn { get; init; } = string.Empty;
+    public bool AllowInsecure { get; init; }
+
+    /// <summary>
+    /// Extracts the first non-empty host when a node lists comma-separated obfuscation/CDN hosts.
+    /// </summary>
+    public string PrimaryHost => ExtractFirstCsvValue(Host);
 
     public string EffectiveSni =>
         !string.IsNullOrWhiteSpace(Sni) ? Sni.Trim()
-        : !string.IsNullOrWhiteSpace(Host) ? Host.Trim()
+        : !string.IsNullOrWhiteSpace(PrimaryHost) ? PrimaryHost
         : Server;
 
     public string EffectiveWsPath
     {
         get
         {
-            string p = (Path ?? string.Empty).Trim();
+            string p = ExtractFirstCsvValue(Path);
             if (string.IsNullOrEmpty(p)) return "/";
             return p.StartsWith("/", StringComparison.Ordinal) ? p : "/" + p;
         }
     }
+
+    public string EffectiveHttpHeaderHost =>
+        !string.IsNullOrWhiteSpace(PrimaryHost) ? PrimaryHost : Server;
 
     /// <summary>
     /// Maps VMess security string to wire protocol Security byte.
@@ -154,11 +163,15 @@ public sealed class VmessConfig
         bool useTls = tlsStr == "tls" || tlsStr == "true" || tlsStr == "1" || tlsStr == "xtls";
         string sni = ReadString(obj, "sni");
         string alpn = ReadString(obj, "alpn");
+        string insecureStr = ReadString(obj, "skip-cert-verify");
+        if (string.IsNullOrEmpty(insecureStr)) insecureStr = ReadString(obj, "allowInsecure");
+        if (string.IsNullOrEmpty(insecureStr)) insecureStr = ReadString(obj, "insecure");
+        bool allowInsecure = IsTruthy(insecureStr);
         string remarks = ReadString(obj, "ps");
         if (string.IsNullOrEmpty(remarks)) remarks = fallbackRemarks;
 
         return ValidateAndBuild(
-            remarks, server, port, userId, aid, scy, net, headerType, host, path, useTls, sni, alpn,
+            remarks, server, port, userId, aid, scy, net, headerType, host, path, useTls, sni, alpn, allowInsecure,
             out config, out error);
     }
 
@@ -213,17 +226,38 @@ public sealed class VmessConfig
         var query = ParseQueryString(queryPart);
         string remarks = query.TryGetValue("remarks", out string? r) && !string.IsNullOrEmpty(r) ? r : fallbackRemarks;
         string obfs = query.TryGetValue("obfs", out string? o) ? o.ToLowerInvariant() : string.Empty;
-        string net = obfs == "websocket" || obfs == "ws" ? "ws" : (query.TryGetValue("net", out string? n) ? n.ToLowerInvariant() : "tcp");
+        string net;
+        string headerType = "none";
+        if (obfs == "websocket" || obfs == "ws")
+        {
+            net = "ws";
+        }
+        else if (obfs == "http")
+        {
+            net = "tcp";
+            headerType = "http";
+        }
+        else
+        {
+            net = query.TryGetValue("net", out string? n) ? n.ToLowerInvariant() : "tcp";
+            if (query.TryGetValue("type", out string? ht) && !string.IsNullOrWhiteSpace(ht))
+            {
+                headerType = ht.Trim().ToLowerInvariant();
+            }
+        }
         string host = query.TryGetValue("obfsParam", out string? op) ? op : (query.TryGetValue("host", out string? h) ? h : string.Empty);
         string path = query.TryGetValue("path", out string? p) ? p : "/";
         string tlsVal = query.TryGetValue("tls", out string? t) ? t.ToLowerInvariant() : string.Empty;
-        bool useTls = tlsVal == "1" || tlsVal == "true" || tlsVal == "tls";
+        bool useTls = IsTruthy(tlsVal) || tlsVal == "tls";
         string sni = query.TryGetValue("peer", out string? peer) ? peer : (query.TryGetValue("sni", out string? s) ? s : string.Empty);
         string alpn = query.TryGetValue("alpn", out string? a) ? a : string.Empty;
+        bool allowInsecure =
+            (query.TryGetValue("allowInsecure", out string? ai) && IsTruthy(ai)) ||
+            (query.TryGetValue("insecure", out string? ins) && IsTruthy(ins));
         int aid = query.TryGetValue("alterId", out string? aidStr) && int.TryParse(aidStr, out int parsedAid) ? parsedAid : 0;
 
         return ValidateAndBuild(
-            remarks, server, port, userId, aid, scy, net, "none", host, path, useTls, sni, alpn,
+            remarks, server, port, userId, aid, scy, net, headerType, host, path, useTls, sni, alpn, allowInsecure,
             out config, out error);
     }
 
@@ -241,6 +275,7 @@ public sealed class VmessConfig
         bool useTls,
         string sni,
         string alpn,
+        bool allowInsecure,
         out VmessConfig? config,
         out string error)
     {
@@ -268,7 +303,7 @@ public sealed class VmessConfig
             error = AgentStrings.FormatUnsupportedVmessTransport(net);
             return false;
         }
-        if (net == "tcp" && !string.IsNullOrEmpty(headerType) && headerType != "none")
+        if (net == "tcp" && !string.IsNullOrEmpty(headerType) && headerType != "none" && headerType != "http")
         {
             error = AgentStrings.FormatUnsupportedVmessTransport($"tcp/{headerType}");
             return false;
@@ -289,9 +324,26 @@ public sealed class VmessConfig
             Path = string.IsNullOrWhiteSpace(path) ? "/" : path.Trim(),
             UseTls = useTls,
             Sni = (sni ?? string.Empty).Trim(),
-            Alpn = (alpn ?? string.Empty).Trim()
+            Alpn = (alpn ?? string.Empty).Trim(),
+            AllowInsecure = allowInsecure
         };
         return true;
+    }
+
+    private static string ExtractFirstCsvValue(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw)) return string.Empty;
+        foreach (string part in raw.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            if (!string.IsNullOrEmpty(part)) return part;
+        }
+        return string.Empty;
+    }
+
+    private static bool IsTruthy(string? raw)
+    {
+        string s = (raw ?? string.Empty).Trim().ToLowerInvariant();
+        return s == "1" || s == "true" || s == "yes";
     }
 
     /// <summary>

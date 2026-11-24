@@ -46,24 +46,26 @@ public static class AgentStrings
         : "VRCX Cloud Agent — Sync & Proxy Settings";
 
     public static string CloudUrlLabel => IsChinese
-        ? "云端连接地址（例如 https://vrcx.your-domain.workers.dev）："
-        : "Cloud URL (e.g. https://vrcx.your-domain.workers.dev):";
+        ? "云端连接地址："
+        : "Cloud URL:";
+
+    public static string CloudUrlPlaceholder => "https://vrcx.your-domain.workers.dev";
 
     public static string SyncSecretLabel => IsChinese
-        ? "同步密钥（在网页端「云端中心 → 创建同步密钥」获取，或 AGENT_SYNC_KEY）："
-        : "Sync Secret (from Cloud Hub -> Create Sync Secret, or AGENT_SYNC_KEY):";
+        ? "同步密钥："
+        : "Sync Secret:";
 
     public static string ShowSecretCheckbox => IsChinese ? "显示" : "Show";
 
     public static string DeviceNameLabel => IsChinese ? "设备名称：" : "Device Name:";
 
     public static string SyncScheduleTitle => IsChinese
-        ? "同步间隔（由网页端统一控制）："
-        : "Sync Schedule (Controlled by Web):";
+        ? "同步间隔："
+        : "Sync Schedule:";
 
     public static string FormatWebScheduleHint(int seconds) => IsChinese
-        ? $"每 {seconds} 秒同步一次（跟随网页端）"
-        : $"Every {seconds}s (synced from Web)";
+        ? $"每 {seconds} 秒同步一次"
+        : $"Every {seconds}s";
 
     public static string FormatWebDeviceAndScheduleHint(string? deviceName, int seconds)
     {
@@ -71,46 +73,46 @@ public static class AgentStrings
         if (!string.IsNullOrEmpty(trimmed))
         {
             return IsChinese
-                ? $"网页端设备：{trimmed} · 每 {seconds} 秒同步一次（跟随网页端）"
-                : $"Web Device: {trimmed} · Sync every {seconds}s (from Web)";
+                ? $"网页端设备：{trimmed} · 每 {seconds} 秒同步一次"
+                : $"Web Device: {trimmed} · Every {seconds}s";
         }
 
         return IsChinese
-            ? $"设备名称与同步间隔均由网页端统一控制（默认每 {seconds} 秒同步一次）"
-            : $"Device name && sync interval follow Web Cloud Hub (default every {seconds}s)";
+            ? $"设备名称与同步间隔由网页端统一控制，默认每 {seconds} 秒同步一次"
+            : $"Device name && sync interval follow Web Cloud Hub, default every {seconds}s";
     }
 
     public static string NetworkGroupTitle => IsChinese
-        ? "网络与代理模式（海外直连 / 中国大陆代理）"
-        : "Network && Proxy Mode (Overseas / Mainland China)";
+        ? "网络与代理模式"
+        : "Network && Proxy Mode";
 
     public static string OverseasDirectRadio => IsChinese
-        ? "海外直连（关闭代理）"
-        : "Overseas (Direct / Proxy Off)";
+        ? "海外直连"
+        : "Overseas Direct";
 
     public static string MainlandProxyRadio => IsChinese
-        ? "中国大陆模式（启用代理）"
-        : "Mainland China (Proxy On)";
+        ? "中国大陆代理"
+        : "Mainland China Proxy";
 
     public static string ProxyAddressLabel => IsChinese
-        ? "代理地址或节点链接（留空跟随系统代理；支持 HTTP / SOCKS5 / VMess）："
-        : "Proxy URL or VMess link (empty = system proxy; HTTP/SOCKS5/vmess://):";
+        ? "代理地址或节点链接："
+        : "Proxy URL or Node Link:";
 
     public static string ProxyAddressPlaceholder => IsChinese
         ? "http://127.0.0.1:7890、socks5://127.0.0.1:7891 或 vmess://..."
         : "http://127.0.0.1:7890, socks5://127.0.0.1:7891, or vmess://...";
 
     public static string SyncScreenshotsCheckbox => IsChinese
-        ? "同步 VRChat 照片到云相册（默认关闭）"
-        : "Sync VRChat screenshots to Cloud Gallery (default: Off)";
+        ? "同步 VRChat 照片到云相册"
+        : "Sync VRChat screenshots to Cloud Gallery";
 
     public static string CompressScreenshotsCheckbox => IsChinese
-        ? "压缩上传照片（转为 WebP 且 ≤1600px；关闭则上传原图 PNG）"
-        : "Compress uploaded screenshots (WebP <=1600px; off = original PNG)";
+        ? "压缩上传照片"
+        : "Compress uploaded screenshots";
 
     public static string AutoStartCheckbox => IsChinese
-        ? "开机自动后台运行（随 Windows 启动并最小化到右下角托盘）"
-        : "Start automatically in background with Windows (system tray)";
+        ? "开机自动后台运行"
+        : "Start automatically in background with Windows";
 
     public static string SettingsDefaultHint => IsChinese
         ? "在网页端设定的同步间隔之外，本地日志与照片仅暂存在磁盘中，到达下次同步时间点时再统一上传。"
@@ -141,8 +143,8 @@ public static class AgentStrings
         : $"Unsupported proxy scheme '{scheme}'. Use http, https, socks4, socks5, or vmess.";
 
     public static string InvalidProxyPortMessage => IsChinese
-        ? "代理地址必须包含有效端口号（1-65535）。"
-        : "Proxy URL must include a valid port (1-65535).";
+        ? "代理地址必须包含 1-65535 范围内的有效端口号。"
+        : "Proxy URL must include a valid port between 1 and 65535.";
 
     public static string InvalidVmessUrlMessage => IsChinese
         ? "VMess 节点链接格式无效，请粘贴完整的 vmess:// 分享链接。"
@@ -157,45 +159,45 @@ public static class AgentStrings
         : "Could not parse the JSON payload inside the vmess:// link.";
 
     public static string InvalidVmessUuidMessage => IsChinese
-        ? "VMess 节点中的用户 UUID (id) 格式无效。"
-        : "Invalid user UUID ('id') inside the vmess:// node.";
+        ? "VMess 节点中的用户 UUID 格式无效。"
+        : "Invalid user UUID inside the vmess:// node.";
 
     public static string FormatUnsupportedVmessTransport(string transport) => IsChinese
-        ? $"暂不支持 VMess 传输协议“{transport}”，当前内置支持 tcp、ws（含 TLS）。"
-        : $"Unsupported VMess transport '{transport}'. Built-in client supports tcp and ws (with optional TLS).";
+        ? $"暂不支持 VMess 传输协议“{transport}”，当前支持 tcp、tcp/http、ws 与 TLS。"
+        : $"Unsupported VMess transport '{transport}'. Supported transports: tcp, tcp/http, ws, and TLS.";
 
-    public static string NetModeOverseasDirect => IsChinese ? "海外直连" : "Overseas (Direct)";
-    public static string NetModeMainlandSystemProxy => IsChinese ? "中国大陆（系统代理）" : "Mainland (System Proxy)";
-    public static string NetModeMainlandCustomProxy => IsChinese ? "中国大陆（自定义代理）" : "Mainland (Custom Proxy)";
+    public static string NetModeOverseasDirect => IsChinese ? "海外直连" : "Overseas Direct";
+    public static string NetModeMainlandSystemProxy => IsChinese ? "中国大陆 · 系统代理" : "Mainland · System Proxy";
+    public static string NetModeMainlandCustomProxy => IsChinese ? "中国大陆 · 自定义代理" : "Mainland · Custom Proxy";
     public static string FormatNetModeMainlandVmess(string nodeLabel) => IsChinese
-        ? $"中国大陆（VMess · {nodeLabel}）"
-        : $"Mainland (VMess · {nodeLabel})";
+        ? $"中国大陆 · VMess · {nodeLabel}"
+        : $"Mainland · VMess · {nodeLabel}";
 
     // HttpSyncClient
     public static string FormatTestConnected(string deviceName, int intervalSeconds) => IsChinese
-        ? $"已连接（{deviceName}）· 网页端间隔 {intervalSeconds} 秒"
-        : $"Connected ({deviceName}) · Web interval {intervalSeconds}s";
+        ? $"已连接 · {deviceName} · 同步间隔 {intervalSeconds} 秒"
+        : $"Connected · {deviceName} · Web interval {intervalSeconds}s";
 
     public static string FormatSyncRejected(int statusCode, string detail) => IsChinese
-        ? $"同步被服务器拒绝（HTTP {statusCode}）：{detail}"
-        : $"Sync rejected ({statusCode}): {detail}";
+        ? $"同步被服务器拒绝 HTTP {statusCode}：{detail}"
+        : $"Sync rejected HTTP {statusCode}: {detail}";
 
     public static string UnknownSyncError => IsChinese ? "未知同步错误" : "Unknown sync error";
 
     // TrayApplicationContext menu items & notifications
     public static string TrayStatusStarting => IsChinese ? "状态：正在启动…" : "Status: Starting...";
     public static string MenuSyncSettings => IsChinese
-        ? "同步设置（地址、密钥与代理）…"
-        : "Sync Settings (URL, Secret && Proxy)...";
+        ? "同步设置…"
+        : "Sync Settings...";
     public static string MenuMainlandProxyMode => IsChinese
-        ? "中国大陆模式（启用代理）"
-        : "Mainland China Mode (Proxy On)";
+        ? "中国大陆代理"
+        : "Mainland China Proxy";
     public static string MenuSyncScreenshots => IsChinese
         ? "同步 VRChat 照片"
         : "Sync VRChat Screenshots";
     public static string MenuCompressScreenshots => IsChinese
-        ? "压缩上传照片（WebP ≤1600px）"
-        : "Compress Screenshots (WebP <=1600px)";
+        ? "压缩上传照片"
+        : "Compress Screenshots";
     public static string MenuSyncNow => IsChinese ? "立即同步" : "Sync Now";
     public static string MenuOpenWebUi => IsChinese ? "打开云端网页" : "Open Cloud Web UI";
     public static string MenuAutoStart => IsChinese ? "开机自动后台启动" : "Start with Windows";
@@ -210,34 +212,34 @@ public static class AgentStrings
         : "VRCX Cloud Agent is already running in the system tray.";
 
     public static string FormatBalloonConnected(string deviceName, string netMode, int intervalSeconds, string nextLocal) => IsChinese
-        ? $"已连接（{deviceName}）· {netMode} · 网页端间隔 {intervalSeconds} 秒（下次同步 {nextLocal}）。"
-        : $"Connected ({deviceName}) · {netMode} · Web interval {intervalSeconds}s (next {nextLocal}).";
+        ? $"已连接 · {deviceName} · {netMode} · 每 {intervalSeconds} 秒同步，下次 {nextLocal}。"
+        : $"Connected · {deviceName} · {netMode} · Every {intervalSeconds}s, next {nextLocal}.";
 
     public static string NextSyncNowLabel => IsChinese ? "立即" : "now";
 
     public static string BalloonScreenshotSyncOnCompressed => IsChinese
-        ? "已开启 VRChat 照片同步（启用 WebP 压缩）。"
-        : "VRChat screenshot sync ON (WebP compression enabled).";
+        ? "已开启 VRChat 照片同步，启用压缩上传。"
+        : "VRChat screenshot sync ON with compression.";
 
     public static string BalloonScreenshotSyncOnOriginal => IsChinese
-        ? "已开启 VRChat 照片同步（上传原图画质）。"
-        : "VRChat screenshot sync ON (original image quality).";
+        ? "已开启 VRChat 照片同步，上传原图。"
+        : "VRChat screenshot sync ON with original quality.";
 
     public static string BalloonScreenshotSyncOff => IsChinese
         ? "已关闭 VRChat 照片同步。"
         : "VRChat screenshot sync OFF.";
 
     public static string BalloonCompressOn => IsChinese
-        ? "已开启照片压缩（WebP ≤1600px）。"
-        : "Screenshot compression ON (WebP <=1600px).";
+        ? "已开启照片压缩上传。"
+        : "Screenshot compression ON.";
 
     public static string BalloonCompressOff => IsChinese
-        ? "已关闭照片压缩（将上传原图 PNG）。"
-        : "Screenshot compression OFF (upload original PNG).";
+        ? "已关闭照片压缩，将上传原图。"
+        : "Screenshot compression OFF.";
 
     public static string FormatBalloonProxySwitched(string netMode) => IsChinese
-        ? $"已切换网络模式：{netMode}（将在下次定时同步时生效）。"
-        : $"Switched network mode to: {netMode} (applies on next scheduled sync).";
+        ? $"已切换网络模式：{netMode}，将在下次定时同步时生效。"
+        : $"Switched network mode to {netMode}; applies on next scheduled sync.";
 
     public static string BalloonAutoStartOn => IsChinese
         ? "已开启开机自动后台启动。"
@@ -258,8 +260,8 @@ public static class AgentStrings
     public static string NetTagDirect => IsChinese ? "直连" : "Direct";
 
     public static string FormatNextSyncPart(string localTime, int intervalSeconds) => IsChinese
-        ? $" · 下次 {localTime}（{intervalSeconds}秒）"
-        : $" · Next {localTime} ({intervalSeconds}s Web)";
+        ? $" · 下次 {localTime} · {intervalSeconds}秒"
+        : $" · Next {localTime} · {intervalSeconds}s";
 
     public static string FormatQueuePart(int pendingLogs, int pendingShots) => IsChinese
         ? $" · 待传 {pendingLogs}日志/{pendingShots}照片"
@@ -270,21 +272,21 @@ public static class AgentStrings
         : $"Status: {syncText}{nextPart} · {netTag} · {vrc}{queuePart}";
 
     public static string FormatTrayTooltip(string syncText, string netTag, string vrc) => IsChinese
-        ? $"VRCX 云端伴侣（{syncText}/{netTag}）- {vrc}"
-        : $"VRCX Agent ({syncText}/{netTag}) - {vrc}";
+        ? $"VRCX 云端伴侣 · {syncText}/{netTag} · {vrc}"
+        : $"VRCX Agent · {syncText}/{netTag} · {vrc}";
 
     // Online updater strings
     public static string AutoCheckUpdatesCheckbox => IsChinese
-        ? "自动检测并自动更新 GitHub 新版本（nuomew/VRCX-Worker）"
-        : "Automatically check && install updates from GitHub Releases";
+        ? "自动检测并自动更新新版本"
+        : "Automatically check && install updates";
 
     public static string FormatMenuCheckUpdate(string currentVersion) => IsChinese
-        ? $"检查更新（当前 v{currentVersion}）…"
-        : $"Check for Updates (v{currentVersion})...";
+        ? $"检查更新 · v{currentVersion}…"
+        : $"Check for Updates · v{currentVersion}...";
 
     public static string FormatMenuUpdateAvailable(string latestTag) => IsChinese
         ? $"发现新版本 {latestTag} — 立即更新…"
-        : $"Update Available ({latestTag}) — Install...";
+        : $"Update Available {latestTag} — Install...";
 
     public static string FormatMenuAutoDownloadingUpdate(string latestTag) => IsChinese
         ? $"正在自动下载更新 {latestTag}…"
@@ -295,8 +297,8 @@ public static class AgentStrings
         : "Checking for updates...";
 
     public static string FormatBalloonUpdateAvailable(string latestTag, string currentVersion) => IsChinese
-        ? $"发现新版本 {latestTag}（当前 v{currentVersion}），正在后台自动下载更新…"
-        : $"New version {latestTag} found (current v{currentVersion}). Downloading update automatically...";
+        ? $"发现新版本 {latestTag}，当前 v{currentVersion}，正在后台自动下载更新…"
+        : $"New version {latestTag} found, current v{currentVersion}. Downloading update automatically...";
 
     public static string FormatBalloonAutoInstallingUpdate(string latestTag) => IsChinese
         ? $"已下载新版本 {latestTag} 并通过 SHA-256 校验，正在自动安装并重启…"
@@ -307,8 +309,8 @@ public static class AgentStrings
         : $"Downloading update {latestTag} in the background. It will install && restart automatically once verified.";
 
     public static string FormatBalloonAlreadyLatest(string currentVersion) => IsChinese
-        ? $"当前已是最新版本（v{currentVersion}）。"
-        : $"You are already running the latest version (v{currentVersion}).";
+        ? $"当前已是最新版本 v{currentVersion}。"
+        : $"You are already running the latest version v{currentVersion}.";
 
     public static string FormatBalloonUpdateCheckFailed(string reason) => IsChinese
         ? $"检查更新失败：{reason}"
@@ -319,8 +321,8 @@ public static class AgentStrings
         : "VRCX Cloud Agent — Online Update";
 
     public static string FormatUpdateDialogHeader(string currentVersion, string latestTag) => IsChinese
-        ? $"发现新版本 {latestTag}（当前版本 v{currentVersion}）"
-        : $"New version {latestTag} available (current v{currentVersion})";
+        ? $"发现新版本 {latestTag}，当前版本 v{currentVersion}"
+        : $"New version {latestTag} available, current v{currentVersion}";
 
     public static string FormatUpdateDialogHint(string sizeText) => IsChinese
         ? $"将从 GitHub Releases 自动下载安装程序{sizeText}、校验 SHA-256 完整性并静默覆盖升级，原有配置与密钥会完整保留。"
@@ -332,8 +334,8 @@ public static class AgentStrings
     public static string UpdateVerifyingAndLaunching => IsChinese ? "校验通过，正在启动安装程序完成更新…" : "Verified! Launching installer to complete update...";
 
     public static string FormatUpdateProgressKnown(int percent, double downloadedMb, double totalMb) => IsChinese
-        ? $"正在下载更新安装包… {percent}%（{downloadedMb:F1} / {totalMb:F1} MB）"
-        : $"Downloading update installer... {percent}% ({downloadedMb:F1} / {totalMb:F1} MB)";
+        ? $"正在下载更新安装包… {percent}% · {downloadedMb:F1} / {totalMb:F1} MB"
+        : $"Downloading update installer... {percent}% · {downloadedMb:F1} / {totalMb:F1} MB";
 
     public static string FormatUpdateProgressUnknown(double downloadedMb) => IsChinese
         ? $"正在下载更新安装包… 已下载 {downloadedMb:F1} MB"

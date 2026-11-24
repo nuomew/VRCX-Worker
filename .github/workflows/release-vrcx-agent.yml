@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag (e.g. v1.7.0)'
+        description: 'Release tag (e.g. v1.8.0)'
         required: true
-        default: 'v1.7.0'
+        default: 'v1.8.0'
   push:
     tags:
       - 'v*'
@@ -35,7 +35,7 @@ jobs:
         run: |
           $tag = if ("${{ github.event_name }}" -eq "workflow_dispatch") { "${{ inputs.tag }}" } else { "${{ github.ref_name }}" }
           $ver = $tag.TrimStart('v')
-          if ($ver -notmatch '^\d+\.\d+\.\d+') { $ver = '1.7.0' }
+          if ($ver -notmatch '^\d+\.\d+\.\d+') { $ver = '1.8.0' }
           echo "tag=$tag" >> $env:GITHUB_OUTPUT
           echo "ver=$ver" >> $env:GITHUB_OUTPUT
 
@@ -157,10 +157,10 @@ jobs:
             "",
             "### 主要功能 / Key Features",
             "- 全界面简体中文 / English 自动适配（中文系统默认全中文界面与托盘菜单）",
-            "- **内置在线自动更新与可见版本提示**：检测到新版本自动下载、SHA-256 校验并静默覆盖重启升级；手动检查更新在已是最新版本或异常时弹出明确提示框",
+            "- **内置在线自动更新与旧安装包自动清理**：检测到新版本自动下载、SHA-256 校验并静默覆盖重启升级，升级启动后自动清理残留安装包；手动检查更新在已是最新版本或异常时弹出明确提示框",
             "- 后台系统托盘运行与开机自启动（单击托盘图标打开设置界面，双击打开云端网页）",
             "- 定时 HTTPS 同步（${bt}POST /api/agent/sync${bt}），设备名称与同步间隔（默认 60 秒）均由网页端统一控制",
-            "- 海外直连 / 中国大陆代理一键切换（支持跟随 Windows 系统代理、HTTP/HTTPS/SOCKS4/SOCKS5，以及**原生直连 ${bt}vmess://${bt} 节点链接（TCP / TLS / WS / WSS）**）",
+            "- 海外直连 / 中国大陆代理一键切换（支持系统代理、HTTP/HTTPS/SOCKS4/SOCKS5，以及**原生直连 ${bt}vmess://${bt} 节点链接，支持 TCP / TCP+HTTP 伪装 / TLS / WS / WSS**）",
             "- VRChat 本地日志增量采集、照片同步开关与可选 WebP 压缩（默认关闭）、Discord RPC 与允许列表远程指令",
             "",
             "### 快速开始 / Quick Setup",

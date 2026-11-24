@@ -3683,6 +3683,7 @@
         },
         "tabs": {
             "devices": "Win Agent (HTTP Sync)",
+            "synced_devices": "Synced Devices",
             "commands": "Remote Control",
             "quota": "Free-Tier Quota & WAF"
         },

@@ -380,8 +380,8 @@ public sealed class AgentCoreTests
             Assert.DoesNotContain("&", AgentStrings.NetworkGroupTitle);
             Assert.DoesNotContain("&", AgentStrings.SettingsDefaultHint);
             Assert.Equal("海外直连", ProxyHttpClientFactory.DescribeMode(new AgentConfig { ProxyEnabled = false }));
-            Assert.Equal("中国大陆（系统代理）", ProxyHttpClientFactory.DescribeMode(new AgentConfig { ProxyEnabled = true, ProxyAddress = "" }));
-            Assert.Equal("中国大陆（自定义代理）", ProxyHttpClientFactory.DescribeMode(new AgentConfig { ProxyEnabled = true, ProxyAddress = "127.0.0.1:7890" }));
+            Assert.Equal("中国大陆 · 系统代理", ProxyHttpClientFactory.DescribeMode(new AgentConfig { ProxyEnabled = true, ProxyAddress = "" }));
+            Assert.Equal("中国大陆 · 自定义代理", ProxyHttpClientFactory.DescribeMode(new AgentConfig { ProxyEnabled = true, ProxyAddress = "127.0.0.1:7890" }));
 
             AgentStrings.LanguageOverride = "en-US";
             Assert.False(AgentStrings.IsChinese);
@@ -390,9 +390,9 @@ public sealed class AgentCoreTests
             // WinForms control labels must escape '&' as '&&' so no mnemonic underscore is rendered
             Assert.Contains("&&", AgentStrings.NetworkGroupTitle);
             Assert.Contains("&&", AgentStrings.SettingsDefaultHint);
-            Assert.Equal("Overseas (Direct)", ProxyHttpClientFactory.DescribeMode(new AgentConfig { ProxyEnabled = false }));
-            Assert.Equal("Mainland (System Proxy)", ProxyHttpClientFactory.DescribeMode(new AgentConfig { ProxyEnabled = true, ProxyAddress = "" }));
-            Assert.Equal("Mainland (Custom Proxy)", ProxyHttpClientFactory.DescribeMode(new AgentConfig { ProxyEnabled = true, ProxyAddress = "127.0.0.1:7890" }));
+            Assert.Equal("Overseas Direct", ProxyHttpClientFactory.DescribeMode(new AgentConfig { ProxyEnabled = false }));
+            Assert.Equal("Mainland · System Proxy", ProxyHttpClientFactory.DescribeMode(new AgentConfig { ProxyEnabled = true, ProxyAddress = "" }));
+            Assert.Equal("Mainland · Custom Proxy", ProxyHttpClientFactory.DescribeMode(new AgentConfig { ProxyEnabled = true, ProxyAddress = "127.0.0.1:7890" }));
         }
         finally
         {
@@ -715,10 +715,176 @@ public sealed class AgentCoreTests
             AgentStrings.LanguageOverride = "zh-CN";
             Assert.Contains("网页端设置的电脑", AgentStrings.FormatWebDeviceAndScheduleHint(res.DeviceName, 90));
             Assert.Contains("网页端统一控制", AgentStrings.FormatWebDeviceAndScheduleHint(string.Empty, 60));
+            // Verify UI labels contain no parenthetical descriptions
+            Assert.DoesNotContain("（", AgentStrings.CloudUrlLabel);
+            Assert.DoesNotContain("（", AgentStrings.SyncSecretLabel);
+            Assert.DoesNotContain("（", AgentStrings.NetworkGroupTitle);
+            Assert.DoesNotContain("（", AgentStrings.OverseasDirectRadio);
+            Assert.DoesNotContain("（", AgentStrings.MainlandProxyRadio);
+            Assert.DoesNotContain("（", AgentStrings.ProxyAddressLabel);
+            Assert.DoesNotContain("（", AgentStrings.SyncScreenshotsCheckbox);
+            Assert.DoesNotContain("（", AgentStrings.CompressScreenshotsCheckbox);
+            Assert.DoesNotContain("（", AgentStrings.AutoStartCheckbox);
+            Assert.DoesNotContain("（", AgentStrings.AutoCheckUpdatesCheckbox);
         }
         finally
         {
             AgentStrings.LanguageOverride = prevLang;
+        }
+    }
+
+    [Fact]
+    public async Task VmessTcpHttpObfuscation_TunnelsHttpEndToEnd_AndInstallerCleanupRemovesOldExes()
+    {
+        // 1. Parse VMess tcp/http with comma-separated obfuscation hosts + Shadowrocket obfs=http
+        string uuid = "de305d54-75b4-431b-adb2-eb6b9e546014";
+        Assert.True(VmessConfig.TryParseUuidBigEndian(uuid, out byte[] uuidBytes));
+        byte[] cmdKey = VmessAeadClient.ComputeCmdKey(uuidBytes);
+        byte[] authKey = VmessAeadClient.Kdf16(cmdKey, Encoding.ASCII.GetBytes("AES Auth ID Encryption"));
+
+        string compactHttp = "vmess://" + Convert.ToBase64String(Encoding.UTF8.GetBytes($"auto:{uuid}@127.0.0.1:80"))
+            + "?obfs=http&obfsParam=a.cdn.test,b.cdn.test&path=/obfs";
+        Assert.True(VmessConfig.TryParse(compactHttp, out VmessConfig? compactCfg, out _));
+        Assert.Equal("tcp", compactCfg!.Network);
+        Assert.Equal("http", compactCfg.HeaderType);
+        Assert.Equal("a.cdn.test", compactCfg.EffectiveHttpHeaderHost);
+        Assert.Equal("/obfs", compactCfg.EffectiveWsPath);
+
+        // 2. End-to-end loopback VMess tcp/http server verifying HTTP request obfuscation + response header stripping
+        using var listener = new System.Net.Sockets.TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        int serverPort = ((IPEndPoint)listener.LocalEndpoint).Port;
+
+        string tcpHttpJson = $"{{\"v\":\"2\",\"ps\":\"AirportTcpHttp\",\"add\":\"127.0.0.1\",\"port\":{serverPort},\"id\":\"{uuid}\",\"aid\":0,\"scy\":\"auto\",\"net\":\"tcp\",\"type\":\"http\",\"host\":\"a.obfs.example,b.obfs.example\",\"path\":\"/ray\",\"tls\":\"\"}}";
+        string tcpHttpLink = "vmess://" + Convert.ToBase64String(Encoding.UTF8.GetBytes(tcpHttpJson));
+        Assert.True(ProxyHttpClientFactory.NormalizeAndValidateProxyUri(tcpHttpLink).Ok);
+
+        string? capturedObfsHeader = null;
+        Task serverTask = Task.Run(async () =>
+        {
+            using var tcpClient = await listener.AcceptTcpClientAsync();
+            using var net = tcpClient.GetStream();
+
+            // Read until CRLFCRLF (HTTP obfuscation request header)
+            using var hdrMs = new MemoryStream();
+            byte[] one = new byte[1];
+            byte[] tail = new byte[4];
+            int matched = 0;
+            while (matched < 4)
+            {
+                int r = await net.ReadAsync(one.AsMemory(0, 1));
+                if (r == 0) throw new EndOfStreamException();
+                hdrMs.WriteByte(one[0]);
+                tail[0] = tail[1]; tail[1] = tail[2]; tail[2] = tail[3]; tail[3] = one[0];
+                if (tail[0] == '\r' && tail[1] == '\n' && tail[2] == '\r' && tail[3] == '\n') matched = 4;
+            }
+            capturedObfsHeader = Encoding.ASCII.GetString(hdrMs.ToArray());
+
+            static async Task<byte[]> ReadExact(Stream s, int n)
+            {
+                byte[] buf = new byte[n];
+                int total = 0;
+                while (total < n)
+                {
+                    int r = await s.ReadAsync(buf.AsMemory(total, n - total));
+                    if (r == 0) throw new EndOfStreamException();
+                    total += r;
+                }
+                return buf;
+            }
+
+            byte[] reqAuthId = await ReadExact(net, 16);
+            byte[] encLen = await ReadExact(net, 18);
+            byte[] reqNonce = await ReadExact(net, 8);
+
+            byte[] lKey = VmessAeadClient.Kdf16(cmdKey, Encoding.ASCII.GetBytes("VMess Header AEAD Key_Length"), reqAuthId, reqNonce);
+            byte[] lIv = VmessAeadClient.Kdf(cmdKey, Encoding.ASCII.GetBytes("VMess Header AEAD Nonce_Length"), reqAuthId, reqNonce)[..12];
+            ushort headerLen = System.Buffers.Binary.BinaryPrimitives.ReadUInt16BigEndian(
+                VmessAeadClient.AesGcmOpen(lKey, lIv, encLen, reqAuthId));
+
+            byte[] encHdr = await ReadExact(net, headerLen + 16);
+            byte[] hKey = VmessAeadClient.Kdf16(cmdKey, Encoding.ASCII.GetBytes("VMess Header AEAD Key"), reqAuthId, reqNonce);
+            byte[] hIv = VmessAeadClient.Kdf(cmdKey, Encoding.ASCII.GetBytes("VMess Header AEAD Nonce"), reqAuthId, reqNonce)[..12];
+            byte[] hdr = VmessAeadClient.AesGcmOpen(hKey, hIv, encHdr, reqAuthId);
+
+            byte[] reqBodyIv = hdr[1..17];
+            byte[] reqBodyKey = hdr[17..33];
+            byte respAuthV = hdr[33];
+
+            // Consume first encrypted HTTP request chunk
+            ushort chunkLen = System.Buffers.Binary.BinaryPrimitives.ReadUInt16BigEndian(await ReadExact(net, 2));
+            _ = await ReadExact(net, chunkLen);
+
+            // Prefix response with fake HTTP/1.1 200 OK header just like Xray-core TCP/HTTP server
+            byte[] fakeRespHeader = Encoding.ASCII.GetBytes(
+                "HTTP/1.1 200 OK\r\nCache-Control: private\r\nContent-Type: application/octet-stream\r\n\r\n");
+            await net.WriteAsync(fakeRespHeader);
+
+            byte[] respBodyKey = System.Security.Cryptography.SHA256.HashData(reqBodyKey)[..16];
+            byte[] respBodyIv = System.Security.Cryptography.SHA256.HashData(reqBodyIv)[..16];
+            byte[] rLenKey = VmessAeadClient.Kdf16(respBodyKey, Encoding.ASCII.GetBytes("AEAD Resp Header Len Key"));
+            byte[] rLenIv = VmessAeadClient.Kdf(respBodyIv, Encoding.ASCII.GetBytes("AEAD Resp Header Len IV"))[..12];
+            byte[] rHdrKey = VmessAeadClient.Kdf16(respBodyKey, Encoding.ASCII.GetBytes("AEAD Resp Header Key"));
+            byte[] rHdrIv = VmessAeadClient.Kdf(respBodyIv, Encoding.ASCII.GetBytes("AEAD Resp Header IV"))[..12];
+
+            await net.WriteAsync(VmessAeadClient.AesGcmSeal(rLenKey, rLenIv, new byte[] { 0x00, 0x04 }, ReadOnlySpan<byte>.Empty));
+            await net.WriteAsync(VmessAeadClient.AesGcmSeal(rHdrKey, rHdrIv, new byte[] { respAuthV, 0x00, 0x00, 0x00 }, ReadOnlySpan<byte>.Empty));
+
+            byte[] httpBody = Encoding.UTF8.GetBytes("HTTP/1.1 200 OK\r\nContent-Length: 18\r\nConnection: close\r\n\r\nVMESS_HTTP_OBFS_OK");
+            byte[] respChunkIv0 = new byte[12];
+            Buffer.BlockCopy(respBodyIv, 2, respChunkIv0, 2, 10);
+            byte[] sealedResp = VmessAeadClient.AesGcmSeal(respBodyKey, respChunkIv0, httpBody, ReadOnlySpan<byte>.Empty);
+            byte[] respFrame = new byte[2 + sealedResp.Length];
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(respFrame.AsSpan(0, 2), (ushort)sealedResp.Length);
+            Buffer.BlockCopy(sealedResp, 0, respFrame, 2, sealedResp.Length);
+            await net.WriteAsync(respFrame);
+
+            byte[] respChunkIv1 = new byte[12];
+            respChunkIv1[1] = 1;
+            Buffer.BlockCopy(respBodyIv, 2, respChunkIv1, 2, 10);
+            byte[] sealedEof = VmessAeadClient.AesGcmSeal(respBodyKey, respChunkIv1, ReadOnlySpan<byte>.Empty, ReadOnlySpan<byte>.Empty);
+            byte[] eofFrame = new byte[2 + sealedEof.Length];
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(eofFrame.AsSpan(0, 2), (ushort)sealedEof.Length);
+            Buffer.BlockCopy(sealedEof, 0, eofFrame, 2, sealedEof.Length);
+            await net.WriteAsync(eofFrame);
+            await net.FlushAsync();
+        });
+
+        using HttpClient vmessHttp = ProxyHttpClientFactory.CreateHttpClient(new AgentConfig
+        {
+            ProxyEnabled = true,
+            ProxyAddress = tcpHttpLink
+        }, TimeSpan.FromSeconds(10));
+
+        string responseText = await vmessHttp.GetStringAsync("http://vrcx-obfs.internal:80/test");
+        await serverTask;
+
+        Assert.Equal("VMESS_HTTP_OBFS_OK", responseText);
+        Assert.NotNull(capturedObfsHeader);
+        Assert.StartsWith("GET /ray HTTP/1.1\r\n", capturedObfsHeader);
+        Assert.Contains("Host: a.obfs.example\r\n", capturedObfsHeader);
+
+        // 3. Verify AgentUpdater.CleanupOldInstallers removes leftover .exe and .part files cleanly
+        string tempUpdatesDir = Path.Combine(Path.GetTempPath(), "vrcx-cleanup-test-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(tempUpdatesDir);
+        try
+        {
+            string oldExe = Path.Combine(tempUpdatesDir, "VRCX.Agent-v1.6.0-Setup-win-x64.exe");
+            string stalePart = Path.Combine(tempUpdatesDir, "VRCX.Agent-v1.7.0-Setup-win-x64.exe.part");
+            string keepNote = Path.Combine(tempUpdatesDir, "keep.txt");
+            await File.WriteAllBytesAsync(oldExe, new byte[] { 1, 2, 3 });
+            await File.WriteAllBytesAsync(stalePart, new byte[] { 4, 5, 6 });
+            await File.WriteAllTextAsync(keepNote, "keep");
+
+            int removed = AgentUpdater.CleanupOldInstallers(tempUpdatesDir);
+            Assert.Equal(2, removed);
+            Assert.False(File.Exists(oldExe));
+            Assert.False(File.Exists(stalePart));
+            Assert.True(File.Exists(keepNote));
+        }
+        finally
+        {
+            if (Directory.Exists(tempUpdatesDir)) Directory.Delete(tempUpdatesDir, recursive: true);
         }
     }
 

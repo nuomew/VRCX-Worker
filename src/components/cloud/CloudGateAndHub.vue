@@ -216,7 +216,10 @@
                             >{{ t('cloud_hub.devices.static_secret_tip_suffix') }}
                         </div>
                     </div>
+                </div>
 
+                <!-- Tab 2: Synced Devices -->
+                <div v-if="activeTab === 'synced_devices'" class="space-y-4">
                     <div class="space-y-2">
                         <div class="font-medium text-foreground">
                             {{ t('cloud_hub.devices.configured_list', { count: devices.length }) }}
@@ -386,6 +389,7 @@
 
     const tabs = computed(() => [
         { id: 'devices', label: t('cloud_hub.tabs.devices') },
+        { id: 'synced_devices', label: t('cloud_hub.tabs.synced_devices') },
         { id: 'commands', label: t('cloud_hub.tabs.commands') },
         { id: 'quota', label: t('cloud_hub.tabs.quota') }
     ]);
@@ -535,7 +539,7 @@
 
     function selectTab(id) {
         activeTab.value = id;
-        if (id === 'devices') loadDevices();
+        if (id === 'devices' || id === 'synced_devices') loadDevices();
         else if (id === 'commands') loadCommands();
         else if (id === 'quota') loadQuota();
     }

@@ -345,45 +345,54 @@ public static class VmessAeadClient
             return await OpenWebSocketTransportAsync(config, ct).ConfigureAwait(false);
         }
 
-        // TCP (optionally wrapped in TLS)
+        // TCP (optionally wrapped in TLS and/or HTTP header obfuscation)
         var tcp = new TcpClient { NoDelay = true };
         try
         {
             await tcp.ConnectAsync(config.Server, config.Port, ct).ConfigureAwait(false);
             NetworkStream netStream = tcp.GetStream();
-            if (!config.UseTls)
+            Stream baseStream = new OwnedTcpStream(tcp, netStream);
+            if (config.UseTls)
             {
-                return new OwnedTcpStream(tcp, netStream);
+                var ssl = new SslStream(baseStream, leaveInnerStreamOpen: false);
+                try
+                {
+                    var sslOptions = new SslClientAuthenticationOptions
+                    {
+                        TargetHost = config.EffectiveSni,
+                        EnabledSslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13
+                    };
+                    if (config.AllowInsecure)
+                    {
+                        sslOptions.RemoteCertificateValidationCallback = (_, _, _, _) => true;
+                    }
+                    if (!string.IsNullOrWhiteSpace(config.Alpn))
+                    {
+                        var protocols = new List<SslApplicationProtocol>();
+                        foreach (string proto in config.Alpn.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+                        {
+                            protocols.Add(new SslApplicationProtocol(proto));
+                        }
+                        if (protocols.Count > 0)
+                        {
+                            sslOptions.ApplicationProtocols = protocols;
+                        }
+                    }
+                    await ssl.AuthenticateAsClientAsync(sslOptions, ct).ConfigureAwait(false);
+                    baseStream = ssl;
+                }
+                catch
+                {
+                    await ssl.DisposeAsync().ConfigureAwait(false);
+                    throw;
+                }
             }
 
-            var ssl = new SslStream(new OwnedTcpStream(tcp, netStream), leaveInnerStreamOpen: false);
-            try
+            if (string.Equals(config.HeaderType, "http", StringComparison.OrdinalIgnoreCase))
             {
-                var sslOptions = new SslClientAuthenticationOptions
-                {
-                    TargetHost = config.EffectiveSni,
-                    EnabledSslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13
-                };
-                if (!string.IsNullOrWhiteSpace(config.Alpn))
-                {
-                    var protocols = new List<SslApplicationProtocol>();
-                    foreach (string proto in config.Alpn.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
-                    {
-                        protocols.Add(new SslApplicationProtocol(proto));
-                    }
-                    if (protocols.Count > 0)
-                    {
-                        sslOptions.ApplicationProtocols = protocols;
-                    }
-                }
-                await ssl.AuthenticateAsClientAsync(sslOptions, ct).ConfigureAwait(false);
-                return ssl;
+                return new HttpHeaderTransportStream(baseStream, config.EffectiveHttpHeaderHost, config.EffectiveWsPath);
             }
-            catch
-            {
-                await ssl.DisposeAsync().ConfigureAwait(false);
-                throw;
-            }
+            return baseStream;
         }
         catch
         {
@@ -402,9 +411,12 @@ public static class VmessAeadClient
 
         var ws = new ClientWebSocket();
         ws.Options.KeepAliveInterval = TimeSpan.FromSeconds(30);
-        if (!string.IsNullOrWhiteSpace(config.Host))
+        ws.Options.SetRequestHeader(
+            "User-Agent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36");
+        if (!string.IsNullOrWhiteSpace(config.PrimaryHost))
         {
-            ws.Options.SetRequestHeader("Host", config.Host);
+            ws.Options.SetRequestHeader("Host", config.PrimaryHost);
         }
 
         HttpMessageInvoker? invoker = null;
@@ -424,6 +436,10 @@ public static class VmessAeadClient
                     TargetHost = config.EffectiveSni,
                     EnabledSslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13
                 };
+                if (config.AllowInsecure)
+                {
+                    wsHandler.SslOptions.RemoteCertificateValidationCallback = (_, _, _, _) => true;
+                }
             }
             invoker = new HttpMessageInvoker(wsHandler, disposeHandler: true);
             await ws.ConnectAsync(wsUri, invoker, ct).ConfigureAwait(false);
@@ -434,6 +450,175 @@ public static class VmessAeadClient
             ws.Dispose();
             invoker?.Dispose();
             throw;
+        }
+    }
+
+    /// <summary>
+    /// Standard V2Ray / Xray-core TCP HTTP header obfuscation (`net: "tcp", type: "http"`):
+    /// prepends an HTTP/1.1 GET request header on the first write and strips the server's HTTP response
+    /// header (up to `\r\n\r\n`) on the first read while tolerating servers that omit a response header.
+    /// </summary>
+    internal sealed class HttpHeaderTransportStream : Stream
+    {
+        private const int MaxHttpHeaderBytes = 8192;
+        private readonly Stream _inner;
+        private byte[]? _pendingRequestHeader;
+        private bool _responseHeaderHandled;
+        private byte[] _bufferedPayload = Array.Empty<byte>();
+        private int _bufferedOffset;
+
+        public HttpHeaderTransportStream(Stream inner, string host, string path)
+        {
+            _inner = inner;
+            string safePath = string.IsNullOrWhiteSpace(path) ? "/" : (path.StartsWith("/", StringComparison.Ordinal) ? path : "/" + path);
+            string safeHost = string.IsNullOrWhiteSpace(host) ? "www.baidu.com" : host.Trim();
+            string headerText =
+                $"GET {safePath} HTTP/1.1\r\n" +
+                $"Host: {safeHost}\r\n" +
+                "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36\r\n" +
+                "Accept-Encoding: gzip, deflate\r\n" +
+                "Connection: keep-alive\r\n" +
+                "Pragma: no-cache\r\n" +
+                "\r\n";
+            _pendingRequestHeader = Encoding.ASCII.GetBytes(headerText);
+        }
+
+        public override bool CanRead => _inner.CanRead;
+        public override bool CanSeek => false;
+        public override bool CanWrite => _inner.CanWrite;
+        public override long Length => throw new NotSupportedException();
+        public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
+        public override void Flush() => _inner.Flush();
+        public override Task FlushAsync(CancellationToken ct) => _inner.FlushAsync(ct);
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+
+        public override int Read(byte[] buffer, int offset, int count) =>
+            ReadAsync(buffer.AsMemory(offset, count)).AsTask().GetAwaiter().GetResult();
+
+        public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken ct) =>
+            ReadAsync(buffer.AsMemory(offset, count), ct).AsTask();
+
+        public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken ct = default)
+        {
+            if (buffer.Length == 0) return 0;
+
+            if (!_responseHeaderHandled)
+            {
+                await ReadAndStripHttpResponseHeaderAsync(ct).ConfigureAwait(false);
+                _responseHeaderHandled = true;
+            }
+
+            if (_bufferedOffset < _bufferedPayload.Length)
+            {
+                int avail = Math.Min(buffer.Length, _bufferedPayload.Length - _bufferedOffset);
+                _bufferedPayload.AsSpan(_bufferedOffset, avail).CopyTo(buffer.Span);
+                _bufferedOffset += avail;
+                if (_bufferedOffset >= _bufferedPayload.Length)
+                {
+                    _bufferedPayload = Array.Empty<byte>();
+                    _bufferedOffset = 0;
+                }
+                return avail;
+            }
+
+            return await _inner.ReadAsync(buffer, ct).ConfigureAwait(false);
+        }
+
+        public override void Write(byte[] buffer, int offset, int count) =>
+            WriteAsync(buffer.AsMemory(offset, count)).AsTask().GetAwaiter().GetResult();
+
+        public override Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken ct) =>
+            WriteAsync(buffer.AsMemory(offset, count), ct).AsTask();
+
+        public override async ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken ct = default)
+        {
+            byte[]? header = _pendingRequestHeader;
+            if (header != null)
+            {
+                _pendingRequestHeader = null;
+                byte[] combined = new byte[header.Length + buffer.Length];
+                Buffer.BlockCopy(header, 0, combined, 0, header.Length);
+                if (buffer.Length > 0)
+                {
+                    buffer.Span.CopyTo(combined.AsSpan(header.Length));
+                }
+                await _inner.WriteAsync(combined, ct).ConfigureAwait(false);
+                return;
+            }
+
+            await _inner.WriteAsync(buffer, ct).ConfigureAwait(false);
+        }
+
+        private async Task ReadAndStripHttpResponseHeaderAsync(CancellationToken ct)
+        {
+            byte[] acc = new byte[MaxHttpHeaderBytes];
+            int filled = 0;
+
+            while (filled < MaxHttpHeaderBytes)
+            {
+                int n = await _inner.ReadAsync(acc.AsMemory(filled, MaxHttpHeaderBytes - filled), ct).ConfigureAwait(false);
+                if (n == 0)
+                {
+                    if (filled > 0)
+                    {
+                        _bufferedPayload = acc[..filled];
+                        _bufferedOffset = 0;
+                    }
+                    return;
+                }
+                filled += n;
+
+                // Only strip if the server actually starts with an HTTP response line ("HTTP").
+                if (filled >= 4 &&
+                    !(acc[0] == (byte)'H' && acc[1] == (byte)'T' && acc[2] == (byte)'T' && acc[3] == (byte)'P'))
+                {
+                    _bufferedPayload = acc[..filled];
+                    _bufferedOffset = 0;
+                    return;
+                }
+
+                int endIdx = FindCrlfCrlf(acc, filled);
+                if (endIdx >= 0)
+                {
+                    int payloadStart = endIdx + 4;
+                    int rem = filled - payloadStart;
+                    if (rem > 0)
+                    {
+                        _bufferedPayload = new byte[rem];
+                        Buffer.BlockCopy(acc, payloadStart, _bufferedPayload, 0, rem);
+                        _bufferedOffset = 0;
+                    }
+                    return;
+                }
+            }
+
+            throw new InvalidDataException("VMess TCP/HTTP obfuscation response header exceeded 8 KiB without CRLFCRLF.");
+        }
+
+        private static int FindCrlfCrlf(byte[] buf, int length)
+        {
+            for (int i = 0; i <= length - 4; i++)
+            {
+                if (buf[i] == (byte)'\r' && buf[i + 1] == (byte)'\n' &&
+                    buf[i + 2] == (byte)'\r' && buf[i + 3] == (byte)'\n')
+                {
+                    return i;
+                }
+            }
+            return -1;
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing) _inner.Dispose();
+            base.Dispose(disposing);
+        }
+
+        public override async ValueTask DisposeAsync()
+        {
+            await _inner.DisposeAsync().ConfigureAwait(false);
+            await base.DisposeAsync().ConfigureAwait(false);
         }
     }
 

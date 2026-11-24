@@ -63,8 +63,8 @@ public sealed class UpdateProgressForm : Form
 
         string sizeText = release.FileSizeBytes > 0
             ? (AgentStrings.IsChinese
-                ? $"（约 {release.FileSizeBytes / (1024.0 * 1024.0):F1} MB）"
-                : $" (~{release.FileSizeBytes / (1024.0 * 1024.0):F1} MB)")
+                ? $"，约 {release.FileSizeBytes / (1024.0 * 1024.0):F1} MB"
+                : $", ~{release.FileSizeBytes / (1024.0 * 1024.0):F1} MB")
             : string.Empty;
 
         _statusLabel = new Label

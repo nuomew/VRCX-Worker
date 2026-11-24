@@ -3346,6 +3346,7 @@
         },
         "tabs": {
             "devices": "Win 伴侶 (HTTP 同步)",
+            "synced_devices": "同步裝置",
             "commands": "遠端控制",
             "quota": "免費配額與連線檢測"
         },
