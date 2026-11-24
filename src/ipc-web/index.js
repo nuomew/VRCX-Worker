@@ -45,7 +45,9 @@ export async function initWebInteropApi() {
 
         if (cloudState.authenticated) {
             await loadBootstrap();
-            connectCloudHubWs();
+            if (cloudState.wsAgentsOnline.length > 0) {
+                connectCloudHubWs();
+            }
         }
     } catch (err) {
         console.warn('[cloud] Initial auth/bootstrap check failed:', err);

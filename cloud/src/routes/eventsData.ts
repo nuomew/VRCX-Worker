@@ -17,6 +17,15 @@ function clampLimit(val: string | null, fallback = 50): number {
     return Math.min(Math.floor(n), MAX_LIMIT);
 }
 
+function safeJsonParse<T>(raw: unknown, fallback: T): T {
+    if (typeof raw !== 'string' || !raw) return fallback;
+    try {
+        return JSON.parse(raw) as T;
+    } catch {
+        return fallback;
+    }
+}
+
 export interface GameLogIngestItem {
     type: 'Location' | 'OnPlayerJoined' | 'OnPlayerLeft' | 'PortalSpawn' | 'VideoPlay' | 'Event' | 'External';
     created_at?: string;
@@ -37,26 +46,24 @@ export interface GameLogIngestItem {
 
 /**
  * Inserts a batch of structured GameLog events into DB_GAMELOG (chunked <= 25 per D1 batch),
- * updates deduplicated entity dictionaries in DB_CORE, and increments stats_counters.
+ * updates deduplicated entity dictionaries in DB_CORE, and increments stats_counters only for inserted rows.
  */
 export async function ingestGameLogItems(
     env: Env,
     items: GameLogIngestItem[]
 ): Promise<{ inserted: number; lastRowId: number }> {
-    const stmts: D1PreparedStatement[] = [];
+    const stmts: Array<{ stmt: D1PreparedStatement; counterKey: string }> = [];
     const userEntities = new Map<string, string>();
     const worldEntities = new Map<string, string>();
-    const counterDeltas = new Map<string, number>();
-
-    const bump = (k: string) => counterDeltas.set(k, (counterDeltas.get(k) ?? 0) + 1);
 
     for (const item of items) {
         const createdAt = item.created_at || new Date().toISOString();
         switch (item.type) {
             case 'Location': {
                 const worldId = item.worldId || (item.location?.split(':')[0] ?? '');
-                stmts.push(
-                    env.DB_GAMELOG.prepare(
+                stmts.push({
+                    counterKey: 'gamelog_location',
+                    stmt: env.DB_GAMELOG.prepare(
                         'INSERT OR IGNORE INTO gamelog_location (created_at, location, world_id, world_name, time, group_name) VALUES (?, ?, ?, ?, ?, ?)'
                     ).bind(
                         createdAt,
@@ -66,15 +73,15 @@ export async function ingestGameLogItems(
                         item.time ?? 0,
                         item.groupName ?? ''
                     )
-                );
+                });
                 if (worldId && item.worldName) worldEntities.set(worldId, item.worldName);
-                bump('gamelog_location');
                 break;
             }
             case 'OnPlayerJoined':
             case 'OnPlayerLeft': {
-                stmts.push(
-                    env.DB_GAMELOG.prepare(
+                stmts.push({
+                    counterKey: 'gamelog_join_leave',
+                    stmt: env.DB_GAMELOG.prepare(
                         'INSERT OR IGNORE INTO gamelog_join_leave (created_at, type, display_name, location, user_id, time) VALUES (?, ?, ?, ?, ?, ?)'
                     ).bind(
                         createdAt,
@@ -84,14 +91,14 @@ export async function ingestGameLogItems(
                         item.userId ?? '',
                         item.time ?? 0
                     )
-                );
+                });
                 if (item.userId && item.displayName) userEntities.set(item.userId, item.displayName);
-                bump('gamelog_join_leave');
                 break;
             }
             case 'PortalSpawn': {
-                stmts.push(
-                    env.DB_GAMELOG.prepare(
+                stmts.push({
+                    counterKey: 'gamelog_portal_spawn',
+                    stmt: env.DB_GAMELOG.prepare(
                         'INSERT OR IGNORE INTO gamelog_portal_spawn (created_at, display_name, location, user_id, instance_id, world_name) VALUES (?, ?, ?, ?, ?, ?)'
                     ).bind(
                         createdAt,
@@ -101,14 +108,14 @@ export async function ingestGameLogItems(
                         item.instanceId ?? '',
                         item.worldName ?? ''
                     )
-                );
+                });
                 if (item.userId && item.displayName) userEntities.set(item.userId, item.displayName);
-                bump('gamelog_portal_spawn');
                 break;
             }
             case 'VideoPlay': {
-                stmts.push(
-                    env.DB_GAMELOG.prepare(
+                stmts.push({
+                    counterKey: 'gamelog_video_play',
+                    stmt: env.DB_GAMELOG.prepare(
                         'INSERT OR IGNORE INTO gamelog_video_play (created_at, video_url, video_name, video_id, location, display_name, user_id) VALUES (?, ?, ?, ?, ?, ?, ?)'
                     ).bind(
                         createdAt,
@@ -119,23 +126,22 @@ export async function ingestGameLogItems(
                         item.displayName ?? '',
                         item.userId ?? ''
                     )
-                );
-                bump('gamelog_video_play');
+                });
                 break;
             }
             case 'Event': {
-                stmts.push(
-                    env.DB_GAMELOG.prepare('INSERT OR IGNORE INTO gamelog_event (created_at, data) VALUES (?, ?)').bind(
-                        createdAt,
-                        item.data ?? ''
-                    )
-                );
-                bump('gamelog_event');
+                stmts.push({
+                    counterKey: 'gamelog_event',
+                    stmt: env.DB_GAMELOG.prepare(
+                        'INSERT OR IGNORE INTO gamelog_event (created_at, data) VALUES (?, ?)'
+                    ).bind(createdAt, item.data ?? '')
+                });
                 break;
             }
             case 'External': {
-                stmts.push(
-                    env.DB_GAMELOG.prepare(
+                stmts.push({
+                    counterKey: 'gamelog_external',
+                    stmt: env.DB_GAMELOG.prepare(
                         'INSERT OR IGNORE INTO gamelog_external (created_at, message, display_name, user_id, location) VALUES (?, ?, ?, ?, ?)'
                     ).bind(
                         createdAt,
@@ -144,8 +150,7 @@ export async function ingestGameLogItems(
                         item.userId ?? '',
                         item.location ?? ''
                     )
-                );
-                bump('gamelog_external');
+                });
                 break;
             }
             default:
@@ -155,11 +160,18 @@ export async function ingestGameLogItems(
 
     let inserted = 0;
     let lastRowId = 0;
+    const counterDeltas = new Map<string, number>();
     for (let i = 0; i < stmts.length; i += 25) {
-        const results = await env.DB_GAMELOG.batch(stmts.slice(i, i + 25));
-        for (const r of results) {
+        const chunk = stmts.slice(i, i + 25);
+        const results = await env.DB_GAMELOG.batch(chunk.map((c) => c.stmt));
+        for (let j = 0; j < results.length; j++) {
+            const r = results[j]!;
             const changes = r.meta?.changes ?? 0;
-            inserted += changes;
+            if (changes > 0) {
+                inserted += changes;
+                const key = chunk[j]!.counterKey;
+                counterDeltas.set(key, (counterDeltas.get(key) ?? 0) + changes);
+            }
             if (r.meta?.last_row_id) {
                 lastRowId = Number(r.meta.last_row_id);
             }
@@ -574,27 +586,143 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
         return Response.json({ ok: true, data: out });
     }
 
+    const runFilteredGameLogQuery = async (
+        limit: number,
+        types: string[],
+        vipList: string[]
+    ): Promise<Array<Record<string, unknown>>> => {
+        const typeSet = new Set(types.filter(Boolean));
+        const hasTypeFilter = typeSet.size > 0;
+        const cleanVips = Array.from(new Set(vipList.map((v) => String(v || '').trim()).filter(Boolean))).slice(0, 80);
+        const hasVip = cleanVips.length > 0;
+        const vipPh = cleanVips.map(() => '?').join(', ');
+
+        const wantLocation = (!hasTypeFilter || typeSet.has('Location')) && !hasVip;
+        const wantJoined = !hasTypeFilter || typeSet.has('OnPlayerJoined');
+        const wantLeft = !hasTypeFilter || typeSet.has('OnPlayerLeft');
+        const wantJl = wantJoined || wantLeft;
+        const wantPortal = !hasTypeFilter || typeSet.has('PortalSpawn');
+        const wantVideo = !hasTypeFilter || typeSet.has('VideoPlay');
+        const wantEvent = (!hasTypeFilter || typeSet.has('Event')) && !hasVip;
+        const wantExternal = !hasTypeFilter || typeSet.has('External');
+
+        const activeTables = [wantLocation, wantJl, wantPortal, wantVideo, wantEvent, wantExternal].filter(
+            Boolean
+        ).length;
+        const perTable = activeTables <= 1 ? limit : Math.max(20, Math.min(limit, 80));
+
+        const stmts: D1PreparedStatement[] = [];
+        const slotIndex: Record<'loc' | 'jl' | 'portal' | 'video' | 'ev' | 'ext', number> = {
+            loc: -1,
+            jl: -1,
+            portal: -1,
+            video: -1,
+            ev: -1,
+            ext: -1
+        };
+
+        if (wantLocation) {
+            slotIndex.loc = stmts.length;
+            stmts.push(
+                env.DB_GAMELOG.prepare('SELECT * FROM gamelog_location ORDER BY created_at DESC LIMIT ?').bind(perTable)
+            );
+        }
+        if (wantJl) {
+            slotIndex.jl = stmts.length;
+            const conds: string[] = [];
+            const binds: unknown[] = [];
+            if (wantJoined && !wantLeft) {
+                conds.push("type = 'OnPlayerJoined'");
+            } else if (!wantJoined && wantLeft) {
+                conds.push("type = 'OnPlayerLeft'");
+            }
+            if (hasVip) {
+                conds.push(`user_id IN (${vipPh})`);
+                binds.push(...cleanVips);
+            }
+            const whereSql = conds.length > 0 ? `WHERE ${conds.join(' AND ')}` : '';
+            stmts.push(
+                env.DB_GAMELOG.prepare(
+                    `SELECT * FROM gamelog_join_leave ${whereSql} ORDER BY created_at DESC LIMIT ?`
+                ).bind(...binds, perTable)
+            );
+        }
+        if (wantPortal) {
+            slotIndex.portal = stmts.length;
+            const whereSql = hasVip ? `WHERE user_id IN (${vipPh})` : '';
+            stmts.push(
+                env.DB_GAMELOG.prepare(
+                    `SELECT * FROM gamelog_portal_spawn ${whereSql} ORDER BY created_at DESC LIMIT ?`
+                ).bind(...(hasVip ? cleanVips : []), perTable)
+            );
+        }
+        if (wantVideo) {
+            slotIndex.video = stmts.length;
+            const whereSql = hasVip ? `WHERE user_id IN (${vipPh})` : '';
+            stmts.push(
+                env.DB_GAMELOG.prepare(
+                    `SELECT * FROM gamelog_video_play ${whereSql} ORDER BY created_at DESC LIMIT ?`
+                ).bind(...(hasVip ? cleanVips : []), perTable)
+            );
+        }
+        if (wantEvent) {
+            slotIndex.ev = stmts.length;
+            stmts.push(
+                env.DB_GAMELOG.prepare('SELECT * FROM gamelog_event ORDER BY created_at DESC LIMIT ?').bind(perTable)
+            );
+        }
+        if (wantExternal) {
+            slotIndex.ext = stmts.length;
+            const whereSql = hasVip ? `WHERE user_id IN (${vipPh})` : '';
+            stmts.push(
+                env.DB_GAMELOG.prepare(
+                    `SELECT * FROM gamelog_external ${whereSql} ORDER BY created_at DESC LIMIT ?`
+                ).bind(...(hasVip ? cleanVips : []), perTable)
+            );
+        }
+
+        if (stmts.length === 0) return [];
+        const rawResults = (await env.DB_GAMELOG.batch(stmts)) as D1Result<Record<string, unknown>>[];
+        const emptyRes = { results: [] } as unknown as D1Result<Record<string, unknown>>;
+        const ordered: D1Result<Record<string, unknown>>[] = [
+            slotIndex.loc >= 0 ? rawResults[slotIndex.loc]! : emptyRes,
+            slotIndex.jl >= 0 ? rawResults[slotIndex.jl]! : emptyRes,
+            slotIndex.portal >= 0 ? rawResults[slotIndex.portal]! : emptyRes,
+            slotIndex.video >= 0 ? rawResults[slotIndex.video]! : emptyRes,
+            slotIndex.ev >= 0 ? rawResults[slotIndex.ev]! : emptyRes,
+            slotIndex.ext >= 0 ? rawResults[slotIndex.ext]! : emptyRes
+        ];
+        return normalizeGameLogRows(ordered).slice(0, limit);
+    };
+
+    if (url.pathname === '/api/gamelog/query' && request.method === 'POST') {
+        const body = (await request.json().catch(() => ({}))) as {
+            limit?: number;
+            types?: unknown;
+            filters?: unknown;
+            vipList?: unknown;
+        };
+        const limit = clampLimit(body.limit != null ? String(body.limit) : null, 100);
+        const rawTypes = Array.isArray(body.types) ? body.types : Array.isArray(body.filters) ? body.filters : [];
+        const filters = rawTypes.map((v) => String(v ?? '').trim()).filter(Boolean);
+        const vipList = Array.isArray(body.vipList)
+            ? body.vipList.map((v) => String(v ?? '').trim()).filter(Boolean)
+            : [];
+        const rows = await runFilteredGameLogQuery(limit, filters, vipList);
+        return Response.json({ ok: true, data: rows });
+    }
+
     if (url.pathname === '/api/gamelog') {
         if (request.method === 'GET') {
             const limit = clampLimit(url.searchParams.get('limit'), 100);
-            const perTable = Math.max(10, Math.min(limit, 50));
-            const results = await env.DB_GAMELOG.batch([
-                env.DB_GAMELOG.prepare('SELECT * FROM gamelog_location ORDER BY created_at DESC LIMIT ?').bind(
-                    perTable
-                ),
-                env.DB_GAMELOG.prepare('SELECT * FROM gamelog_join_leave ORDER BY created_at DESC LIMIT ?').bind(
-                    perTable
-                ),
-                env.DB_GAMELOG.prepare('SELECT * FROM gamelog_portal_spawn ORDER BY created_at DESC LIMIT ?').bind(
-                    perTable
-                ),
-                env.DB_GAMELOG.prepare('SELECT * FROM gamelog_video_play ORDER BY created_at DESC LIMIT ?').bind(
-                    perTable
-                ),
-                env.DB_GAMELOG.prepare('SELECT * FROM gamelog_event ORDER BY created_at DESC LIMIT ?').bind(perTable),
-                env.DB_GAMELOG.prepare('SELECT * FROM gamelog_external ORDER BY created_at DESC LIMIT ?').bind(perTable)
-            ]);
-            const rows = normalizeGameLogRows(results as D1Result<Record<string, unknown>>[]).slice(0, limit);
+            const rawTypes = (url.searchParams.get('types') ?? '').trim();
+            const types = rawTypes
+                ? rawTypes
+                      .split(',')
+                      .map((s) => s.trim())
+                      .filter(Boolean)
+                : [];
+            const rows = await runFilteredGameLogQuery(limit, types, []);
             return Response.json({ ok: true, data: rows });
         }
 
@@ -690,10 +818,153 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
         return Response.json({ ok: true, data: rows });
     }
 
+    if (url.pathname === '/api/gamelog/stats/users' && request.method === 'POST') {
+        const body = (await request.json().catch(() => ({}))) as { userIds?: string[] };
+        const userIds = Array.from(
+            new Set(
+                (Array.isArray(body.userIds) ? body.userIds : []).map((s) => String(s || '').trim()).filter(Boolean)
+            )
+        ).slice(0, 400);
+        if (userIds.length === 0) {
+            return Response.json({ ok: true, data: [] });
+        }
+        const out: Array<{
+            lastSeen: string;
+            userId: string;
+            timeSpent: number;
+            joinCount: number;
+            displayName: string;
+        }> = [];
+        // Chunk <= 40 per query to stay strictly below D1's 100 bind-parameter ceiling
+        for (let i = 0; i < userIds.length; i += 40) {
+            const chunk = userIds.slice(i, i + 40);
+            const ph = chunk.map(() => '?').join(', ');
+            const res = await env.DB_GAMELOG.prepare(
+                `SELECT
+                    MAX(created_at) AS last_seen,
+                    user_id,
+                    COALESCE(SUM(time), 0) AS time_spent,
+                    COUNT(DISTINCT CASE WHEN location != '' THEN location END) AS join_count,
+                    MAX(display_name) AS display_name
+                 FROM gamelog_join_leave
+                 WHERE user_id IN (${ph})
+                 GROUP BY user_id`
+            )
+                .bind(...chunk)
+                .all<{
+                    last_seen: string;
+                    user_id: string;
+                    time_spent: number;
+                    join_count: number;
+                    display_name: string;
+                }>();
+            for (const r of res.results ?? []) {
+                out.push({
+                    lastSeen: r.last_seen || '',
+                    userId: r.user_id || '',
+                    timeSpent: Number(r.time_spent ?? 0),
+                    joinCount: Number(r.join_count ?? 0),
+                    displayName: r.display_name || ''
+                });
+            }
+        }
+        return Response.json({ ok: true, data: out });
+    }
+
+    if (url.pathname === '/api/gamelog/sessions/events' && request.method === 'POST') {
+        const body = (await request.json().catch(() => ({}))) as {
+            locations?: string[];
+            afterDate?: string;
+            beforeDate?: string;
+            selfUserId?: string;
+        };
+        const locations = Array.from(
+            new Set(
+                (Array.isArray(body.locations) ? body.locations : []).map((s) => String(s || '').trim()).filter(Boolean)
+            )
+        ).slice(0, 75);
+        if (locations.length === 0) {
+            return Response.json({ ok: true, data: [] });
+        }
+        const afterDate = String(body.afterDate ?? '').trim();
+        const beforeDate = String(body.beforeDate ?? '').trim();
+        const selfUserId = String(body.selfUserId ?? '').trim();
+        const out: Array<Record<string, unknown>> = [];
+
+        for (let i = 0; i < locations.length; i += 25) {
+            const chunk = locations.slice(i, i + 25);
+            const ph = chunk.map(() => '?').join(', ');
+            const jlConds = [`location IN (${ph})`];
+            const jlBinds: unknown[] = [...chunk];
+            if (selfUserId) {
+                jlConds.push('user_id != ?');
+                jlBinds.push(selfUserId);
+            }
+            if (afterDate) {
+                jlConds.push('created_at >= ?');
+                jlBinds.push(afterDate);
+            }
+            if (beforeDate) {
+                jlConds.push('created_at <= ?');
+                jlBinds.push(beforeDate);
+            }
+            const vpConds = [`location IN (${ph})`];
+            const vpBinds: unknown[] = [...chunk];
+            if (afterDate) {
+                vpConds.push('created_at >= ?');
+                vpBinds.push(afterDate);
+            }
+            if (beforeDate) {
+                vpConds.push('created_at <= ?');
+                vpBinds.push(beforeDate);
+            }
+            const [jlRes, vpRes] = await env.DB_GAMELOG.batch([
+                env.DB_GAMELOG.prepare(
+                    `SELECT type, created_at, display_name, user_id, location
+                     FROM gamelog_join_leave
+                     WHERE ${jlConds.join(' AND ')}
+                     ORDER BY created_at ASC
+                     LIMIT 500`
+                ).bind(...jlBinds),
+                env.DB_GAMELOG.prepare(
+                    `SELECT created_at, video_url, video_name, video_id, display_name, user_id, location
+                     FROM gamelog_video_play
+                     WHERE ${vpConds.join(' AND ')}
+                     ORDER BY created_at ASC
+                     LIMIT 200`
+                ).bind(...vpBinds)
+            ]);
+            for (const r of (jlRes?.results ?? []) as Array<Record<string, unknown>>) {
+                out.push({
+                    type: r.type,
+                    created_at: r.created_at,
+                    displayName: r.display_name || '',
+                    userId: r.user_id || '',
+                    location: r.location || ''
+                });
+            }
+            for (const r of (vpRes?.results ?? []) as Array<Record<string, unknown>>) {
+                out.push({
+                    type: 'VideoPlay',
+                    created_at: r.created_at,
+                    videoUrl: r.video_url || '',
+                    videoName: r.video_name || '',
+                    videoId: r.video_id || '',
+                    displayName: r.display_name || '',
+                    userId: r.user_id || '',
+                    location: r.location || ''
+                });
+            }
+        }
+        out.sort((a, b) => String(a.created_at ?? '').localeCompare(String(b.created_at ?? '')));
+        return Response.json({ ok: true, data: out });
+    }
+
     if (url.pathname === '/api/gamelog/stats' && request.method === 'GET') {
         const kind = url.searchParams.get('kind') ?? '';
         const worldId = url.searchParams.get('worldId') ?? '';
         const userId = url.searchParams.get('userId') ?? '';
+        const groupId = url.searchParams.get('groupId') ?? '';
         const limit = clampLimit(url.searchParams.get('limit'), 50);
 
         if (kind === 'world' && worldId) {
@@ -706,18 +977,48 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
                 ).bind(worldId),
                 env.DB_GAMELOG.prepare(
                     'SELECT id, created_at, location, world_id, world_name, time, group_name FROM gamelog_location WHERE world_id = ? ORDER BY id DESC LIMIT ?'
-                ).bind(worldId, limit)
+                ).bind(worldId, Math.max(limit, 100))
             ]);
             const aggRow = (agg?.results?.[0] ?? {}) as { visitCount?: number; totalTime?: number };
             const lastRow = (lastVisit?.results?.[0] ?? {}) as { created_at?: string; world_name?: string };
+            const fallbackWorld = await env.DB_CORE.prepare(
+                'SELECT world_name FROM entity_worlds WHERE world_id = ? LIMIT 1'
+            )
+                .bind(worldId)
+                .first<{ world_name?: string }>();
+            const resolvedWorldName = lastRow.world_name || fallbackWorld?.world_name || '';
+
+            const byLocation = new Map<
+                string,
+                { created_at: string; location: string; time: number; worldName: string; groupName: string }
+            >();
+            for (const r of (recent?.results ?? []) as Array<Record<string, unknown>>) {
+                const loc = String(r.location ?? '');
+                if (!loc) continue;
+                const prev = byLocation.get(loc);
+                const t = Number(r.time ?? 0);
+                if (prev) {
+                    prev.time += t;
+                    if (!prev.worldName && r.world_name) prev.worldName = String(r.world_name);
+                    if (!prev.groupName && r.group_name) prev.groupName = String(r.group_name);
+                } else {
+                    byLocation.set(loc, {
+                        created_at: String(r.created_at ?? ''),
+                        location: loc,
+                        time: t,
+                        worldName: String(r.world_name ?? '') || resolvedWorldName,
+                        groupName: String(r.group_name ?? '')
+                    });
+                }
+            }
             return Response.json({
                 ok: true,
                 data: {
                     visitCount: aggRow.visitCount ?? 0,
                     timeSpent: aggRow.totalTime ?? 0,
                     lastVisit: lastRow.created_at ?? '',
-                    worldName: lastRow.world_name ?? '',
-                    instances: recent?.results ?? []
+                    worldName: resolvedWorldName,
+                    instances: Array.from(byLocation.values()).slice(0, limit)
                 }
             });
         }
@@ -725,27 +1026,215 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
         if (kind === 'user' && userId) {
             const [agg, lastSeen, recent] = await env.DB_GAMELOG.batch([
                 env.DB_GAMELOG.prepare(
-                    "SELECT COUNT(*) AS joinCount, COALESCE(SUM(time), 0) AS totalTime FROM gamelog_join_leave WHERE user_id = ? AND type = 'OnPlayerLeft'"
+                    "SELECT COUNT(DISTINCT CASE WHEN location != '' THEN location END) AS joinCount, COALESCE(SUM(time), 0) AS totalTime FROM gamelog_join_leave WHERE user_id = ?"
                 ).bind(userId),
                 env.DB_GAMELOG.prepare(
                     'SELECT created_at, display_name FROM gamelog_join_leave WHERE user_id = ? ORDER BY id DESC LIMIT 1'
                 ).bind(userId),
                 env.DB_GAMELOG.prepare(
                     'SELECT id, created_at, type, display_name, location, user_id, time FROM gamelog_join_leave WHERE user_id = ? ORDER BY id DESC LIMIT ?'
-                ).bind(userId, limit)
+                ).bind(userId, Math.max(limit * 4, 250))
             ]);
             const aggRow = (agg?.results?.[0] ?? {}) as { joinCount?: number; totalTime?: number };
             const lastRow = (lastSeen?.results?.[0] ?? {}) as { created_at?: string; display_name?: string };
+            const rawEvents = ((recent?.results ?? []) as Array<Record<string, unknown>>).slice().reverse();
+
+            // Resolve worldName & groupName for referenced instance locations using indexed idx_gamelog_loc_location
+            const uniqueLocs = Array.from(
+                new Set(rawEvents.map((r) => String(r.location ?? '').trim()).filter(Boolean))
+            ).slice(0, 100);
+            const locMeta = new Map<string, { worldName: string; groupName: string }>();
+            for (let i = 0; i < uniqueLocs.length; i += 25) {
+                const chunk = uniqueLocs.slice(i, i + 25);
+                const ph = chunk.map(() => '?').join(', ');
+                const metaRes = await env.DB_GAMELOG.prepare(
+                    `SELECT location, MAX(world_name) AS world_name, MAX(group_name) AS group_name
+                     FROM gamelog_location
+                     WHERE location IN (${ph})
+                     GROUP BY location`
+                )
+                    .bind(...chunk)
+                    .all<{ location: string; world_name: string; group_name: string }>();
+                for (const m of metaRes.results ?? []) {
+                    locMeta.set(m.location, { worldName: m.world_name || '', groupName: m.group_name || '' });
+                }
+            }
+
+            // Group contiguous join/leave events per instance (1-hour tolerance, matching desktop gameLog.js)
+            // and reconstruct durations when VRCX.Agent recorded time = 0.
+            const GROUP_TOLERANCE_MS = 3600_000;
+            const instances: Array<{
+                created_at: string;
+                location: string;
+                time: number;
+                worldName: string;
+                groupName: string;
+                events: number[];
+                lastTs: number;
+                openJoinMs: number;
+                prevType: string;
+            }> = [];
+            let reconstructedTotalTime = 0;
+            for (const r of rawEvents) {
+                const loc = String(r.location ?? '').trim();
+                const createdAt = String(r.created_at ?? '');
+                const ts = Date.parse(createdAt);
+                const evType = String(r.type ?? '');
+                const evTime = Number(r.time ?? 0);
+                const evId = Number(r.id ?? 0);
+                if (!loc || !Number.isFinite(ts)) continue;
+
+                const meta = locMeta.get(loc);
+                const current = instances[instances.length - 1];
+                if (
+                    !current ||
+                    current.location !== loc ||
+                    (ts - current.lastTs > GROUP_TOLERANCE_MS &&
+                        !(current.prevType === 'OnPlayerJoined' && evType === 'OnPlayerLeft'))
+                ) {
+                    const inst = {
+                        created_at: createdAt,
+                        location: loc,
+                        time: evTime > 0 ? evTime : 0,
+                        worldName: meta?.worldName || '',
+                        groupName: meta?.groupName || '',
+                        events: [evId],
+                        lastTs: ts,
+                        openJoinMs: evType === 'OnPlayerJoined' ? ts : 0,
+                        prevType: evType
+                    };
+                    if (evTime > 0) reconstructedTotalTime += evTime;
+                    instances.push(inst);
+                } else {
+                    let addedTime = evTime > 0 ? evTime : 0;
+                    if (
+                        addedTime === 0 &&
+                        evType === 'OnPlayerLeft' &&
+                        current.openJoinMs > 0 &&
+                        ts >= current.openJoinMs
+                    ) {
+                        addedTime = Math.min(ts - current.openJoinMs, 6 * 3600_000);
+                    }
+                    if (evType === 'OnPlayerJoined') {
+                        current.openJoinMs = ts;
+                    } else if (evType === 'OnPlayerLeft') {
+                        current.openJoinMs = 0;
+                    }
+                    current.time += addedTime;
+                    reconstructedTotalTime += addedTime;
+                    current.events.push(evId);
+                    current.lastTs = ts;
+                    current.prevType = evType;
+                }
+            }
+
+            const totalTime = Number(aggRow.totalTime ?? 0) > 0 ? Number(aggRow.totalTime) : reconstructedTotalTime;
+            const formattedInstances = instances
+                .slice()
+                .reverse()
+                .slice(0, limit)
+                .map(({ created_at, location, time, worldName, groupName, events }) => ({
+                    created_at,
+                    location,
+                    time,
+                    worldName,
+                    groupName,
+                    events
+                }));
+
             return Response.json({
                 ok: true,
                 data: {
                     joinCount: aggRow.joinCount ?? 0,
-                    timeSpent: aggRow.totalTime ?? 0,
+                    timeSpent: totalTime,
                     lastSeen: lastRow.created_at ?? '',
                     lastDisplayName: lastRow.display_name ?? '',
-                    recentEvents: recent?.results ?? []
+                    instances: formattedInstances,
+                    recentEvents: formattedInstances
                 }
             });
+        }
+
+        if (kind === 'group' && groupId) {
+            const cleanGroupId = groupId.trim();
+            if (!/^grp_[0-9a-zA-Z_-]+$/.test(cleanGroupId)) {
+                return Response.json({
+                    ok: true,
+                    data: { lastVisit: '', joinCount: 0, groupId: cleanGroupId, instances: [] }
+                });
+            }
+            const needle = `group(${cleanGroupId})`;
+            const recentLocs = await env.DB_GAMELOG.prepare(
+                'SELECT created_at, location, time, world_name, group_name FROM gamelog_location ORDER BY id DESC LIMIT 1000'
+            ).all<{
+                created_at: string;
+                location: string;
+                time: number;
+                world_name: string;
+                group_name: string;
+            }>();
+            const byLocation = new Map<
+                string,
+                { created_at: string; location: string; time: number; worldName: string; groupName: string }
+            >();
+            let lastVisit = '';
+            for (const r of recentLocs.results ?? []) {
+                if (!r.location || !r.location.includes(needle)) continue;
+                if (!lastVisit) lastVisit = r.created_at || '';
+                const prev = byLocation.get(r.location);
+                const t = Number(r.time ?? 0);
+                if (prev) {
+                    prev.time += t;
+                } else {
+                    byLocation.set(r.location, {
+                        created_at: r.created_at || '',
+                        location: r.location,
+                        time: t,
+                        worldName: r.world_name || '',
+                        groupName: r.group_name || ''
+                    });
+                }
+            }
+            const instances = Array.from(byLocation.values()).slice(0, limit);
+            return Response.json({
+                ok: true,
+                data: {
+                    lastVisit,
+                    joinCount: byLocation.size,
+                    groupId: cleanGroupId,
+                    instances
+                }
+            });
+        }
+
+        if (kind === 'join_history') {
+            const oneWeekAgoIso = new Date(Date.now() - 7 * 86400_000).toISOString();
+            const queries: D1PreparedStatement[] = [
+                env.DB_GAMELOG.prepare(
+                    'SELECT created_at, location FROM gamelog_location WHERE created_at >= ? ORDER BY created_at DESC LIMIT 300'
+                ).bind(oneWeekAgoIso)
+            ];
+            if (userId) {
+                queries.unshift(
+                    env.DB_GAMELOG.prepare(
+                        'SELECT created_at, location FROM gamelog_join_leave WHERE user_id = ? AND created_at >= ? ORDER BY id DESC LIMIT 300'
+                    ).bind(userId, oneWeekAgoIso)
+                );
+            }
+            const batch = await env.DB_GAMELOG.batch(queries);
+            const seen = new Map<string, number>();
+            for (const res of batch) {
+                for (const r of (res?.results ?? []) as Array<{ created_at?: string; location?: string }>) {
+                    const loc = String(r.location ?? '').trim();
+                    const ms = Date.parse(String(r.created_at ?? ''));
+                    if (!loc || !Number.isFinite(ms)) continue;
+                    const prev = seen.get(loc);
+                    if (prev === undefined || ms > prev) {
+                        seen.set(loc, ms);
+                    }
+                }
+            }
+            return Response.json({ ok: true, data: Array.from(seen.entries()) });
         }
 
         if (kind === 'top_worlds') {
@@ -773,19 +1262,34 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
 
         if (kind === 'sessions_segments') {
             const beforeId = Number(url.searchParams.get('beforeId') ?? '0');
-            const segs =
-                beforeId > 0
-                    ? await env.DB_GAMELOG.prepare(
-                          'SELECT id, created_at, location, world_id, world_name, time, group_name FROM gamelog_location WHERE id < ? ORDER BY id DESC LIMIT ?'
-                      )
-                          .bind(beforeId, limit)
-                          .all()
-                    : await env.DB_GAMELOG.prepare(
-                          'SELECT id, created_at, location, world_id, world_name, time, group_name FROM gamelog_location ORDER BY id DESC LIMIT ?'
-                      )
-                          .bind(limit)
-                          .all();
-            return Response.json({ ok: true, data: segs.results ?? [] });
+            const sinceDate = (url.searchParams.get('sinceDate') ?? '').trim();
+            const segs = sinceDate
+                ? await env.DB_GAMELOG.prepare(
+                      'SELECT id, created_at, location, world_id, world_name, time, group_name FROM gamelog_location WHERE created_at >= ? ORDER BY id DESC LIMIT ?'
+                  )
+                      .bind(sinceDate, limit)
+                      .all<Record<string, unknown>>()
+                : beforeId > 0
+                  ? await env.DB_GAMELOG.prepare(
+                        'SELECT id, created_at, location, world_id, world_name, time, group_name FROM gamelog_location WHERE id < ? ORDER BY id DESC LIMIT ?'
+                    )
+                        .bind(beforeId, limit)
+                        .all<Record<string, unknown>>()
+                  : await env.DB_GAMELOG.prepare(
+                        'SELECT id, created_at, location, world_id, world_name, time, group_name FROM gamelog_location ORDER BY id DESC LIMIT ?'
+                    )
+                        .bind(limit)
+                        .all<Record<string, unknown>>();
+            const mapped = (segs.results ?? []).map((r) => ({
+                id: Number(r.id ?? 0),
+                created_at: String(r.created_at ?? ''),
+                location: String(r.location ?? ''),
+                worldId: String(r.world_id ?? ''),
+                worldName: String(r.world_name ?? ''),
+                time: Number(r.time ?? 0),
+                groupName: String(r.group_name ?? '')
+            }));
+            return Response.json({ ok: true, data: mapped });
         }
 
         return Response.json({ ok: true, data: {} });
@@ -1158,74 +1662,161 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
     }
 
     // ===== FEED =====
+    const FEED_ALLOWED_TYPES = new Set(['GPS', 'Online', 'Offline', 'Status', 'Bio']);
+
+    const mapFeedGpsRow = (r: Record<string, unknown>) => ({
+        rowId: r.id,
+        created_at: r.created_at,
+        type: 'GPS',
+        userId: r.user_id,
+        displayName: r.display_name,
+        location: r.location,
+        worldName: r.world_name,
+        previousLocation: r.previous_location,
+        time: r.time,
+        groupName: r.group_name
+    });
+
+    const mapFeedOoRow = (r: Record<string, unknown>) => ({
+        rowId: r.id,
+        created_at: r.created_at,
+        type: r.type,
+        userId: r.user_id,
+        displayName: r.display_name,
+        location: r.location,
+        worldName: r.world_name,
+        time: r.time,
+        groupName: r.group_name
+    });
+
+    const mapFeedStatusRow = (r: Record<string, unknown>) => ({
+        rowId: r.id,
+        created_at: r.created_at,
+        type: 'Status',
+        userId: r.user_id,
+        displayName: r.display_name,
+        status: r.status,
+        statusDescription: r.status_description,
+        previousStatus: r.previous_status,
+        previousStatusDescription: r.previous_status_description
+    });
+
+    const mapFeedBioRow = (r: Record<string, unknown>) => ({
+        rowId: r.id,
+        created_at: r.created_at,
+        type: 'Bio',
+        userId: r.user_id,
+        displayName: r.display_name,
+        bio: r.bio,
+        previousBio: r.previous_bio,
+        bioLinks: safeJsonParse<string[]>(r.bio_links, []),
+        previousBioLinks: safeJsonParse<string[]>(r.previous_bio_links, [])
+    });
+
+    const runFilteredFeedQuery = async (
+        limit: number,
+        rawTypes: string[],
+        rawVipList: string[]
+    ): Promise<Array<Record<string, unknown>>> => {
+        const typeSet = new Set(rawTypes.filter((t) => FEED_ALLOWED_TYPES.has(t)));
+        const useAll = typeSet.size === 0;
+        const vipIds = Array.from(new Set(rawVipList.map((v) => v.trim()).filter(Boolean))).slice(0, 80);
+        const hasVip = vipIds.length > 0;
+        const vipPh = hasVip ? vipIds.map(() => '?').join(', ') : '';
+
+        const wantGps = useAll || typeSet.has('GPS');
+        const wantOnline = useAll || typeSet.has('Online');
+        const wantOffline = useAll || typeSet.has('Offline');
+        const wantStatus = useAll || typeSet.has('Status');
+        const wantBio = useAll || typeSet.has('Bio');
+
+        const activeTables = Number(wantGps) + Number(wantOnline || wantOffline) + Number(wantStatus) + Number(wantBio);
+        if (activeTables === 0) return [];
+
+        const perTable = activeTables === 1 ? Math.min(limit, 100) : Math.max(15, Math.min(limit, 60));
+        const stmts: D1PreparedStatement[] = [];
+        const kinds: Array<'gps' | 'oo' | 'status' | 'bio'> = [];
+
+        if (wantGps) {
+            stmts.push(
+                hasVip
+                    ? env.DB_FEED.prepare(
+                          `SELECT * FROM feed_gps WHERE user_id IN (${vipPh}) ORDER BY id DESC LIMIT ?`
+                      ).bind(...vipIds, perTable)
+                    : env.DB_FEED.prepare('SELECT * FROM feed_gps ORDER BY id DESC LIMIT ?').bind(perTable)
+            );
+            kinds.push('gps');
+        }
+        if (wantOnline || wantOffline) {
+            const conds: string[] = [];
+            const binds: unknown[] = [];
+            if (hasVip) {
+                conds.push(`user_id IN (${vipPh})`);
+                binds.push(...vipIds);
+            }
+            if (wantOnline !== wantOffline) {
+                conds.push('type = ?');
+                binds.push(wantOnline ? 'Online' : 'Offline');
+            }
+            const whereClause = conds.length > 0 ? `WHERE ${conds.join(' AND ')}` : '';
+            stmts.push(
+                env.DB_FEED.prepare(`SELECT * FROM feed_online_offline ${whereClause} ORDER BY id DESC LIMIT ?`).bind(
+                    ...binds,
+                    perTable
+                )
+            );
+            kinds.push('oo');
+        }
+        if (wantStatus) {
+            stmts.push(
+                hasVip
+                    ? env.DB_FEED.prepare(
+                          `SELECT * FROM feed_status WHERE user_id IN (${vipPh}) ORDER BY id DESC LIMIT ?`
+                      ).bind(...vipIds, perTable)
+                    : env.DB_FEED.prepare('SELECT * FROM feed_status ORDER BY id DESC LIMIT ?').bind(perTable)
+            );
+            kinds.push('status');
+        }
+        if (wantBio) {
+            stmts.push(
+                hasVip
+                    ? env.DB_FEED.prepare(
+                          `SELECT * FROM feed_bio WHERE user_id IN (${vipPh}) ORDER BY id DESC LIMIT ?`
+                      ).bind(...vipIds, perTable)
+                    : env.DB_FEED.prepare('SELECT * FROM feed_bio ORDER BY id DESC LIMIT ?').bind(perTable)
+            );
+            kinds.push('bio');
+        }
+
+        const results = await env.DB_FEED.batch(stmts);
+        const items: Array<Record<string, unknown>> = [];
+        for (let i = 0; i < kinds.length; i++) {
+            const rows = (results[i]?.results ?? []) as Array<Record<string, unknown>>;
+            const kind = kinds[i];
+            if (kind === 'gps') {
+                for (const r of rows) items.push(mapFeedGpsRow(r));
+            } else if (kind === 'oo') {
+                for (const r of rows) items.push(mapFeedOoRow(r));
+            } else if (kind === 'status') {
+                for (const r of rows) items.push(mapFeedStatusRow(r));
+            } else if (kind === 'bio') {
+                for (const r of rows) items.push(mapFeedBioRow(r));
+            }
+        }
+
+        items.sort((a, b) => String(b.created_at ?? '').localeCompare(String(a.created_at ?? '')));
+        return items.slice(0, limit);
+    };
+
     if (url.pathname === '/api/feed') {
         if (request.method === 'GET') {
             const limit = clampLimit(url.searchParams.get('limit'), 100);
-            const perTable = Math.max(10, Math.min(limit, 50));
-            const [gps, oo, status, bio] = await env.DB_FEED.batch([
-                env.DB_FEED.prepare('SELECT * FROM feed_gps ORDER BY id DESC LIMIT ?').bind(perTable),
-                env.DB_FEED.prepare('SELECT * FROM feed_online_offline ORDER BY id DESC LIMIT ?').bind(perTable),
-                env.DB_FEED.prepare('SELECT * FROM feed_status ORDER BY id DESC LIMIT ?').bind(perTable),
-                env.DB_FEED.prepare('SELECT * FROM feed_bio ORDER BY id DESC LIMIT ?').bind(perTable)
-            ]);
-
-            const items: Array<Record<string, unknown>> = [];
-            for (const r of (gps?.results ?? []) as Array<Record<string, unknown>>) {
-                items.push({
-                    rowId: r.id,
-                    created_at: r.created_at,
-                    type: 'GPS',
-                    userId: r.user_id,
-                    displayName: r.display_name,
-                    location: r.location,
-                    worldName: r.world_name,
-                    previousLocation: r.previous_location,
-                    time: r.time,
-                    groupName: r.group_name
-                });
-            }
-            for (const r of (oo?.results ?? []) as Array<Record<string, unknown>>) {
-                items.push({
-                    rowId: r.id,
-                    created_at: r.created_at,
-                    type: r.type,
-                    userId: r.user_id,
-                    displayName: r.display_name,
-                    location: r.location,
-                    worldName: r.world_name,
-                    time: r.time,
-                    groupName: r.group_name
-                });
-            }
-            for (const r of (status?.results ?? []) as Array<Record<string, unknown>>) {
-                items.push({
-                    rowId: r.id,
-                    created_at: r.created_at,
-                    type: 'Status',
-                    userId: r.user_id,
-                    displayName: r.display_name,
-                    status: r.status,
-                    statusDescription: r.status_description,
-                    previousStatus: r.previous_status,
-                    previousStatusDescription: r.previous_status_description
-                });
-            }
-            for (const r of (bio?.results ?? []) as Array<Record<string, unknown>>) {
-                items.push({
-                    rowId: r.id,
-                    created_at: r.created_at,
-                    type: 'Bio',
-                    userId: r.user_id,
-                    displayName: r.display_name,
-                    bio: r.bio,
-                    previousBio: r.previous_bio,
-                    bioLinks: JSON.parse(String(r.bio_links ?? '[]')),
-                    previousBioLinks: JSON.parse(String(r.previous_bio_links ?? '[]'))
-                });
-            }
-
-            items.sort((a, b) => String(b.created_at ?? '').localeCompare(String(a.created_at ?? '')));
-            return Response.json({ ok: true, data: items.slice(0, limit) });
+            const rawTypes = (url.searchParams.get('types') ?? '')
+                .split(',')
+                .map((s) => s.trim())
+                .filter(Boolean);
+            const items = await runFilteredFeedQuery(limit, rawTypes, []);
+            return Response.json({ ok: true, data: items });
         }
 
         if (request.method === 'POST') {
@@ -1238,26 +1829,68 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
         }
     }
 
+    if (url.pathname === '/api/feed/query' && request.method === 'POST') {
+        const body = (await request.json().catch(() => ({}))) as {
+            types?: unknown;
+            vipList?: unknown;
+            limit?: unknown;
+        };
+        const limit = clampLimit(body.limit != null ? String(body.limit) : null, 100);
+        const rawTypes = Array.isArray(body.types) ? body.types.map((t) => String(t ?? '').trim()).filter(Boolean) : [];
+        const rawVipList = Array.isArray(body.vipList)
+            ? body.vipList.map((v) => String(v ?? '').trim()).filter(Boolean)
+            : [];
+        const items = await runFilteredFeedQuery(limit, rawTypes, rawVipList);
+        return Response.json({ ok: true, data: items });
+    }
+
     if (url.pathname === '/api/feed/search' && request.method === 'GET') {
         const q = (url.searchParams.get('q') ?? '').trim();
         const limit = clampLimit(url.searchParams.get('limit'), 50);
+        const rawTypes = (url.searchParams.get('types') ?? '')
+            .split(',')
+            .map((s) => s.trim())
+            .filter((t) => FEED_ALLOWED_TYPES.has(t));
         if (!q) {
             return Response.json({ ok: true, data: [] });
         }
-        // Resolve matching user_ids via deduplicated FTS5 trigram dictionary in DB_CORE
+        const typeSet = new Set(rawTypes);
+        const useAll = typeSet.size === 0;
+        const wantGps = useAll || typeSet.has('GPS');
+        const wantOnline = useAll || typeSet.has('Online');
+        const wantOffline = useAll || typeSet.has('Offline');
+        const wantStatus = useAll || typeSet.has('Status');
+        const wantBio = useAll || typeSet.has('Bio');
+
+        // Resolve matching user_ids and world_ids via deduplicated FTS5 trigram dictionaries in DB_CORE
         let userIds: string[] = [];
+        let worldIds: string[] = [];
         if (q.startsWith('usr_')) {
             userIds = [q];
+        } else if (q.startsWith('wrld_')) {
+            worldIds = [q];
         } else if (Array.from(q).length >= 3) {
             const matchExpr = buildSafeTrigramMatch(q);
-            const res = await env.DB_CORE.prepare(
-                `SELECT u.user_id FROM entity_users_fts f
-                 JOIN entity_users u ON u.rowid = f.rowid
-                 WHERE entity_users_fts MATCH ? LIMIT 30`
-            )
-                .bind(matchExpr)
-                .all<{ user_id: string }>();
-            userIds = (res.results ?? []).map((r) => r.user_id);
+            const [uRes, wRes] = await env.DB_CORE.batch([
+                env.DB_CORE.prepare(
+                    `SELECT u.user_id FROM entity_users_fts f
+                     JOIN entity_users u ON u.rowid = f.rowid
+                     WHERE entity_users_fts MATCH ? LIMIT 30`
+                ).bind(matchExpr),
+                wantGps
+                    ? env.DB_CORE.prepare(
+                          `SELECT w.world_id FROM entity_worlds_fts f
+                           JOIN entity_worlds w ON w.rowid = f.rowid
+                           WHERE entity_worlds_fts MATCH ? LIMIT 20`
+                      ).bind(matchExpr)
+                    : env.DB_CORE.prepare('SELECT 1 WHERE 0')
+            ]);
+            userIds = ((uRes?.results ?? []) as Array<{ user_id?: string }>)
+                .map((r) => String(r.user_id ?? ''))
+                .filter(Boolean);
+            worldIds = ((wRes?.results ?? []) as Array<{ world_id?: string }>)
+                .map((r) => String(r.world_id ?? ''))
+                .filter(Boolean);
         } else {
             const res = await env.DB_CORE.prepare(
                 `SELECT user_id FROM (SELECT user_id, display_name FROM entity_users ORDER BY rowid DESC LIMIT 50)
@@ -1268,24 +1901,100 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
             userIds = (res.results ?? []).map((r) => r.user_id);
         }
 
-        if (userIds.length === 0) {
+        const stmts: D1PreparedStatement[] = [];
+        const kinds: Array<'gps' | 'oo' | 'status' | 'bio' | 'gps_world'> = [];
+
+        if (userIds.length > 0) {
+            const ph = userIds.map(() => '?').join(', ');
+            if (wantGps) {
+                stmts.push(
+                    env.DB_FEED.prepare(
+                        `SELECT * FROM feed_gps WHERE user_id IN (${ph}) ORDER BY id DESC LIMIT ?`
+                    ).bind(...userIds, limit)
+                );
+                kinds.push('gps');
+            }
+            if (wantOnline || wantOffline) {
+                if (wantOnline !== wantOffline) {
+                    stmts.push(
+                        env.DB_FEED.prepare(
+                            `SELECT * FROM feed_online_offline WHERE user_id IN (${ph}) AND type = ? ORDER BY id DESC LIMIT ?`
+                        ).bind(...userIds, wantOnline ? 'Online' : 'Offline', limit)
+                    );
+                } else {
+                    stmts.push(
+                        env.DB_FEED.prepare(
+                            `SELECT * FROM feed_online_offline WHERE user_id IN (${ph}) ORDER BY id DESC LIMIT ?`
+                        ).bind(...userIds, limit)
+                    );
+                }
+                kinds.push('oo');
+            }
+            if (wantStatus) {
+                stmts.push(
+                    env.DB_FEED.prepare(
+                        `SELECT * FROM feed_status WHERE user_id IN (${ph}) ORDER BY id DESC LIMIT ?`
+                    ).bind(...userIds, limit)
+                );
+                kinds.push('status');
+            }
+            if (wantBio) {
+                stmts.push(
+                    env.DB_FEED.prepare(
+                        `SELECT * FROM feed_bio WHERE user_id IN (${ph}) ORDER BY id DESC LIMIT ?`
+                    ).bind(...userIds, limit)
+                );
+                kinds.push('bio');
+            }
+        }
+
+        // Bounded recent-window scan (<= 400 rows) for world matches to avoid unindexed full-table scans on feed_gps
+        if (wantGps && worldIds.length > 0) {
+            stmts.push(env.DB_FEED.prepare('SELECT * FROM feed_gps ORDER BY id DESC LIMIT 400'));
+            kinds.push('gps_world');
+        }
+
+        if (stmts.length === 0) {
             return Response.json({ ok: true, data: [] });
         }
-        const ph = userIds.map(() => '?').join(', ');
-        const [gps, oo, status] = await env.DB_FEED.batch([
-            env.DB_FEED.prepare(
-                `SELECT *, 'GPS' AS _kind FROM feed_gps WHERE user_id IN (${ph}) ORDER BY id DESC LIMIT ?`
-            ).bind(...userIds, limit),
-            env.DB_FEED.prepare(
-                `SELECT *, type AS _kind FROM feed_online_offline WHERE user_id IN (${ph}) ORDER BY id DESC LIMIT ?`
-            ).bind(...userIds, limit),
-            env.DB_FEED.prepare(
-                `SELECT *, 'Status' AS _kind FROM feed_status WHERE user_id IN (${ph}) ORDER BY id DESC LIMIT ?`
-            ).bind(...userIds, limit)
-        ]);
-        const merged = [...(gps?.results ?? []), ...(oo?.results ?? []), ...(status?.results ?? [])] as Array<
-            Record<string, unknown>
-        >;
+
+        const results = await env.DB_FEED.batch(stmts);
+        const worldIdSet = new Set(worldIds);
+        const qLower = q.toLowerCase();
+        const seenKeys = new Set<string>();
+        const merged: Array<Record<string, unknown>> = [];
+
+        const pushUnique = (item: Record<string, unknown>) => {
+            const key = `${String(item.type)}:${String(item.rowId)}`;
+            if (seenKeys.has(key)) return;
+            seenKeys.add(key);
+            merged.push(item);
+        };
+
+        for (let i = 0; i < kinds.length; i++) {
+            const rows = (results[i]?.results ?? []) as Array<Record<string, unknown>>;
+            const kind = kinds[i];
+            if (kind === 'gps') {
+                for (const r of rows) pushUnique(mapFeedGpsRow(r));
+            } else if (kind === 'oo') {
+                for (const r of rows) pushUnique(mapFeedOoRow(r));
+            } else if (kind === 'status') {
+                for (const r of rows) pushUnique(mapFeedStatusRow(r));
+            } else if (kind === 'bio') {
+                for (const r of rows) pushUnique(mapFeedBioRow(r));
+            } else if (kind === 'gps_world') {
+                for (const r of rows) {
+                    const loc = String(r.location ?? '');
+                    const colon = loc.indexOf(':');
+                    const wid = colon > 0 ? loc.slice(0, colon) : loc;
+                    const wname = String(r.world_name ?? '').toLowerCase();
+                    if (worldIdSet.has(wid) || (qLower.length >= 3 && wname.includes(qLower))) {
+                        pushUnique(mapFeedGpsRow(r));
+                    }
+                }
+            }
+        }
+
         merged.sort((a, b) => String(b.created_at ?? '').localeCompare(String(a.created_at ?? '')));
         return Response.json({ ok: true, data: merged.slice(0, limit) });
     }
@@ -1400,13 +2109,193 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
         return Response.json({ ok: true, data: out });
     }
 
-    // ===== ACTIVITY SESSIONS V2 =====
+    // ===== ACTIVITY V2 SOURCE & SESSIONS =====
+    if (url.pathname === '/api/activity/source' && request.method === 'GET') {
+        const kind = (url.searchParams.get('kind') ?? '').trim();
+        const userId = (url.searchParams.get('userId') ?? '').trim();
+        const fromDateIso = (url.searchParams.get('fromDateIso') ?? '').trim();
+        const toDateIso = (url.searchParams.get('toDateIso') ?? '').trim();
+        const afterCreatedAt = (url.searchParams.get('afterCreatedAt') ?? '').trim();
+        const inclusive = url.searchParams.get('inclusive') === '1' || url.searchParams.get('inclusive') === 'true';
+
+        if (kind === 'friend_slice') {
+            if (!userId || !fromDateIso) {
+                return Response.json({ ok: true, data: [] });
+            }
+            const queries: D1PreparedStatement[] = [
+                env.DB_FEED.prepare(
+                    `SELECT created_at, type FROM feed_online_offline
+                     WHERE user_id = ? AND (type = 'Online' OR type = 'Offline') AND created_at < ?
+                     ORDER BY created_at DESC LIMIT 1`
+                ).bind(userId, fromDateIso),
+                toDateIso
+                    ? env.DB_FEED.prepare(
+                          `SELECT created_at, type FROM feed_online_offline
+                           WHERE user_id = ? AND (type = 'Online' OR type = 'Offline') AND created_at >= ? AND created_at < ?
+                           ORDER BY created_at ASC LIMIT 1500`
+                      ).bind(userId, fromDateIso, toDateIso)
+                    : env.DB_FEED.prepare(
+                          `SELECT created_at, type FROM feed_online_offline
+                           WHERE user_id = ? AND (type = 'Online' OR type = 'Offline') AND created_at >= ?
+                           ORDER BY created_at ASC LIMIT 1500`
+                      ).bind(userId, fromDateIso)
+            ];
+            if (toDateIso) {
+                queries.push(
+                    env.DB_FEED.prepare(
+                        `SELECT created_at, type FROM feed_online_offline
+                         WHERE user_id = ? AND (type = 'Online' OR type = 'Offline') AND created_at >= ?
+                         ORDER BY created_at ASC LIMIT 1`
+                    ).bind(userId, toDateIso)
+                );
+            }
+            const batch = await env.DB_FEED.batch(queries);
+            const rows: Array<{ created_at: string; type: string }> = [];
+            for (const res of batch) {
+                for (const r of (res?.results ?? []) as Array<{ created_at?: string; type?: string }>) {
+                    if (r.created_at && (r.type === 'Online' || r.type === 'Offline')) {
+                        rows.push({ created_at: String(r.created_at), type: String(r.type) });
+                    }
+                }
+            }
+            rows.sort((a, b) => a.created_at.localeCompare(b.created_at));
+            return Response.json({ ok: true, data: rows });
+        }
+
+        if (kind === 'friend_after') {
+            if (!userId || !afterCreatedAt) {
+                return Response.json({ ok: true, data: [] });
+            }
+            const res = await env.DB_FEED.prepare(
+                `SELECT created_at, type FROM feed_online_offline
+                 WHERE user_id = ? AND (type = 'Online' OR type = 'Offline') AND created_at > ?
+                 ORDER BY created_at ASC LIMIT 1500`
+            )
+                .bind(userId, afterCreatedAt)
+                .all<{ created_at?: string; type?: string }>();
+            const rows = (res.results ?? [])
+                .filter((r) => r.created_at && (r.type === 'Online' || r.type === 'Offline'))
+                .map((r) => ({ created_at: String(r.created_at), type: String(r.type) }));
+            return Response.json({ ok: true, data: rows });
+        }
+
+        if (kind === 'self_slice' || kind === 'self_after') {
+            const locQueries: D1PreparedStatement[] = [];
+            let eventFloorIso = '';
+
+            if (kind === 'self_slice') {
+                if (!fromDateIso) {
+                    return Response.json({ ok: true, data: [] });
+                }
+                eventFloorIso = fromDateIso;
+                locQueries.push(
+                    env.DB_GAMELOG.prepare(
+                        'SELECT created_at, time FROM gamelog_location WHERE created_at < ? ORDER BY created_at DESC LIMIT 1'
+                    ).bind(fromDateIso)
+                );
+                if (toDateIso) {
+                    locQueries.push(
+                        env.DB_GAMELOG.prepare(
+                            'SELECT created_at, time FROM gamelog_location WHERE created_at >= ? AND created_at < ? ORDER BY created_at ASC LIMIT 1500'
+                        ).bind(fromDateIso, toDateIso),
+                        env.DB_GAMELOG.prepare(
+                            'SELECT created_at, time FROM gamelog_location WHERE created_at >= ? ORDER BY created_at ASC LIMIT 1'
+                        ).bind(toDateIso)
+                    );
+                } else {
+                    locQueries.push(
+                        env.DB_GAMELOG.prepare(
+                            'SELECT created_at, time FROM gamelog_location WHERE created_at >= ? ORDER BY created_at ASC LIMIT 1500'
+                        ).bind(fromDateIso)
+                    );
+                }
+            } else {
+                if (!afterCreatedAt) {
+                    return Response.json({ ok: true, data: [] });
+                }
+                eventFloorIso = afterCreatedAt;
+                const op = inclusive ? '>=' : '>';
+                locQueries.push(
+                    env.DB_GAMELOG.prepare(
+                        `SELECT created_at, time FROM gamelog_location WHERE created_at ${op} ? ORDER BY created_at ASC LIMIT 1500`
+                    ).bind(afterCreatedAt)
+                );
+            }
+
+            // Include VRChat quit events in the same window so zero-duration VRCX.Agent
+            // Location rows are bounded accurately instead of stretching up to 24 hours.
+            locQueries.push(
+                env.DB_GAMELOG.prepare(
+                    'SELECT created_at, data FROM gamelog_event WHERE created_at >= ? ORDER BY created_at ASC LIMIT 500'
+                ).bind(eventFloorIso)
+            );
+
+            const batch = await env.DB_GAMELOG.batch(locQueries);
+            const quitEventRes = batch[batch.length - 1];
+            const rawLocRows: Array<{ created_at: string; time: number; ms: number }> = [];
+            for (let i = 0; i < batch.length - 1; i++) {
+                for (const r of (batch[i]?.results ?? []) as Array<{ created_at?: string; time?: number }>) {
+                    const ts = String(r.created_at ?? '').trim();
+                    const ms = Date.parse(ts);
+                    if (!ts || !Number.isFinite(ms)) continue;
+                    rawLocRows.push({ created_at: ts, time: Math.max(0, Number(r.time ?? 0)), ms });
+                }
+            }
+            rawLocRows.sort((a, b) => a.ms - b.ms || a.created_at.localeCompare(b.created_at));
+
+            const quitTimestamps: number[] = [];
+            for (const r of (quitEventRes?.results ?? []) as Array<{ created_at?: string; data?: string }>) {
+                if (!String(r.data ?? '').includes('VRChat closed')) continue;
+                const ms = Date.parse(String(r.created_at ?? ''));
+                if (Number.isFinite(ms)) quitTimestamps.push(ms);
+            }
+            quitTimestamps.sort((a, b) => a - b);
+
+            const MAX_SELF_GAP_MS = 6 * 3600_000;
+            const nowMs = Date.now();
+            let quitIdx = 0;
+            const normalized: Array<{ created_at: string; time: number }> = [];
+
+            for (let i = 0; i < rawLocRows.length; i++) {
+                const cur = rawLocRows[i]!;
+                if (cur.time > 0) {
+                    normalized.push({ created_at: cur.created_at, time: cur.time });
+                    continue;
+                }
+                while (quitIdx < quitTimestamps.length && quitTimestamps[quitIdx]! <= cur.ms) {
+                    quitIdx++;
+                }
+                const nextLocMs = i + 1 < rawLocRows.length ? rawLocRows[i + 1]!.ms : Number.POSITIVE_INFINITY;
+                const nextQuitMs =
+                    quitIdx < quitTimestamps.length && quitTimestamps[quitIdx]! < nextLocMs
+                        ? quitTimestamps[quitIdx]!
+                        : null;
+
+                let estimatedTime = 0;
+                if (nextQuitMs !== null) {
+                    estimatedTime = Math.max(1000, Math.min(nextQuitMs - cur.ms, MAX_SELF_GAP_MS));
+                } else if (Number.isFinite(nextLocMs)) {
+                    const gap = nextLocMs - cur.ms;
+                    estimatedTime = gap > 0 && gap <= MAX_SELF_GAP_MS ? gap : 60_000;
+                } else {
+                    // Open tail: keep time=0 if recent so activityEngine extends to nowMs; cap stale tails.
+                    estimatedTime = nowMs - cur.ms <= MAX_SELF_GAP_MS ? 0 : 60_000;
+                }
+                normalized.push({ created_at: cur.created_at, time: estimatedTime });
+            }
+
+            return Response.json({ ok: true, data: normalized });
+        }
+
+        return Response.json({ ok: true, data: [] });
+    }
+
     if (url.pathname === '/api/activity/sessions') {
         if (request.method === 'GET') {
             const userId = url.searchParams.get('userId') ?? '';
-            const limit = clampLimit(url.searchParams.get('limit'), 100);
+            const limit = clampLimit(url.searchParams.get('limit'), 500);
             const res = await env.DB_FEED.prepare(
-                'SELECT session_id, user_id, start_at, end_at, is_open_tail, source_revision FROM activity_sessions_v2 WHERE user_id = ? ORDER BY start_at DESC LIMIT ?'
+                'SELECT session_id, user_id, start_at, end_at, is_open_tail, source_revision FROM activity_sessions_v2 WHERE user_id = ? ORDER BY start_at ASC LIMIT ?'
             )
                 .bind(userId, limit)
                 .all();
@@ -1416,17 +2305,35 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
             const body = (await request.json()) as {
                 userId: string;
                 replace?: boolean;
-                sessions: Array<{ startAt: number; endAt: number; isOpenTail?: boolean; sourceRevision?: string }>;
+                replaceFromStartAt?: number | null;
+                sessions: Array<{
+                    start?: number;
+                    end?: number;
+                    startAt?: number;
+                    endAt?: number;
+                    isOpenTail?: boolean;
+                    sourceRevision?: string;
+                }>;
             };
             const stmts: D1PreparedStatement[] = [];
             if (body.replace) {
                 stmts.push(env.DB_FEED.prepare('DELETE FROM activity_sessions_v2 WHERE user_id = ?').bind(body.userId));
+            } else if (typeof body.replaceFromStartAt === 'number' && Number.isFinite(body.replaceFromStartAt)) {
+                stmts.push(
+                    env.DB_FEED.prepare('DELETE FROM activity_sessions_v2 WHERE user_id = ? AND start_at >= ?').bind(
+                        body.userId,
+                        body.replaceFromStartAt
+                    )
+                );
             }
-            for (const s of (body.sessions ?? []).slice(0, 40)) {
+            for (const s of (body.sessions ?? []).slice(0, 200)) {
+                const startAt = Number(s.start ?? s.startAt ?? 0);
+                const endAt = Number(s.end ?? s.endAt ?? 0);
+                if (!Number.isFinite(startAt) || !Number.isFinite(endAt) || endAt <= startAt) continue;
                 stmts.push(
                     env.DB_FEED.prepare(
                         'INSERT INTO activity_sessions_v2 (user_id, start_at, end_at, is_open_tail, source_revision) VALUES (?, ?, ?, ?, ?)'
-                    ).bind(body.userId, s.startAt, s.endAt, s.isOpenTail ? 1 : 0, s.sourceRevision ?? '')
+                    ).bind(body.userId, startAt, endAt, s.isOpenTail ? 1 : 0, s.sourceRevision ?? '')
                 );
             }
             if (stmts.length > 0) {

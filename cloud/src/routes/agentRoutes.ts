@@ -1,4 +1,11 @@
-import { authenticateAgent, getMasterKey } from '../auth/auth';
+import {
+    authenticateAgent,
+    checkAuthRateLimit,
+    clearAuthRateLimit,
+    getMasterKey,
+    recordAuthFailure,
+    resolveClientRateBucket
+} from '../auth/auth';
 import { encryptAesGcm, randomHex, sha256Hex } from '../crypto/vault';
 import type { Env } from '../env';
 import { accrueCloudUptime, getCloudSyncIntervalSeconds } from './coreData';
@@ -81,6 +88,21 @@ export function validateCommand(
 export async function handleAgentPublicRoutes(request: Request, env: Env, url: URL): Promise<Response | null> {
     // 1. Windows Agent redeems 6-digit single-use pairing code
     if (url.pathname === '/api/agent/pair' && request.method === 'POST') {
+        const rateBucket = resolveClientRateBucket(request, 'pair');
+        const rateCheck = await checkAuthRateLimit(env, rateBucket);
+        if (rateCheck.blocked) {
+            return Response.json(
+                {
+                    ok: false,
+                    error: {
+                        code: 'RATE_LIMITED',
+                        message: `Too many failed pairing attempts. Try again in ${rateCheck.retryAfterSec}s.`
+                    }
+                },
+                { status: 429, headers: { 'Retry-After': String(rateCheck.retryAfterSec) } }
+            );
+        }
+
         let body: { code?: string; deviceName?: string; agentVersion?: string; capabilities?: string[] };
         try {
             body = (await request.json()) as typeof body;
@@ -93,6 +115,7 @@ export async function handleAgentPublicRoutes(request: Request, env: Env, url: U
 
         const code = (body.code ?? '').trim();
         if (!/^\d{6}$/.test(code)) {
+            await recordAuthFailure(env, rateBucket);
             return Response.json(
                 { ok: false, error: { code: 'INVALID_CODE', message: '6-digit pairing code required' } },
                 { status: 400 }
@@ -107,11 +130,28 @@ export async function handleAgentPublicRoutes(request: Request, env: Env, url: U
             .first<{ code: string; device_label: string; expires_at: string; used: number }>();
 
         if (!row || row.used !== 0 || row.expires_at < nowIso) {
+            await recordAuthFailure(env, rateBucket);
             return Response.json(
                 { ok: false, error: { code: 'PAIR_CODE_INVALID', message: 'Pairing code expired or already used' } },
                 { status: 401 }
             );
         }
+
+        // Atomic CAS claim prevents two concurrent requests from redeeming the same 6-digit code
+        const claimRes = await env.DB_CORE.prepare(
+            'UPDATE cloud_pairing_codes SET used = 1 WHERE code = ? AND used = 0 AND expires_at >= ?'
+        )
+            .bind(code, nowIso)
+            .run();
+        if ((claimRes.meta?.changes ?? 0) !== 1) {
+            await recordAuthFailure(env, rateBucket);
+            return Response.json(
+                { ok: false, error: { code: 'PAIR_CODE_INVALID', message: 'Pairing code expired or already used' } },
+                { status: 401 }
+            );
+        }
+
+        await clearAuthRateLimit(env, rateBucket);
 
         const deviceId = `win-${randomHex(8)}`;
         const deviceToken = randomHex(32);
@@ -120,13 +160,12 @@ export async function handleAgentPublicRoutes(request: Request, env: Env, url: U
         const { ciphertextB64, ivB64 } = await encryptAesGcm(getMasterKey(env), hmacSecret);
         const deviceName = (body.deviceName || row.device_label || 'Windows PC').slice(0, 64);
 
-        await env.DB_CORE.batch([
-            env.DB_CORE.prepare('UPDATE cloud_pairing_codes SET used = 1 WHERE code = ?').bind(code),
-            env.DB_CORE.prepare(
-                `INSERT INTO cloud_devices
-                 (device_id, device_name, token_hash, hmac_secret_enc, agent_version, capabilities_json, last_seen_at, created_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-            ).bind(
+        await env.DB_CORE.prepare(
+            `INSERT INTO cloud_devices
+             (device_id, device_name, token_hash, hmac_secret_enc, agent_version, capabilities_json, last_seen_at, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+        )
+            .bind(
                 deviceId,
                 deviceName,
                 tokenHash,
@@ -136,7 +175,7 @@ export async function handleAgentPublicRoutes(request: Request, env: Env, url: U
                 nowIso,
                 nowIso
             )
-        ]);
+            .run();
 
         return Response.json({
             ok: true,
@@ -515,30 +554,8 @@ export async function handleAgentPublicRoutes(request: Request, env: Env, url: U
 
         await env.DB_CORE.batch(coreWrites);
 
-        // Broadcast fresh GameLog events and/or live state snapshot in a single DO request
-        if (events.length > 0 || persistedState) {
-            const messages: Array<{ type: string; payload: Record<string, unknown> }> = [];
-            if (events.length > 0) {
-                messages.push({
-                    type: 'gamelog.batch',
-                    payload: { deviceId: auth.deviceId, events }
-                });
-            }
-            if (persistedState) {
-                messages.push({
-                    type: 'agent.state',
-                    payload: { deviceId: auth.deviceId, ...persistedState }
-                });
-            }
-            const hub = env.AGENT_HUB.get(env.AGENT_HUB.idFromName('primary'));
-            await hub.fetch(
-                new Request('https://agent-hub.internal/broadcast', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ messages })
-                })
-            );
-        }
+        // Periodic HTTP sync persists live state into DB_CORE.cloud_device_states and GameLog into DB_GAMELOG
+        // without waking AgentHubDO on every 60s tick (preserving Free-tier Durable Object quotas).
 
         const syncIntervalSeconds = await getCloudSyncIntervalSeconds(env);
         await accrueCloudUptime(env.DB_CORE, nowIso, Math.max(syncIntervalSeconds * 3, 360));
@@ -646,7 +663,11 @@ export async function handleAgentWebRoutes(request: Request, env: Env, url: URL)
         if (request.method === 'DELETE') {
             const deviceId = url.searchParams.get('deviceId') ?? '';
             if (deviceId) {
-                await env.DB_CORE.prepare('DELETE FROM cloud_devices WHERE device_id = ?').bind(deviceId).run();
+                await env.DB_CORE.batch([
+                    env.DB_CORE.prepare('DELETE FROM cloud_devices WHERE device_id = ?').bind(deviceId),
+                    env.DB_CORE.prepare('DELETE FROM cloud_device_states WHERE device_id = ?').bind(deviceId),
+                    env.DB_CORE.prepare('DELETE FROM cloud_sync_cursors WHERE device_id = ?').bind(deviceId)
+                ]);
             }
             return Response.json({ ok: true });
         }
@@ -684,13 +705,15 @@ export async function handleAgentWebRoutes(request: Request, env: Env, url: URL)
             const now = Date.now();
             const createdAt = new Date(now).toISOString();
             const expiresAt = new Date(now + ttlMs).toISOString();
+            const pruneBeforeIso = new Date(now - 24 * 3600_000).toISOString();
 
-            await env.DB_CORE.prepare(
-                `INSERT INTO cloud_commands (cmd_id, target_device_id, action, payload_json, status, result_json, created_at, expires_at, finished_at)
-                 VALUES (?, ?, ?, ?, 'pending', '{}', ?, ?, '')`
-            )
-                .bind(cmdId, body.targetDeviceId ?? '', body.action, JSON.stringify(params), createdAt, expiresAt)
-                .run();
+            await env.DB_CORE.batch([
+                env.DB_CORE.prepare(
+                    `INSERT INTO cloud_commands (cmd_id, target_device_id, action, payload_json, status, result_json, created_at, expires_at, finished_at)
+                     VALUES (?, ?, ?, ?, 'pending', '{}', ?, ?, '')`
+                ).bind(cmdId, body.targetDeviceId ?? '', body.action, JSON.stringify(params), createdAt, expiresAt),
+                env.DB_CORE.prepare('DELETE FROM cloud_commands WHERE expires_at < ?').bind(pruneBeforeIso)
+            ]);
 
             const hub = env.AGENT_HUB.get(env.AGENT_HUB.idFromName('primary'));
             const dispatchRes = await hub.fetch(

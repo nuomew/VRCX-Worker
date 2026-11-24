@@ -1979,4 +1979,413 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
             fetchSpy.mockRestore();
         }
     });
+
+    it('converts binary PNG responses to data URLs without caching, allows regional S3/YouTube/public translation endpoints, handles malformed cookies, and rate-limits pairing', async () => {
+        // 1. Malformed percent-encoded cookie must not crash /api/auth/me with 500
+        const malformedCookieRes = await exports.default.fetch('http://example.com/api/auth/me', {
+            headers: { Cookie: 'bad=%E0%A4%A; other=ok' }
+        });
+        expect(malformedCookieRes.status).toBe(200);
+
+        // 2. Configure a public HTTPS custom translation endpoint in config_bundles (vrcx_config)
+        await env.DB_CORE.prepare(
+            "INSERT OR REPLACE INTO config_bundles (bundle_key, version, payload_json, updated_at) VALUES ('vrcx_config', 1, ?, ?)"
+        )
+            .bind(
+                JSON.stringify({ VRCX_translationApiEndpoint: 'https://translate.public.example/v1/chat/completions' }),
+                new Date().toISOString()
+            )
+            .run();
+
+        const pngBytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+        const forwardedCookies = new Map<string, string | null>();
+        const realFetch = globalThis.fetch.bind(globalThis);
+        const fetchSpy = vi
+            .spyOn(globalThis, 'fetch')
+            .mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+                const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+                const hdrs = new Headers(init?.headers);
+                if (url.startsWith('https://files.vrchat.cloud/')) {
+                    return new Response(pngBytes, {
+                        status: 200,
+                        headers: { 'Content-Type': 'image/png' }
+                    });
+                }
+                if (
+                    url.startsWith('https://vrc-uploads.s3.us-west-2.amazonaws.com/') ||
+                    url.startsWith('https://www.googleapis.com/') ||
+                    url.startsWith('https://translation.googleapis.com/') ||
+                    url.startsWith('https://translate.public.example/')
+                ) {
+                    forwardedCookies.set(url, hdrs.get('cookie'));
+                    return Response.json({ ok: true, host: new URL(url).hostname });
+                }
+                return realFetch(input, init);
+            });
+
+        try {
+            // Binary image returns data:image/png;base64,... and is NOT cached in DB_CACHE
+            const imgUrl = 'https://files.vrchat.cloud/file_png_test_001/1/file';
+            const imgRes = await exports.default.fetch('http://example.com/api/vrc/execute', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ url: imgUrl, method: 'GET' })
+            });
+            expect(imgRes.status).toBe(200);
+            const imgJson = (await imgRes.json()) as { ok: boolean; data: { status: number; data: string } };
+            expect(imgJson.data.status).toBe(200);
+            expect(imgJson.data.data).toBe('data:image/png;base64,iVBORw0KGgo=');
+            const cachedPng = await env.DB_CACHE?.prepare(
+                "SELECT cache_key FROM vrc_api_cache WHERE cache_key LIKE '%file_png_test_001%'"
+            ).first();
+            expect(cachedPng).toBeNull();
+
+            // Regional AWS S3, YouTube, Google Translate, and configured public translation endpoint succeed without VRChat cookies
+            for (const target of [
+                { url: 'https://vrc-uploads.s3.us-west-2.amazonaws.com/bucket/item.png', method: 'PUT', body: 'abc' },
+                { url: 'https://www.googleapis.com/youtube/v3/videos?id=dQw4w9WgXcQ', method: 'GET' },
+                { url: 'https://translation.googleapis.com/language/translate/v2', method: 'POST', body: '{}' },
+                { url: 'https://translate.public.example/v1/chat/completions', method: 'POST', body: '{}' }
+            ]) {
+                const res = await exports.default.fetch('http://example.com/api/vrc/execute', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(target)
+                });
+                expect(res.status).toBe(200);
+                expect(forwardedCookies.get(target.url)).toBeNull();
+            }
+
+            // Private/loopback translation endpoint in config is rejected (SSRF protection)
+            await env.DB_CORE.prepare(
+                "INSERT OR REPLACE INTO config_bundles (bundle_key, version, payload_json, updated_at) VALUES ('vrcx_config', 2, ?, ?)"
+            )
+                .bind(
+                    JSON.stringify({ VRCX_translationApiEndpoint: 'https://127.0.0.1/v1/chat/completions' }),
+                    new Date().toISOString()
+                )
+                .run();
+            const ssrfRes = await exports.default.fetch('http://example.com/api/vrc/execute', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ url: 'https://127.0.0.1/v1/chat/completions', method: 'POST', body: '{}' })
+            });
+            expect(ssrfRes.status).toBe(403);
+        } finally {
+            fetchSpy.mockRestore();
+        }
+
+        // 3. Atomic pairing code redemption + brute-force 429 rate limiting
+        const codeRes = await exports.default.fetch('http://example.com/api/agent/pair-code', { method: 'POST' });
+        expect(codeRes.status).toBe(200);
+        const codeJson = (await codeRes.json()) as { ok: boolean; data: { code: string } };
+        const pairCode = codeJson.data.code;
+
+        const firstPair = await exports.default.fetch('http://example.com/api/agent/pair', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': '198.51.100.20' },
+            body: JSON.stringify({ code: pairCode, deviceName: 'Atomic-PC' })
+        });
+        expect(firstPair.status).toBe(200);
+        const firstPairJson = (await firstPair.json()) as { ok: boolean; data: { deviceId: string } };
+
+        // Reusing the same code fails atomically
+        const replayPair = await exports.default.fetch('http://example.com/api/agent/pair', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': '198.51.100.21' },
+            body: JSON.stringify({ code: pairCode, deviceName: 'Replay-PC' })
+        });
+        expect(replayPair.status).toBe(401);
+
+        // 5 consecutive invalid pairing attempts lock out the client IP with 429 on the 6th attempt
+        for (let attempt = 0; attempt < 5; attempt++) {
+            const bad = await exports.default.fetch('http://example.com/api/agent/pair', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': '198.51.100.99' },
+                body: JSON.stringify({ code: '000000', deviceName: 'Brute-PC' })
+            });
+            expect(bad.status).toBe(401);
+        }
+        const locked = await exports.default.fetch('http://example.com/api/agent/pair', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': '198.51.100.99' },
+            body: JSON.stringify({ code: '000000', deviceName: 'Brute-PC' })
+        });
+        expect(locked.status).toBe(429);
+
+        // 4. DELETE /api/agent/devices cascades cloud_device_states & cloud_sync_cursors
+        const devId = firstPairJson.data.deviceId;
+        await env.DB_CORE.prepare(
+            'INSERT OR REPLACE INTO cloud_device_states (device_id, state_json, updated_at) VALUES (?, ?, ?)'
+        )
+            .bind(devId, JSON.stringify({ vrcRunning: true }), new Date().toISOString())
+            .run();
+        await env.DB_CORE.prepare(
+            'INSERT OR REPLACE INTO cloud_sync_cursors (device_id, stream_name, file_name, byte_offset, updated_at) VALUES (?, ?, ?, 128, ?)'
+        )
+            .bind(devId, 'gamelog', 'output_log.txt', new Date().toISOString())
+            .run();
+
+        const delDev = await exports.default.fetch(
+            `http://example.com/api/agent/devices?deviceId=${encodeURIComponent(devId)}`,
+            { method: 'DELETE' }
+        );
+        expect(delDev.status).toBe(200);
+        const stateLeft = await env.DB_CORE.prepare('SELECT device_id FROM cloud_device_states WHERE device_id = ?')
+            .bind(devId)
+            .first();
+        const cursorLeft = await env.DB_CORE.prepare('SELECT device_id FROM cloud_sync_cursors WHERE device_id = ?')
+            .bind(devId)
+            .first();
+        expect(stateLeft).toBeNull();
+        expect(cursorLeft).toBeNull();
+    });
+
+    it('supports indexed GameLog/Feed server-side filtering, safe bio JSON, batch stats, sessions events, and Activity V2 source', async () => {
+        // 1. Verify new location indexes exist and are used by SQLite planner
+        const locPlan = await env.DB_GAMELOG.prepare(
+            'EXPLAIN QUERY PLAN SELECT location, world_name FROM gamelog_location WHERE location IN (?) ORDER BY id DESC'
+        )
+            .bind('wrld_audit_1:100~group(grp_audit_1)')
+            .all<{ detail: string }>();
+        expect((locPlan.results ?? []).map((r) => r.detail).join(' | ')).toContain('idx_gamelog_loc_location');
+
+        const vidPlan = await env.DB_GAMELOG.prepare(
+            'EXPLAIN QUERY PLAN SELECT created_at, video_url FROM gamelog_video_play WHERE location IN (?) AND created_at >= ?'
+        )
+            .bind('wrld_audit_1:100~group(grp_audit_1)', '2026-11-01T00:00:00.000Z')
+            .all<{ detail: string }>();
+        expect((vidPlan.results ?? []).map((r) => r.detail).join(' | ')).toContain('idx_gamelog_video_location');
+
+        // 2. Duplicate GameLog Location insert must NOT over-increment stats_counters
+        const auditLoc = 'wrld_audit_1:100~group(grp_audit_1)';
+        const ts1 = '2026-11-22T10:00:00.000Z';
+        const ts2 = '2026-11-22T10:30:00.000Z';
+        const ts3 = '2026-11-22T11:00:00.000Z';
+        const beforeCounter = await env.DB_CORE.prepare(
+            "SELECT row_count FROM stats_counters WHERE counter_key = 'gamelog_location'"
+        ).first<{ row_count: number }>();
+
+        const dupSeed = await exports.default.fetch('http://example.com/api/gamelog', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                items: [
+                    {
+                        type: 'Location',
+                        created_at: ts1,
+                        location: auditLoc,
+                        worldId: 'wrld_audit_1',
+                        worldName: 'Audit Plaza',
+                        groupName: 'Audit Group',
+                        time: 0
+                    },
+                    {
+                        type: 'Location',
+                        created_at: ts1,
+                        location: auditLoc,
+                        worldId: 'wrld_audit_1',
+                        worldName: 'Audit Plaza',
+                        groupName: 'Audit Group',
+                        time: 0
+                    },
+                    {
+                        type: 'OnPlayerJoined',
+                        created_at: '2026-11-22T10:05:00.000Z',
+                        displayName: 'VipBuddy',
+                        userId: 'usr_vip_audit',
+                        location: auditLoc,
+                        time: 0
+                    },
+                    {
+                        type: 'OnPlayerLeft',
+                        created_at: '2026-11-22T10:25:00.000Z',
+                        displayName: 'VipBuddy',
+                        userId: 'usr_vip_audit',
+                        location: auditLoc,
+                        time: 1200_000
+                    },
+                    {
+                        type: 'VideoPlay',
+                        created_at: '2026-11-22T10:10:00.000Z',
+                        location: auditLoc,
+                        videoUrl: 'https://youtu.be/audit123',
+                        videoName: 'Audit Song',
+                        videoId: 'audit123',
+                        displayName: 'VipBuddy',
+                        userId: 'usr_vip_audit'
+                    },
+                    {
+                        type: 'Event',
+                        created_at: ts2,
+                        data: 'VRChat closed gracefully'
+                    },
+                    {
+                        type: 'Location',
+                        created_at: ts3,
+                        location: 'wrld_audit_2:200',
+                        worldId: 'wrld_audit_2',
+                        worldName: 'Second Audit Room',
+                        time: 900_000
+                    }
+                ]
+            })
+        });
+        expect(dupSeed.status).toBe(200);
+        const afterCounter = await env.DB_CORE.prepare(
+            "SELECT row_count FROM stats_counters WHERE counter_key = 'gamelog_location'"
+        ).first<{ row_count: number }>();
+        // 2 distinct Location rows inserted (duplicate ts1 ignored -> delta must be 2, not 3)
+        expect((afterCounter?.row_count ?? 0) - (beforeCounter?.row_count ?? 0)).toBe(2);
+
+        // 3. POST /api/gamelog/query pushes down type + vipList
+        const glQueryRes = await exports.default.fetch('http://example.com/api/gamelog/query', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ types: ['VideoPlay'], vipList: ['usr_vip_audit'], limit: 20 })
+        });
+        expect(glQueryRes.status).toBe(200);
+        const glQueryJson = (await glQueryRes.json()) as {
+            ok: boolean;
+            data: Array<{ type: string; videoId?: string }>;
+        };
+        expect(glQueryJson.data.length).toBeGreaterThanOrEqual(1);
+        expect(glQueryJson.data.every((r) => r.type === 'VideoPlay')).toBe(true);
+        expect(glQueryJson.data.some((r) => r.videoId === 'audit123')).toBe(true);
+
+        // 4. Batch user stats, group stats, world stats, join_history, and sessions events
+        const batchUserStatsRes = await exports.default.fetch('http://example.com/api/gamelog/stats/users', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ userIds: ['usr_vip_audit'] })
+        });
+        expect(batchUserStatsRes.status).toBe(200);
+        const batchUserStatsJson = (await batchUserStatsRes.json()) as {
+            ok: boolean;
+            data: Array<{ userId: string; joinCount: number; timeSpent: number; displayName: string }>;
+        };
+        expect(batchUserStatsJson.data[0]).toMatchObject({
+            userId: 'usr_vip_audit',
+            joinCount: 1,
+            timeSpent: 1200_000,
+            displayName: 'VipBuddy'
+        });
+
+        const groupStatsRes = await exports.default.fetch(
+            'http://example.com/api/gamelog/stats?kind=group&groupId=grp_audit_1'
+        );
+        expect(groupStatsRes.status).toBe(200);
+        const groupStatsJson = (await groupStatsRes.json()) as {
+            ok: boolean;
+            data: { lastVisit: string; joinCount: number; groupId: string; instances: Array<{ location: string }> };
+        };
+        expect(groupStatsJson.data.groupId).toBe('grp_audit_1');
+        expect(groupStatsJson.data.joinCount).toBe(1);
+        expect(groupStatsJson.data.lastVisit).toBe(ts1);
+        expect(groupStatsJson.data.instances[0]?.location).toBe(auditLoc);
+
+        const sessEventsRes = await exports.default.fetch('http://example.com/api/gamelog/sessions/events', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                locations: [auditLoc],
+                afterDate: '2026-11-22T09:50:00.000Z',
+                beforeDate: '2026-11-22T11:30:00.000Z',
+                selfUserId: 'usr_self_other'
+            })
+        });
+        expect(sessEventsRes.status).toBe(200);
+        const sessEventsJson = (await sessEventsRes.json()) as {
+            ok: boolean;
+            data: Array<{ type: string; location: string; videoId?: string }>;
+        };
+        expect(sessEventsJson.data.some((e) => e.type === 'OnPlayerJoined' && e.location === auditLoc)).toBe(true);
+        expect(sessEventsJson.data.some((e) => e.type === 'VideoPlay' && e.videoId === 'audit123')).toBe(true);
+
+        const anchorSegsRes = await exports.default.fetch(
+            `http://example.com/api/gamelog/stats?kind=sessions_segments&sinceDate=${encodeURIComponent(ts3)}&limit=10`
+        );
+        const anchorSegsJson = (await anchorSegsRes.json()) as {
+            ok: boolean;
+            data: Array<{ location: string; worldId: string; worldName: string }>;
+        };
+        expect(
+            anchorSegsJson.data.some((s) => s.worldId === 'wrld_audit_2' && s.worldName === 'Second Audit Room')
+        ).toBe(true);
+
+        // 5. Feed malformed bio JSON resilience + POST /api/feed/query + /api/feed/search (bio & world FTS)
+        await env.DB_CORE.prepare(
+            'INSERT OR REPLACE INTO entity_users (user_id, display_name, updated_at) VALUES (?, ?, ?)'
+        )
+            .bind('usr_bio_corrupt', 'CorruptBioUser', ts1)
+            .run();
+        await env.DB_FEED.prepare(
+            'INSERT INTO feed_bio (created_at, user_id, display_name, bio, previous_bio, bio_links, previous_bio_links) VALUES (?, ?, ?, ?, ?, ?, ?)'
+        )
+            .bind(ts1, 'usr_bio_corrupt', 'CorruptBioUser', 'Hello bio', 'Old bio', '{broken_json', 'also_broken')
+            .run();
+
+        const feedBioQueryRes = await exports.default.fetch('http://example.com/api/feed/query', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ types: ['Bio'], vipList: ['usr_bio_corrupt'], limit: 10 })
+        });
+        expect(feedBioQueryRes.status).toBe(200);
+        const feedBioQueryJson = (await feedBioQueryRes.json()) as {
+            ok: boolean;
+            data: Array<{ type: string; userId: string; bio: string; bioLinks: string[] }>;
+        };
+        expect(feedBioQueryJson.data).toHaveLength(1);
+        expect(feedBioQueryJson.data[0]).toMatchObject({
+            type: 'Bio',
+            userId: 'usr_bio_corrupt',
+            bio: 'Hello bio',
+            bioLinks: []
+        });
+
+        const feedSearchRes = await exports.default.fetch('http://example.com/api/feed/search?q=CorruptBio&limit=10');
+        expect(feedSearchRes.status).toBe(200);
+        const feedSearchJson = (await feedSearchRes.json()) as {
+            ok: boolean;
+            data: Array<{ type: string; userId: string; bio?: string }>;
+        };
+        expect(feedSearchJson.data.some((r) => r.type === 'Bio' && r.userId === 'usr_bio_corrupt')).toBe(true);
+
+        // 6. Activity V2 source (friend_slice & self_slice reconstructing zero-duration VRCX.Agent location via quit event)
+        await env.DB_FEED.batch([
+            env.DB_FEED.prepare(
+                'INSERT INTO feed_online_offline (created_at, user_id, display_name, type, location, world_name, time, group_name) VALUES (?, ?, ?, ?, ?, ?, 0, ?)'
+            ).bind('2026-11-22T08:00:00.000Z', 'usr_act_friend', 'ActFriend', 'Online', '', '', ''),
+            env.DB_FEED.prepare(
+                'INSERT INTO feed_online_offline (created_at, user_id, display_name, type, location, world_name, time, group_name) VALUES (?, ?, ?, ?, ?, ?, 0, ?)'
+            ).bind('2026-11-22T09:30:00.000Z', 'usr_act_friend', 'ActFriend', 'Offline', '', '', '')
+        ]);
+        const friendSliceRes = await exports.default.fetch(
+            'http://example.com/api/activity/source?kind=friend_slice&userId=usr_act_friend&fromDateIso=2026-11-22T07:00:00.000Z&toDateIso=2026-11-22T12:00:00.000Z'
+        );
+        expect(friendSliceRes.status).toBe(200);
+        const friendSliceJson = (await friendSliceRes.json()) as {
+            ok: boolean;
+            data: Array<{ created_at: string; type: string }>;
+        };
+        expect(friendSliceJson.data).toEqual([
+            { created_at: '2026-11-22T08:00:00.000Z', type: 'Online' },
+            { created_at: '2026-11-22T09:30:00.000Z', type: 'Offline' }
+        ]);
+
+        const selfSliceRes = await exports.default.fetch(
+            'http://example.com/api/activity/source?kind=self_slice&fromDateIso=2026-11-22T09:00:00.000Z&toDateIso=2026-11-22T12:00:00.000Z'
+        );
+        expect(selfSliceRes.status).toBe(200);
+        const selfSliceJson = (await selfSliceRes.json()) as {
+            ok: boolean;
+            data: Array<{ created_at: string; time: number }>;
+        };
+        const firstAuditSelf = selfSliceJson.data.find((r) => r.created_at === ts1);
+        const secondAuditSelf = selfSliceJson.data.find((r) => r.created_at === ts3);
+        // ts1 had time=0 and VRChat closed at ts2 (+30m) -> reconstructed duration = 1800000ms
+        expect(firstAuditSelf?.time).toBe(30 * 60_000);
+        // ts3 already had explicit time=900000ms -> preserved as-is
+        expect(secondAuditSelf?.time).toBe(900_000);
+    });
 });

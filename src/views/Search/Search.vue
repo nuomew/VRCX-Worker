@@ -9,7 +9,7 @@
                 <TabsList>
                     <TabsTrigger value="user">{{ t('view.search.user.header') }}</TabsTrigger>
                     <TabsTrigger value="world">{{ t('view.search.world.header') }}</TabsTrigger>
-                    <TabsTrigger value="avatar">{{ t('view.search.avatar.header') }}</TabsTrigger>
+                    <TabsTrigger v-if="!isWebMode" value="avatar">{{ t('view.search.avatar.header') }}</TabsTrigger>
                     <TabsTrigger value="group">{{ t('view.search.group.header') }}</TabsTrigger>
                     <TabsTrigger value="marketplace">{{ t('view.search.marketplace.header') }}</TabsTrigger>
                 </TabsList>
@@ -173,7 +173,7 @@
                     @prev="paginationConfig.onPrev"
                     @next="paginationConfig.onNext" />
             </TabsContent>
-            <TabsContent value="avatar" class="flex flex-col min-h-0 flex-1">
+            <TabsContent v-if="!isWebMode" value="avatar" class="flex flex-col min-h-0 flex-1">
                 <div class="flex flex-col min-h-0" style="flex: 9">
                     <div class="shrink-0 mb-3 flex items-center justify-end gap-2">
                         <Select
@@ -404,6 +404,7 @@
     const { t } = useI18n();
     const { userImage } = useUserDisplay();
 
+    const isWebMode = typeof WEB !== 'undefined' && WEB;
     const activeSearchTab = ref('user');
 
     // Keyboard shortcuts: Alt+Left (prev page) / Alt+Right (next page)

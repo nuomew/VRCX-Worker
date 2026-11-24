@@ -55,12 +55,28 @@ public sealed class VrcLogParser
     private string _currentWorldName = string.Empty;
     private DateTimeOffset _lastJoiningAt = DateTimeOffset.MinValue;
     private bool _lastJoiningHadWorldName;
+    private GameLogEventItem? _pendingJoiningEvent;
     private readonly Dictionary<string, (string UserId, string JoinedAt)> _currentPlayers = new(StringComparer.OrdinalIgnoreCase);
 
     public string CurrentLocation => _currentLocation;
     public string CurrentWorldId => _currentWorldId;
     public string CurrentWorldName => _currentWorldName;
     public int CurrentPlayerCount => _currentPlayers.Count;
+
+    /// <summary>
+    /// Flushes a buffered Joining Location event that never received a follow-up Entering Room line.
+    /// </summary>
+    public GameLogEventItem? FlushPendingLocation()
+    {
+        if (_pendingJoiningEvent == null)
+        {
+            return null;
+        }
+        GameLogEventItem pending = _pendingJoiningEvent;
+        _pendingJoiningEvent = null;
+        _lastJoiningHadWorldName = true;
+        return pending;
+    }
 
     public IReadOnlyList<Dictionary<string, string>> SnapshotCurrentPlayers()
     {
@@ -152,6 +168,7 @@ public sealed class VrcLogParser
             {
                 _lastJoiningHadWorldName = true;
                 _pendingWorldName = string.Empty;
+                _pendingJoiningEvent = null;
                 if (IsFloodDuplicate($"Location:{_currentLocation}:{worldName}", eventTime, TimeSpan.FromSeconds(5)))
                 {
                     return null;
@@ -192,6 +209,7 @@ public sealed class VrcLogParser
                 _pendingWorldName = string.Empty;
                 _currentWorldName = worldName;
                 _lastJoiningHadWorldName = true;
+                _pendingJoiningEvent = null;
 
                 if (IsFloodDuplicate($"Location:{loc}:{worldName}", eventTime, TimeSpan.FromSeconds(5)))
                 {
@@ -208,8 +226,17 @@ public sealed class VrcLogParser
                 };
             }
 
-            // World name has not arrived yet (reverse-order log or world without Entering Room line)
+            // World name has not arrived yet (reverse-order log or world without Entering Room line);
+            // keep a pending fallback event so LogTailCollector flushes it if no Entering Room line follows.
             _lastJoiningHadWorldName = false;
+            _pendingJoiningEvent = new GameLogEventItem
+            {
+                Type = "Location",
+                CreatedAt = isoTs,
+                Location = loc,
+                WorldId = worldId,
+                WorldName = string.Empty
+            };
             return null;
         }
 

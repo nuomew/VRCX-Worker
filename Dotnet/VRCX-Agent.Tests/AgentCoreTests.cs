@@ -1239,6 +1239,62 @@ public sealed class AgentCoreTests
         }
     }
 
+    [Fact]
+    public void VrcLogParser_PreservesLocationWhenEnteringRoomLineIsMissing()
+    {
+        var parser = new VrcLogParser();
+
+        // Joining without a preceding Entering Room buffers a pending Location event
+        Assert.Null(parser.ParseLine("2026.11.24 16:00:00 Log        -  [Behaviour] Joining wrld_33333333-3333-3333-3333-333333333333:3003~region(jp)"));
+        GameLogEventItem? flushed = parser.FlushPendingLocation();
+        Assert.NotNull(flushed);
+        Assert.Equal("Location", flushed!.Type);
+        Assert.Equal("wrld_33333333-3333-3333-3333-333333333333:3003~region(jp)", flushed.Location);
+        Assert.Equal("wrld_33333333-3333-3333-3333-333333333333", flushed.WorldId);
+        // Subsequent flush returns null (no duplicate)
+        Assert.Null(parser.FlushPendingLocation());
+
+        // Verify LogTailCollector flushes pending Location before OnPlayerJoined when Entering Room is absent
+        string tempRoot = Path.Combine(Path.GetTempPath(), "vrcx-no-entering-test-" + Guid.NewGuid().ToString("N"));
+        string logDir = Path.Combine(tempRoot, "logs");
+        string stateDir = Path.Combine(tempRoot, "state");
+        Directory.CreateDirectory(logDir);
+        Directory.CreateDirectory(stateDir);
+        try
+        {
+            string logFile = Path.Combine(logDir, "output_log_2026-11-24_16-00-00.txt");
+            File.WriteAllLines(logFile, new[]
+            {
+                "2026.11.24 16:00:00 Log        -  [Behaviour] Joining wrld_44444444-4444-4444-4444-444444444444:4004~region(jp)",
+                "2026.11.24 16:00:05 Log        -  [Behaviour] OnPlayerJoined SoloBuddy (usr_44444444-4444-4444-4444-444444444444)"
+            });
+
+            var collector = new LogTailCollector(stateDir);
+            int parsed = collector.PollLogDirectory(logDir);
+            Assert.Equal(2, parsed);
+            List<GameLogEventItem> batch = collector.PeekBatch(10);
+            Assert.Equal("Location", batch[0].Type);
+            Assert.Equal("wrld_44444444-4444-4444-4444-444444444444:4004~region(jp)", batch[0].Location);
+            Assert.Equal("OnPlayerJoined", batch[1].Type);
+            Assert.Equal("SoloBuddy", batch[1].DisplayName);
+        }
+        finally
+        {
+            if (Directory.Exists(tempRoot)) Directory.Delete(tempRoot, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void CommandValidator_AllowsRegionalAwsS3AndGoogleTranslateAndYouTubeHosts()
+    {
+        Assert.True(CommandValidator.IsAllowedVrcUrl("https://s3.us-west-2.amazonaws.com/bucket/file.png"));
+        Assert.True(CommandValidator.IsAllowedVrcUrl("https://vrc-bucket.s3-ap-northeast-1.amazonaws.com/file.png"));
+        Assert.True(CommandValidator.IsAllowedVrcUrl("https://www.googleapis.com/youtube/v3/videos?id=abc"));
+        Assert.True(CommandValidator.IsAllowedVrcUrl("https://translation.googleapis.com/language/translate/v2"));
+        Assert.False(CommandValidator.IsAllowedVrcUrl("https://evil-s3.amazonaws.com.attacker.test/file.png"));
+        Assert.False(CommandValidator.IsAllowedVrcUrl("http://s3.us-west-2.amazonaws.com/bucket/file.png"));
+    }
+
     private sealed class StubHttpHandler : HttpMessageHandler
     {
         private readonly Func<HttpRequestMessage, Task<HttpResponseMessage>> _responder;

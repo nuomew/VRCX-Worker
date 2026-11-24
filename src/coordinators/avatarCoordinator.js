@@ -272,16 +272,30 @@ export async function getAvatarName(imageUrl) {
  * @param type
  * @param search
  */
+function isWebBlockedAvatarProvider(providerUrl) {
+    if (typeof WEB === 'undefined' || !WEB || !providerUrl) {
+        return false;
+    }
+    try {
+        const host = new URL(providerUrl).hostname.toLowerCase();
+        return host === 'api.avtrdb.com' || host.endsWith('.avtrdb.com');
+    } catch {
+        return false;
+    }
+}
+
 export async function lookupAvatars(type, search) {
     const avatarProviderStore = useAvatarProviderStore();
     const vrcxUpdaterStore = useVRCXUpdaterStore();
 
     const avatars = new Map();
     if (type === 'search') {
+        const provider = avatarProviderStore.avatarRemoteDatabaseProvider;
+        if (!provider || isWebBlockedAvatarProvider(provider)) {
+            return avatars;
+        }
         try {
-            const url = `${
-                avatarProviderStore.avatarRemoteDatabaseProvider
-            }?${type}=${encodeURIComponent(search)}&n=5000`;
+            const url = `${provider}?${type}=${encodeURIComponent(search)}&n=5000`;
             const response = await webApiService.execute({
                 url,
                 method: 'GET',
@@ -290,9 +304,12 @@ export async function lookupAvatars(type, search) {
                     'VRCX-ID': vrcxUpdaterStore.vrcxId
                 }
             });
+            if (response.status !== 200) {
+                throw new Error(`HTTP ${response.status}`);
+            }
             const json = JSON.parse(response.data);
             logWebRequest('[EXTERNAL GET]', url, `(${response.status})`, json);
-            if (response.status === 200 && typeof json === 'object') {
+            if (Array.isArray(json)) {
                 json.forEach((avatar) => {
                     if (!avatars.has(avatar.Id)) {
                         const ref = {
@@ -311,11 +328,9 @@ export async function lookupAvatars(type, search) {
                         avatars.set(ref.id, ref);
                     }
                 });
-            } else {
-                throw new Error(`Error: ${response.data}`);
             }
         } catch (err) {
-            const msg = `Avatar search failed for ${search} with ${avatarProviderStore.avatarRemoteDatabaseProvider}\n${err}`;
+            const msg = `Avatar search failed for ${search} with ${provider}\n${err}`;
             console.error(msg);
             toast.error(msg);
         }
@@ -323,6 +338,9 @@ export async function lookupAvatars(type, search) {
         const length = avatarProviderStore.avatarRemoteDatabaseProviderList.length;
         for (let i = 0; i < length; ++i) {
             const url = avatarProviderStore.avatarRemoteDatabaseProviderList[i];
+            if (isWebBlockedAvatarProvider(url)) {
+                continue;
+            }
             const avatarArray = await lookupAvatarsByAuthor(url, search);
             avatarArray.forEach((avatar) => {
                 if (!avatars.has(avatar.id)) {
@@ -342,6 +360,9 @@ export async function lookupAvatarByImageFileId(authorId, fileId) {
     const avatarProviderStore = useAvatarProviderStore();
 
     for (const providerUrl of avatarProviderStore.avatarRemoteDatabaseProviderList) {
+        if (isWebBlockedAvatarProvider(providerUrl)) {
+            continue;
+        }
         const avatar = await lookupAvatarByFileId(providerUrl, fileId);
         if (avatar?.id) {
             return avatar.id;
@@ -349,6 +370,9 @@ export async function lookupAvatarByImageFileId(authorId, fileId) {
     }
 
     for (const providerUrl of avatarProviderStore.avatarRemoteDatabaseProviderList) {
+        if (isWebBlockedAvatarProvider(providerUrl)) {
+            continue;
+        }
         const avatarArray = await lookupAvatarsByAuthor(providerUrl, authorId);
         for (const avatar of avatarArray) {
             if (extractFileId(avatar.imageUrl) === fileId) {
@@ -365,6 +389,9 @@ export async function lookupAvatarByImageFileId(authorId, fileId) {
  */
 async function lookupAvatarByFileId(providerUrl, fileId) {
     const vrcxUpdaterStore = useVRCXUpdaterStore();
+    if (!providerUrl || isWebBlockedAvatarProvider(providerUrl)) {
+        return null;
+    }
 
     try {
         const url = `${providerUrl}?fileId=${encodeURIComponent(fileId)}`;
@@ -376,9 +403,12 @@ async function lookupAvatarByFileId(providerUrl, fileId) {
                 'VRCX-ID': vrcxUpdaterStore.vrcxId
             }
         });
+        if (response.status !== 200) {
+            return null;
+        }
         const json = JSON.parse(response.data);
         logWebRequest('[EXTERNAL GET]', url, `(${response.status})`, json);
-        if (response.status === 200 && typeof json === 'object') {
+        if (json && typeof json === 'object') {
             const ref = {
                 authorId: '',
                 authorName: '',
@@ -393,9 +423,8 @@ async function lookupAvatarByFileId(providerUrl, fileId) {
                 ...json
             };
             return ref;
-        } else {
-            return null;
         }
+        return null;
     } catch {
         // ignore errors for now, not all providers support this lookup type
         return null;
@@ -410,7 +439,7 @@ async function lookupAvatarsByAuthor(providerUrl, authorId) {
     const vrcxUpdaterStore = useVRCXUpdaterStore();
 
     const avatars = [];
-    if (!providerUrl || !authorId) {
+    if (!providerUrl || !authorId || isWebBlockedAvatarProvider(providerUrl)) {
         return avatars;
     }
     const url = `${providerUrl}?authorId=${encodeURIComponent(authorId)}`;
@@ -423,9 +452,12 @@ async function lookupAvatarsByAuthor(providerUrl, authorId) {
                 'VRCX-ID': vrcxUpdaterStore.vrcxId
             }
         });
+        if (response.status !== 200) {
+            throw new Error(`HTTP ${response.status}`);
+        }
         const json = JSON.parse(response.data);
         logWebRequest('[EXTERNAL GET]', url, `(${response.status})`, json);
-        if (response.status === 200 && typeof json === 'object') {
+        if (Array.isArray(json)) {
             json.forEach((avatar) => {
                 const ref = {
                     authorId: '',
@@ -442,8 +474,6 @@ async function lookupAvatarsByAuthor(providerUrl, authorId) {
                 };
                 avatars.push(ref);
             });
-        } else {
-            throw new Error(`Error: ${response.data}`);
         }
     } catch (err) {
         const msg = `Avatar lookup failed for ${authorId} with ${url}\n${err}`;

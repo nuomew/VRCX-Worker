@@ -107,6 +107,9 @@ export default {
             }
 
             // 2. Auth endpoints (/api/auth/me, /api/auth/login, /api/auth/logout)
+            if (url.pathname === '/api/auth/login' && request.method === 'POST') {
+                await ensureSchemaReady(env);
+            }
             const authResp = await handleAuthRoutes(request, env, url);
             if (authResp) {
                 return authResp;

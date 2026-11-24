@@ -13,7 +13,7 @@ import {
     getAggregatedGameState,
     getOnlineAgentIds
 } from '../cloudState.js';
-import { createAppApiBridge } from '../appApiWeb.js';
+import { createAppApiBridge, createDiscordBridge } from '../appApiWeb.js';
 import { createWebApiBridge } from '../webApiRemote.js';
 import { createCloudDatabase } from '../../services/database/cloud/index.js';
 import { formatTotalUptime } from '../../components/statusBarUtils.js';
@@ -177,7 +177,12 @@ describe('WEB cloud adapter (stateless)', () => {
         );
         const logs = await db.lookupGameLogDatabase(['Location'], [], 50);
         expect(logs).toHaveLength(1);
-        expect(fetchSpy.mock.calls[1][0]).toContain('/api/gamelog?');
+        expect(fetchSpy.mock.calls[1][0]).toBe('/api/gamelog/query');
+        expect(JSON.parse(fetchSpy.mock.calls[1][1].body)).toEqual({
+            types: ['Location'],
+            vipList: [],
+            limit: 50
+        });
 
         fetchSpy.mockResolvedValueOnce(
             mockOk({
@@ -310,9 +315,9 @@ describe('WEB cloud adapter (stateless)', () => {
             db.getVisitCount('wrld_dedupe'),
             db.getTimeSpentInWorld('wrld_dedupe')
         ]);
-        expect(lastVisit).toBe('2026-11-24T00:00:00Z');
-        expect(visitCount).toBe(7);
-        expect(timeSpent).toBe(3600);
+        expect(lastVisit).toEqual({ created_at: '2026-11-24T00:00:00Z', worldId: 'wrld_dedupe' });
+        expect(visitCount).toEqual({ visitCount: 7, worldId: 'wrld_dedupe' });
+        expect(timeSpent).toEqual({ timeSpent: 3600, worldId: 'wrld_dedupe' });
         expect(fetchSpy).toHaveBeenCalledTimes(1);
 
         // Multiple setUserProfile / setFriendLogCurrent / addNotificationToDatabase calls coalesce into 1 request each
@@ -799,5 +804,199 @@ describe('WEB cloud adapter (stateless)', () => {
             responses: [{ type: 'reply', text: 'Reply' }],
             details: {}
         });
+    });
+
+    it('computes librsync BLAKE2b signatures byte-for-byte identical to Dotnet librsync.net.dll and guards Discord commands when no agents are online', async () => {
+        const appApi = createAppApiBridge();
+        const toHex = (b64) => Buffer.from(b64, 'base64').toString('hex');
+
+        // Reference vectors captured directly from Dotnet/libs/librsync.net.dll (RS_BLAKE2_SIG_MAGIC = 0x72730137, blockLen=2048, strongLen=32)
+        expect(toHex(await appApi.SignFile(''))).toBe('727301370000080000000020');
+        expect(toHex(await appApi.SignFile(Buffer.from('hello').toString('base64')))).toBe(
+            '72730137000008000000002007f802af324dcf027dd4a30a932c441f365a25e86b173defa4b8e58948253471b81b72cf'
+        );
+        const len3000 = Uint8Array.from({ length: 3000 }, (_, i) => i % 251);
+        expect(toHex(await appApi.SignFile(Buffer.from(len3000).toString('base64')))).toBe(
+            '7273013700000800000000202d90cf84159bf6cd482f6efed5b4db91c4bdb9e499fac1605493f8f4fc53562e32f78fd432f64f0202c810dc13d296effa866465c80c7f4344ef9fb9f986950bef8d4bf6312bae5b'
+        );
+
+        // Discord bridge skips sending /api/commands after debounce when no online agents exist
+        const discord = createDiscordBridge();
+        cloudState.authenticated = true;
+        cloudState.agentsOnline = [];
+        await discord.SetText('In VRChat', 'Sakura Shrine');
+        await vi.advanceTimersByTimeAsync(3_000);
+        expect(fetchSpy).not.toHaveBeenCalled();
+
+        // Sends discord_update after debounce when an agent is online
+        cloudState.agentsOnline = ['dev_online_1'];
+        fetchSpy.mockResolvedValueOnce(mockOk({ id: 'cmd_disc_1' }));
+        await discord.SetText('In VRChat', 'Moonlight Cafe');
+        await vi.advanceTimersByTimeAsync(3_000);
+        expect(fetchSpy).toHaveBeenCalledTimes(1);
+        expect(fetchSpy.mock.calls[0][0]).toBe('/api/commands');
+    });
+
+    it('matches desktop contracts for group/user/world instances, getAllUserStats, getInstanceJoinHistory, Sessions, Activity V2, and drains >50 queued feed writes', async () => {
+        const db = createCloudDatabase({ userId: 'usr_me', userPrefix: 'usr_me', maxTableSize: 500 });
+
+        // 1. getAllUserStats returns an Array matching desktop gameLog.js
+        fetchSpy.mockResolvedValueOnce(
+            mockOk([
+                {
+                    userId: 'usr_f1',
+                    displayName: 'Alice',
+                    joinCount: 4,
+                    timeSpent: 3600_000,
+                    lastSeen: '2026-11-24T10:00:00.000Z'
+                }
+            ])
+        );
+        const allStats = await db.getAllUserStats(['usr_f1'], ['Alice']);
+        expect(Array.isArray(allStats)).toBe(true);
+        expect(allStats[0]).toMatchObject({ userId: 'usr_f1', joinCount: 4, timeSpent: 3600_000 });
+
+        // 2. Group stats return desktop shapes ({ created_at }, { joinCount, groupId }, Map) via 1 cached request
+        fetchSpy.mockResolvedValueOnce(
+            mockOk({
+                lastVisit: '2026-11-24T09:00:00.000Z',
+                joinCount: 2,
+                groupId: 'grp_test_1',
+                instances: [
+                    {
+                        created_at: '2026-11-24T09:00:00.000Z',
+                        location: 'wrld_g:1~group(grp_test_1)',
+                        time: 1200_000,
+                        worldName: 'Group Hall',
+                        groupName: 'Sakura Club'
+                    }
+                ]
+            })
+        );
+        const [lastGrp, grpCount, grpInstances] = await Promise.all([
+            db.getLastGroupVisit('grp_test_1'),
+            db.getGroupJoinCount('grp_test_1'),
+            db.getPreviousInstancesByGroupId('grp_test_1')
+        ]);
+        expect(lastGrp).toEqual({ created_at: '2026-11-24T09:00:00.000Z' });
+        expect(grpCount).toEqual({ joinCount: 2, groupId: 'grp_test_1' });
+        expect(grpInstances instanceof Map).toBe(true);
+        expect(grpInstances.get('wrld_g:1~group(grp_test_1)')?.worldName).toBe('Group Hall');
+
+        // 3. getInstanceJoinHistory returns Map<location, epochMs>
+        fetchSpy.mockResolvedValueOnce(mockOk([['wrld_1:100', 1764000000000]]));
+        const joinHist = await db.getInstanceJoinHistory();
+        expect(joinHist instanceof Map).toBe(true);
+        expect(joinHist.get('wrld_1:100')).toBe(1764000000000);
+
+        // 4. getPlayersFromInstance (Map) & getPlayerDetailFromInstance (Array) reconstruct zero-duration VRCX.Agent leaves
+        const roomRows = [
+            {
+                rowId: 1,
+                type: 'OnPlayerJoined',
+                created_at: '2026-11-24T10:00:00.000Z',
+                displayName: 'Bob',
+                userId: 'usr_bob',
+                time: 0
+            },
+            {
+                rowId: 2,
+                type: 'OnPlayerLeft',
+                created_at: '2026-11-24T10:15:00.000Z',
+                displayName: 'Bob',
+                userId: 'usr_bob',
+                time: 0
+            }
+        ];
+        fetchSpy.mockResolvedValueOnce(mockOk(roomRows));
+        const playersMap = await db.getPlayersFromInstance('wrld_1:100');
+        expect(playersMap instanceof Map).toBe(true);
+        expect(playersMap.get('Bob')).toMatchObject({
+            displayName: 'Bob',
+            userId: 'usr_bob',
+            count: 1,
+            time: 15 * 60_000
+        });
+
+        fetchSpy.mockResolvedValueOnce(mockOk(roomRows));
+        const playerDetails = await db.getPlayerDetailFromInstance('wrld_1:100');
+        expect(playerDetails).toEqual([
+            {
+                created_at: '2026-11-24T10:15:00.000Z',
+                display_name: 'Bob',
+                user_id: 'usr_bob',
+                time: 15 * 60_000
+            }
+        ]);
+
+        // 5. Sessions anchor + events + Activity V2 contract (ACTIVITY_VIEW_KIND, source slice, sessions start/end, bucket cache)
+        expect(db.ACTIVITY_VIEW_KIND).toEqual({ ACTIVITY: 'activity', OVERLAP: 'overlap' });
+        fetchSpy.mockResolvedValueOnce(
+            mockOk([{ id: 5, created_at: '2026-11-24T10:00:00.000Z', location: 'wrld_1:100', worldId: 'wrld_1' }])
+        );
+        const anchorSegs = await db.getSessionsLocationSegmentsByAnchor('2026-11-24T00:00:00.000Z', 20);
+        expect(anchorSegs).toHaveLength(1);
+        expect(fetchSpy.mock.calls.at(-1)[0]).toContain('sinceDate=');
+
+        fetchSpy.mockResolvedValueOnce(
+            mockOk([{ type: 'VideoPlay', created_at: '2026-11-24T10:05:00.000Z', location: 'wrld_1:100' }])
+        );
+        const sessEvents = await db.getSessionsEventsForSegments(
+            ['wrld_1:100'],
+            '2026-11-24T09:00:00.000Z',
+            '2026-11-24T12:00:00.000Z'
+        );
+        expect(sessEvents).toHaveLength(1);
+        expect(fetchSpy.mock.calls.at(-1)[0]).toBe('/api/gamelog/sessions/events');
+
+        fetchSpy.mockResolvedValueOnce(mockOk([{ created_at: '2026-11-24T08:00:00.000Z', type: 'Online' }]));
+        const actSlice = await db.getActivitySourceSliceV2({ userId: 'usr_f1', isSelf: false, fromDays: 7 });
+        expect(actSlice).toEqual([{ created_at: '2026-11-24T08:00:00.000Z', type: 'Online' }]);
+        expect(fetchSpy.mock.calls.at(-1)[0]).toContain('/api/activity/source?kind=friend_slice');
+
+        fetchSpy.mockResolvedValueOnce(
+            mockOk([{ start_at: 1000, end_at: 5000, is_open_tail: 0, source_revision: 'rev1' }])
+        );
+        const actSessions = await db.getActivitySessionsV2('usr_f1');
+        expect(actSessions).toEqual([{ start: 1000, end: 5000, isOpenTail: false, sourceRevision: 'rev1' }]);
+
+        await db.upsertActivityBucketCacheV2({
+            ownerUserId: 'usr_me',
+            targetUserId: 'usr_f1',
+            rangeDays: 30,
+            viewKind: db.ACTIVITY_VIEW_KIND.OVERLAP,
+            excludeKey: '',
+            builtFromCursor: 'c1',
+            rawBuckets: [1],
+            normalizedBuckets: [1],
+            summary: { overlapPercent: 42 },
+            builtAt: '2026-11-24T12:00:00.000Z'
+        });
+        const cachedBucket = await db.getActivityBucketCacheV2({
+            ownerUserId: 'usr_me',
+            targetUserId: 'usr_f1',
+            rangeDays: 30,
+            viewKind: db.ACTIVITY_VIEW_KIND.OVERLAP,
+            excludeKey: ''
+        });
+        expect(cachedBucket?.summary?.overlapPercent).toBe(42);
+
+        // 6. Queueing >50 feed items flushes first chunk immediately and reschedules timer for remainder
+        const callsBeforeFeed = fetchSpy.mock.calls.length;
+        fetchSpy.mockImplementation(() => Promise.resolve(mockOk({ inserted: 50 })));
+        for (let i = 0; i < 65; i++) {
+            await db.addGPSToDatabase({
+                created_at: `2026-11-24T12:00:${String(i % 60).padStart(2, '0')}.000Z`,
+                userId: `usr_q_${i}`,
+                displayName: `User${i}`,
+                location: 'wrld_1:100'
+            });
+        }
+        // First 40 triggered immediate flush (40 items); remaining 25 flush when timer fires
+        expect(fetchSpy.mock.calls.length).toBeGreaterThan(callsBeforeFeed);
+        await vi.advanceTimersByTimeAsync(35_000);
+        const feedCalls = fetchSpy.mock.calls.slice(callsBeforeFeed).filter((c) => c[0] === '/api/feed');
+        const totalSent = feedCalls.reduce((sum, c) => sum + JSON.parse(c[1].body).items.length, 0);
+        expect(totalSent).toBe(65);
     });
 });

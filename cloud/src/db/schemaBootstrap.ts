@@ -5,7 +5,7 @@ let initPromise: Promise<void> | null = null;
 
 // Static DDL mirrored from cloud/migrations/*/0001_init.sql.
 // Uses a schema_meta version sentinel so upgrades from Phase 0 auto-add Phase 1 tables idempotently.
-const SCHEMA_VERSION = 'v5-bg-feed-sync';
+const SCHEMA_VERSION = 'v6-indexes-and-ratelimit';
 
 const CORE_STATEMENTS: readonly string[] = [
     `CREATE TABLE IF NOT EXISTS schema_meta (
@@ -273,6 +273,12 @@ const CORE_STATEMENTS: readonly string[] = [
         state_key TEXT PRIMARY KEY,
         payload_json TEXT NOT NULL DEFAULT '{}',
         updated_at TEXT NOT NULL
+    )`,
+    `CREATE TABLE IF NOT EXISTS cloud_auth_rate_limits (
+        bucket_key TEXT PRIMARY KEY,
+        failures INTEGER NOT NULL DEFAULT 0,
+        locked_until TEXT NOT NULL DEFAULT '',
+        updated_at TEXT NOT NULL
     )`
 ];
 
@@ -288,6 +294,7 @@ const GAMELOG_STATEMENTS: readonly string[] = [
         UNIQUE (created_at, location)
     )`,
     `CREATE INDEX IF NOT EXISTS idx_gamelog_loc_world_id ON gamelog_location (world_id, id DESC)`,
+    `CREATE INDEX IF NOT EXISTS idx_gamelog_loc_location ON gamelog_location (location, id DESC)`,
     `CREATE TABLE IF NOT EXISTS gamelog_join_leave (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         created_at TEXT NOT NULL,
@@ -321,6 +328,7 @@ const GAMELOG_STATEMENTS: readonly string[] = [
         user_id TEXT NOT NULL DEFAULT '',
         UNIQUE (created_at, video_url)
     )`,
+    `CREATE INDEX IF NOT EXISTS idx_gamelog_video_location ON gamelog_video_play (location, created_at)`,
     `CREATE TABLE IF NOT EXISTS gamelog_event (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         created_at TEXT NOT NULL,
@@ -446,13 +454,18 @@ async function initCoreIfNeeded(db: D1Database): Promise<void> {
         .run();
 }
 
-async function initShardIfNeeded(db: D1Database, markerTable: string, statements: readonly string[]): Promise<void> {
+async function initShardIfNeeded(
+    db: D1Database,
+    markerName: string,
+    statements: readonly string[],
+    markerType: 'table' | 'index' = 'table'
+): Promise<void> {
     const existing = await db
-        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1")
-        .bind(markerTable)
+        .prepare('SELECT name FROM sqlite_master WHERE type = ? AND name = ? LIMIT 1')
+        .bind(markerType, markerName)
         .first<{ name: string }>();
 
-    if (existing?.name === markerTable) {
+    if (existing?.name === markerName) {
         return;
     }
 
@@ -470,9 +483,9 @@ export async function ensureSchemaReady(env: Env): Promise<void> {
     if (!initPromise) {
         initPromise = Promise.all([
             initCoreIfNeeded(env.DB_CORE),
-            initShardIfNeeded(env.DB_GAMELOG, 'gamelog_external', GAMELOG_STATEMENTS),
-            initShardIfNeeded(env.DB_FEED, 'activity_sessions_v2', FEED_STATEMENTS),
-            initShardIfNeeded(getCacheDb(env), 'cloud_rss_snapshot', CACHE_STATEMENTS)
+            initShardIfNeeded(env.DB_GAMELOG, 'idx_gamelog_video_location', GAMELOG_STATEMENTS, 'index'),
+            initShardIfNeeded(env.DB_FEED, 'activity_sessions_v2', FEED_STATEMENTS, 'table'),
+            initShardIfNeeded(getCacheDb(env), 'cloud_rss_snapshot', CACHE_STATEMENTS, 'table')
         ])
             .then(() => {
                 schemaInitialized = true;

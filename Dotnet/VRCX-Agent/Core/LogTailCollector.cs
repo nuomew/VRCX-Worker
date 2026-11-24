@@ -207,8 +207,21 @@ public sealed class LogTailCollector
                 GameLogEventItem? ev = isolatedParser.ParseLine(line);
                 if (ev != null)
                 {
+                    if (ev.Type != "Location")
+                    {
+                        GameLogEventItem? pendingLoc = isolatedParser.FlushPendingLocation();
+                        if (pendingLoc != null)
+                        {
+                            batch.Add(pendingLoc);
+                        }
+                    }
                     batch.Add(ev);
                 }
+            }
+            GameLogEventItem? trailingLoc = isolatedParser.FlushPendingLocation();
+            if (trailingLoc != null)
+            {
+                batch.Add(trailingLoc);
             }
             endPosition = fs.Position;
         }
@@ -283,6 +296,7 @@ public sealed class LogTailCollector
             {
                 _parser.ParseLine(line);
             }
+            _parser.FlushPendingLocation();
         }
         catch (Exception ex)
         {
@@ -365,6 +379,14 @@ public sealed class LogTailCollector
                 GameLogEventItem? ev = _parser.ParseLine(line);
                 if (ev != null)
                 {
+                    if (ev.Type != "Location")
+                    {
+                        GameLogEventItem? pendingLoc = _parser.FlushPendingLocation();
+                        if (pendingLoc != null)
+                        {
+                            batch.Add(pendingLoc);
+                        }
+                    }
                     batch.Add(ev);
                     _cursor.LastEventDt = ev.CreatedAt;
 

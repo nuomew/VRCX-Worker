@@ -11,7 +11,7 @@ import { parseWebSyncIntervalSeconds } from './coreData';
 
 export const VRC_USER_AGENT = 'VRCX-Cloud/2026.11 (personal-self-hosted-vrcx)';
 
-// Strict SSRF allowlist: only VRChat API/CDN/presigned upload hosts, built-in avatar lookup database (avtrdb), and known status services VRCX calls.
+// Strict SSRF allowlist: VRChat API/CDN/presigned S3 hosts, built-in status/YouTube/Google Translate services VRCX calls.
 const ALLOWED_HOST_SUFFIXES = [
     'api.vrchat.cloud',
     'vrchat.com',
@@ -20,11 +20,15 @@ const ALLOWED_HOST_SUFFIXES = [
     'd348imysud55la.cloudfront.net',
     'status.vrchat.com',
     'api.avtrdb.com',
-    's3.amazonaws.com',
-    's3.us-east-1.amazonaws.com',
+    'www.googleapis.com',
+    'translation.googleapis.com',
     'r2.cloudflarestorage.com',
     'api.github.com'
 ];
+
+// Matches standard AWS S3 regional & virtual-hosted-style bucket endpoints used by VRChat presigned uploads.
+const AWS_S3_HOST_RE = /^(?:[a-z0-9-]+\.)?s3(?:[.-][a-z0-9-]+)?\.amazonaws\.com$/;
+const MAX_IMAGE_PROXY_BYTES = 15 * 1024 * 1024; // 15 MiB cap for binary image Data URL conversion
 
 interface WebApiExecutePayload {
     url: string;
@@ -44,6 +48,41 @@ interface WebApiExecutePayload {
     bypassCache?: boolean;
 }
 
+function isPrivateOrLocalHost(hostname: string): boolean {
+    const h = hostname.toLowerCase().replace(/^\[|\]$/g, '');
+    if (
+        !h ||
+        h === 'localhost' ||
+        h.endsWith('.localhost') ||
+        h.endsWith('.local') ||
+        h.endsWith('.internal') ||
+        h === '::1' ||
+        h === '0:0:0:0:0:0:0:1' ||
+        h.startsWith('fc') ||
+        h.startsWith('fd') ||
+        h.startsWith('fe80:')
+    ) {
+        return true;
+    }
+    const ipv4 = h.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+    if (ipv4) {
+        const a = Number(ipv4[1]);
+        const b = Number(ipv4[2]);
+        if (
+            a === 0 ||
+            a === 10 ||
+            a === 127 ||
+            (a === 169 && b === 254) ||
+            (a === 172 && b >= 16 && b <= 31) ||
+            (a === 192 && b === 168) ||
+            (a === 100 && b >= 64 && b <= 127)
+        ) {
+            return true;
+        }
+    }
+    return false;
+}
+
 function isAllowedTargetUrl(rawUrl: string): boolean {
     let parsed: URL;
     try {
@@ -55,7 +94,43 @@ function isAllowedTargetUrl(rawUrl: string): boolean {
         return false;
     }
     const host = parsed.hostname.toLowerCase();
+    if (AWS_S3_HOST_RE.test(host)) {
+        return true;
+    }
     return ALLOWED_HOST_SUFFIXES.some((suffix) => host === suffix || host.endsWith(`.${suffix}`));
+}
+
+/**
+ * Checks whether a non-default URL matches the user's configured public HTTPS translation API endpoint
+ * (stored in DB_CORE vrcx_config under `VRCX_translationApiEndpoint`), blocking private/local hosts (SSRF).
+ */
+async function isConfiguredPublicTranslationUrl(env: Env, rawUrl: string): Promise<boolean> {
+    let target: URL;
+    try {
+        target = new URL(rawUrl);
+    } catch {
+        return false;
+    }
+    if (target.protocol !== 'https:' || isPrivateOrLocalHost(target.hostname)) {
+        return false;
+    }
+    try {
+        const row = await env.DB_CORE.prepare(
+            "SELECT payload_json FROM config_bundles WHERE bundle_key = 'vrcx_config' LIMIT 1"
+        ).first<{ payload_json?: string }>();
+        if (!row?.payload_json) return false;
+        const cfg = JSON.parse(row.payload_json) as Record<string, unknown>;
+        const configuredRaw =
+            typeof cfg['VRCX_translationApiEndpoint'] === 'string' ? cfg['VRCX_translationApiEndpoint'].trim() : '';
+        if (!configuredRaw) return false;
+        const configured = new URL(configuredRaw);
+        if (configured.protocol !== 'https:' || isPrivateOrLocalHost(configured.hostname)) {
+            return false;
+        }
+        return target.origin === configured.origin;
+    } catch {
+        return false;
+    }
 }
 
 /**
@@ -73,7 +148,7 @@ function isVrchatDomainHost(hostname: string): boolean {
 
 /**
  * Returns true only for VRChat endpoints that require the user's VRChat session cookies.
- * Third-party allowlisted hosts (e.g. api.avtrdb.com, api.github.com, S3) and public VRChat
+ * Third-party allowlisted hosts (e.g. api.avtrdb.com, api.github.com, googleapis, S3) and public VRChat
  * endpoints must never receive VRChat cookies or write Set-Cookie values into cloud_cookie_vault.
  */
 function isVrchatAuthTarget(rawUrl: string): boolean {
@@ -94,6 +169,39 @@ function isVrchatAuthTarget(rawUrl: string): boolean {
         return false;
     }
     return true;
+}
+
+function uint8ArrayToBase64(bytes: Uint8Array): string {
+    const chunkSize = 0x8000;
+    let bin = '';
+    for (let i = 0; i < bytes.length; i += chunkSize) {
+        bin += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+    }
+    return btoa(bin);
+}
+
+/**
+ * Reads an upstream response body matching desktop Dotnet/WebApi.cs behavior:
+ * binary image / octet-stream responses are returned as `data:image/png;base64,...` Data URLs
+ * so FullscreenImagePreview copy/download works seamlessly in Web mode.
+ */
+async function readUpstreamResponseBody(upstream: Response): Promise<{ bodyText: string; isBinaryImage: boolean }> {
+    const ct = (upstream.headers.get('content-type') ?? '').toLowerCase();
+    if (ct.includes('image/') || ct.includes('application/octet-stream')) {
+        const buf = await upstream.arrayBuffer();
+        if (buf.byteLength > MAX_IMAGE_PROXY_BYTES) {
+            throw new Error('Image response exceeds 15 MiB proxy limit');
+        }
+        const b64 = uint8ArrayToBase64(new Uint8Array(buf));
+        return {
+            bodyText: `data:image/png;base64,${b64}`,
+            isBinaryImage: true
+        };
+    }
+    return {
+        bodyText: await upstream.text(),
+        isBinaryImage: false
+    };
 }
 
 function base64ToUint8Array(b64: string): Uint8Array {
@@ -323,7 +431,10 @@ export async function handleVrcProxyRoutes(request: Request, env: Env, url: URL)
             );
         }
 
-        if (!payload?.url || !isAllowedTargetUrl(payload.url)) {
+        const urlAllowed =
+            Boolean(payload?.url) &&
+            (isAllowedTargetUrl(payload.url) || (await isConfiguredPublicTranslationUrl(env, payload.url)));
+        if (!urlAllowed) {
             return Response.json(
                 { ok: false, error: { code: 'FORBIDDEN_TARGET', message: 'Target URL is not in VRChat allowlist' } },
                 { status: 403 }
@@ -362,7 +473,7 @@ export async function handleVrcProxyRoutes(request: Request, env: Env, url: URL)
         const needsAuthCookie = isVrchatAuthTarget(payload.url);
 
         // Strategy 1: Prefer online Windows VRCX.Agent residential-IP relay for authenticated VRChat requests.
-        // Public/third-party allowlisted endpoints (e.g. api.avtrdb.com) do not need residential IP or VRChat cookies
+        // Public/third-party allowlisted endpoints do not need residential IP or VRChat cookies
         // and go direct from Worker when cloud fallback is enabled (also keeping compatibility with older Agent builds).
         const skipAgentRelay =
             Boolean(payload.preferCloudDirect) || (!needsAuthCookie && env.VRC_ALLOW_CLOUD_FALLBACK !== 'false');
@@ -389,9 +500,10 @@ export async function handleVrcProxyRoutes(request: Request, env: Env, url: URL)
                     }
                     const status = rpcJson.data.status ?? 200;
                     const bodyText = rpcJson.data.data ?? '';
+                    const isBinaryImage = bodyText.startsWith('data:image/');
                     if (isMutation && status >= 200 && status < 300) {
                         await invalidateVrcCacheOnWrite(env, payload.url).catch(() => {});
-                    } else if (cacheMeta && status >= 200 && status < 300) {
+                    } else if (cacheMeta && !isBinaryImage && status >= 200 && status < 300) {
                         await putCachedVrcResponses(env, [
                             { url: payload.url, tier: cacheMeta.tier, status, bodyText, ttlMs: cacheMeta.ttlMs }
                         ]).catch(() => {});
@@ -433,13 +545,15 @@ export async function handleVrcProxyRoutes(request: Request, env: Env, url: URL)
                     await saveCookieJar(env, jar);
                 }
             }
-            const text = await upstream.text();
+            const { bodyText: text, isBinaryImage } = await readUpstreamResponseBody(upstream);
             const wafBlocked =
-                upstream.status === 403 && (upstream.headers.has('cf-mitigated') || text.includes('Just a moment'));
+                !isBinaryImage &&
+                upstream.status === 403 &&
+                (upstream.headers.has('cf-mitigated') || text.includes('Just a moment'));
 
             if (isMutation && upstream.status >= 200 && upstream.status < 300) {
                 await invalidateVrcCacheOnWrite(env, payload.url).catch(() => {});
-            } else if (cacheMeta && upstream.status >= 200 && upstream.status < 300) {
+            } else if (cacheMeta && !isBinaryImage && upstream.status >= 200 && upstream.status < 300) {
                 await putCachedVrcResponses(env, [
                     {
                         url: payload.url,
@@ -580,8 +694,8 @@ export async function handleVrcProxyRoutes(request: Request, env: Env, url: URL)
                     if (targetNeedsAuthCookie && mergeSetCookies(jar, upstream.headers)) {
                         cookieChanged = true;
                     }
-                    const text = await upstream.text();
-                    if (plan && upstream.status >= 200 && upstream.status < 300) {
+                    const { bodyText: text, isBinaryImage } = await readUpstreamResponseBody(upstream);
+                    if (plan && !isBinaryImage && upstream.status >= 200 && upstream.status < 300) {
                         toWriteCache.push({
                             url: item.url,
                             tier: plan.tier,

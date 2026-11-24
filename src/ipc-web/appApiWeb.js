@@ -1,6 +1,6 @@
 import { cloudFetch, onCloudGameLogEvent } from './apiClient.js';
 import { bootstrapCache, flushStorageNow, scheduleStoragePatch } from './bootstrapCache.js';
-import { getAggregatedGameState, getPrimaryAgentState, syncGameRunningBridge } from './cloudState.js';
+import { cloudState, getAggregatedGameState, getPrimaryAgentState, syncGameRunningBridge } from './cloudState.js';
 
 /**
  * Lightweight RFC 1321 MD5 returning Base64 (used by imageUploadCoordinator for VRChat file uploads).
@@ -89,6 +89,157 @@ function base64ToBytes(b64) {
         bytes[i] = bin.charCodeAt(i);
     }
     return bytes;
+}
+
+function bytesToBase64(bytes) {
+    const chunkSize = 0x8000;
+    let bin = '';
+    for (let i = 0; i < bytes.length; i += chunkSize) {
+        bin += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+    }
+    return btoa(bin);
+}
+
+const MASK64 = 0xffffffffffffffffn;
+const BLAKE2B_IV = [
+    0x6a09e667f3bcc908n,
+    0xbb67ae8584caa73bn,
+    0x3c6ef372fe94f82bn,
+    0xa54ff53a5f1d36f1n,
+    0x510e527fade682d1n,
+    0x9b05688c2b3e6c1fn,
+    0x1f83d9abfb41bd6bn,
+    0x5be0cd19137e2179n
+];
+const BLAKE2B_SIGMA = [
+    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+    [14, 10, 4, 8, 9, 15, 13, 6, 1, 12, 0, 2, 11, 7, 5, 3],
+    [11, 8, 12, 0, 5, 2, 15, 13, 10, 14, 3, 6, 7, 1, 9, 4],
+    [7, 9, 3, 1, 13, 12, 11, 14, 2, 6, 5, 10, 4, 0, 15, 8],
+    [9, 0, 5, 7, 2, 4, 10, 15, 14, 1, 11, 12, 6, 8, 3, 13],
+    [2, 12, 6, 10, 0, 11, 8, 3, 4, 13, 7, 5, 15, 14, 1, 9],
+    [12, 5, 1, 15, 14, 13, 4, 10, 0, 7, 6, 3, 9, 2, 8, 11],
+    [13, 11, 7, 14, 12, 1, 3, 9, 5, 0, 15, 4, 8, 6, 2, 10],
+    [6, 15, 14, 9, 11, 3, 0, 8, 12, 2, 13, 7, 1, 4, 10, 5],
+    [10, 2, 8, 4, 7, 6, 1, 5, 15, 11, 9, 14, 3, 12, 13, 0]
+];
+
+function rotr64(x, n) {
+    return ((x >> n) | ((x << (64n - n)) & MASK64)) & MASK64;
+}
+
+/**
+ * Pure-JS RFC 7693 BLAKE2b-256 hash (32-byte digest, unkeyed).
+ *
+ * @param {Uint8Array} input
+ * @returns {Uint8Array}
+ */
+function blake2b256(input) {
+    const outlen = 32;
+    const h = BLAKE2B_IV.slice();
+    h[0] ^= 0x01010000n ^ BigInt(outlen);
+
+    const v = new Array(16);
+    const m = new Array(16);
+    const block = new Uint8Array(128);
+    const blockView = new DataView(block.buffer);
+
+    const mix = (a, b, c, d, x, y) => {
+        v[a] = (v[a] + v[b] + x) & MASK64;
+        v[d] = rotr64(v[d] ^ v[a], 32n);
+        v[c] = (v[c] + v[d]) & MASK64;
+        v[b] = rotr64(v[b] ^ v[c], 24n);
+        v[a] = (v[a] + v[b] + y) & MASK64;
+        v[d] = rotr64(v[d] ^ v[a], 16n);
+        v[c] = (v[c] + v[d]) & MASK64;
+        v[b] = rotr64(v[b] ^ v[c], 63n);
+    };
+
+    const compress = (bytesRead, isLast) => {
+        for (let i = 0; i < 16; i++) {
+            m[i] = blockView.getBigUint64(i * 8, true);
+        }
+        for (let i = 0; i < 8; i++) {
+            v[i] = h[i];
+            v[i + 8] = BLAKE2B_IV[i];
+        }
+        v[12] ^= BigInt(bytesRead) & MASK64;
+        if (isLast) {
+            v[14] ^= MASK64;
+        }
+        for (let r = 0; r < 12; r++) {
+            const s = BLAKE2B_SIGMA[r % 10];
+            mix(0, 4, 8, 12, m[s[0]], m[s[1]]);
+            mix(1, 5, 9, 13, m[s[2]], m[s[3]]);
+            mix(2, 6, 10, 14, m[s[4]], m[s[5]]);
+            mix(3, 7, 11, 15, m[s[6]], m[s[7]]);
+            mix(0, 5, 10, 15, m[s[8]], m[s[9]]);
+            mix(1, 6, 11, 12, m[s[10]], m[s[11]]);
+            mix(2, 7, 8, 13, m[s[12]], m[s[13]]);
+            mix(3, 4, 9, 14, m[s[14]], m[s[15]]);
+        }
+        for (let i = 0; i < 8; i++) {
+            h[i] ^= v[i] ^ v[i + 8];
+        }
+    };
+
+    let offset = 0;
+    while (input.length - offset > 128) {
+        block.set(input.subarray(offset, offset + 128));
+        offset += 128;
+        compress(offset, false);
+    }
+    block.fill(0);
+    const remaining = input.length - offset;
+    if (remaining > 0) {
+        block.set(input.subarray(offset));
+    }
+    compress(input.length, true);
+
+    const out = new Uint8Array(outlen);
+    const outView = new DataView(out.buffer);
+    for (let i = 0; i < 4; i++) {
+        outView.setBigUint64(i * 8, h[i], true);
+    }
+    return out;
+}
+
+/**
+ * Computes a byte-identical librsync BLAKE2b signature matching desktop `librsync.net.dll`
+ * (`RS_BLAKE2_SIG_MAGIC = 0x72730137`, `blockLength = 2048`, `strongSumLength = 32`).
+ *
+ * @param {Uint8Array} fileBytes
+ * @returns {Uint8Array}
+ */
+export function computeLibrsyncSignature(fileBytes) {
+    const BLOCK_LEN = 2048;
+    const STRONG_LEN = 32;
+    const CHAR_OFFSET = 31;
+    const blockCount = fileBytes.length === 0 ? 0 : Math.ceil(fileBytes.length / BLOCK_LEN);
+    const out = new Uint8Array(12 + blockCount * (4 + STRONG_LEN));
+    const dv = new DataView(out.buffer);
+
+    // Big-endian header: magic (0x72730137), blockLength (2048), strongSumLength (32)
+    dv.setUint32(0, 0x72730137, false);
+    dv.setUint32(4, BLOCK_LEN, false);
+    dv.setUint32(8, STRONG_LEN, false);
+
+    let writePos = 12;
+    for (let offset = 0; offset < fileBytes.length; offset += BLOCK_LEN) {
+        const chunk = fileBytes.subarray(offset, Math.min(offset + BLOCK_LEN, fileBytes.length));
+        let s1 = 0;
+        let s2 = 0;
+        for (let i = 0; i < chunk.length; i++) {
+            s1 = (s1 + chunk[i] + CHAR_OFFSET) & 0xffff;
+            s2 = (s2 + s1) & 0xffff;
+        }
+        dv.setUint32(writePos, ((s2 << 16) | s1) >>> 0, false);
+        writePos += 4;
+        const strong = blake2b256(chunk);
+        out.set(strong, writePos);
+        writePos += STRONG_LEN;
+    }
+    return out;
 }
 
 /**
@@ -226,6 +377,9 @@ export function createDiscordBridge() {
         if (syncTimer) clearTimeout(syncTimer);
         syncTimer = setTimeout(() => {
             syncTimer = null;
+            if (!cloudState.authenticated || cloudState.agentsOnline.length === 0) {
+                return;
+            }
             dispatchRemoteCommand('discord_update', { ...state });
         }, 2500);
     }
@@ -387,7 +541,11 @@ export function createAppApiBridge() {
             window.open(`https://discord.com/users/${encodeURIComponent(discordId)}`, '_blank', 'noopener,noreferrer');
         },
         async OpenSteamStorePage(appId) {
-            window.open(`https://store.steampowered.com/app/${encodeURIComponent(appId)}`, '_blank', 'noopener,noreferrer');
+            window.open(
+                `https://store.steampowered.com/app/${encodeURIComponent(appId)}`,
+                '_blank',
+                'noopener,noreferrer'
+            );
         },
         async GetLaunchCommand() {
             return '';
@@ -427,7 +585,10 @@ export function createAppApiBridge() {
             const match = rawArgs.match(/vrchat:\/\/launch\?[^\s"']+/);
             if (!match) return false;
             const desktopMode = /(?:^|\s)--no-vr(?:\s|$)/.test(rawArgs);
-            return dispatchRemoteCommand('launch_vrc', desktopMode ? { launchUrl: match[0], desktopMode: true } : { launchUrl: match[0] });
+            return dispatchRemoteCommand(
+                'launch_vrc',
+                desktopMode ? { launchUrl: match[0], desktopMode: true } : { launchUrl: match[0] }
+            );
         },
         async StartGameFromPath(_path, args) {
             return this.StartGame(args);
@@ -449,7 +610,7 @@ export function createAppApiBridge() {
             return md5Base64(base64ToBytes(base64));
         },
         async SignFile(base64) {
-            return md5Base64(base64ToBytes(base64));
+            return bytesToBase64(computeLibrsyncSignature(base64ToBytes(base64)));
         },
         async FileLength(base64) {
             return String(base64ToBytes(base64).byteLength);

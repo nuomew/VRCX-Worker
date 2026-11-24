@@ -65,7 +65,11 @@ function parseCookies(cookieHeader: string | null): Record<string, string> {
         if (idx <= 0) continue;
         const k = part.slice(0, idx).trim();
         const v = part.slice(idx + 1).trim();
-        out[k] = decodeURIComponent(v);
+        try {
+            out[k] = decodeURIComponent(v);
+        } catch {
+            out[k] = v;
+        }
     }
     return out;
 }
@@ -86,7 +90,10 @@ async function verifyCloudflareAccessJwt(jwt: string, teamDomain: string, expect
     const parts = jwt.split('.');
     if (parts.length !== 3) return null;
     try {
-        const header = JSON.parse(new TextDecoder().decode(base64UrlDecode(parts[0]!))) as { kid?: string; alg?: string };
+        const header = JSON.parse(new TextDecoder().decode(base64UrlDecode(parts[0]!))) as {
+            kid?: string;
+            alg?: string;
+        };
         const payload = JSON.parse(new TextDecoder().decode(base64UrlDecode(parts[1]!))) as {
             aud?: string | string[];
             exp?: number;
@@ -99,7 +106,11 @@ async function verifyCloudflareAccessJwt(jwt: string, teamDomain: string, expect
         if (!payload.exp || payload.exp < Math.floor(Date.now() / 1000)) return null;
 
         const now = Date.now();
-        if (!cachedAccessJwks || cachedAccessJwks.domain !== teamDomain || now - cachedAccessJwks.fetchedAt > 3_600_000) {
+        if (
+            !cachedAccessJwks ||
+            cachedAccessJwks.domain !== teamDomain ||
+            now - cachedAccessJwks.fetchedAt > 3_600_000
+        ) {
             const certsUrl = `https://${teamDomain.replace(/^https?:\/\//, '')}/cdn-cgi/access/certs`;
             const res = await fetch(certsUrl);
             if (!res.ok) return null;
@@ -186,11 +197,7 @@ export async function authenticateWeb(request: Request, env: Env): Promise<WebAu
  * Verifies Windows VRCX.Agent requests using per-device Bearer token (SHA-256 hash stored in D1)
  * plus optional HMAC-SHA256 request signature with ±60s replay protection.
  */
-export async function authenticateAgent(
-    request: Request,
-    env: Env,
-    rawBodyText = ''
-): Promise<AgentAuthResult> {
+export async function authenticateAgent(request: Request, env: Env, rawBodyText = ''): Promise<AgentAuthResult> {
     const authHeader = request.headers.get('Authorization') ?? '';
     const syncKeyHeader = request.headers.get('X-Sync-Key')?.trim() ?? '';
     const deviceIdHeader = request.headers.get('X-Device-Id')?.trim();
@@ -272,6 +279,78 @@ export async function authenticateAgent(
     };
 }
 
+const MAX_AUTH_FAILURES_BEFORE_LOCK = 5;
+const AUTH_LOCKOUT_MS = 10 * 60 * 1000; // 10-minute lockout after 5 consecutive failures
+
+export function resolveClientRateBucket(request: Request, scope: string): string {
+    const ip =
+        request.headers.get('CF-Connecting-IP')?.trim() ||
+        request.headers.get('X-Forwarded-For')?.split(',')[0]?.trim() ||
+        'unknown';
+    return `${scope}:${ip.slice(0, 64)}`;
+}
+
+export async function checkAuthRateLimit(
+    env: Env,
+    bucketKey: string
+): Promise<{ blocked: boolean; retryAfterSec: number }> {
+    try {
+        const row = await env.DB_CORE.prepare(
+            'SELECT failures, locked_until FROM cloud_auth_rate_limits WHERE bucket_key = ? LIMIT 1'
+        )
+            .bind(bucketKey)
+            .first<{ failures: number; locked_until: string }>();
+        if (!row?.locked_until) {
+            return { blocked: false, retryAfterSec: 0 };
+        }
+        const lockMs = Date.parse(row.locked_until);
+        const nowMs = Date.now();
+        if (Number.isFinite(lockMs) && lockMs > nowMs) {
+            return { blocked: true, retryAfterSec: Math.max(1, Math.ceil((lockMs - nowMs) / 1000)) };
+        }
+    } catch {
+        // Non-fatal if table not yet bootstrapped
+    }
+    return { blocked: false, retryAfterSec: 0 };
+}
+
+export async function recordAuthFailure(env: Env, bucketKey: string): Promise<void> {
+    try {
+        const nowMs = Date.now();
+        const nowIso = new Date(nowMs).toISOString();
+        const existing = await env.DB_CORE.prepare(
+            'SELECT failures, locked_until FROM cloud_auth_rate_limits WHERE bucket_key = ? LIMIT 1'
+        )
+            .bind(bucketKey)
+            .first<{ failures: number; locked_until: string }>();
+        const prevLockMs = existing?.locked_until ? Date.parse(existing.locked_until) : 0;
+        const prevFailures = prevLockMs > 0 && prevLockMs <= nowMs ? 0 : Number(existing?.failures ?? 0);
+        const nextFailures = prevFailures + 1;
+        const lockedUntil =
+            nextFailures >= MAX_AUTH_FAILURES_BEFORE_LOCK ? new Date(nowMs + AUTH_LOCKOUT_MS).toISOString() : '';
+        await env.DB_CORE.prepare(
+            `INSERT INTO cloud_auth_rate_limits (bucket_key, failures, locked_until, updated_at)
+             VALUES (?, ?, ?, ?)
+             ON CONFLICT(bucket_key) DO UPDATE SET
+                failures = excluded.failures,
+                locked_until = excluded.locked_until,
+                updated_at = excluded.updated_at`
+        )
+            .bind(bucketKey, nextFailures, lockedUntil, nowIso)
+            .run();
+    } catch {
+        // Non-fatal
+    }
+}
+
+export async function clearAuthRateLimit(env: Env, bucketKey: string): Promise<void> {
+    try {
+        await env.DB_CORE.prepare('DELETE FROM cloud_auth_rate_limits WHERE bucket_key = ?').bind(bucketKey).run();
+    } catch {
+        // Non-fatal
+    }
+}
+
 export async function handleAuthRoutes(request: Request, env: Env, url: URL): Promise<Response | null> {
     if (url.pathname === '/api/auth/me' && request.method === 'GET') {
         const result = await authenticateWeb(request, env);
@@ -297,6 +376,21 @@ export async function handleAuthRoutes(request: Request, env: Env, url: URL): Pr
             });
         }
 
+        const rateBucket = resolveClientRateBucket(request, 'login');
+        const rateCheck = await checkAuthRateLimit(env, rateBucket);
+        if (rateCheck.blocked) {
+            return Response.json(
+                {
+                    ok: false,
+                    error: {
+                        code: 'RATE_LIMITED',
+                        message: `Too many failed login attempts. Try again in ${rateCheck.retryAfterSec}s.`
+                    }
+                },
+                { status: 429, headers: { 'Retry-After': String(rateCheck.retryAfterSec) } }
+            );
+        }
+
         let body: { passcode?: string; totp?: string };
         try {
             body = (await request.json()) as { passcode?: string; totp?: string };
@@ -309,6 +403,7 @@ export async function handleAuthRoutes(request: Request, env: Env, url: URL): Pr
 
         const passcodeOk = typeof body.passcode === 'string' && (await verifyPasscode(configured, body.passcode));
         if (!passcodeOk) {
+            await recordAuthFailure(env, rateBucket);
             return Response.json(
                 { ok: false, error: { code: 'INVALID_CREDENTIALS', message: 'Invalid passcode' } },
                 { status: 401 }
@@ -319,12 +414,15 @@ export async function handleAuthRoutes(request: Request, env: Env, url: URL): Pr
         if (totpSecret) {
             const totpOk = typeof body.totp === 'string' && (await verifyTotp(totpSecret, body.totp));
             if (!totpOk) {
+                await recordAuthFailure(env, rateBucket);
                 return Response.json(
                     { ok: false, error: { code: 'INVALID_TOTP', message: 'Valid 6-digit TOTP code required' } },
                     { status: 401 }
                 );
             }
         }
+
+        await clearAuthRateLimit(env, rateBucket);
 
         const sessionId = randomHex(16);
         const expSec = Math.floor(Date.now() / 1000) + SESSION_TTL_SECONDS;

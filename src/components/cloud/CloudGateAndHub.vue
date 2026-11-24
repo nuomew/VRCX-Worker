@@ -394,7 +394,7 @@
 <script setup>
     import { computed, ref, watch } from 'vue';
     import { useI18n } from 'vue-i18n';
-    import { cloudFetch, connectCloudHubWs } from '../../ipc-web/apiClient';
+    import { cloudFetch } from '../../ipc-web/apiClient';
     import { loadBootstrap, saveCloudSyncIntervalSeconds } from '../../ipc-web/bootstrapCache';
     import { applyCloudPresenceUpdate, cloudState, getAgentOnlineWindowMs } from '../../ipc-web/cloudState';
     import { links } from '../../shared/constants/link';
@@ -485,7 +485,6 @@
             });
             cloudState.authenticated = true;
             await loadBootstrap();
-            connectCloudHubWs();
             window.location.reload();
         } catch (err) {
             unlockError.value = err?.message || t('cloud_hub.unlock.failed');

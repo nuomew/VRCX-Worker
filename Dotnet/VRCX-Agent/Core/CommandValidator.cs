@@ -32,6 +32,10 @@ public static class CommandValidator
         @"^[A-Za-z0-9._-]{1,64}$",
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
+    private static readonly Regex AwsS3HostRegex = new(
+        @"^(?:[a-z0-9-]+\.)?s3(?:[.-][a-z0-9-]+)?\.amazonaws\.com$",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+
     private static readonly string[] AllowedVrcHostSuffixes =
     {
         "api.vrchat.cloud",
@@ -41,6 +45,8 @@ public static class CommandValidator
         "d348imysud55la.cloudfront.net",
         "status.vrchat.com",
         "api.avtrdb.com",
+        "www.googleapis.com",
+        "translation.googleapis.com",
         "s3.amazonaws.com",
         "s3.us-east-1.amazonaws.com",
         "r2.cloudflarestorage.com",
@@ -139,6 +145,10 @@ public static class CommandValidator
             return false;
         }
         string host = uri.Host.ToLowerInvariant();
+        if (AwsS3HostRegex.IsMatch(host))
+        {
+            return true;
+        }
         foreach (string suffix in AllowedVrcHostSuffixes)
         {
             if (host == suffix || host.EndsWith("." + suffix, StringComparison.Ordinal))
