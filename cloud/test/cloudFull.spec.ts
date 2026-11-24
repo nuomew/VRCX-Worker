@@ -1429,4 +1429,289 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
             fetchSpy.mockRestore();
         }
     });
+
+    it('serves index-backed Hot Worlds and reconstructs Instance Activity timelines from VRCX.Agent logs', async () => {
+        // 1. Verify EXPLAIN QUERY PLAN uses created_at / user_id indexes (zero full-table scans)
+        const hotPlan = await env.DB_FEED.prepare(
+            `EXPLAIN QUERY PLAN
+             SELECT SUBSTR(location, 1, INSTR(location, ':') - 1) AS world_id
+             FROM feed_gps
+             WHERE created_at >= ? AND location LIKE 'wrld_%' AND INSTR(location, ':') > 0
+             GROUP BY world_id`
+        )
+            .bind('2026-01-01T00:00:00.000Z')
+            .all<{ detail: string }>();
+        const hotPlanText = (hotPlan.results ?? []).map((r) => r.detail).join(' | ');
+        expect(hotPlanText).toMatch(/SEARCH feed_gps USING (?:COVERING )?INDEX/);
+
+        const actDatesPlan = await env.DB_GAMELOG.prepare(
+            'EXPLAIN QUERY PLAN SELECT created_at FROM gamelog_join_leave WHERE user_id = ? ORDER BY id DESC LIMIT 2000'
+        )
+            .bind('usr_self_act')
+            .all<{ detail: string }>();
+        expect((actDatesPlan.results ?? []).map((r) => r.detail).join(' | ')).toContain('idx_gamelog_jl_user_id');
+
+        const actRangePlan = await env.DB_GAMELOG.prepare(
+            'EXPLAIN QUERY PLAN SELECT id, created_at, type, display_name, location, user_id, time FROM gamelog_join_leave WHERE created_at >= ? AND created_at <= ? ORDER BY created_at ASC LIMIT 2500'
+        )
+            .bind('2026-01-01T00:00:00.000Z', '2026-01-03T00:00:00.000Z')
+            .all<{ detail: string }>();
+        const actRangeText = (actRangePlan.results ?? []).map((r) => r.detail).join(' | ');
+        expect(actRangeText).toMatch(/SEARCH gamelog_join_leave USING (?:COVERING )?INDEX/);
+        expect(actRangeText).not.toContain('USE TEMP B-TREE');
+
+        // 2. Seed Hot Worlds GPS feeds across old half (20d ago) vs recent half (2d ago),
+        // including one world whose feed row has blank world_name resolved via entity_worlds
+        const nowMs = Date.now();
+        const recent1 = new Date(nowMs - 2 * 86400_000).toISOString();
+        const recent2 = new Date(nowMs - 1 * 86400_000).toISOString();
+        const old1 = new Date(nowMs - 20 * 86400_000).toISOString();
+        const old2 = new Date(nowMs - 19 * 86400_000).toISOString();
+        const wRising = 'wrld_hot_rising_0001';
+        const wCooling = 'wrld_hot_cooling_0002';
+        const wFallback = 'wrld_hot_fallback_0003';
+
+        await env.DB_CORE.prepare(
+            'INSERT OR REPLACE INTO entity_worlds (world_id, world_name, updated_at) VALUES (?, ?, ?)'
+        )
+            .bind(wFallback, 'Fallback World Dictionary Name', recent1)
+            .run();
+
+        const feedSeedRes = await exports.default.fetch('http://example.com/api/feed', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                items: [
+                    // wRising: 0 old friends, 2 recent friends (3 visits) -> rising, #1
+                    {
+                        type: 'GPS',
+                        created_at: recent1,
+                        userId: 'usr_hw_1',
+                        displayName: 'Hana',
+                        location: `${wRising}:101`,
+                        worldName: 'Rising Shrine'
+                    },
+                    {
+                        type: 'GPS',
+                        created_at: recent2,
+                        userId: 'usr_hw_1',
+                        displayName: 'Hana',
+                        location: `${wRising}:102`,
+                        worldName: 'Rising Shrine'
+                    },
+                    {
+                        type: 'GPS',
+                        created_at: recent2,
+                        userId: 'usr_hw_2',
+                        displayName: 'Sora',
+                        location: `${wRising}:102`,
+                        worldName: 'Rising Shrine'
+                    },
+                    // wCooling: 2 old friends, 0 recent friends -> cooling
+                    {
+                        type: 'GPS',
+                        created_at: old1,
+                        userId: 'usr_hw_1',
+                        displayName: 'Hana',
+                        location: `${wCooling}:201`,
+                        worldName: 'Cooling Bar'
+                    },
+                    {
+                        type: 'GPS',
+                        created_at: old2,
+                        userId: 'usr_hw_3',
+                        displayName: 'Kaito',
+                        location: `${wCooling}:202`,
+                        worldName: 'Cooling Bar'
+                    },
+                    // wFallback: blank worldName on feed_gps, resolved from DB_CORE.entity_worlds
+                    {
+                        type: 'GPS',
+                        created_at: recent1,
+                        userId: 'usr_hw_4',
+                        displayName: 'Yuki',
+                        location: `${wFallback}:301`,
+                        worldName: ''
+                    }
+                ]
+            })
+        });
+        expect(feedSeedRes.status).toBe(200);
+
+        const hotRes = await exports.default.fetch('http://example.com/api/feed/hot-worlds?days=30&limit=10');
+        expect(hotRes.status).toBe(200);
+        const hotJson = (await hotRes.json()) as {
+            ok: boolean;
+            data: Array<{
+                worldId: string;
+                worldName: string;
+                visitCount: number;
+                uniqueFriends: number;
+                trend: string;
+            }>;
+        };
+        const risingRow = hotJson.data.find((w) => w.worldId === wRising);
+        const coolingRow = hotJson.data.find((w) => w.worldId === wCooling);
+        const fallbackRow = hotJson.data.find((w) => w.worldId === wFallback);
+        expect(risingRow).toMatchObject({
+            worldName: 'Rising Shrine',
+            visitCount: 3,
+            uniqueFriends: 2,
+            trend: 'rising'
+        });
+        expect(coolingRow).toMatchObject({
+            worldName: 'Cooling Bar',
+            visitCount: 2,
+            uniqueFriends: 2,
+            trend: 'cooling'
+        });
+        expect(fallbackRow).toMatchObject({
+            worldName: 'Fallback World Dictionary Name',
+            visitCount: 1,
+            uniqueFriends: 1,
+            trend: 'rising'
+        });
+
+        const detailRes = await exports.default.fetch(
+            `http://example.com/api/feed/hot-worlds/detail?worldId=${encodeURIComponent(wRising)}&days=30`
+        );
+        expect(detailRes.status).toBe(200);
+        const detailJson = (await detailRes.json()) as {
+            ok: boolean;
+            data: Array<{ userId: string; displayName: string; visitCount: number; lastVisit: string }>;
+        };
+        expect(detailJson.data).toHaveLength(2);
+        expect(detailJson.data[0]).toMatchObject({ userId: 'usr_hw_1', displayName: 'Hana', visitCount: 2 });
+        expect(detailJson.data[1]).toMatchObject({ userId: 'usr_hw_2', displayName: 'Sora', visitCount: 1 });
+
+        // Reject invalid worldId gracefully without throwing
+        const badDetailRes = await exports.default.fetch(
+            'http://example.com/api/feed/hot-worlds/detail?worldId=invalid%25&days=30'
+        );
+        const badDetailJson = (await badDetailRes.json()) as { ok: boolean; data: unknown[] };
+        expect(badDetailJson.data).toEqual([]);
+
+        // 3. Seed realistic VRCX.Agent logs (time = 0 on OnPlayerLeft, room switch without self OnPlayerLeft,
+        // and graceful quit closing remaining players) for a clean historical day
+        const dayStart = '2026-11-18T00:00:00.000Z';
+        const dayEnd = '2026-11-18T23:59:59.999Z';
+        const roomA = 'wrld_act_room_a:1001~region(jp)';
+        const roomB = 'wrld_act_room_b:2002~region(jp)';
+        const selfId = 'usr_self_act';
+
+        const actSeedRes = await exports.default.fetch('http://example.com/api/gamelog', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                items: [
+                    // 10:00 Enter Room A with friend Alice; Alice leaves at 10:20 (time = 0 raw from VRCX.Agent)
+                    {
+                        type: 'Location',
+                        created_at: '2026-11-18T10:00:00.000Z',
+                        location: roomA,
+                        worldId: 'wrld_act_room_a',
+                        worldName: 'Room A'
+                    },
+                    {
+                        type: 'OnPlayerJoined',
+                        created_at: '2026-11-18T10:00:02.000Z',
+                        displayName: 'SelfUser',
+                        userId: selfId,
+                        location: roomA,
+                        time: 0
+                    },
+                    {
+                        type: 'OnPlayerJoined',
+                        created_at: '2026-11-18T10:05:00.000Z',
+                        displayName: 'AliceAct',
+                        userId: 'usr_alice_act',
+                        location: roomA,
+                        time: 0
+                    },
+                    {
+                        type: 'OnPlayerLeft',
+                        created_at: '2026-11-18T10:20:00.000Z',
+                        displayName: 'AliceAct',
+                        userId: 'usr_alice_act',
+                        location: roomA,
+                        time: 0
+                    },
+                    // 10:30 Switch to Room B (no OnPlayerLeft for SelfUser in Room A -> must auto-close Room A at 10:30)
+                    {
+                        type: 'Location',
+                        created_at: '2026-11-18T10:30:00.000Z',
+                        location: roomB,
+                        worldId: 'wrld_act_room_b',
+                        worldName: 'Room B'
+                    },
+                    {
+                        type: 'OnPlayerJoined',
+                        created_at: '2026-11-18T10:30:05.000Z',
+                        displayName: 'SelfUser',
+                        userId: selfId,
+                        location: roomB,
+                        time: 0
+                    },
+                    // 11:00 VRChat closed gracefully -> must auto-close SelfUser in Room B at 11:00
+                    {
+                        type: 'Event',
+                        created_at: '2026-11-18T11:00:05.000Z',
+                        data: 'VRChat closed gracefully'
+                    }
+                ]
+            })
+        });
+        expect(actSeedRes.status).toBe(200);
+
+        const datesRes = await exports.default.fetch(
+            `http://example.com/api/gamelog/instance-activity/dates?userId=${encodeURIComponent(selfId)}`
+        );
+        expect(datesRes.status).toBe(200);
+        const datesJson = (await datesRes.json()) as { ok: boolean; data: string[] };
+        expect(Array.isArray(datesJson.data)).toBe(true);
+        expect(datesJson.data.some((d) => d.startsWith('2026-11-18'))).toBe(true);
+
+        const actRes = await exports.default.fetch(
+            `http://example.com/api/gamelog/instance-activity?startDate=${encodeURIComponent(dayStart)}&endDate=${encodeURIComponent(dayEnd)}&userId=${encodeURIComponent(selfId)}`
+        );
+        expect(actRes.status).toBe(200);
+        const actJson = (await actRes.json()) as {
+            ok: boolean;
+            data: {
+                currentUserData: Array<{
+                    created_at: string;
+                    type: string;
+                    location: string;
+                    user_id: string;
+                    time: number;
+                }>;
+                detailEntries: Array<
+                    [
+                        string,
+                        Array<{
+                            created_at: string;
+                            type: string;
+                            display_name: string;
+                            location: string;
+                            user_id: string;
+                            time: number;
+                        }>
+                    ]
+                >;
+            };
+        };
+
+        // Current user has 2 reconstructed sessions: Room A (~29m58s) and Room B (30m00s)
+        expect(actJson.data.currentUserData).toHaveLength(2);
+        expect(actJson.data.currentUserData[0]?.location).toBe(roomA);
+        expect(actJson.data.currentUserData[0]?.time).toBe(29 * 60_000 + 58_000);
+        expect(actJson.data.currentUserData[1]?.location).toBe(roomB);
+        expect(actJson.data.currentUserData[1]?.time).toBe(30 * 60_000);
+
+        const detailMap = new Map(actJson.data.detailEntries);
+        const roomARows = detailMap.get(roomA) ?? [];
+        expect(roomARows).toHaveLength(2);
+        const aliceRow = roomARows.find((r) => r.user_id === 'usr_alice_act');
+        expect(aliceRow?.time).toBe(15 * 60_000); // 10:05 -> 10:20 reconstructed from time=0 OnPlayerLeft
+    });
 });

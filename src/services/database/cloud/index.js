@@ -1096,11 +1096,33 @@ export function createCloudDatabase(dbVars) {
         async getUserIdFromDisplayName() {
             return '';
         },
-        async getInstanceActivity() {
-            return [];
+        async getInstanceActivity(startDate, endDate) {
+            if (!startDate || !endDate) {
+                return { currentUserData: [], detailData: new Map() };
+            }
+            const params = new URLSearchParams({
+                startDate: String(startDate),
+                endDate: String(endDate)
+            });
+            if (dbVars.userId) {
+                params.set('userId', String(dbVars.userId));
+            }
+            const res = await cloudFetch(`/api/gamelog/instance-activity?${params.toString()}`).catch(() => null);
+            const currentUserData = Array.isArray(res?.currentUserData) ? res.currentUserData : [];
+            const detailData = new Map();
+            if (Array.isArray(res?.detailEntries)) {
+                for (const entry of res.detailEntries) {
+                    if (Array.isArray(entry) && typeof entry[0] === 'string' && Array.isArray(entry[1])) {
+                        detailData.set(entry[0], entry[1]);
+                    }
+                }
+            }
+            return { currentUserData, detailData };
         },
         async getDateOfInstanceActivity() {
-            return { firstDate: '', lastDate: '' };
+            const query = dbVars.userId ? `?userId=${encodeURIComponent(String(dbVars.userId))}` : '';
+            const rows = await cloudFetch(`/api/gamelog/instance-activity/dates${query}`).catch(() => []);
+            return Array.isArray(rows) ? rows : [];
         },
         async getInstanceJoinHistory() {
             return [];
@@ -1197,11 +1219,19 @@ export function createCloudDatabase(dbVars) {
         async getFeedByInstanceId() {
             return [];
         },
-        async getHotWorlds() {
-            return [];
+        async getHotWorlds(days = 30, limit = 30) {
+            const safeDays = Math.max(1, Math.min(365, Math.floor(Number(days) || 30)));
+            const safeLimit = Math.max(1, Math.min(50, Math.floor(Number(limit) || 30)));
+            const rows = await cloudFetch(`/api/feed/hot-worlds?days=${safeDays}&limit=${safeLimit}`).catch(() => []);
+            return Array.isArray(rows) ? rows : [];
         },
-        async getHotWorldFriendDetail() {
-            return [];
+        async getHotWorldFriendDetail(worldId, days = 30) {
+            if (!worldId) return [];
+            const safeDays = Math.max(1, Math.min(365, Math.floor(Number(days) || 30)));
+            const rows = await cloudFetch(
+                `/api/feed/hot-worlds/detail?worldId=${encodeURIComponent(String(worldId))}&days=${safeDays}`
+            ).catch(() => []);
+            return Array.isArray(rows) ? rows : [];
         },
 
         // ===== activityV2 =====

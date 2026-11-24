@@ -791,6 +791,372 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
         return Response.json({ ok: true, data: {} });
     }
 
+    if (url.pathname === '/api/gamelog/instance-activity/dates' && request.method === 'GET') {
+        const userId = (url.searchParams.get('userId') ?? '').trim();
+        const queries: D1PreparedStatement[] = [
+            env.DB_GAMELOG.prepare('SELECT created_at FROM gamelog_location ORDER BY created_at DESC LIMIT 1500')
+        ];
+        if (userId) {
+            queries.unshift(
+                env.DB_GAMELOG.prepare(
+                    'SELECT created_at FROM gamelog_join_leave WHERE user_id = ? ORDER BY id DESC LIMIT 2000'
+                ).bind(userId)
+            );
+        }
+        const results = await env.DB_GAMELOG.batch(queries);
+        // Keep earliest + latest timestamp per UTC calendar day so client timezone conversion
+        // preserves every active local calendar day while keeping payload compact.
+        const perUtcDay = new Map<string, { min: string; max: string }>();
+        for (const res of results) {
+            for (const row of (res?.results ?? []) as Array<{ created_at?: string }>) {
+                const ts = typeof row.created_at === 'string' ? row.created_at.trim() : '';
+                if (ts.length < 10) continue;
+                const dayKey = ts.slice(0, 10);
+                const cur = perUtcDay.get(dayKey);
+                if (!cur) {
+                    perUtcDay.set(dayKey, { min: ts, max: ts });
+                } else {
+                    if (ts < cur.min) cur.min = ts;
+                    if (ts > cur.max) cur.max = ts;
+                }
+            }
+        }
+        const dates: string[] = [];
+        for (const { min, max } of perUtcDay.values()) {
+            dates.push(min);
+            if (max !== min) dates.push(max);
+        }
+        dates.sort();
+        return Response.json({ ok: true, data: dates });
+    }
+
+    if (url.pathname === '/api/gamelog/instance-activity' && request.method === 'GET') {
+        const startDate = (url.searchParams.get('startDate') ?? '').trim();
+        const endDate = (url.searchParams.get('endDate') ?? '').trim();
+        const userId = (url.searchParams.get('userId') ?? '').trim();
+
+        const startMs = Date.parse(startDate);
+        const endMs = Date.parse(endDate);
+        if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs < startMs) {
+            return Response.json({ ok: true, data: { currentUserData: [], detailEntries: [] } });
+        }
+        // Cap query window to <= 7 days to protect Free-tier D1 rows_read.
+        const safeEndMs = Math.min(endMs, startMs + 7 * 86400_000);
+        const windowStartIso = new Date(startMs - 12 * 3600_000).toISOString();
+        const windowEndIso = new Date(safeEndMs + 12 * 3600_000).toISOString();
+
+        const [gamelogBatch, userRow] = await Promise.all([
+            env.DB_GAMELOG.batch([
+                env.DB_GAMELOG.prepare(
+                    'SELECT id, created_at, location, world_id, world_name, time FROM gamelog_location WHERE created_at >= ? AND created_at <= ? ORDER BY created_at ASC LIMIT 500'
+                ).bind(windowStartIso, windowEndIso),
+                env.DB_GAMELOG.prepare(
+                    'SELECT id, created_at, type, display_name, location, user_id, time FROM gamelog_join_leave WHERE created_at >= ? AND created_at <= ? ORDER BY created_at ASC LIMIT 2500'
+                ).bind(windowStartIso, windowEndIso),
+                env.DB_GAMELOG.prepare(
+                    'SELECT id, created_at, data FROM gamelog_event WHERE created_at >= ? AND created_at <= ? ORDER BY created_at ASC LIMIT 500'
+                ).bind(windowStartIso, windowEndIso)
+            ]),
+            userId
+                ? env.DB_CORE.prepare('SELECT display_name FROM entity_users WHERE user_id = ? LIMIT 1')
+                      .bind(userId)
+                      .first<{ display_name?: string }>()
+                : Promise.resolve(null)
+        ]);
+
+        const currentDisplayName = typeof userRow?.display_name === 'string' ? userRow.display_name.trim() : '';
+
+        interface ActivityRow {
+            id: number;
+            created_at: string;
+            type: 'OnPlayerLeft';
+            display_name: string;
+            location: string;
+            user_id: string;
+            time: number;
+        }
+        interface TimelineEvent {
+            order: number;
+            ms: number;
+            kind: 'quit' | 'left' | 'location' | 'joined';
+            id: number;
+            created_at: string;
+            display_name: string;
+            location: string;
+            user_id: string;
+            time: number;
+        }
+
+        const timeline: TimelineEvent[] = [];
+        for (const r of (gamelogBatch[0]?.results ?? []) as Array<Record<string, unknown>>) {
+            const ts = String(r.created_at ?? '');
+            const ms = Date.parse(ts);
+            const loc = String(r.location ?? '').trim();
+            if (!Number.isFinite(ms) || !loc || loc === 'traveling') continue;
+            timeline.push({
+                order: 2,
+                ms,
+                kind: 'location',
+                id: Number(r.id ?? 0),
+                created_at: ts,
+                display_name: '',
+                location: loc,
+                user_id: '',
+                time: Number(r.time ?? 0)
+            });
+        }
+        for (const r of (gamelogBatch[1]?.results ?? []) as Array<Record<string, unknown>>) {
+            const ts = String(r.created_at ?? '');
+            const ms = Date.parse(ts);
+            const type = String(r.type ?? '');
+            if (!Number.isFinite(ms) || (type !== 'OnPlayerJoined' && type !== 'OnPlayerLeft')) continue;
+            timeline.push({
+                order: type === 'OnPlayerLeft' ? 1 : 3,
+                ms,
+                kind: type === 'OnPlayerLeft' ? 'left' : 'joined',
+                id: Number(r.id ?? 0),
+                created_at: ts,
+                display_name: String(r.display_name ?? ''),
+                location: String(r.location ?? '').trim(),
+                user_id: String(r.user_id ?? '').trim(),
+                time: Number(r.time ?? 0)
+            });
+        }
+        for (const r of (gamelogBatch[2]?.results ?? []) as Array<Record<string, unknown>>) {
+            const ts = String(r.created_at ?? '');
+            const ms = Date.parse(ts);
+            const data = String(r.data ?? '');
+            if (!Number.isFinite(ms) || !data.includes('VRChat closed')) continue;
+            timeline.push({
+                order: 0,
+                ms,
+                kind: 'quit',
+                id: Number(r.id ?? 0),
+                created_at: ts,
+                display_name: '',
+                location: '',
+                user_id: '',
+                time: 0
+            });
+        }
+
+        timeline.sort((a, b) => a.ms - b.ms || a.order - b.order || a.id - b.id);
+
+        const MAX_IDLE_SESSION_GAP_MS = 6 * 3600_000;
+        const activePlayers = new Map<
+            string,
+            { id: number; display_name: string; user_id: string; location: string; joinMs: number }
+        >();
+        const emitted: ActivityRow[] = [];
+        let currentLocation = '';
+        let currentLocationStartMs = 0;
+        let currentLocationDurationMs = 0;
+        let currentLocationRowId = 0;
+        let currentRoomSawCurrentUser = false;
+        let lastRoomEventMs = 0;
+
+        const resolveUserId = (rawUid: string, rawName: string): string => {
+            if (rawUid) return rawUid;
+            if (userId && currentDisplayName && rawName && rawName.toLowerCase() === currentDisplayName.toLowerCase()) {
+                return userId;
+            }
+            return '';
+        };
+
+        const playerKey = (uid: string, name: string): string =>
+            uid ? `id:${uid}` : `name:${name.trim().toLowerCase()}`;
+
+        const flushActiveRoom = (closeMs: number) => {
+            if (activePlayers.size > 0) {
+                let effectiveCloseMs = closeMs;
+                if (lastRoomEventMs > 0 && closeMs - lastRoomEventMs > MAX_IDLE_SESSION_GAP_MS) {
+                    effectiveCloseMs = lastRoomEventMs + 60_000;
+                }
+                for (const p of activePlayers.values()) {
+                    const leaveMs = Math.max(effectiveCloseMs, p.joinMs + 1000);
+                    emitted.push({
+                        id: p.id,
+                        created_at: new Date(leaveMs).toISOString(),
+                        type: 'OnPlayerLeft',
+                        display_name: p.display_name,
+                        location: p.location,
+                        user_id: p.user_id,
+                        time: leaveMs - p.joinMs
+                    });
+                    if (userId && p.user_id === userId) {
+                        currentRoomSawCurrentUser = true;
+                    }
+                }
+                activePlayers.clear();
+            }
+
+            // Fallback: if a desktop/historical Location row had duration or bounded next-transition
+            // without a matching self OnPlayerJoined/Left row, synthesize the current user's room bar.
+            if (userId && currentLocation && !currentRoomSawCurrentUser && currentLocationStartMs > 0) {
+                const dur =
+                    currentLocationDurationMs > 0
+                        ? currentLocationDurationMs
+                        : closeMs > currentLocationStartMs &&
+                            closeMs - currentLocationStartMs <= MAX_IDLE_SESSION_GAP_MS
+                          ? closeMs - currentLocationStartMs
+                          : 0;
+                if (dur > 0) {
+                    const leaveMs = currentLocationStartMs + dur;
+                    emitted.push({
+                        id: currentLocationRowId,
+                        created_at: new Date(leaveMs).toISOString(),
+                        type: 'OnPlayerLeft',
+                        display_name: currentDisplayName || userId,
+                        location: currentLocation,
+                        user_id: userId,
+                        time: dur
+                    });
+                }
+            }
+            currentRoomSawCurrentUser = false;
+            currentLocationStartMs = 0;
+            currentLocationDurationMs = 0;
+            currentLocationRowId = 0;
+        };
+
+        for (const ev of timeline) {
+            if (ev.kind === 'quit') {
+                flushActiveRoom(ev.ms);
+                currentLocation = '';
+                lastRoomEventMs = 0;
+                continue;
+            }
+
+            if (ev.kind === 'location') {
+                if (currentLocation && ev.location !== currentLocation) {
+                    flushActiveRoom(ev.ms);
+                }
+                currentLocation = ev.location;
+                if (currentLocationStartMs === 0) {
+                    currentLocationStartMs = ev.ms;
+                    currentLocationDurationMs = ev.time > 0 ? ev.time : 0;
+                    currentLocationRowId = ev.id;
+                }
+                lastRoomEventMs = Math.max(lastRoomEventMs, ev.ms);
+                continue;
+            }
+
+            const loc = ev.location && ev.location !== 'traveling' ? ev.location : currentLocation;
+            if (!loc || loc === 'traveling') continue;
+
+            const uid = resolveUserId(ev.user_id, ev.display_name);
+            const key = playerKey(uid, ev.display_name);
+
+            if (ev.kind === 'joined') {
+                if (currentLocation && loc !== currentLocation) {
+                    flushActiveRoom(ev.ms);
+                    currentLocation = loc;
+                    currentLocationStartMs = ev.ms;
+                    currentLocationRowId = ev.id;
+                } else if (!currentLocation) {
+                    currentLocation = loc;
+                    currentLocationStartMs = ev.ms;
+                    currentLocationRowId = ev.id;
+                }
+                if (!activePlayers.has(key)) {
+                    activePlayers.set(key, {
+                        id: ev.id,
+                        display_name: ev.display_name,
+                        user_id: uid,
+                        location: loc,
+                        joinMs: ev.ms
+                    });
+                }
+                lastRoomEventMs = Math.max(lastRoomEventMs, ev.ms);
+                continue;
+            }
+
+            // OnPlayerLeft
+            if (ev.time > 0) {
+                activePlayers.delete(key);
+                emitted.push({
+                    id: ev.id,
+                    created_at: ev.created_at,
+                    type: 'OnPlayerLeft',
+                    display_name: ev.display_name,
+                    location: loc,
+                    user_id: uid,
+                    time: ev.time
+                });
+                if (userId && uid === userId) {
+                    currentRoomSawCurrentUser = true;
+                }
+                lastRoomEventMs = Math.max(lastRoomEventMs, ev.ms);
+                continue;
+            }
+
+            const active = activePlayers.get(key);
+            if (active) {
+                activePlayers.delete(key);
+                const dur = Math.max(1000, ev.ms - active.joinMs);
+                emitted.push({
+                    id: ev.id,
+                    created_at: ev.created_at,
+                    type: 'OnPlayerLeft',
+                    display_name: ev.display_name || active.display_name,
+                    location: active.location || loc,
+                    user_id: uid || active.user_id,
+                    time: dur
+                });
+                if (userId && (uid || active.user_id) === userId) {
+                    currentRoomSawCurrentUser = true;
+                }
+            }
+            lastRoomEventMs = Math.max(lastRoomEventMs, ev.ms);
+        }
+
+        if (activePlayers.size > 0 || (currentLocation && currentLocationStartMs > 0)) {
+            const nowMs = Date.now();
+            const closeMs =
+                lastRoomEventMs > 0 && nowMs >= lastRoomEventMs && nowMs - lastRoomEventMs <= MAX_IDLE_SESSION_GAP_MS
+                    ? nowMs
+                    : lastRoomEventMs + 60_000;
+            flushActiveRoom(closeMs);
+        }
+
+        // Filter to rows whose [joinMs, leaveMs] overlaps the requested [startMs, safeEndMs] day window
+        const filtered = emitted
+            .filter((row) => {
+                if (!row.location || row.location === 'traveling') return false;
+                const leaveMs = Date.parse(row.created_at);
+                if (!Number.isFinite(leaveMs)) return false;
+                const joinMs = leaveMs - Math.max(0, row.time);
+                return joinMs <= safeEndMs && leaveMs >= startMs;
+            })
+            .sort((a, b) => {
+                const aJoin = Date.parse(a.created_at) - a.time;
+                const bJoin = Date.parse(b.created_at) - b.time;
+                return aJoin - bJoin || Date.parse(a.created_at) - Date.parse(b.created_at);
+            });
+
+        const currentUserData: ActivityRow[] = [];
+        const detailMap = new Map<string, ActivityRow[]>();
+        for (const row of filtered) {
+            if (userId && row.user_id === userId) {
+                currentUserData.push(row);
+            }
+            const bucket = detailMap.get(row.location);
+            if (bucket) {
+                bucket.push(row);
+            } else {
+                detailMap.set(row.location, [row]);
+            }
+        }
+
+        return Response.json({
+            ok: true,
+            data: {
+                currentUserData,
+                detailEntries: Array.from(detailMap.entries())
+            }
+        });
+    }
+
     // ===== FEED =====
     if (url.pathname === '/api/feed') {
         if (request.method === 'GET') {
@@ -922,6 +1288,116 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
         >;
         merged.sort((a, b) => String(b.created_at ?? '').localeCompare(String(a.created_at ?? '')));
         return Response.json({ ok: true, data: merged.slice(0, limit) });
+    }
+
+    if (url.pathname === '/api/feed/hot-worlds' && request.method === 'GET') {
+        const rawDays = Number(url.searchParams.get('days') ?? '30');
+        const days = Number.isFinite(rawDays) && rawDays > 0 ? Math.min(Math.floor(rawDays), 365) : 30;
+        const rawLimit = Number(url.searchParams.get('limit') ?? '30');
+        const limit = Number.isFinite(rawLimit) && rawLimit > 0 ? Math.min(Math.floor(rawLimit), 50) : 30;
+        const halfDays = Math.floor(days / 2);
+        const nowMs = Date.now();
+        const sinceIso = new Date(nowMs - days * 86400_000).toISOString();
+        const halfIso = new Date(nowMs - halfDays * 86400_000).toISOString();
+
+        const res = await env.DB_FEED.prepare(
+            `SELECT
+                SUBSTR(location, 1, INSTR(location, ':') - 1) AS world_id,
+                MAX(NULLIF(world_name, '')) AS world_name,
+                COUNT(*) AS visit_count,
+                COUNT(DISTINCT user_id) AS unique_friends,
+                MAX(created_at) AS last_visited,
+                COUNT(DISTINCT CASE WHEN created_at < ? THEN user_id END) AS old_friends,
+                COUNT(DISTINCT CASE WHEN created_at >= ? THEN user_id END) AS new_friends
+             FROM feed_gps
+             WHERE created_at >= ?
+                 AND location LIKE 'wrld_%'
+                 AND INSTR(location, ':') > 0
+             GROUP BY world_id
+             ORDER BY unique_friends DESC, visit_count DESC
+             LIMIT ?`
+        )
+            .bind(halfIso, halfIso, sinceIso, Math.min(limit + 10, 60))
+            .all<{
+                world_id: string;
+                world_name: string | null;
+                visit_count: number;
+                unique_friends: number;
+                last_visited: string;
+                old_friends: number;
+                new_friends: number;
+            }>();
+
+        const rows = res.results ?? [];
+        const missingNameIds = rows.filter((r) => !r.world_name).map((r) => r.world_id);
+        const fallbackNames = new Map<string, string>();
+        if (missingNameIds.length > 0) {
+            for (let i = 0; i < missingNameIds.length; i += 20) {
+                const chunk = missingNameIds.slice(i, i + 20);
+                const ph = chunk.map(() => '?').join(', ');
+                const dictRes = await env.DB_CORE.prepare(
+                    `SELECT world_id, world_name FROM entity_worlds WHERE world_id IN (${ph})`
+                )
+                    .bind(...chunk)
+                    .all<{ world_id: string; world_name: string }>();
+                for (const d of dictRes.results ?? []) {
+                    if (d.world_id && d.world_name) fallbackNames.set(d.world_id, d.world_name);
+                }
+            }
+        }
+
+        const out = [];
+        for (const r of rows) {
+            const worldName = (r.world_name || fallbackNames.get(r.world_id) || '').trim();
+            if (!worldName) continue;
+            const oldFriends = Number(r.old_friends ?? 0);
+            const newFriends = Number(r.new_friends ?? 0);
+            const trend = newFriends > oldFriends ? 'rising' : newFriends < oldFriends ? 'cooling' : 'stable';
+            out.push({
+                worldId: r.world_id,
+                worldName,
+                visitCount: Number(r.visit_count ?? 0),
+                uniqueFriends: Number(r.unique_friends ?? 0),
+                lastVisited: r.last_visited || '',
+                trend
+            });
+            if (out.length >= limit) break;
+        }
+        return Response.json({ ok: true, data: out });
+    }
+
+    if (url.pathname === '/api/feed/hot-worlds/detail' && request.method === 'GET') {
+        const worldId = (url.searchParams.get('worldId') ?? '').trim();
+        if (!/^wrld_[0-9a-zA-Z_-]+$/.test(worldId)) {
+            return Response.json({ ok: true, data: [] });
+        }
+        const rawDays = Number(url.searchParams.get('days') ?? '30');
+        const days = Number.isFinite(rawDays) && rawDays > 0 ? Math.min(Math.floor(rawDays), 365) : 30;
+        const sinceIso = new Date(Date.now() - days * 86400_000).toISOString();
+
+        const res = await env.DB_FEED.prepare(
+            `SELECT
+                user_id,
+                MAX(display_name) AS display_name,
+                COUNT(*) AS visit_count,
+                MAX(created_at) AS last_visit
+             FROM feed_gps
+             WHERE created_at >= ?
+                 AND location LIKE ?
+             GROUP BY user_id
+             ORDER BY visit_count DESC
+             LIMIT 100`
+        )
+            .bind(sinceIso, `${worldId}:%`)
+            .all<{ user_id: string; display_name: string; visit_count: number; last_visit: string }>();
+
+        const out = (res.results ?? []).map((r) => ({
+            userId: r.user_id,
+            displayName: r.display_name || r.user_id,
+            visitCount: Number(r.visit_count ?? 0),
+            lastVisit: r.last_visit || ''
+        }));
+        return Response.json({ ok: true, data: out });
     }
 
     // ===== ACTIVITY SESSIONS V2 =====

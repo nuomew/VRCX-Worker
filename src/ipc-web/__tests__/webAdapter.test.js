@@ -651,4 +651,75 @@ describe('WEB cloud adapter (stateless)', () => {
         expect(JSON.parse(offRes3).message).toContain('usr_off_1');
         expect(fetchSpy).toHaveBeenCalledTimes(2);
     });
+
+    it('loads Hot Worlds and Instance Activity charts through cloud database REST endpoints', async () => {
+        const db = createCloudDatabase({ userId: 'usr_me', userPrefix: 'usr_me', maxTableSize: 500 });
+
+        fetchSpy.mockResolvedValueOnce(
+            mockOk([
+                {
+                    worldId: 'wrld_hot_1',
+                    worldName: 'Sakura Shrine',
+                    visitCount: 5,
+                    uniqueFriends: 3,
+                    lastVisited: '2026-11-24T10:00:00.000Z',
+                    trend: 'rising'
+                }
+            ])
+        );
+        const hotWorlds = await db.getHotWorlds(30, 20);
+        expect(fetchSpy.mock.calls[0][0]).toBe('/api/feed/hot-worlds?days=30&limit=20');
+        expect(hotWorlds).toHaveLength(1);
+        expect(hotWorlds[0].worldId).toBe('wrld_hot_1');
+
+        fetchSpy.mockResolvedValueOnce(
+            mockOk([{ userId: 'usr_f1', displayName: 'Alice', visitCount: 3, lastVisit: '2026-11-24T10:00:00.000Z' }])
+        );
+        const detail = await db.getHotWorldFriendDetail('wrld_hot_1', 30);
+        expect(fetchSpy.mock.calls[1][0]).toBe('/api/feed/hot-worlds/detail?worldId=wrld_hot_1&days=30');
+        expect(detail[0].displayName).toBe('Alice');
+
+        fetchSpy.mockResolvedValueOnce(mockOk(['2026-11-23T12:00:00.000Z', '2026-11-24T12:00:00.000Z']));
+        const dates = await db.getDateOfInstanceActivity();
+        expect(fetchSpy.mock.calls[2][0]).toBe('/api/gamelog/instance-activity/dates?userId=usr_me');
+        expect(dates).toEqual(['2026-11-23T12:00:00.000Z', '2026-11-24T12:00:00.000Z']);
+
+        fetchSpy.mockResolvedValueOnce(
+            mockOk({
+                currentUserData: [
+                    {
+                        id: 1,
+                        created_at: '2026-11-24T11:00:00.000Z',
+                        type: 'OnPlayerLeft',
+                        display_name: 'Me',
+                        location: 'wrld_hot_1:100',
+                        user_id: 'usr_me',
+                        time: 1800000
+                    }
+                ],
+                detailEntries: [
+                    [
+                        'wrld_hot_1:100',
+                        [
+                            {
+                                id: 1,
+                                created_at: '2026-11-24T11:00:00.000Z',
+                                type: 'OnPlayerLeft',
+                                display_name: 'Me',
+                                location: 'wrld_hot_1:100',
+                                user_id: 'usr_me',
+                                time: 1800000
+                            }
+                        ]
+                    ]
+                ]
+            })
+        );
+        const act = await db.getInstanceActivity('2026-11-24T00:00:00.000Z', '2026-11-24T23:59:59.999Z');
+        expect(fetchSpy.mock.calls[3][0]).toContain('/api/gamelog/instance-activity?');
+        expect(fetchSpy.mock.calls[3][0]).toContain('userId=usr_me');
+        expect(act.currentUserData).toHaveLength(1);
+        expect(act.detailData instanceof Map).toBe(true);
+        expect(act.detailData.get('wrld_hot_1:100')).toHaveLength(1);
+    });
 });
