@@ -708,7 +708,7 @@ async function pollNotifications(
 
     // 1. Notifications v1 (invites, requestInvite, inviteResponse, etc.)
     try {
-        const v1Path = 'auth/user/notifications?n=60';
+        const v1Path = 'auth/user/notifications?n=100&offset=0';
         const resV1 = await fetchVrcJson(v1Path, jar);
         if (resV1.cookieChanged) cookieChanged = true;
         if (resV1.status === 200 && Array.isArray(resV1.data)) {
@@ -776,7 +776,7 @@ async function pollNotifications(
 
     // 2. Notifications v2 (group announcements, boops, invites v2)
     try {
-        const v2Path = 'notifications?n=60';
+        const v2Path = 'notifications?n=100&offset=0';
         const resV2 = await fetchVrcJson(v2Path, jar);
         if (resV2.cookieChanged) cookieChanged = true;
         if (resV2.status === 200 && Array.isArray(resV2.data)) {
@@ -1575,6 +1575,53 @@ export async function getRssAggregatedFeed(
         ? recentFeeds.filter((f) => String(f.created_at ?? '') > since).slice(0, 60)
         : recentFeeds.slice(0, 60);
 
+    const rawV1 = (notifResults[0] as D1Result<Record<string, unknown>> | undefined)?.results ?? [];
+    const rawV2 = (notifResults[1] as D1Result<Record<string, unknown>> | undefined)?.results ?? [];
+
+    const notificationsV1 = rawV1.map((r) => ({
+        id: String(r.id ?? ''),
+        created_at: String(r.created_at ?? ''),
+        type: String(r.type ?? ''),
+        senderUserId: String(r.sender_user_id ?? ''),
+        senderUsername: String(r.sender_username ?? ''),
+        receiverUserId: String(r.receiver_user_id ?? ''),
+        message: String(r.message ?? ''),
+        details: {
+            worldId: String(r.world_id ?? ''),
+            worldName: String(r.world_name ?? ''),
+            imageUrl: String(r.image_url ?? ''),
+            inviteMessage: String(r.invite_message ?? ''),
+            requestMessage: String(r.request_message ?? ''),
+            responseMessage: String(r.response_message ?? '')
+        },
+        $isExpired: Boolean(r.expired)
+    }));
+
+    const notificationsV2 = rawV2.map((r) => {
+        const createdAt = String(r.created_at ?? '');
+        const parsedResponses = safeJsonParse<unknown>(typeof r.responses === 'string' ? r.responses : null, []);
+        return {
+            id: String(r.id ?? ''),
+            createdAt,
+            created_at: createdAt,
+            updatedAt: String(r.updated_at ?? ''),
+            expiresAt: String(r.expires_at ?? ''),
+            type: String(r.type ?? ''),
+            link: String(r.link ?? ''),
+            linkText: String(r.link_text ?? ''),
+            message: String(r.message ?? ''),
+            title: String(r.title ?? ''),
+            imageUrl: String(r.image_url ?? ''),
+            seen: Boolean(r.seen),
+            senderUserId: String(r.sender_user_id ?? ''),
+            senderUsername: String(r.sender_username ?? ''),
+            data: safeJsonParse<Record<string, unknown>>(typeof r.data === 'string' ? r.data : null, {}),
+            responses: Array.isArray(parsedResponses) ? parsedResponses : [],
+            details: safeJsonParse<Record<string, unknown>>(typeof r.details === 'string' ? r.details : null, {}),
+            version: 2
+        };
+    });
+
     return {
         changed: true,
         syncedAt: snapshot.syncedAt,
@@ -1587,8 +1634,8 @@ export async function getRssAggregatedFeed(
         friendLogInserted: Number(snapshot.friendLogInserted ?? 0),
         onlineFriends: snapshot.onlineFriends,
         recentFeeds: filteredFeeds,
-        notificationsV1: (notifResults[0] as D1Result<Record<string, unknown>> | undefined)?.results ?? [],
-        notificationsV2: (notifResults[1] as D1Result<Record<string, unknown>> | undefined)?.results ?? [],
+        notificationsV1,
+        notificationsV2,
         ...(syncResult ? { syncResult } : {})
     };
 }

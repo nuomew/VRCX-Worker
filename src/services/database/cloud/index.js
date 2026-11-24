@@ -825,21 +825,22 @@ export function createCloudDatabase(dbVars) {
         // ===== notifications (v1 & v2) =====
         async getNotifications() {
             const rows = await cloudFetch('/api/notifications?v=1&limit=150').catch(() => []);
+            if (!Array.isArray(rows)) return [];
             return rows.map((r) => ({
-                id: r.id,
-                created_at: r.created_at,
-                type: r.type,
-                senderUserId: r.sender_user_id,
-                senderUsername: r.sender_username,
-                receiverUserId: r.receiver_user_id,
-                message: r.message,
+                id: r.id || '',
+                created_at: r.created_at || '',
+                type: r.type || '',
+                senderUserId: r.sender_user_id || '',
+                senderUsername: r.sender_username || '',
+                receiverUserId: r.receiver_user_id || '',
+                message: r.message || '',
                 details: {
-                    worldId: r.world_id,
-                    worldName: r.world_name,
-                    imageUrl: r.image_url,
-                    inviteMessage: r.invite_message,
-                    requestMessage: r.request_message,
-                    responseMessage: r.response_message
+                    worldId: r.world_id || '',
+                    worldName: r.world_name || '',
+                    imageUrl: r.image_url || '',
+                    inviteMessage: r.invite_message || '',
+                    requestMessage: r.request_message || '',
+                    responseMessage: r.response_message || ''
                 },
                 $isExpired: Boolean(r.expired)
             }));
@@ -875,24 +876,41 @@ export function createCloudDatabase(dbVars) {
         },
         async getNotificationsV2() {
             const rows = await cloudFetch('/api/notifications?v=2&limit=150').catch(() => []);
-            return rows.map((r) => ({
-                id: r.id,
-                createdAt: r.created_at,
-                updatedAt: r.updated_at,
-                expiresAt: r.expires_at,
-                type: r.type,
-                link: r.link,
-                linkText: r.link_text,
-                message: r.message,
-                title: r.title,
-                imageUrl: r.image_url,
-                seen: Boolean(r.seen),
-                senderUserId: r.sender_user_id,
-                senderUsername: r.sender_username,
-                data: JSON.parse(r.data || '{}'),
-                responses: JSON.parse(r.responses || '[]'),
-                details: JSON.parse(r.details || '{}')
-            }));
+            if (!Array.isArray(rows)) return [];
+            const parseJson = (raw, fallback) => {
+                if (raw && typeof raw === 'object') return raw;
+                if (typeof raw !== 'string' || !raw) return fallback;
+                try {
+                    const parsed = JSON.parse(raw);
+                    return parsed && typeof parsed === 'object' ? parsed : fallback;
+                } catch {
+                    return fallback;
+                }
+            };
+            return rows.map((r) => {
+                const createdAt = r.created_at || r.createdAt || '';
+                const parsedResponses = parseJson(r.responses, []);
+                return {
+                    id: r.id || '',
+                    createdAt,
+                    created_at: createdAt,
+                    updatedAt: r.updated_at || '',
+                    expiresAt: r.expires_at || '',
+                    type: r.type || '',
+                    link: r.link || '',
+                    linkText: r.link_text || '',
+                    message: r.message || '',
+                    title: r.title || '',
+                    imageUrl: r.image_url || '',
+                    seen: Boolean(r.seen),
+                    senderUserId: r.sender_user_id || '',
+                    senderUsername: r.sender_username || '',
+                    data: parseJson(r.data, {}),
+                    responses: Array.isArray(parsedResponses) ? parsedResponses : [],
+                    details: parseJson(r.details, {}),
+                    version: 2
+                };
+            });
         },
         async addNotificationV2ToDatabase(entry) {
             queueNotificationWrite(2, entry);

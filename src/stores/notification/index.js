@@ -157,7 +157,7 @@ export const useNotificationStore = defineStore('Notification', () => {
                 initNotifications();
             }
         },
-        { flush: 'sync' }
+        { flush: 'sync', immediate: true }
     );
 
     watch(
@@ -713,72 +713,94 @@ export const useNotificationStore = defineStore('Notification', () => {
         isNotificationsLoading.value = true;
         let count;
         let params;
-        try {
-            expireFriendRequestNotifications();
-            params = {
-                n: 100,
-                offset: 0
-            };
-            count = 50; // 5000 max
-            for (let i = 0; i < count; i++) {
-                const args = await notificationRequest.getNotifications(params);
-                for (const json of args.json) {
-                    handleNotification({
-                        json,
-                        params: {
-                            notificationId: json.id
-                        }
-                    });
-                }
-                params.offset += 100;
-                if (args.json.length < 100) {
-                    break;
-                }
-            }
-            params = {
-                n: 100,
-                offset: 0
-            };
-            count = 50; // 5000 max
-            for (let i = 0; i < count; i++) {
-                const args = await notificationRequest.getNotificationsV2(params);
-                for (const json of args.json) {
-                    handleNotificationV2({
-                        json,
-                        params: {
-                            notificationId: json.id
-                        }
-                    });
-                }
-                params.offset += 100;
-                if (args.json.length < 100) {
-                    break;
-                }
-            }
-            params = {
-                n: 100,
-                offset: 0
-            };
-            count = 50; // 5000 max
-            for (let i = 0; i < count; i++) {
-                const args = await notificationRequest.getHiddenFriendRequests(params);
-                for (const json of args.json) {
-                    handleNotification({
-                        json: { ...json, type: 'ignoredFriendRequest' },
-                        params: {
-                            notificationId: json.id
-                        }
-                    });
-                }
-                params.offset += 100;
-                if (args.json.length < 100) {
-                    break;
-                }
-            }
-        } catch (err) {
+        const handleFetchError = (err) => {
             console.error(err);
             if (err?.status === 429) {
                 refreshNotificationsBlockedUntil = Date.now() + 120000;
+            }
+        };
+        try {
+            expireFriendRequestNotifications();
+            try {
+                params = {
+                    n: 100,
+                    offset: 0
+                };
+                count = 50; // 5000 max
+                for (let i = 0; i < count; i++) {
+                    const args = await notificationRequest.getNotifications(params);
+                    if (!Array.isArray(args?.json)) {
+                        break;
+                    }
+                    for (const json of args.json) {
+                        handleNotification({
+                            json,
+                            params: {
+                                notificationId: json.id
+                            }
+                        });
+                    }
+                    params.offset += 100;
+                    if (args.json.length < 100) {
+                        break;
+                    }
+                }
+            } catch (err) {
+                handleFetchError(err);
+            }
+            try {
+                params = {
+                    n: 100,
+                    offset: 0
+                };
+                count = 50; // 5000 max
+                for (let i = 0; i < count; i++) {
+                    const args = await notificationRequest.getNotificationsV2(params);
+                    if (!Array.isArray(args?.json)) {
+                        break;
+                    }
+                    for (const json of args.json) {
+                        handleNotificationV2({
+                            json,
+                            params: {
+                                notificationId: json.id
+                            }
+                        });
+                    }
+                    params.offset += 100;
+                    if (args.json.length < 100) {
+                        break;
+                    }
+                }
+            } catch (err) {
+                handleFetchError(err);
+            }
+            try {
+                params = {
+                    n: 100,
+                    offset: 0
+                };
+                count = 50; // 5000 max
+                for (let i = 0; i < count; i++) {
+                    const args = await notificationRequest.getHiddenFriendRequests(params);
+                    if (!Array.isArray(args?.json)) {
+                        break;
+                    }
+                    for (const json of args.json) {
+                        handleNotification({
+                            json: { ...json, type: 'ignoredFriendRequest' },
+                            params: {
+                                notificationId: json.id
+                            }
+                        });
+                    }
+                    params.offset += 100;
+                    if (args.json.length < 100) {
+                        break;
+                    }
+                }
+            } catch (err) {
+                handleFetchError(err);
             }
         } finally {
             isNotificationsLoading.value = false;
@@ -1111,12 +1133,22 @@ export const useNotificationStore = defineStore('Notification', () => {
 
     async function initNotifications() {
         notificationInitStatus.value = false;
-        let tableData = await database.getNotificationsV2();
-        let notifications = await database.getNotifications();
-        tableData = tableData.concat(notifications.filter((n) => !tableData.some((t) => t.id === n.id)));
-        tableData.sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at));
-        tableData.splice(dbVars.maxTableSize);
-        notificationTable.value.data = tableData;
+        try {
+            const [v2Rows, v1Rows] = await Promise.all([
+                Promise.resolve(database.getNotificationsV2()).catch(() => []),
+                Promise.resolve(database.getNotifications()).catch(() => [])
+            ]);
+            let tableData = Array.isArray(v2Rows) ? [...v2Rows] : [];
+            const notifications = Array.isArray(v1Rows) ? v1Rows : [];
+            tableData = tableData.concat(notifications.filter((n) => !tableData.some((t) => t.id === n.id)));
+            tableData.sort(
+                (a, b) => Date.parse(b.created_at || b.createdAt || '') - Date.parse(a.created_at || a.createdAt || '')
+            );
+            tableData.splice(dbVars.maxTableSize);
+            notificationTable.value.data = tableData;
+        } catch (err) {
+            console.error('Failed to hydrate notifications from database:', err);
+        }
         refreshNotifications();
     }
 

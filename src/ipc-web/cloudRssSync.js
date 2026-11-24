@@ -90,22 +90,86 @@ export function applyCloudRssSnapshot(data) {
         friendStore.initFriendLogHistoryTable();
     }
 
+    const parseObj = (val, fallback) => {
+        if (val && typeof val === 'object') return val;
+        if (typeof val !== 'string' || !val) return fallback;
+        try {
+            const parsed = JSON.parse(val);
+            return parsed && typeof parsed === 'object' ? parsed : fallback;
+        } catch {
+            return fallback;
+        }
+    };
+
+    const normalizeV1 = (r) => ({
+        id: r.id || '',
+        created_at: r.created_at || '',
+        type: r.type || '',
+        senderUserId: r.senderUserId ?? r.sender_user_id ?? '',
+        senderUsername: r.senderUsername ?? r.sender_username ?? '',
+        receiverUserId: r.receiverUserId ?? r.receiver_user_id ?? '',
+        message: r.message || '',
+        details:
+            r.details && typeof r.details === 'object'
+                ? r.details
+                : {
+                      worldId: r.world_id || '',
+                      worldName: r.world_name || '',
+                      imageUrl: r.image_url || '',
+                      inviteMessage: r.invite_message || '',
+                      requestMessage: r.request_message || '',
+                      responseMessage: r.response_message || ''
+                  },
+        $isExpired: Boolean(r.$isExpired ?? r.expired)
+    });
+
+    const normalizeV2 = (r) => {
+        const createdAt = r.createdAt ?? r.created_at ?? '';
+        const parsedResponses = parseObj(r.responses, []);
+        return {
+            id: r.id || '',
+            createdAt,
+            created_at: createdAt,
+            updatedAt: r.updatedAt ?? r.updated_at ?? '',
+            expiresAt: r.expiresAt ?? r.expires_at ?? '',
+            type: r.type || '',
+            link: r.link || '',
+            linkText: r.linkText ?? r.link_text ?? '',
+            message: r.message || '',
+            title: r.title || '',
+            imageUrl: r.imageUrl ?? r.image_url ?? '',
+            seen: Boolean(r.seen),
+            senderUserId: r.senderUserId ?? r.sender_user_id ?? '',
+            senderUsername: r.senderUsername ?? r.sender_username ?? '',
+            data: parseObj(r.data, {}),
+            responses: Array.isArray(parsedResponses) ? parsedResponses : [],
+            details: parseObj(r.details, {}),
+            version: 2
+        };
+    };
+
     const n1 = Array.isArray(data.notificationsV1) ? data.notificationsV1 : [];
     const n2 = Array.isArray(data.notificationsV2) ? data.notificationsV2 : [];
     if (n1.length > 0 || n2.length > 0) {
-        const merged = [];
-        const seen = new Set();
-        for (const row of n2) {
-            if (!row?.id || seen.has(row.id)) continue;
-            seen.add(row.id);
-            merged.push(row);
+        const byId = new Map();
+        const existing = Array.isArray(notificationStore.notificationTable.data)
+            ? notificationStore.notificationTable.data
+            : [];
+        for (const row of existing) {
+            if (row?.id) byId.set(row.id, row);
         }
         for (const row of n1) {
-            if (!row?.id || seen.has(row.id)) continue;
-            seen.add(row.id);
-            merged.push(row);
+            if (!row?.id) continue;
+            byId.set(row.id, normalizeV1(row));
         }
-        merged.sort((a, b) => Date.parse(b.created_at || '') - Date.parse(a.created_at || ''));
+        for (const row of n2) {
+            if (!row?.id) continue;
+            byId.set(row.id, normalizeV2(row));
+        }
+        const merged = Array.from(byId.values());
+        merged.sort(
+            (a, b) => Date.parse(b.created_at || b.createdAt || '') - Date.parse(a.created_at || a.createdAt || '')
+        );
         notificationStore.notificationTable.data = merged;
     }
 }

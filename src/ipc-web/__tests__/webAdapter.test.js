@@ -769,4 +769,35 @@ describe('WEB cloud adapter (stateless)', () => {
             }
         ]);
     });
+
+    it('normalizes cloud getNotificationsV2 with created_at, version=2, and safe JSON parsing fallback', async () => {
+        const db = createCloudDatabase({ userId: 'usr_me', userPrefix: 'usr_me', maxTableSize: 500 });
+        fetchSpy.mockResolvedValueOnce(
+            mockOk([
+                {
+                    id: 'not_v2_ok',
+                    created_at: '2026-11-24T13:00:00.000Z',
+                    type: 'boop',
+                    sender_user_id: 'usr_f1',
+                    sender_username: 'Alice',
+                    message: 'Boop!',
+                    data: '{"emoji":"heart"}',
+                    responses: '[{"type":"reply","text":"Reply"}]',
+                    details: '{bad json'
+                }
+            ])
+        );
+        const rows = await db.getNotificationsV2();
+        expect(rows).toHaveLength(1);
+        expect(rows[0]).toMatchObject({
+            id: 'not_v2_ok',
+            createdAt: '2026-11-24T13:00:00.000Z',
+            created_at: '2026-11-24T13:00:00.000Z',
+            version: 2,
+            senderUsername: 'Alice',
+            data: { emoji: 'heart' },
+            responses: [{ type: 'reply', text: 'Reply' }],
+            details: {}
+        });
+    });
 });

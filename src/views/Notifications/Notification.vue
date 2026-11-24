@@ -315,5 +315,13 @@
 
     onMounted(() => {
         markAllAsSeen();
+        if (
+            typeof WEB !== 'undefined' &&
+            WEB &&
+            notificationTable.value.data.length === 0 &&
+            !isNotificationsLoading.value
+        ) {
+            refreshNotifications();
+        }
     });
 </script>

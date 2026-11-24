@@ -1400,11 +1400,30 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
             expect(rss1.status).toBe(200);
             const rss1Json = (await rss1.json()) as {
                 ok: boolean;
-                data: { changed: boolean; syncedAt: string; onlineFriends: Array<{ id: string }> };
+                data: {
+                    changed: boolean;
+                    syncedAt: string;
+                    onlineFriends: Array<{ id: string }>;
+                    notificationsV1: Array<{ id: string; senderUsername?: string; details?: { worldName?: string } }>;
+                    notificationsV2: Array<{
+                        id: string;
+                        created_at?: string;
+                        createdAt?: string;
+                        version?: number;
+                        responses?: unknown;
+                    }>;
+                };
             };
             expect(rss1Json.data.changed).toBe(true);
             expect(rss1Json.data.syncedAt).toBeTruthy();
             expect(rss1Json.data.onlineFriends.length).toBeGreaterThan(0);
+            expect(
+                rss1Json.data.notificationsV1.some((n) => n.id === 'not_bg_v1_1' && n.senderUsername === 'Alice')
+            ).toBe(true);
+            const v2Notif = rss1Json.data.notificationsV2.find((n) => n.id === 'not_bg_v2_1');
+            expect(v2Notif?.version).toBe(2);
+            expect(v2Notif?.created_at).toBeTruthy();
+            expect(Array.isArray(v2Notif?.responses)).toBe(true);
             expect(upstreamCalls).toBe(callsBeforeRssRead);
 
             // Watermark match returns changed: false with 0 upstream calls
