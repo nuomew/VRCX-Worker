@@ -27,7 +27,6 @@ public sealed class TrayApplicationContext : ApplicationContext
     private const int ImmediateFlushThreshold = 30;
 
     private readonly AgentConfigStore _configStore;
-    private readonly HttpClient _cloudHttp;
     private readonly HttpSyncClient _syncClient;
     private readonly LogTailCollector _logCollector;
     private readonly ScreenshotPipeline _screenshotPipeline;
@@ -38,9 +37,11 @@ public sealed class TrayApplicationContext : ApplicationContext
 
     private readonly NotifyIcon _trayIcon;
     private readonly ToolStripMenuItem _statusMenuItem;
+    private readonly ToolStripMenuItem _proxyModeItem;
     private readonly ToolStripMenuItem _autoStartItem;
 
     private AgentConfig _config;
+    private volatile HttpClient _cloudHttp;
     private DateTimeOffset _lastSyncAttemptAt = DateTimeOffset.MinValue;
     private DateTimeOffset _lastSyncSuccessAt = DateTimeOffset.MinValue;
     private DateTimeOffset _nextRetryAllowedAt = DateTimeOffset.MinValue;
@@ -53,10 +54,10 @@ public sealed class TrayApplicationContext : ApplicationContext
         _configStore = new AgentConfigStore();
         _config = _configStore.LoadConfig();
 
-        _cloudHttp = new HttpClient { Timeout = TimeSpan.FromSeconds(20) };
-        _syncClient = new HttpSyncClient(_cloudHttp);
+        _cloudHttp = ProxyHttpClientFactory.CreateHttpClient(_config);
+        _syncClient = new HttpSyncClient(() => _cloudHttp);
         _logCollector = new LogTailCollector(_configStore.DataDirectory);
-        _screenshotPipeline = new ScreenshotPipeline(() => _config, _cloudHttp);
+        _screenshotPipeline = new ScreenshotPipeline(() => _config, () => _cloudHttp);
         _processMonitor = new LocalProcessMonitor();
         _commandExecutor = new RemoteCommandExecutor(() => _config, ct => RunSyncCycleAsync(force: true, ct));
 
@@ -65,6 +66,13 @@ public sealed class TrayApplicationContext : ApplicationContext
         _logCollector.ScreenshotCaptured += OnScreenshotCaptured;
 
         _statusMenuItem = new ToolStripMenuItem("Status: Starting...") { Enabled = false };
+        _proxyModeItem = new ToolStripMenuItem("Mainland China Mode (Proxy On)")
+        {
+            CheckOnClick = true,
+            Checked = _config.ProxyEnabled
+        };
+        _proxyModeItem.Click += (_, _) => ToggleProxyMode(_proxyModeItem.Checked);
+
         _autoStartItem = new ToolStripMenuItem("Start with Windows")
         {
             CheckOnClick = true,
@@ -75,7 +83,8 @@ public sealed class TrayApplicationContext : ApplicationContext
         var menu = new ContextMenuStrip();
         menu.Items.Add(_statusMenuItem);
         menu.Items.Add(new ToolStripSeparator());
-        menu.Items.Add("Sync Settings (URL && Secret)...", null, (_, _) => ShowSyncSettingsDialog());
+        menu.Items.Add("Sync Settings (URL, Secret && Proxy)...", null, (_, _) => ShowSyncSettingsDialog());
+        menu.Items.Add(_proxyModeItem);
         menu.Items.Add("Sync Now", null, (_, _) => _ = RunSyncCycleAsync(force: true, _cts.Token));
         menu.Items.Add("Open Cloud Web UI", null, (_, _) => OpenCloudWebUi());
         menu.Items.Add(_autoStartItem);
@@ -103,7 +112,7 @@ public sealed class TrayApplicationContext : ApplicationContext
             _trayIcon.ShowBalloonTip(
                 4500,
                 "VRCX Cloud Agent",
-                "Double-click or right-click the tray icon -> 'Sync Settings (URL & Secret)...' to configure periodic upload.",
+                "Double-click or right-click the tray icon -> 'Sync Settings (URL, Secret & Proxy)...' to configure.",
                 ToolTipIcon.Info);
         }
     }
@@ -319,6 +328,8 @@ public sealed class TrayApplicationContext : ApplicationContext
         {
             _config = dialog.SavedConfig;
             _configStore.SaveConfig(_config);
+            _proxyModeItem.Checked = _config.ProxyEnabled;
+            RebuildCloudHttpClient();
             _consecutiveFailures = 0;
             _nextRetryAllowedAt = DateTimeOffset.MinValue;
             _lastSyncError = string.Empty;
@@ -328,11 +339,41 @@ public sealed class TrayApplicationContext : ApplicationContext
             _trayIcon.ShowBalloonTip(
                 3000,
                 "VRCX Cloud Agent",
-                $"Saved ({_config.DeviceName}). Uploading every {_config.EffectiveSyncIntervalSeconds}s.",
+                $"Saved ({_config.DeviceName}) · {ProxyHttpClientFactory.DescribeMode(_config)} · Every {_config.EffectiveSyncIntervalSeconds}s.",
                 ToolTipIcon.Info);
 
             _ = Task.Run(() => RunSyncCycleAsync(force: true, _cts.Token));
         }
+    }
+
+    private void ToggleProxyMode(bool enableProxy)
+    {
+        _config.ProxyEnabled = enableProxy;
+        _configStore.SaveConfig(_config);
+        RebuildCloudHttpClient();
+        _consecutiveFailures = 0;
+        _nextRetryAllowedAt = DateTimeOffset.MinValue;
+        _lastSyncError = string.Empty;
+        UpdateTrayStatus();
+
+        _trayIcon.ShowBalloonTip(
+            3000,
+            "VRCX Cloud Agent",
+            $"Switched network mode to: {ProxyHttpClientFactory.DescribeMode(_config)}",
+            ToolTipIcon.Info);
+
+        if (_config.IsConfigured)
+        {
+            _ = Task.Run(() => RunSyncCycleAsync(force: true, _cts.Token));
+        }
+    }
+
+    private void RebuildCloudHttpClient()
+    {
+        HttpClient oldClient = _cloudHttp;
+        _cloudHttp = ProxyHttpClientFactory.CreateHttpClient(_config);
+        // Delay disposal briefly so any in-flight HTTP request finishes cleanly without ObjectDisposedException.
+        _ = Task.Delay(TimeSpan.FromSeconds(25)).ContinueWith(_ => oldClient.Dispose());
     }
 
     private void OpenCloudWebUi()
@@ -381,23 +422,26 @@ public sealed class TrayApplicationContext : ApplicationContext
         }
 
         string vrc = _processMonitor.IsVrcRunning ? "VRChat Running" : "VRChat Idle";
+        string netTag = _config.ProxyEnabled ? "Proxy" : "Direct";
         int pending = _logCollector.OfflineQueueCount;
         string intervalPart = _config.IsConfigured ? $" · Every {_config.EffectiveSyncIntervalSeconds}s" : string.Empty;
         string queuePart = pending > 0 ? $" · Queue {pending}" : string.Empty;
-        string summary = $"Status: {syncText}{intervalPart} · {vrc}{queuePart}";
-        string tip = TruncateNotifyText($"VRCX Agent ({syncText}) - {vrc}");
+        string summary = $"Status: {syncText} · {netTag}{intervalPart} · {vrc}{queuePart}";
+        string tip = TruncateNotifyText($"VRCX Agent ({syncText}/{netTag}) - {vrc}");
 
         if (_trayIcon.ContextMenuStrip?.InvokeRequired == true)
         {
             _trayIcon.ContextMenuStrip.BeginInvoke(new Action(() =>
             {
                 _statusMenuItem.Text = summary;
+                _proxyModeItem.Checked = _config.ProxyEnabled;
                 _trayIcon.Text = tip;
             }));
         }
         else
         {
             _statusMenuItem.Text = summary;
+            _proxyModeItem.Checked = _config.ProxyEnabled;
             _trayIcon.Text = tip;
         }
     }

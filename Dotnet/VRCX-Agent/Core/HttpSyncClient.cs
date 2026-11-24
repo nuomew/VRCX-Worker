@@ -17,21 +17,31 @@ namespace VRCX.Agent.Core;
 public sealed class HttpSyncClient
 {
     private const string AgentVersion = "1.1.0";
-    private readonly HttpClient _http;
+    private readonly Func<HttpClient> _httpProvider;
+    private readonly bool _usesInjectedClient;
 
     public HttpSyncClient(HttpClient httpClient)
     {
-        _http = httpClient;
+        _httpProvider = () => httpClient;
+        _usesInjectedClient = true;
+    }
+
+    public HttpSyncClient(Func<HttpClient> httpProvider)
+    {
+        _httpProvider = httpProvider;
+        _usesInjectedClient = false;
     }
 
     /// <summary>
-    /// Validates Cloud URL + Sync Secret connectivity by sending a lightweight empty sync request.
+    /// Validates Cloud URL + Sync Secret + selected proxy mode by sending a lightweight empty sync request.
     /// </summary>
     public async Task<(bool Ok, string Message, string? AssignedDeviceId)> TestConnectionAsync(
         string cloudUrl,
         string syncSecret,
         string deviceId,
         string deviceName,
+        bool proxyEnabled,
+        string proxyAddress,
         CancellationToken ct)
     {
         string normalizedUrl = (cloudUrl ?? string.Empty).Trim().TrimEnd('/');
@@ -41,17 +51,38 @@ public sealed class HttpSyncClient
             return (false, "Cloud URL must start with https:// or http://", null);
         }
 
+        if (proxyEnabled)
+        {
+            var (proxyOk, _, proxyErr) = ProxyHttpClientFactory.NormalizeAndValidateProxyUri(proxyAddress);
+            if (!proxyOk)
+            {
+                return (false, proxyErr, null);
+            }
+        }
+
         var probeCfg = new AgentConfig
         {
             CloudUrl = normalizedUrl,
             SyncSecret = (syncSecret ?? string.Empty).Trim(),
             DeviceId = deviceId,
-            DeviceName = string.IsNullOrWhiteSpace(deviceName) ? Environment.MachineName : deviceName.Trim()
+            DeviceName = string.IsNullOrWhiteSpace(deviceName) ? Environment.MachineName : deviceName.Trim(),
+            ProxyEnabled = proxyEnabled,
+            ProxyAddress = (proxyAddress ?? string.Empty).Trim()
         };
 
         try
         {
-            var res = await SyncOnceAsync(probeCfg, Array.Empty<GameLogEventItem>(), null, null, ct).ConfigureAwait(false);
+            AgentSyncResponse res;
+            if (_usesInjectedClient)
+            {
+                res = await SyncOnceAsync(probeCfg, Array.Empty<GameLogEventItem>(), null, null, ct).ConfigureAwait(false);
+            }
+            else
+            {
+                using HttpClient probeHttp = ProxyHttpClientFactory.CreateHttpClient(probeCfg, TimeSpan.FromSeconds(15));
+                var probeClient = new HttpSyncClient(probeHttp);
+                res = await probeClient.SyncOnceAsync(probeCfg, Array.Empty<GameLogEventItem>(), null, null, ct).ConfigureAwait(false);
+            }
             return (true, $"Connected ({res.DeviceName})", res.DeviceId);
         }
         catch (HttpRequestException ex)
@@ -108,7 +139,7 @@ public sealed class HttpSyncClient
         };
         HmacSigner.ApplySyncAuthHeaders(req, config);
 
-        using HttpResponseMessage res = await _http.SendAsync(req, ct).ConfigureAwait(false);
+        using HttpResponseMessage res = await _httpProvider().SendAsync(req, ct).ConfigureAwait(false);
         string raw = await res.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
         if (!res.IsSuccessStatusCode)
         {
@@ -153,7 +184,7 @@ public sealed class HttpSyncClient
         };
         HmacSigner.ApplySyncAuthHeaders(req, config);
 
-        using HttpResponseMessage res = await _http.SendAsync(req, ct).ConfigureAwait(false);
+        using HttpResponseMessage res = await _httpProvider().SendAsync(req, ct).ConfigureAwait(false);
         return res.IsSuccessStatusCode;
     }
 

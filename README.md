@@ -26,6 +26,7 @@
   - **WebSocket Hibernation**: `AgentHubDO` uses `ctx.acceptWebSocket` and zero-cost `ping`/`pong` auto-responses so idle connections consume zero compute duration.
 - **Lightweight Windows Companion Agent (`Dotnet/VRCX-Agent/`, zero CEF/Electron)**:
   - Simple **Cloud URL + Sync Secret** configuration with configurable periodic HTTPS upload interval (default 60s, no persistent WebSocket needed)
+  - Built-in **Overseas (Direct / Proxy Off)** vs **Mainland China (Proxy On)** network switch supporting Windows system proxy and custom HTTP/HTTPS/SOCKS5 proxies (instant toggle from tray menu or settings dialog)
   - Incremental VRChat `output_log_*.txt` GameLog sync with persisted byte-offset cursor & durable offline JSONL queue (`POST /api/agent/sync`)
   - Local PNG metadata embedding (`Dotnet/ScreenshotMetadata`) + ≤1600px WebP thumbnail upload to optional private R2 gallery
   - Discord Rich Presence, VRChat/SteamVR process monitoring, AutoAppLaunch, XSOverlay / OVRToolkit VR notifications

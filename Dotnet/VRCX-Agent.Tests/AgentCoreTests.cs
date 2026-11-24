@@ -233,6 +233,48 @@ public sealed class AgentCoreTests
         }
     }
 
+    [Fact]
+    public void ProxyHttpClientFactory_SwitchesOverseasDirectAndMainlandProxyModes()
+    {
+        // 1. Overseas mode (ProxyEnabled = false) disables proxy completely even if an old address is present
+        using (var directHandler = ProxyHttpClientFactory.CreateHandler(proxyEnabled: false, "http://127.0.0.1:7890"))
+        {
+            Assert.False(directHandler.UseProxy);
+            Assert.Null(directHandler.Proxy);
+        }
+
+        // 2. Mainland China mode with empty address follows Windows system proxy
+        using (var sysHandler = ProxyHttpClientFactory.CreateHandler(proxyEnabled: true, ""))
+        {
+            Assert.True(sysHandler.UseProxy);
+            Assert.NotNull(sysHandler.Proxy);
+        }
+
+        // 3. Mainland China mode with shorthand host:port normalizes to http://
+        var (okHttp, httpUri, _) = ProxyHttpClientFactory.NormalizeAndValidateProxyUri("127.0.0.1:7890");
+        Assert.True(okHttp);
+        Assert.Equal("http://127.0.0.1:7890/", httpUri!.ToString());
+
+        // 4. Mainland China mode supports SOCKS5 and optional user:pass credentials
+        var (okSocks, socksUri, _) = ProxyHttpClientFactory.NormalizeAndValidateProxyUri("socks5://alice:secret@127.0.0.1:7891");
+        Assert.True(okSocks);
+        Assert.Equal("socks5", socksUri!.Scheme);
+
+        using (var socksHandler = ProxyHttpClientFactory.CreateHandler(proxyEnabled: true, "socks5://alice:secret@127.0.0.1:7891"))
+        {
+            Assert.True(socksHandler.UseProxy);
+            var webProxy = Assert.IsType<WebProxy>(socksHandler.Proxy);
+            Assert.Equal("socks5://127.0.0.1:7891/", webProxy.Address!.ToString());
+            var creds = Assert.IsType<NetworkCredential>(webProxy.Credentials);
+            Assert.Equal("alice", creds.UserName);
+            Assert.Equal("secret", creds.Password);
+        }
+
+        // 5. Unsupported proxy schemes are rejected
+        Assert.False(ProxyHttpClientFactory.NormalizeAndValidateProxyUri("ftp://127.0.0.1:21").Ok);
+        Assert.False(ProxyHttpClientFactory.NormalizeAndValidateProxyUri("file:///etc/passwd").Ok);
+    }
+
     private sealed class StubHttpHandler : HttpMessageHandler
     {
         private readonly Func<HttpRequestMessage, Task<HttpResponseMessage>> _responder;

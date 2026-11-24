@@ -53,8 +53,8 @@ dotnet publish Dotnet/VRCX-Agent/VRCX-Agent.csproj -c Release -r win-x64 --self-
 ```
 The compiled executable is written to `build/VRCX-Agent/VRCX.Agent.exe`.
 
-### Setup with Cloud URL & Sync Secret
+### Setup with Cloud URL, Sync Secret & Network Mode (Overseas / Mainland China)
 1. Open your deployed VRCX Cloud Web URL and click **Cloud** in the bottom status bar to open **Cloud Hub -> Win Agent (HTTP Sync)**.
 2. Copy the **Cloud URL**, enter a device name, and click **Create Sync Secret** to generate a persistent `vrcx_sync_...` secret (stored SHA-256 hashed in D1, revocable anytime). Alternatively, set a static `AGENT_SYNC_KEY` in Cloudflare Worker Secrets.
-3. Launch `VRCX.Agent.exe` on your Windows PC, right-click the tray icon -> **Sync Settings (URL & Secret)...**, paste the **Cloud URL** and **Sync Secret**, pick your preferred **Sync Interval (seconds)** (default `60`), and click **Test & Save**.
-4. The URL and secret are encrypted locally using Windows DPAPI (`CurrentUser`), and VRChat logs, state, and screenshots begin uploading automatically every interval.
+3. Launch `VRCX.Agent.exe` on your Windows PC, right-click the tray icon -> **Sync Settings (URL, Secret & Proxy)...**, paste the **Cloud URL** and **Sync Secret**, pick your preferred **Sync Interval (seconds)** (default `60`), choose **Overseas (Direct / Proxy Off)** or **Mainland China (Proxy On)** (leave proxy URL blank to follow Windows system proxy, or enter `http://127.0.0.1:7890` / `socks5://127.0.0.1:7891`), and click **Test & Save**.
+4. You can also toggle **Mainland China Mode (Proxy On)** directly from the tray right-click menu at any time without restarting `VRCX.Agent`. All URL, secret, and proxy settings are encrypted locally using Windows DPAPI (`CurrentUser`).

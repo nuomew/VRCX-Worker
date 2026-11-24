@@ -19,6 +19,10 @@ public sealed class AgentConfig
     public string DeviceId { get; set; } = string.Empty;
     public string DeviceName { get; set; } = Environment.MachineName;
     public int SyncIntervalSeconds { get; set; } = DefaultSyncIntervalSeconds;
+    /// <summary>False = Overseas (Direct / Proxy Off), True = Mainland China (Proxy On).</summary>
+    public bool ProxyEnabled { get; set; } = false;
+    /// <summary>Optional proxy URL (http/https/socks5) when ProxyEnabled is true; empty follows Windows system proxy.</summary>
+    public string ProxyAddress { get; set; } = string.Empty;
     public bool AutoUploadScreenshots { get; set; } = true;
     public bool WritePngMetadata { get; set; } = true;
     public bool AutoLaunchAppsEnabled { get; set; } = true;

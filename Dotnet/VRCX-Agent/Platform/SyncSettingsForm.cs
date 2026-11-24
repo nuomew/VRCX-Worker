@@ -9,7 +9,8 @@ namespace VRCX.Agent.Platform;
 
 /// <summary>
 /// Configuration dialog where users enter their VRCX Cloud URL, Sync Secret, Device Name,
-/// and periodic HTTP upload interval, with live connectivity validation before saving.
+/// periodic upload interval, and switch between Overseas (Direct / Proxy Off) and
+/// Mainland China (Proxy On) network modes with live connectivity testing before saving.
 /// </summary>
 public sealed class SyncSettingsForm : Form
 {
@@ -21,6 +22,9 @@ public sealed class SyncSettingsForm : Form
     private readonly CheckBox _showSecretCheck;
     private readonly TextBox _deviceNameBox;
     private readonly NumericUpDown _intervalInput;
+    private readonly RadioButton _overseasDirectRadio;
+    private readonly RadioButton _mainlandProxyRadio;
+    private readonly TextBox _proxyAddressBox;
     private readonly CheckBox _autoUploadScreenshotsCheck;
     private readonly Label _statusLabel;
     private readonly Button _saveButton;
@@ -32,44 +36,44 @@ public sealed class SyncSettingsForm : Form
         _initialConfig = currentConfig;
         _syncClient = syncClient;
 
-        Text = "VRCX Cloud Agent — HTTP Sync Settings";
+        Text = "VRCX Cloud Agent — HTTP Sync & Proxy Settings";
         FormBorderStyle = FormBorderStyle.FixedDialog;
         MaximizeBox = false;
         MinimizeBox = false;
         StartPosition = FormStartPosition.CenterScreen;
-        ClientSize = new Size(460, 345);
+        ClientSize = new Size(476, 468);
         Font = new Font("Segoe UI", 9.5f);
 
         var urlLabel = new Label
         {
             Text = "Cloud URL (e.g. https://vrcx.your-domain.workers.dev):",
-            Location = new Point(20, 16),
+            Location = new Point(20, 14),
             AutoSize = true
         };
         _urlBox = new TextBox
         {
-            Location = new Point(20, 38),
-            Width = 420,
+            Location = new Point(20, 36),
+            Width = 436,
             Text = string.IsNullOrWhiteSpace(currentConfig.CloudUrl) ? "https://" : currentConfig.CloudUrl
         };
 
         var secretLabel = new Label
         {
             Text = "Sync Secret (from Cloud Hub -> Create Sync Secret, or AGENT_SYNC_KEY):",
-            Location = new Point(20, 74),
+            Location = new Point(20, 70),
             AutoSize = true
         };
         _secretBox = new TextBox
         {
-            Location = new Point(20, 96),
-            Width = 335,
+            Location = new Point(20, 92),
+            Width = 352,
             UseSystemPasswordChar = true,
             Text = currentConfig.SyncSecret ?? string.Empty
         };
         _showSecretCheck = new CheckBox
         {
             Text = "Show",
-            Location = new Point(365, 98),
+            Location = new Point(382, 94),
             AutoSize = true
         };
         _showSecretCheck.CheckedChanged += (_, _) =>
@@ -80,52 +84,100 @@ public sealed class SyncSettingsForm : Form
         var deviceLabel = new Label
         {
             Text = "Device Name:",
-            Location = new Point(20, 134),
+            Location = new Point(20, 128),
             AutoSize = true
         };
         _deviceNameBox = new TextBox
         {
-            Location = new Point(20, 156),
-            Width = 230,
+            Location = new Point(20, 150),
+            Width = 240,
             Text = string.IsNullOrWhiteSpace(currentConfig.DeviceName) ? Environment.MachineName : currentConfig.DeviceName
         };
 
         var intervalLabel = new Label
         {
             Text = "Sync Interval (seconds):",
-            Location = new Point(270, 134),
+            Location = new Point(276, 128),
             AutoSize = true
         };
         _intervalInput = new NumericUpDown
         {
-            Location = new Point(270, 156),
-            Width = 170,
+            Location = new Point(276, 150),
+            Width = 180,
             Minimum = AgentConfig.MinSyncIntervalSeconds,
             Maximum = AgentConfig.MaxSyncIntervalSeconds,
             Increment = 15,
             Value = currentConfig.EffectiveSyncIntervalSeconds
         };
 
+        var networkGroup = new GroupBox
+        {
+            Text = "Network & Proxy Mode (Overseas / Mainland China)",
+            Location = new Point(20, 188),
+            Size = new Size(436, 126)
+        };
+
+        _overseasDirectRadio = new RadioButton
+        {
+            Text = "Overseas (Direct / Proxy Off)",
+            Location = new Point(14, 24),
+            AutoSize = true,
+            Checked = !currentConfig.ProxyEnabled
+        };
+        _mainlandProxyRadio = new RadioButton
+        {
+            Text = "Mainland China (Proxy On)",
+            Location = new Point(220, 24),
+            AutoSize = true,
+            Checked = currentConfig.ProxyEnabled
+        };
+
+        var proxyLabel = new Label
+        {
+            Text = "Proxy URL (leave empty to follow Windows system proxy):",
+            Location = new Point(14, 54),
+            AutoSize = true
+        };
+        _proxyAddressBox = new TextBox
+        {
+            Location = new Point(14, 76),
+            Width = 408,
+            PlaceholderText = "http://127.0.0.1:7890 or socks5://127.0.0.1:7891",
+            Text = currentConfig.ProxyAddress ?? string.Empty,
+            Enabled = currentConfig.ProxyEnabled
+        };
+
+        _overseasDirectRadio.CheckedChanged += (_, _) => UpdateProxyInputState();
+        _mainlandProxyRadio.CheckedChanged += (_, _) => UpdateProxyInputState();
+
+        networkGroup.Controls.AddRange(new Control[]
+        {
+            _overseasDirectRadio,
+            _mainlandProxyRadio,
+            proxyLabel,
+            _proxyAddressBox
+        });
+
         _autoUploadScreenshotsCheck = new CheckBox
         {
-            Text = "Automatically embed VRCX metadata & upload WebP screenshots",
-            Location = new Point(20, 198),
+            Text = "Automatically embed VRCX metadata && upload WebP screenshots",
+            Location = new Point(20, 326),
             AutoSize = true,
             Checked = currentConfig.AutoUploadScreenshots
         };
 
         _statusLabel = new Label
         {
-            Location = new Point(20, 232),
-            Size = new Size(420, 48),
+            Location = new Point(20, 358),
+            Size = new Size(436, 48),
             ForeColor = Color.DimGray,
-            Text = "Local VRChat logs are tailed continuously and uploaded every interval via HTTPS."
+            Text = "Overseas mode connects directly; Mainland China mode routes uploads via system or custom HTTP/SOCKS5 proxy."
         };
 
         _saveButton = new Button
         {
             Text = "Test && Save",
-            Location = new Point(236, 294),
+            Location = new Point(252, 418),
             Width = 112,
             Height = 32
         };
@@ -134,7 +186,7 @@ public sealed class SyncSettingsForm : Form
         var cancelButton = new Button
         {
             Text = "Cancel",
-            Location = new Point(358, 294),
+            Location = new Point(374, 418),
             Width = 82,
             Height = 32,
             DialogResult = DialogResult.Cancel
@@ -146,12 +198,18 @@ public sealed class SyncSettingsForm : Form
             secretLabel, _secretBox, _showSecretCheck,
             deviceLabel, _deviceNameBox,
             intervalLabel, _intervalInput,
+            networkGroup,
             _autoUploadScreenshotsCheck,
             _statusLabel,
             _saveButton, cancelButton
         });
         AcceptButton = _saveButton;
         CancelButton = cancelButton;
+    }
+
+    private void UpdateProxyInputState()
+    {
+        _proxyAddressBox.Enabled = _mainlandProxyRadio.Checked;
     }
 
     private async Task TestAndSaveAsync()
@@ -162,6 +220,8 @@ public sealed class SyncSettingsForm : Form
             ? Environment.MachineName
             : _deviceNameBox.Text.Trim();
         int intervalSec = (int)_intervalInput.Value;
+        bool proxyEnabled = _mainlandProxyRadio.Checked;
+        string proxyAddress = _proxyAddressBox.Text.Trim();
 
         if (!Uri.TryCreate(cloudUrl, UriKind.Absolute, out Uri? uri) ||
             (uri.Scheme != Uri.UriSchemeHttps && uri.Scheme != Uri.UriSchemeHttp))
@@ -171,9 +231,22 @@ public sealed class SyncSettingsForm : Form
             return;
         }
 
+        if (proxyEnabled)
+        {
+            var (proxyOk, _, proxyErr) = ProxyHttpClientFactory.NormalizeAndValidateProxyUri(proxyAddress);
+            if (!proxyOk)
+            {
+                _statusLabel.ForeColor = Color.Firebrick;
+                _statusLabel.Text = proxyErr;
+                return;
+            }
+        }
+
         _saveButton.Enabled = false;
         _statusLabel.ForeColor = Color.SteelBlue;
-        _statusLabel.Text = "Testing connection to /api/agent/sync ...";
+        _statusLabel.Text = proxyEnabled
+            ? "Testing connection via proxy to /api/agent/sync ..."
+            : "Testing direct connection to /api/agent/sync ...";
 
         try
         {
@@ -184,6 +257,8 @@ public sealed class SyncSettingsForm : Form
                 syncSecret,
                 localDeviceId,
                 deviceName,
+                proxyEnabled,
+                proxyAddress,
                 cts.Token);
 
             if (!ok)
@@ -200,6 +275,8 @@ public sealed class SyncSettingsForm : Form
                 DeviceId = string.IsNullOrWhiteSpace(assignedDeviceId) ? localDeviceId : assignedDeviceId,
                 DeviceName = deviceName,
                 SyncIntervalSeconds = intervalSec,
+                ProxyEnabled = proxyEnabled,
+                ProxyAddress = proxyAddress,
                 AutoUploadScreenshots = _autoUploadScreenshotsCheck.Checked,
                 WritePngMetadata = _initialConfig.WritePngMetadata,
                 AutoLaunchAppsEnabled = _initialConfig.AutoLaunchAppsEnabled,

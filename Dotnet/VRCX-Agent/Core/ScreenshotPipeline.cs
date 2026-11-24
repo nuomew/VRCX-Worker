@@ -27,12 +27,17 @@ public sealed class ScreenshotPipeline
     private const int WebpQuality = 80;
 
     private readonly Func<AgentConfig> _configProvider;
-    private readonly HttpClient _http;
+    private readonly Func<HttpClient> _httpProvider;
 
     public ScreenshotPipeline(Func<AgentConfig> configProvider, HttpClient httpClient)
+        : this(configProvider, () => httpClient)
+    {
+    }
+
+    public ScreenshotPipeline(Func<AgentConfig> configProvider, Func<HttpClient> httpProvider)
     {
         _configProvider = configProvider;
-        _http = httpClient;
+        _httpProvider = httpProvider;
     }
 
     /// <summary>
@@ -156,7 +161,7 @@ public sealed class ScreenshotPipeline
 
             HmacSigner.ApplySyncAuthHeaders(req, cfg);
 
-            using HttpResponseMessage res = await _http.SendAsync(req, ct).ConfigureAwait(false);
+            using HttpResponseMessage res = await _httpProvider().SendAsync(req, ct).ConfigureAwait(false);
             if (!res.IsSuccessStatusCode)
             {
                 string err = await res.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
