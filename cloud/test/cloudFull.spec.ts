@@ -1874,4 +1874,109 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
             fetchSpy.mockRestore();
         }
     });
+
+    it('allows api.avtrdb.com avatar lookups without leaking or polluting VRChat cookies while blocking non-allowlisted hosts', async () => {
+        // Seed a VRChat auth cookie into cloud_cookie_vault to prove third-party hosts never receive or overwrite it
+        const encodedJar = btoa(JSON.stringify({ auth: 'authcookie_secret_vrc_token' }));
+        const seedRes = await exports.default.fetch('http://example.com/api/vrc/cookies', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ cookies: encodedJar })
+        });
+        expect(seedRes.status).toBe(200);
+
+        const seenHeaders: Array<{
+            url: string;
+            cookie: string | null;
+            referer: string | null;
+            vrcxId: string | null;
+        }> = [];
+        const realFetch = globalThis.fetch.bind(globalThis);
+        const fetchSpy = vi
+            .spyOn(globalThis, 'fetch')
+            .mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+                const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+                if (url.startsWith('https://api.avtrdb.com/')) {
+                    const hdrs = new Headers(init?.headers);
+                    seenHeaders.push({
+                        url,
+                        cookie: hdrs.get('cookie'),
+                        referer: hdrs.get('referer'),
+                        vrcxId: hdrs.get('vrcx-id')
+                    });
+                    return new Response(
+                        JSON.stringify([
+                            {
+                                id: 'avtr_11111111-1111-1111-1111-111111111111',
+                                name: 'Public Demo Avatar',
+                                authorId: 'usr_afa65f7f-4817-4b32-9350-bf37a471ce7b',
+                                releaseStatus: 'public'
+                            }
+                        ]),
+                        {
+                            status: 200,
+                            headers: {
+                                'Content-Type': 'application/json',
+                                'Set-Cookie': '__cf_bm=third_party_cookie; Path=/; HttpOnly'
+                            }
+                        }
+                    );
+                }
+                return realFetch(input, init);
+            });
+
+        try {
+            const avtrRes = await exports.default.fetch('http://example.com/api/vrc/execute', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    url: 'https://api.avtrdb.com/v3/avatar/search/vrcx?authorId=usr_afa65f7f-4817-4b32-9350-bf37a471ce7b',
+                    method: 'GET',
+                    headers: {
+                        Referer: 'https://vrcx.app',
+                        'VRCX-ID': 'vrcx_test_id'
+                    }
+                })
+            });
+            expect(avtrRes.status).toBe(200);
+            const avtrJson = (await avtrRes.json()) as {
+                ok: boolean;
+                data: { status: number; data: string; route: string };
+            };
+            expect(avtrJson.ok).toBe(true);
+            expect(avtrJson.data.status).toBe(200);
+            expect(avtrJson.data.route).toBe('cloud_direct');
+            const parsedAvatars = JSON.parse(avtrJson.data.data) as Array<{ id: string; name: string }>;
+            expect(parsedAvatars).toHaveLength(1);
+            expect(parsedAvatars[0]?.id).toBe('avtr_11111111-1111-1111-1111-111111111111');
+
+            // Verify VRChat cookies were NOT sent to api.avtrdb.com, while Referer/VRCX-ID were forwarded
+            expect(seenHeaders).toHaveLength(1);
+            expect(seenHeaders[0]?.cookie).toBeNull();
+            expect(seenHeaders[0]?.referer).toBe('https://vrcx.app');
+            expect(seenHeaders[0]?.vrcxId).toBe('vrcx_test_id');
+
+            // Verify third-party Set-Cookie did NOT pollute cloud_cookie_vault
+            const cookiesAfter = await exports.default.fetch('http://example.com/api/vrc/cookies');
+            const cookiesAfterJson = (await cookiesAfter.json()) as { ok: boolean; data: { cookies: string } };
+            const jarAfter = JSON.parse(atob(cookiesAfterJson.data.cookies)) as Record<string, string>;
+            expect(jarAfter).toEqual({ auth: 'authcookie_secret_vrc_token' });
+
+            // Verify non-allowlisted and suffix-spoofed hosts remain strictly blocked
+            for (const blockedUrl of [
+                'https://evil.example.com/v3/avatar/search/vrcx',
+                'https://evilapi.avtrdb.com/v3/avatar/search/vrcx',
+                'https://evilvrchat.cloud/api/1/auth/user'
+            ]) {
+                const blockedRes = await exports.default.fetch('http://example.com/api/vrc/execute', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ url: blockedUrl, method: 'GET' })
+                });
+                expect(blockedRes.status).toBe(403);
+            }
+        } finally {
+            fetchSpy.mockRestore();
+        }
+    });
 });

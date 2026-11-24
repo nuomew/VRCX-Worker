@@ -11,7 +11,7 @@ import { parseWebSyncIntervalSeconds } from './coreData';
 
 export const VRC_USER_AGENT = 'VRCX-Cloud/2026.11 (personal-self-hosted-vrcx)';
 
-// Strict SSRF allowlist: only VRChat API/CDN/presigned upload hosts and known status/translation services VRCX calls.
+// Strict SSRF allowlist: only VRChat API/CDN/presigned upload hosts, built-in avatar lookup database (avtrdb), and known status services VRCX calls.
 const ALLOWED_HOST_SUFFIXES = [
     'api.vrchat.cloud',
     'vrchat.com',
@@ -19,6 +19,7 @@ const ALLOWED_HOST_SUFFIXES = [
     'assets.vrchat.com',
     'd348imysud55la.cloudfront.net',
     'status.vrchat.com',
+    'api.avtrdb.com',
     's3.amazonaws.com',
     's3.us-east-1.amazonaws.com',
     'r2.cloudflarestorage.com',
@@ -55,6 +56,44 @@ function isAllowedTargetUrl(rawUrl: string): boolean {
     }
     const host = parsed.hostname.toLowerCase();
     return ALLOWED_HOST_SUFFIXES.some((suffix) => host === suffix || host.endsWith(`.${suffix}`));
+}
+
+/**
+ * Checks whether a hostname strictly belongs to VRChat's own domains (never suffix-spoofable).
+ */
+function isVrchatDomainHost(hostname: string): boolean {
+    const host = hostname.toLowerCase();
+    return (
+        host === 'vrchat.cloud' ||
+        host.endsWith('.vrchat.cloud') ||
+        host === 'vrchat.com' ||
+        host.endsWith('.vrchat.com')
+    );
+}
+
+/**
+ * Returns true only for VRChat endpoints that require the user's VRChat session cookies.
+ * Third-party allowlisted hosts (e.g. api.avtrdb.com, api.github.com, S3) and public VRChat
+ * endpoints must never receive VRChat cookies or write Set-Cookie values into cloud_cookie_vault.
+ */
+function isVrchatAuthTarget(rawUrl: string): boolean {
+    let parsed: URL;
+    try {
+        parsed = new URL(rawUrl);
+    } catch {
+        return false;
+    }
+    const host = parsed.hostname.toLowerCase();
+    if (!isVrchatDomainHost(host)) {
+        return false;
+    }
+    if (host === 'status.vrchat.com') {
+        return false;
+    }
+    if (host === 'api.vrchat.cloud' && parsed.pathname === '/api/1/config') {
+        return false;
+    }
+    return true;
 }
 
 function base64ToUint8Array(b64: string): Uint8Array {
@@ -159,8 +198,7 @@ function buildUpstreamRequestInit(payload: WebApiExecutePayload, cookieHeader: s
     }
 
     const parsedUrl = new URL(payload.url);
-    const isVrchatDomain = parsedUrl.hostname.endsWith('vrchat.cloud') || parsedUrl.hostname.endsWith('vrchat.com');
-    if (isVrchatDomain && cookieHeader) {
+    if (isVrchatDomainHost(parsedUrl.hostname) && cookieHeader) {
         headers.set('Cookie', cookieHeader);
     }
 
@@ -321,8 +359,14 @@ export async function handleVrcProxyRoutes(request: Request, env: Env, url: URL)
             }
         }
 
-        // Strategy 1: Prefer online Windows VRCX.Agent residential-IP relay
-        if (!payload.preferCloudDirect) {
+        const needsAuthCookie = isVrchatAuthTarget(payload.url);
+
+        // Strategy 1: Prefer online Windows VRCX.Agent residential-IP relay for authenticated VRChat requests.
+        // Public/third-party allowlisted endpoints (e.g. api.avtrdb.com) do not need residential IP or VRChat cookies
+        // and go direct from Worker when cloud fallback is enabled (also keeping compatibility with older Agent builds).
+        const skipAgentRelay =
+            Boolean(payload.preferCloudDirect) || (!needsAuthCookie && env.VRC_ALLOW_CLOUD_FALLBACK !== 'false');
+        if (!skipAgentRelay) {
             const hub = env.AGENT_HUB.get(env.AGENT_HUB.idFromName('primary'));
             const rpcRes = await hub.fetch(
                 new Request('https://agent-hub.internal/rpc/vrc-http', {
@@ -378,15 +422,12 @@ export async function handleVrcProxyRoutes(request: Request, env: Env, url: URL)
             );
         }
 
-        const isPublicUnauthTarget =
-            payload.url.startsWith('https://status.vrchat.com/') ||
-            payload.url === 'https://api.vrchat.cloud/api/1/config';
-        const jar = isPublicUnauthTarget ? {} : await loadCookieJar(env);
-        const init = buildUpstreamRequestInit(payload, isPublicUnauthTarget ? '' : buildCookieHeader(jar));
+        const jar = needsAuthCookie ? await loadCookieJar(env) : {};
+        const init = buildUpstreamRequestInit(payload, needsAuthCookie ? buildCookieHeader(jar) : '');
 
         try {
             const upstream = await fetch(payload.url, init);
-            if (!isPublicUnauthTarget) {
+            if (needsAuthCookie) {
                 const cookieChanged = mergeSetCookies(jar, upstream.headers);
                 if (cookieChanged) {
                     await saveCookieJar(env, jar);
@@ -494,11 +535,7 @@ export async function handleVrcProxyRoutes(request: Request, env: Env, url: URL)
         if (missIndexes.length > 0) {
             const needsAuthCookie = missIndexes.some((idx) => {
                 const u = items[idx]?.url ?? '';
-                return (
-                    Boolean(u) &&
-                    !u.startsWith('https://status.vrchat.com/') &&
-                    u !== 'https://api.vrchat.cloud/api/1/config'
-                );
+                return Boolean(u) && isVrchatAuthTarget(u);
             });
             if (needsAuthCookie) {
                 jar = await loadCookieJar(env);
@@ -533,13 +570,14 @@ export async function handleVrcProxyRoutes(request: Request, env: Env, url: URL)
                         cached: true
                     };
                 }
-                const isPublicTarget =
-                    item.url.startsWith('https://status.vrchat.com/') ||
-                    item.url === 'https://api.vrchat.cloud/api/1/config';
-                const init = buildUpstreamRequestInit({ ...item, method: 'GET' }, isPublicTarget ? '' : cookieHeader);
+                const targetNeedsAuthCookie = isVrchatAuthTarget(item.url);
+                const init = buildUpstreamRequestInit(
+                    { ...item, method: 'GET' },
+                    targetNeedsAuthCookie ? cookieHeader : ''
+                );
                 try {
                     const upstream = await fetch(item.url, init);
-                    if (!isPublicTarget && mergeSetCookies(jar, upstream.headers)) {
+                    if (targetNeedsAuthCookie && mergeSetCookies(jar, upstream.headers)) {
                         cookieChanged = true;
                     }
                     const text = await upstream.text();

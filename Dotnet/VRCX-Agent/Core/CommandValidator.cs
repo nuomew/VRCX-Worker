@@ -40,6 +40,7 @@ public static class CommandValidator
         "assets.vrchat.com",
         "d348imysud55la.cloudfront.net",
         "status.vrchat.com",
+        "api.avtrdb.com",
         "s3.amazonaws.com",
         "s3.us-east-1.amazonaws.com",
         "r2.cloudflarestorage.com",
