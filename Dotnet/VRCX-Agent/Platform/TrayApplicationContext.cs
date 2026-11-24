@@ -27,6 +27,7 @@ public sealed class TrayApplicationContext : ApplicationContext
 
     private readonly AgentConfigStore _configStore;
     private readonly HttpSyncClient _syncClient;
+    private readonly AgentUpdater _updater;
     private readonly LogTailCollector _logCollector;
     private readonly ScreenshotPipeline _screenshotPipeline;
     private readonly LocalProcessMonitor _processMonitor;
@@ -34,6 +35,7 @@ public sealed class TrayApplicationContext : ApplicationContext
     private readonly SyncScheduleGate _scheduleGate;
     private readonly Queue<PendingScreenshotTask> _pendingScreenshots = new();
     private readonly SemaphoreSlim _syncLock = new(1, 1);
+    private readonly SemaphoreSlim _updateCheckLock = new(1, 1);
     private readonly CancellationTokenSource _cts = new();
 
     private readonly NotifyIcon _trayIcon;
@@ -42,12 +44,17 @@ public sealed class TrayApplicationContext : ApplicationContext
     private readonly ToolStripMenuItem _syncScreenshotsItem;
     private readonly ToolStripMenuItem _compressScreenshotsItem;
     private readonly ToolStripMenuItem _autoStartItem;
+    private readonly ToolStripMenuItem _checkUpdateItem;
     private readonly SynchronizationContext? _uiSyncContext;
     private readonly RegisteredWaitHandle? _wakeWaitHandle;
 
     private AgentConfig _config;
     private volatile HttpClient _cloudHttp;
     private SyncSettingsForm? _activeSettingsDialog;
+    private UpdateProgressForm? _activeUpdateDialog;
+    private AgentReleaseInfo? _availableUpdate;
+    private string _lastNotifiedUpdateTag = string.Empty;
+    private bool _balloonPointsToUpdate;
     private DateTimeOffset _lastSyncSuccessAt = DateTimeOffset.MinValue;
     private int _consecutiveFailures;
     private string _lastSyncError = string.Empty;
@@ -61,6 +68,9 @@ public sealed class TrayApplicationContext : ApplicationContext
         _scheduleGate = new SyncScheduleGate(_config.EffectiveSyncIntervalSeconds);
         _cloudHttp = ProxyHttpClientFactory.CreateHttpClient(_config);
         _syncClient = new HttpSyncClient(() => _cloudHttp);
+        _updater = new AgentUpdater(
+            () => _cloudHttp,
+            () => ProxyHttpClientFactory.CreateHttpClient(_config, TimeSpan.FromMinutes(10)));
         _logCollector = new LogTailCollector(_configStore.DataDirectory);
         _screenshotPipeline = new ScreenshotPipeline(() => _config, () => _cloudHttp);
         _processMonitor = new LocalProcessMonitor();
@@ -100,6 +110,19 @@ public sealed class TrayApplicationContext : ApplicationContext
         };
         _autoStartItem.Click += (_, _) => ToggleAutoStart(_autoStartItem.Checked);
 
+        _checkUpdateItem = new ToolStripMenuItem(AgentStrings.FormatMenuCheckUpdate(AgentMetadata.Version));
+        _checkUpdateItem.Click += (_, _) =>
+        {
+            if (_availableUpdate != null && _availableUpdate.IsUpdateAvailable)
+            {
+                ShowUpdateDialog(_availableUpdate);
+            }
+            else
+            {
+                _ = CheckForUpdatesAsync(manual: true, _cts.Token);
+            }
+        };
+
         var menu = new ContextMenuStrip
         {
             Font = new Font(AgentStrings.UiFontFamily, 9.5f)
@@ -113,6 +136,7 @@ public sealed class TrayApplicationContext : ApplicationContext
         menu.Items.Add(AgentStrings.MenuSyncNow, null, (_, _) => _ = RunSyncCycleAsync(force: true, _cts.Token));
         menu.Items.Add(AgentStrings.MenuOpenWebUi, null, (_, _) => OpenCloudWebUi());
         menu.Items.Add(_autoStartItem);
+        menu.Items.Add(_checkUpdateItem);
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(AgentStrings.MenuExit, null, (_, _) => ShutdownAndExit());
 
@@ -127,6 +151,13 @@ public sealed class TrayApplicationContext : ApplicationContext
         {
             if (!_config.IsConfigured) ShowSyncSettingsDialog();
             else OpenCloudWebUi();
+        };
+        _trayIcon.BalloonTipClicked += (_, _) =>
+        {
+            if (_balloonPointsToUpdate && _availableUpdate != null && _availableUpdate.IsUpdateAvailable)
+            {
+                ShowUpdateDialog(_availableUpdate);
+            }
         };
 
         // Ensure a WinForms SynchronizationContext is captured after control creation
@@ -151,9 +182,11 @@ public sealed class TrayApplicationContext : ApplicationContext
 
         UpdateTrayStatus();
         _ = Task.Run(() => BackgroundSyncLoopAsync(_cts.Token));
+        _ = Task.Run(() => AutoUpdateCheckLoopAsync(_cts.Token));
 
         if (!_config.IsConfigured)
         {
+            _balloonPointsToUpdate = false;
             _trayIcon.ShowBalloonTip(
                 4500,
                 AgentStrings.AppTitle,
@@ -490,6 +523,7 @@ public sealed class TrayApplicationContext : ApplicationContext
                     ? AgentStrings.NextSyncNowLabel
                     : _scheduleGate.NextSyncAtUtc.ToLocalTime().ToString("HH:mm:ss");
 
+                _balloonPointsToUpdate = false;
                 _trayIcon.ShowBalloonTip(
                     3500,
                     AgentStrings.AppTitle,
@@ -513,6 +547,7 @@ public sealed class TrayApplicationContext : ApplicationContext
         _configStore.SaveConfig(_config);
         _compressScreenshotsItem.Enabled = enabled;
         UpdateTrayStatus();
+        _balloonPointsToUpdate = false;
         _trayIcon.ShowBalloonTip(
             2500,
             AgentStrings.AppTitle,
@@ -528,6 +563,7 @@ public sealed class TrayApplicationContext : ApplicationContext
     {
         _config.CompressScreenshots = compress;
         _configStore.SaveConfig(_config);
+        _balloonPointsToUpdate = false;
         _trayIcon.ShowBalloonTip(
             2500,
             AgentStrings.AppTitle,
@@ -540,6 +576,7 @@ public sealed class TrayApplicationContext : ApplicationContext
     private void ToggleAutoStart(bool enabled)
     {
         AgentConfigStore.SetAutoStartEnabled(enabled);
+        _balloonPointsToUpdate = false;
         _trayIcon.ShowBalloonTip(
             2500,
             AgentStrings.AppTitle,
@@ -556,6 +593,7 @@ public sealed class TrayApplicationContext : ApplicationContext
         _lastSyncError = string.Empty;
         UpdateTrayStatus();
 
+        _balloonPointsToUpdate = false;
         _trayIcon.ShowBalloonTip(
             3000,
             AgentStrings.AppTitle,
@@ -648,6 +686,208 @@ public sealed class TrayApplicationContext : ApplicationContext
         }
     }
 
+    private async Task AutoUpdateCheckLoopAsync(CancellationToken ct)
+    {
+        try
+        {
+            // Wait 20s after startup so initial UI & first sync finish cleanly without contention.
+            await Task.Delay(TimeSpan.FromSeconds(20), ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            return;
+        }
+
+        while (!ct.IsCancellationRequested)
+        {
+            if (_config.AutoCheckUpdates)
+            {
+                await CheckForUpdatesAsync(manual: false, ct).ConfigureAwait(false);
+            }
+
+            try
+            {
+                await Task.Delay(TimeSpan.FromHours(6), ct).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
+        }
+    }
+
+    private async Task CheckForUpdatesAsync(bool manual, CancellationToken ct)
+    {
+        if (!await _updateCheckLock.WaitAsync(0, ct).ConfigureAwait(false))
+        {
+            return;
+        }
+
+        if (manual)
+        {
+            RunOnUiThread(() =>
+            {
+                _checkUpdateItem.Enabled = false;
+                _checkUpdateItem.Text = AgentStrings.MenuCheckingUpdate;
+            });
+        }
+
+        try
+        {
+            using var checkCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            checkCts.CancelAfter(TimeSpan.FromSeconds(25));
+            AgentReleaseInfo release = await _updater.CheckForUpdateAsync(AgentMetadata.Version, checkCts.Token).ConfigureAwait(false);
+
+            if (release.IsUpdateAvailable)
+            {
+                _availableUpdate = release;
+                RunOnUiThread(() =>
+                {
+                    _checkUpdateItem.Enabled = true;
+                    _checkUpdateItem.Text = AgentStrings.FormatMenuUpdateAvailable(release.TagName);
+                    if (manual)
+                    {
+                        ShowUpdateDialog(release);
+                    }
+                    else if (!string.Equals(_lastNotifiedUpdateTag, release.TagName, StringComparison.OrdinalIgnoreCase))
+                    {
+                        _lastNotifiedUpdateTag = release.TagName;
+                        _balloonPointsToUpdate = true;
+                        _trayIcon.ShowBalloonTip(
+                            6000,
+                            AgentStrings.AppTitle,
+                            AgentStrings.FormatBalloonUpdateAvailable(release.TagName, AgentMetadata.Version),
+                            ToolTipIcon.Info);
+                    }
+                });
+            }
+            else
+            {
+                _availableUpdate = null;
+                RunOnUiThread(() =>
+                {
+                    _checkUpdateItem.Enabled = true;
+                    _checkUpdateItem.Text = AgentStrings.FormatMenuCheckUpdate(AgentMetadata.Version);
+                    if (manual)
+                    {
+                        _balloonPointsToUpdate = false;
+                        _trayIcon.ShowBalloonTip(
+                            3000,
+                            AgentStrings.AppTitle,
+                            AgentStrings.FormatBalloonAlreadyLatest(AgentMetadata.Version),
+                            ToolTipIcon.Info);
+                    }
+                });
+            }
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            // Shutting down
+        }
+        catch (Exception ex)
+        {
+            Log.Debug(ex, "Online update check failed (manual={Manual}).", manual);
+            RunOnUiThread(() =>
+            {
+                _checkUpdateItem.Enabled = true;
+                _checkUpdateItem.Text = _availableUpdate != null && _availableUpdate.IsUpdateAvailable
+                    ? AgentStrings.FormatMenuUpdateAvailable(_availableUpdate.TagName)
+                    : AgentStrings.FormatMenuCheckUpdate(AgentMetadata.Version);
+                if (manual)
+                {
+                    _balloonPointsToUpdate = false;
+                    _trayIcon.ShowBalloonTip(
+                        4000,
+                        AgentStrings.AppTitle,
+                        AgentStrings.FormatBalloonUpdateCheckFailed(ex.Message),
+                        ToolTipIcon.Warning);
+                }
+            });
+        }
+        finally
+        {
+            _updateCheckLock.Release();
+        }
+    }
+
+    private void ShowUpdateDialog(AgentReleaseInfo release)
+    {
+        if (_activeUpdateDialog != null && !_activeUpdateDialog.IsDisposed)
+        {
+            if (_activeUpdateDialog.WindowState == FormWindowState.Minimized)
+            {
+                _activeUpdateDialog.WindowState = FormWindowState.Normal;
+            }
+            _activeUpdateDialog.BringToFront();
+            _activeUpdateDialog.Activate();
+            return;
+        }
+
+        string updatesDir = Path.Combine(_configStore.DataDirectory, "updates");
+        using var dialog = new UpdateProgressForm(release, _updater, updatesDir, _trayIcon.Icon);
+        _activeUpdateDialog = dialog;
+        try
+        {
+            if (dialog.ShowDialog() == DialogResult.OK &&
+                !string.IsNullOrWhiteSpace(dialog.DownloadedInstallerPath) &&
+                File.Exists(dialog.DownloadedInstallerPath))
+            {
+                LaunchDownloadedInstallerAndExit(dialog.DownloadedInstallerPath);
+            }
+        }
+        finally
+        {
+            _activeUpdateDialog = null;
+        }
+    }
+
+    private void LaunchDownloadedInstallerAndExit(string installerPath)
+    {
+        try
+        {
+            var psi = new ProcessStartInfo
+            {
+                FileName = installerPath,
+                UseShellExecute = false,
+                WorkingDirectory = Path.GetDirectoryName(installerPath) ?? _configStore.DataDirectory
+            };
+            psi.ArgumentList.Add("/SILENT");
+            psi.ArgumentList.Add("/NORESTART");
+            Process.Start(psi);
+            ShutdownAndExit();
+        }
+        catch (Exception ex)
+        {
+            Log.Warn(ex, "Failed to launch downloaded VRCX.Agent installer {Path}.", installerPath);
+            _balloonPointsToUpdate = false;
+            _trayIcon.ShowBalloonTip(
+                4500,
+                AgentStrings.AppTitle,
+                AgentStrings.FormatUpdateFailed(ex.Message),
+                ToolTipIcon.Error);
+        }
+    }
+
+    private void RunOnUiThread(Action action)
+    {
+        if (_cts.IsCancellationRequested) return;
+        if (_trayIcon.ContextMenuStrip?.InvokeRequired == true)
+        {
+            _trayIcon.ContextMenuStrip.BeginInvoke(action);
+        }
+        else if (_uiSyncContext != null)
+        {
+            _uiSyncContext.Post(_ =>
+            {
+                if (!_cts.IsCancellationRequested) action();
+            }, null);
+        }
+        else
+        {
+            action();
+        }
+    }
+
     private static string TruncateNotifyText(string text)
     {
         return text.Length <= 63 ? text : text.Substring(0, 63);
@@ -688,6 +928,7 @@ public sealed class TrayApplicationContext : ApplicationContext
         _trayIcon.Dispose();
         _cloudHttp.Dispose();
         _syncLock.Dispose();
+        _updateCheckLock.Dispose();
         ExitThread();
     }
 }

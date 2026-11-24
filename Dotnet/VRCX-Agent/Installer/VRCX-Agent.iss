@@ -3,7 +3,7 @@
 ; with default-enabled background auto-start (HKCU Run) and clean upgrade/uninstall.
 
 #ifndef AppVersion
-  #define AppVersion "1.3.0"
+  #define AppVersion "1.4.0"
 #endif
 #ifndef SourceDir
   #define SourceDir "..\..\..\build\VRCX-Agent"
@@ -82,6 +82,7 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 
 [Run]
 Filename: "{app}\VRCX.Agent.exe"; Description: "{cm:LaunchAfterInstall}"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\VRCX.Agent.exe"; Parameters: "--autostart"; Flags: nowait skipifnotsilent
 
 [Code]
 procedure StopRunningAgent();

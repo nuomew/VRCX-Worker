@@ -28,6 +28,7 @@ public sealed class SyncSettingsForm : Form
     private readonly CheckBox _autoUploadScreenshotsCheck;
     private readonly CheckBox _compressScreenshotsCheck;
     private readonly CheckBox _autoStartCheck;
+    private readonly CheckBox _autoCheckUpdatesCheck;
     private readonly Label _statusLabel;
     private readonly Button _saveButton;
 
@@ -40,7 +41,7 @@ public sealed class SyncSettingsForm : Form
         _initialConfig = currentConfig;
         _syncClient = syncClient;
 
-        Text = AgentStrings.SettingsWindowTitle;
+        Text = $"{AgentStrings.SettingsWindowTitle} (v{AgentMetadata.Version})";
         if (windowIcon != null)
         {
             Icon = windowIcon;
@@ -49,7 +50,7 @@ public sealed class SyncSettingsForm : Form
         MaximizeBox = false;
         MinimizeBox = false;
         StartPosition = FormStartPosition.CenterScreen;
-        ClientSize = new Size(504, 544);
+        ClientSize = new Size(504, 574);
         Font = new Font(AgentStrings.UiFontFamily, 9.5f);
 
         var urlLabel = new Label
@@ -193,9 +194,17 @@ public sealed class SyncSettingsForm : Form
             Checked = autoStartEnabled
         };
 
+        _autoCheckUpdatesCheck = new CheckBox
+        {
+            Text = AgentStrings.AutoCheckUpdatesCheckbox,
+            Location = new Point(20, 420),
+            AutoSize = true,
+            Checked = currentConfig.AutoCheckUpdates
+        };
+
         _statusLabel = new Label
         {
-            Location = new Point(20, 426),
+            Location = new Point(20, 456),
             Size = new Size(464, 52),
             ForeColor = Color.DimGray,
             Text = AgentStrings.SettingsDefaultHint
@@ -204,7 +213,7 @@ public sealed class SyncSettingsForm : Form
         _saveButton = new Button
         {
             Text = AgentStrings.TestAndSaveButton,
-            Location = new Point(252, 492),
+            Location = new Point(252, 522),
             Width = 134,
             Height = 34
         };
@@ -213,7 +222,7 @@ public sealed class SyncSettingsForm : Form
         var cancelButton = new Button
         {
             Text = AgentStrings.CancelButton,
-            Location = new Point(396, 492),
+            Location = new Point(396, 522),
             Width = 88,
             Height = 34,
             DialogResult = DialogResult.Cancel
@@ -229,6 +238,7 @@ public sealed class SyncSettingsForm : Form
             _autoUploadScreenshotsCheck,
             _compressScreenshotsCheck,
             _autoStartCheck,
+            _autoCheckUpdatesCheck,
             _statusLabel,
             _saveButton, cancelButton
         });
@@ -311,6 +321,7 @@ public sealed class SyncSettingsForm : Form
                 ProxyAddress = proxyAddress,
                 AutoUploadScreenshots = _autoUploadScreenshotsCheck.Checked,
                 CompressScreenshots = _compressScreenshotsCheck.Checked,
+                AutoCheckUpdates = _autoCheckUpdatesCheck.Checked,
                 WritePngMetadata = _initialConfig.WritePngMetadata,
                 AutoLaunchAppsEnabled = _initialConfig.AutoLaunchAppsEnabled,
                 VrChatLogDirectory = _initialConfig.VrChatLogDirectory,

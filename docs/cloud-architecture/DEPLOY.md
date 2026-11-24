@@ -53,6 +53,7 @@ Without `R2_MEDIA` bound, screenshot metadata still syncs to D1 cleanly.
 
 `VRCX.Agent` is a lightweight .NET 10 Windows Forms system-tray companion (zero CEF, zero Electron) that auto-detects Simplified Chinese / English from Windows OS locale and runs silently in the background with optional Windows startup:
 - **Recommended Windows Installer (`VRCX.Agent-v*-Setup-win-x64.exe`)**: Download from [GitHub Releases](https://github.com/nuomew/VRCX-Worker/releases). Bundles .NET 10 Desktop Runtime, installs per-user into `%LocalAppData%\Programs\VRCX.Agent` (no admin elevation required), enables **Start with Windows in background** by default, supports in-place upgrades, and registers a standard Windows uninstaller.
+- **Built-in Online Auto-Update**: Periodically checks `https://github.com/nuomew/VRCX-Worker/releases` (via GitHub Releases API with automatic `/releases/latest` redirect fallback on rate-limited proxy IPs), verifies the installer's SHA-256 digest, and runs `/SILENT /NORESTART` in-place upgrades with automatic tray relaunch.
 - Incremental VRChat `output_log_*.txt` GameLog tailing with persisted byte-offset cursor & durable offline JSONL queue
 - Periodic HTTPS upload (`POST /api/agent/sync`, default every 60 seconds, configurable 30–3600s) using only **Cloud URL + Sync Secret**
 - Optional VRChat screenshot upload (default off) with original PNG or ≤1600px WebP compression toggle (`PUT /api/agent/media/screenshots/{sha256}`)

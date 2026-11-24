@@ -234,4 +234,82 @@ public static class AgentStrings
     public static string FormatTrayTooltip(string syncText, string netTag, string vrc) => IsChinese
         ? $"VRCX 云端伴侣（{syncText}/{netTag}）- {vrc}"
         : $"VRCX Agent ({syncText}/{netTag}) - {vrc}";
+
+    // Online updater strings
+    public static string AutoCheckUpdatesCheckbox => IsChinese
+        ? "自动检测 GitHub 新版本更新（nuomew/VRCX-Worker）"
+        : "Automatically check GitHub Releases for updates";
+
+    public static string FormatMenuCheckUpdate(string currentVersion) => IsChinese
+        ? $"检查更新（当前 v{currentVersion}）…"
+        : $"Check for Updates (v{currentVersion})...";
+
+    public static string FormatMenuUpdateAvailable(string latestTag) => IsChinese
+        ? $"发现新版本 {latestTag} — 立即更新…"
+        : $"Update Available ({latestTag}) — Install...";
+
+    public static string MenuCheckingUpdate => IsChinese
+        ? "正在检查更新…"
+        : "Checking for updates...";
+
+    public static string FormatBalloonUpdateAvailable(string latestTag, string currentVersion) => IsChinese
+        ? $"发现新版本 {latestTag}（当前 v{currentVersion}）。点击此通知或右键托盘菜单「立即更新」即可在线自动升级。"
+        : $"New version {latestTag} is available (current v{currentVersion}). Click here or use the tray menu to update.";
+
+    public static string FormatBalloonAlreadyLatest(string currentVersion) => IsChinese
+        ? $"当前已是最新版本（v{currentVersion}）。"
+        : $"You are already running the latest version (v{currentVersion}).";
+
+    public static string FormatBalloonUpdateCheckFailed(string reason) => IsChinese
+        ? $"检查更新失败：{reason}"
+        : $"Update check failed: {reason}";
+
+    public static string UpdateDialogTitle => IsChinese
+        ? "VRCX 云端伴侣 — 在线更新"
+        : "VRCX Cloud Agent — Online Update";
+
+    public static string FormatUpdateDialogHeader(string currentVersion, string latestTag) => IsChinese
+        ? $"发现新版本 {latestTag}（当前版本 v{currentVersion}）"
+        : $"New version {latestTag} available (current v{currentVersion})";
+
+    public static string FormatUpdateDialogHint(string sizeText) => IsChinese
+        ? $"将从 GitHub Releases 自动下载安装程序{sizeText}、校验 SHA-256 完整性并静默覆盖升级，原有配置与密钥会完整保留。"
+        : $"Downloads the official installer from GitHub Releases{sizeText}, verifies SHA-256, and upgrades cleanly while preserving your configuration.";
+
+    public static string UpdateNowButton => IsChinese ? "立即下载并更新" : "Download && Update";
+    public static string OpenReleasesPageButton => IsChinese ? "打开 Releases 页面" : "Open Releases";
+    public static string UpdateStartingDownload => IsChinese ? "正在连接 GitHub 下载安装包…" : "Connecting to GitHub to download installer...";
+    public static string UpdateVerifyingAndLaunching => IsChinese ? "校验通过，正在启动安装程序完成更新…" : "Verified! Launching installer to complete update...";
+
+    public static string FormatUpdateProgressKnown(int percent, double downloadedMb, double totalMb) => IsChinese
+        ? $"正在下载更新安装包… {percent}%（{downloadedMb:F1} / {totalMb:F1} MB）"
+        : $"Downloading update installer... {percent}% ({downloadedMb:F1} / {totalMb:F1} MB)";
+
+    public static string FormatUpdateProgressUnknown(double downloadedMb) => IsChinese
+        ? $"正在下载更新安装包… 已下载 {downloadedMb:F1} MB"
+        : $"Downloading update installer... {downloadedMb:F1} MB";
+
+    public static string FormatUpdateFailed(string error) => IsChinese
+        ? $"更新失败：{error}。您也可以点击「打开 Releases 页面」手动下载。"
+        : $"Update failed: {error}. You can also click 'Open Releases' to download manually.";
+
+    public static string UpdateCheckParseError => IsChinese
+        ? "无法解析 GitHub Releases 最新版本号"
+        : "Could not parse the latest version tag from GitHub Releases";
+
+    public static string UpdateUntrustedUrlError => IsChinese
+        ? "安装包下载地址不在受信任的 GitHub 域名白名单内，已拒绝下载。"
+        : "Blocked download from untrusted non-GitHub host.";
+
+    public static string UpdateInvalidFileNameError => IsChinese
+        ? "安装包文件名不合法，已中止下载。"
+        : "Invalid installer filename; download aborted.";
+
+    public static string UpdateChecksumMismatchError => IsChinese
+        ? "安装包 SHA-256 完整性校验未通过，文件可能损坏，已自动删除。"
+        : "Installer SHA-256 checksum mismatch; downloaded file removed.";
+
+    public static string UpdateDownloadedFileTooSmallError => IsChinese
+        ? "下载的安装包文件不完整，请重试。"
+        : "Downloaded installer file appears incomplete; please try again.";
 }

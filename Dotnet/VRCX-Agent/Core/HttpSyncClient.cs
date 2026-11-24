@@ -16,7 +16,7 @@ namespace VRCX.Agent.Core;
 /// </summary>
 public sealed class HttpSyncClient
 {
-    private const string AgentVersion = "1.3.0";
+    private const string AgentVersion = AgentMetadata.Version;
     private readonly Func<HttpClient> _httpProvider;
     private readonly bool _usesInjectedClient;
 

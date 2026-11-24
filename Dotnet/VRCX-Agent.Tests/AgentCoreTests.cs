@@ -400,6 +400,102 @@ public sealed class AgentCoreTests
         }
     }
 
+    [Fact]
+    public async Task AgentUpdater_ParsesReleasesFallsBackOnRateLimitAndVerifiesSha256()
+    {
+        // 1. Semantic version comparisons
+        Assert.True(AgentUpdater.IsNewerVersion("1.3.0", "v1.4.0"));
+        Assert.True(AgentUpdater.IsNewerVersion("1.9.0", "v1.10.0"));
+        Assert.False(AgentUpdater.IsNewerVersion("1.4.0", "v1.4.0"));
+        Assert.False(AgentUpdater.IsNewerVersion("1.5.0", "v1.4.0"));
+        Assert.False(AgentUpdater.IsNewerVersion("1.4.0", "not-a-tag"));
+
+        // 2. Trusted GitHub download host allowlist (SSRF / supply-chain protection)
+        Assert.True(AgentUpdater.IsTrustedDownloadUrl("https://github.com/nuomew/VRCX-Worker/releases/download/v1.4.0/VRCX.Agent-v1.4.0-Setup-win-x64.exe"));
+        Assert.True(AgentUpdater.IsTrustedDownloadUrl("https://objects.githubusercontent.com/github-production-release-asset/123"));
+        Assert.False(AgentUpdater.IsTrustedDownloadUrl("http://github.com/nuomew/VRCX-Worker/releases/download/v1.4.0/a.exe"));
+        Assert.False(AgentUpdater.IsTrustedDownloadUrl("https://evil-github.com.attacker.net/payload.exe"));
+
+        // 3. API JSON parsing with GitHub native sha256 digest
+        byte[] fakeInstallerBytes = new byte[4096];
+        new Random(42).NextBytes(fakeInstallerBytes);
+        string expectedSha = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(fakeInstallerBytes)).ToLowerInvariant();
+
+        string apiJson = $@"{{
+            ""tag_name"": ""v1.5.0"",
+            ""html_url"": ""https://github.com/nuomew/VRCX-Worker/releases/tag/v1.5.0"",
+            ""body"": ""Release notes"",
+            ""assets"": [
+                {{
+                    ""name"": ""VRCX.Agent-v1.5.0-Setup-win-x64.exe"",
+                    ""size"": {fakeInstallerBytes.Length},
+                    ""digest"": ""sha256:{expectedSha}"",
+                    ""browser_download_url"": ""https://github.com/nuomew/VRCX-Worker/releases/download/v1.5.0/VRCX.Agent-v1.5.0-Setup-win-x64.exe""
+                }}
+            ]
+        }}";
+        AgentReleaseInfo? parsed = AgentUpdater.ParseReleaseApiJson(apiJson, "1.4.0");
+        Assert.NotNull(parsed);
+        Assert.True(parsed!.IsUpdateAvailable);
+        Assert.Equal("v1.5.0", parsed.TagName);
+        Assert.Equal(expectedSha, parsed.ExpectedSha256);
+
+        // 4. Rate-limit (HTTP 403) fallback to github.com/releases/latest redirect + HTML checksum extraction
+        using var fallbackHttp = new HttpClient(new StubHttpHandler(req =>
+        {
+            string url = req.RequestUri!.AbsoluteUri;
+            if (url == AgentUpdater.LatestApiUrl)
+            {
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.Forbidden)
+                {
+                    Content = new StringContent("{\"message\":\"API rate limit exceeded\"}")
+                });
+            }
+            if (url == AgentUpdater.LatestWebRedirectUrl)
+            {
+                var res = new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    RequestMessage = new HttpRequestMessage(HttpMethod.Get, "https://github.com/nuomew/VRCX-Worker/releases/tag/v1.5.0"),
+                    Content = new StringContent($"<code>VRCX.Agent-v1.5.0-Setup-win-x64.exe</code>: <code>{expectedSha}</code>")
+                };
+                return Task.FromResult(res);
+            }
+            if (url.EndsWith("VRCX.Agent-v1.5.0-Setup-win-x64.exe", StringComparison.Ordinal))
+            {
+                var content = new ByteArrayContent(fakeInstallerBytes);
+                content.Headers.ContentLength = fakeInstallerBytes.Length;
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = content });
+            }
+            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NotFound));
+        }));
+
+        var updater = new AgentUpdater(fallbackHttp);
+        AgentReleaseInfo fallbackRelease = await updater.CheckForUpdateAsync("1.4.0", CancellationToken.None);
+        Assert.True(fallbackRelease.UsedFallbackRedirect);
+        Assert.True(fallbackRelease.IsUpdateAvailable);
+        Assert.Equal("v1.5.0", fallbackRelease.TagName);
+        Assert.Equal(expectedSha, fallbackRelease.ExpectedSha256);
+
+        // 5. Streaming download + SHA-256 verification succeeds and writes exact file
+        string tempDir = Path.Combine(Path.GetTempPath(), "vrcx-update-test-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            string savedPath = await updater.DownloadAndVerifyInstallerAsync(fallbackRelease, tempDir, null, CancellationToken.None);
+            Assert.True(File.Exists(savedPath));
+            Assert.Equal(fakeInstallerBytes, await File.ReadAllBytesAsync(savedPath));
+
+            // 6. Tampered checksum is rejected and temporary .part file is removed
+            fallbackRelease.ExpectedSha256 = new string('0', 64);
+            await Assert.ThrowsAsync<InvalidOperationException>(() =>
+                updater.DownloadAndVerifyInstallerAsync(fallbackRelease, tempDir, null, CancellationToken.None));
+            Assert.False(File.Exists(savedPath + ".part"));
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir)) Directory.Delete(tempDir, recursive: true);
+        }
+    }
+
     private sealed class StubHttpHandler : HttpMessageHandler
     {
         private readonly Func<HttpRequestMessage, Task<HttpResponseMessage>> _responder;

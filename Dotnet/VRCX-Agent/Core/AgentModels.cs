@@ -5,6 +5,14 @@ using Newtonsoft.Json;
 namespace VRCX.Agent.Core;
 
 /// <summary>
+/// Single source of truth for the VRCX.Agent release version.
+/// </summary>
+public static class AgentMetadata
+{
+    public const string Version = "1.4.0";
+}
+
+/// <summary>
 /// Persisted configuration and sync secret for a Windows VRCX.Agent instance.
 /// Encrypted at rest via Windows DPAPI by AgentConfigStore.
 /// </summary>
@@ -27,6 +35,8 @@ public sealed class AgentConfig
     public bool AutoUploadScreenshots { get; set; } = false;
     /// <summary>Whether to resize & compress uploaded screenshots to WebP <=1600px (default: false / upload original).</summary>
     public bool CompressScreenshots { get; set; } = false;
+    /// <summary>Whether to automatically check GitHub Releases for newer VRCX.Agent versions in background (default: true).</summary>
+    public bool AutoCheckUpdates { get; set; } = true;
     public bool WritePngMetadata { get; set; } = true;
     public bool AutoLaunchAppsEnabled { get; set; } = true;
     public string VrChatLogDirectory { get; set; } = string.Empty;
@@ -142,7 +152,7 @@ public sealed class LiveAgentState
     public int PlayerCount { get; set; }
 
     [JsonProperty("agentVersion")]
-    public string AgentVersion { get; set; } = "1.3.0";
+    public string AgentVersion { get; set; } = AgentMetadata.Version;
 
     [JsonProperty("machineName")]
     public string MachineName { get; set; } = Environment.MachineName;
