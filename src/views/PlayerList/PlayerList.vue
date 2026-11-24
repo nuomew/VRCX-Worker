@@ -207,6 +207,7 @@
     import Timer from '../../components/Timer.vue';
     import { showUserDialog, lookupUser } from '../../coordinators/userCoordinator';
     import { showWorldDialog } from '../../coordinators/worldCoordinator';
+    import { tryLoadPlayerList } from '../../coordinators/gameLogCoordinator';
 
     import PhotonEventTable from './components/PhotonEventTable.vue';
     import { useUserDisplay } from '../../composables/useUserDisplay';
@@ -341,11 +342,19 @@
         selectCurrentInstanceRow(row?.original ?? null);
     };
 
+    const isWeb = typeof WEB !== 'undefined' && WEB;
+
     onMounted(() => {
         getCurrentInstanceUserList();
+        if (isWeb) {
+            tryLoadPlayerList();
+        }
     });
 
     onActivated(() => {
         getCurrentInstanceUserList();
+        if (isWeb) {
+            tryLoadPlayerList();
+        }
     });
 </script>

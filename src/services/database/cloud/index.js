@@ -15,7 +15,7 @@ const sessionMutualGraph = {
 const sessionActivitySyncState = new Map();
 const sessionActivityBuckets = new Map();
 
-/** @type {Array<Record<string, any>>} */
+/** @type {Record<string, any>[]} */
 let pendingFeedBatch = [];
 /** @type {ReturnType<typeof setTimeout> | null} */
 let feedFlushTimer = null;
@@ -382,7 +382,12 @@ export function createCloudDatabase(dbVars) {
             await cloudFetch(`/api/memos?kind=avatar&id=${encodeURIComponent(avatarId)}`, { method: 'DELETE' });
         },
         async addUserNote(userId, displayName, note) {
-            const next = { userId, displayName: displayName || '', note: note || '', createdAt: new Date().toISOString() };
+            const next = {
+                userId,
+                displayName: displayName || '',
+                note: note || '',
+                createdAt: new Date().toISOString()
+            };
             bootstrapCache.notes.set(userId, next);
             await cloudFetch('/api/notes', { method: 'PUT', json: next });
         },
@@ -782,9 +787,9 @@ export function createCloudDatabase(dbVars) {
             await cloudFetch('/api/friend-log/history', { method: 'POST', json: { entries } });
         },
         async getFriendLogHistoryForUserId(userId, types) {
-            const rows = await cloudFetch(`/api/friend-log/history?userId=${encodeURIComponent(userId)}&limit=200`).catch(
-                () => []
-            );
+            const rows = await cloudFetch(
+                `/api/friend-log/history?userId=${encodeURIComponent(userId)}&limit=200`
+            ).catch(() => []);
             const mapped = rows.map((r) => ({
                 rowId: r.id,
                 created_at: r.created_at,
@@ -833,12 +838,16 @@ export function createCloudDatabase(dbVars) {
             const all = await this.getNotifications();
             const q = String(search || '').toLowerCase();
             return all
-                .filter((n) => (!filters?.length || filters.includes(n.type)))
+                .filter((n) => !filters?.length || filters.includes(n.type))
                 .filter(
                     (n) =>
                         !q ||
-                        String(n.senderUsername || '').toLowerCase().includes(q) ||
-                        String(n.message || '').toLowerCase().includes(q)
+                        String(n.senderUsername || '')
+                            .toLowerCase()
+                            .includes(q) ||
+                        String(n.message || '')
+                            .toLowerCase()
+                            .includes(q)
                 )
                 .slice(0, maxEntries);
         },
@@ -890,7 +899,7 @@ export function createCloudDatabase(dbVars) {
 
         // ===== gameLog =====
         async getGamelogDatabase() {
-            return cloudFetch(`/api/gamelog?limit=${Math.min(dbVars.maxTableSize || 100, 100)}`).catch(() => []);
+            return cloudFetch('/api/gamelog/current-instance').catch(() => []);
         },
         async lookupGameLogDatabase(filters, _vipList, maxEntries = 100) {
             const rows = await cloudFetch(`/api/gamelog?limit=${Math.min(maxEntries || 100, 100)}`).catch(() => []);
@@ -1098,7 +1107,10 @@ export function createCloudDatabase(dbVars) {
         },
         async deleteGameLogInstanceByInstanceId(input) {
             const loc = typeof input === 'string' ? input : input?.location || '';
-            if (loc) await cloudFetch(`/api/gamelog?kind=instance&location=${encodeURIComponent(loc)}`, { method: 'DELETE' });
+            if (loc)
+                await cloudFetch(`/api/gamelog?kind=instance&location=${encodeURIComponent(loc)}`, {
+                    method: 'DELETE'
+                });
         },
         async deleteGameLogInstance(input) {
             await this.deleteGameLogInstanceByInstanceId(input);
@@ -1121,9 +1133,9 @@ export function createCloudDatabase(dbVars) {
         },
         async deleteGameLogResourceLoad() {},
         async getSessionsLocationSegments(beforeId = 0, limit = 30) {
-            return cloudFetch(`/api/gamelog/stats?kind=sessions_segments&beforeId=${beforeId || 0}&limit=${limit}`).catch(
-                () => []
-            );
+            return cloudFetch(
+                `/api/gamelog/stats?kind=sessions_segments&beforeId=${beforeId || 0}&limit=${limit}`
+            ).catch(() => []);
         },
         async getSessionsEventsForSegments() {
             return [];
@@ -1178,7 +1190,9 @@ export function createCloudDatabase(dbVars) {
                 status: r.status,
                 statusDescription: r.status_description
             }));
-            return Array.isArray(filters) && filters.length > 0 ? mapped.filter((r) => filters.includes(r.type)) : mapped;
+            return Array.isArray(filters) && filters.length > 0
+                ? mapped.filter((r) => filters.includes(r.type))
+                : mapped;
         },
         async getFeedByInstanceId() {
             return [];
@@ -1216,7 +1230,9 @@ export function createCloudDatabase(dbVars) {
             if (state?.userId) sessionActivitySyncState.set(state.userId, state);
         },
         async getActivitySessionsV2(userId) {
-            const rows = await cloudFetch(`/api/activity/sessions?userId=${encodeURIComponent(userId)}`).catch(() => []);
+            const rows = await cloudFetch(`/api/activity/sessions?userId=${encodeURIComponent(userId)}`).catch(
+                () => []
+            );
             return rows.map((r) => ({
                 sessionId: r.session_id,
                 userId: r.user_id,

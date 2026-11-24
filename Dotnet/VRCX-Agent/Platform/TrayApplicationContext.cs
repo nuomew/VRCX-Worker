@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
 using System.IO;
+using System.Linq;
 using System.Net.Http;
 using System.Threading;
 using System.Threading.Tasks;
@@ -524,21 +525,33 @@ public sealed class TrayApplicationContext : ApplicationContext
 
     private LiveAgentState? BuildStateIfChangedOrForced(bool allowHeartbeat)
     {
+        bool vrcRunning = _processMonitor.IsVrcRunning;
+        string currentLocation = _logCollector.Parser.CurrentLocation;
+        List<AgentPlayerSnapshot>? currentPlayers = vrcRunning && !string.IsNullOrEmpty(currentLocation)
+            ? _logCollector.Parser.SnapshotCurrentPlayerDetails()
+            : null;
+
         var state = new LiveAgentState
         {
-            VrcRunning = _processMonitor.IsVrcRunning,
-            VrcStartedAt = _processMonitor.IsVrcRunning ? _processMonitor.VrcStartedAtUtc?.ToString("O") : null,
+            VrcRunning = vrcRunning,
+            VrcStartedAt = vrcRunning ? _processMonitor.VrcStartedAtUtc?.ToString("O") : null,
             SteamVrRunning = _processMonitor.IsSteamVrRunning,
             SteamVrStartedAt = _processMonitor.IsSteamVrRunning ? _processMonitor.SteamVrStartedAtUtc?.ToString("O") : null,
             CacheSizeBytes = _processMonitor.CacheSizeBytes,
-            CurrentLocation = _logCollector.Parser.CurrentLocation,
+            CurrentLocation = currentLocation,
             CurrentWorldId = _logCollector.Parser.CurrentWorldId,
             CurrentWorldName = _logCollector.Parser.CurrentWorldName,
             PlayerCount = _logCollector.Parser.CurrentPlayerCount,
+            CurrentPlayers = currentPlayers,
             OfflineQueueCount = _logCollector.OfflineQueueCount
         };
 
-        string sig = $"{state.VrcRunning}|{state.VrcStartedAt}|{state.SteamVrRunning}|{state.SteamVrStartedAt}|{state.CurrentLocation}|{state.CurrentWorldName}|{state.PlayerCount}|{state.OfflineQueueCount}";
+        string playersSig = currentPlayers is null
+            ? string.Empty
+            : string.Join(",", currentPlayers
+                .Select(p => $"{p.UserId}:{p.DisplayName}")
+                .OrderBy(s => s, StringComparer.Ordinal));
+        string sig = $"{state.VrcRunning}|{state.VrcStartedAt}|{state.SteamVrRunning}|{state.SteamVrStartedAt}|{state.CurrentLocation}|{state.CurrentWorldName}|{state.PlayerCount}|{playersSig}|{state.OfflineQueueCount}";
         if (sig != _lastSentStateSignature)
         {
             _lastSentStateSignature = sig;

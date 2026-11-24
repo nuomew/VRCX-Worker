@@ -40,90 +40,116 @@ import gameLogService from '../services/gameLog.js';
 
 import * as workerTimers from 'worker-timers';
 
+let inFlightPlayerListLoad = null;
+
 /**
  * Loads the player list from game log history and syncs it to
  * locationStore, instanceStore, vrStore, and userStore.
  */
 export async function tryLoadPlayerList() {
-    const gameStore = useGameStore();
-    const locationStore = useLocationStore();
-    const userStore = useUserStore();
-    const friendStore = useFriendStore();
-    const instanceStore = useInstanceStore();
-    const vrStore = useVrStore();
+    if (inFlightPlayerListLoad) {
+        return inFlightPlayerListLoad;
+    }
+    inFlightPlayerListLoad = (async () => {
+        const gameStore = useGameStore();
+        const locationStore = useLocationStore();
+        const userStore = useUserStore();
+        const friendStore = useFriendStore();
+        const instanceStore = useInstanceStore();
+        const vrStore = useVrStore();
 
-    if (!gameStore.isGameRunning) {
-        return;
-    }
-    console.log('Loading player list from game log...');
-    let ctx;
-    let i;
-    const data = await database.getGamelogDatabase();
-    if (data.length === 0) {
-        return;
-    }
-    let length = 0;
-    for (i = data.length - 1; i > -1; i--) {
-        ctx = data[i];
-        if (ctx.type === 'Location') {
-            locationStore.setLastLocation({
-                date: Date.parse(ctx.created_at),
-                location: ctx.location,
-                name: ctx.worldName,
-                playerList: new Map(),
-                friendList: new Map()
-            });
-            length = i;
-            break;
+        if (!gameStore.isGameRunning) {
+            return;
         }
-    }
-    if (length > 0) {
-        for (i = length + 1; i < data.length; i++) {
+        console.log('Loading player list from game log...');
+        let ctx;
+        let i;
+        const data = await database.getGamelogDatabase();
+        if (!Array.isArray(data) || data.length === 0) {
+            return;
+        }
+        let lastLocationIndex = -1;
+        for (i = data.length - 1; i > -1; i--) {
             ctx = data[i];
-            if (ctx.type === 'OnPlayerJoined') {
-                if (!ctx.userId) {
-                    ctx.userId =
-                        findUserByDisplayName(
-                            userStore.cachedUsers,
-                            ctx.displayName,
-                            userStore.cachedUserIdsByDisplayName
-                        )?.id ?? '';
-                }
-                const userMap = {
-                    displayName: ctx.displayName,
-                    userId: ctx.userId,
-                    joinTime: Date.parse(ctx.created_at),
-                    lastAvatar: ''
-                };
-                locationStore.lastLocation.playerList.set(ctx.userId, userMap);
-                if (friendStore.friends.has(ctx.userId)) {
-                    locationStore.lastLocation.friendList.set(ctx.userId, userMap);
-                }
-            }
-            if (ctx.type === 'OnPlayerLeft') {
-                locationStore.lastLocation.playerList.delete(ctx.userId);
-                locationStore.lastLocation.friendList.delete(ctx.userId);
+            if (ctx.type === 'Location') {
+                locationStore.setLastLocation({
+                    date: Date.parse(ctx.created_at),
+                    location: ctx.location,
+                    name: ctx.worldName,
+                    playerList: new Map(),
+                    friendList: new Map()
+                });
+                lastLocationIndex = i;
+                break;
             }
         }
-        locationStore.lastLocation.playerList.forEach((ref1) => {
-            if (ref1.userId && typeof ref1.userId === 'string') {
-                if (!userStore.cachedUsers.has(ref1.userId)) {
-                    userRequest.getUser({ userId: ref1.userId });
+        if (lastLocationIndex >= 0) {
+            for (i = lastLocationIndex + 1; i < data.length; i++) {
+                ctx = data[i];
+                if (ctx.type === 'OnPlayerJoined') {
+                    if (!ctx.userId) {
+                        ctx.userId =
+                            findUserByDisplayName(
+                                userStore.cachedUsers,
+                                ctx.displayName,
+                                userStore.cachedUserIdsByDisplayName
+                            )?.id ?? '';
+                    }
+                    const playerKey = ctx.userId || ctx.displayName;
+                    if (!playerKey) {
+                        continue;
+                    }
+                    const userMap = {
+                        displayName: ctx.displayName,
+                        userId: ctx.userId,
+                        joinTime: Date.parse(ctx.created_at),
+                        lastAvatar: ''
+                    };
+                    locationStore.lastLocation.playerList.set(playerKey, userMap);
+                    if (ctx.userId && friendStore.friends.has(ctx.userId)) {
+                        locationStore.lastLocation.friendList.set(ctx.userId, userMap);
+                    }
                 }
-                if (!userStore.cachedProfiles.has(ref1.userId)) {
-                    userRequest.getPublicProfile({ userId: ref1.userId });
+                if (ctx.type === 'OnPlayerLeft') {
+                    const playerKey = ctx.userId || ctx.displayName;
+                    if (playerKey) {
+                        locationStore.lastLocation.playerList.delete(playerKey);
+                    }
+                    if (ctx.userId) {
+                        locationStore.lastLocation.friendList.delete(ctx.userId);
+                    } else if (ctx.displayName) {
+                        for (const [k, v] of locationStore.lastLocation.playerList.entries()) {
+                            if (v.displayName === ctx.displayName) {
+                                locationStore.lastLocation.playerList.delete(k);
+                                locationStore.lastLocation.friendList.delete(k);
+                            }
+                        }
+                    }
                 }
             }
-        });
+            locationStore.lastLocation.playerList.forEach((ref1) => {
+                if (ref1.userId && typeof ref1.userId === 'string') {
+                    if (!userStore.cachedUsers.has(ref1.userId)) {
+                        userRequest.getUser({ userId: ref1.userId });
+                    }
+                    if (!userStore.cachedProfiles.has(ref1.userId)) {
+                        userRequest.getPublicProfile({ userId: ref1.userId });
+                    }
+                }
+            });
 
-        runUpdateCurrentUserLocationFlow();
-        instanceStore.updateCurrentInstanceWorld();
-        vrStore.updateVRLastLocation();
-        instanceStore.getCurrentInstanceUserList();
-        userStore.applyUserDialogLocation();
-        instanceStore.applyWorldDialogInstances();
-        instanceStore.applyGroupDialogInstances();
-    }
+            runUpdateCurrentUserLocationFlow();
+            instanceStore.updateCurrentInstanceWorld();
+            vrStore.updateVRLastLocation();
+            instanceStore.getCurrentInstanceUserList();
+            userStore.applyUserDialogLocation();
+            instanceStore.applyWorldDialogInstances();
+            instanceStore.applyGroupDialogInstances();
+        }
+    })().finally(() => {
+        inFlightPlayerListLoad = null;
+    });
+    return inFlightPlayerListLoad;
 }
 
 /**

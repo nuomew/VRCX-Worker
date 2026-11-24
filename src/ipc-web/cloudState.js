@@ -162,6 +162,35 @@ export function getAggregatedGameStartTimes(nowMs = Date.now()) {
     return { vrcStartedAtMs: earliestVrcMs, steamVrStartedAtMs: earliestSteamMs };
 }
 
+let lastCloudInstanceSignature = '';
+
+/**
+ * Computes a compact signature of online VRChat room & player snapshots so the Web PlayerList
+ * refreshes automatically whenever HTTP-synced VRCX.Agent uploads a room change or player join/leave.
+ *
+ * @param {number} [nowMs]
+ * @returns {string}
+ */
+function getActiveCloudInstanceSignature(nowMs = Date.now()) {
+    const parts = [];
+    for (const deviceId of getOnlineAgentIds(nowMs)) {
+        const entry = cloudState.deviceStates[deviceId];
+        const st = entry?.state;
+        if (!st || typeof st !== 'object') continue;
+        if (st.vrcRunning !== true && st.isGameRunning !== true) continue;
+        const playerSig = Array.isArray(st.currentPlayers)
+            ? st.currentPlayers
+                  .map((p) => `${p?.userId || ''}:${p?.displayName || ''}`)
+                  .sort()
+                  .join(',')
+            : String(st.playerCount ?? '');
+        parts.push(
+            `${deviceId}|${st.currentLocation || ''}|${st.currentWorldName || ''}|${playerSig}|${entry?.updatedAt || ''}`
+        );
+    }
+    return parts.sort().join(';');
+}
+
 /**
  * Synchronizes aggregated multi-PC game/SteamVR running state and process start times into upstream `window.$bridge`.
  *
@@ -175,6 +204,14 @@ export function syncGameRunningBridge(nowMs = Date.now()) {
     const startTimes = getAggregatedGameStartTimes(nowMs);
     window.$bridge.updateCloudGameStartTimes?.(startTimes);
     window.$bridge.updateIsGameRunning(vrcRunning, steamVrRunning);
+
+    const nextSig = vrcRunning ? getActiveCloudInstanceSignature(nowMs) : '';
+    if (vrcRunning && nextSig && nextSig !== lastCloudInstanceSignature) {
+        lastCloudInstanceSignature = nextSig;
+        window.$bridge.refreshCloudPlayerList?.();
+    } else if (!vrcRunning) {
+        lastCloudInstanceSignature = '';
+    }
 }
 
 /**

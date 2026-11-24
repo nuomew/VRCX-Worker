@@ -523,4 +523,89 @@ describe('WEB cloud adapter (stateless)', () => {
             delete (/** @type {any} */ (globalThis).window);
         }
     });
+
+    it('loads chronological current-instance player list and triggers refreshCloudPlayerList on room/player updates', async () => {
+        const db = createCloudDatabase({ userPrefix: 'usr_me', maxTableSize: 500 });
+        fetchSpy.mockResolvedValueOnce(
+            mockOk([
+                {
+                    type: 'Location',
+                    created_at: '2026-11-24T02:00:00.000Z',
+                    location: 'wrld_room1:100',
+                    worldId: 'wrld_room1',
+                    worldName: 'Sakura Shrine'
+                },
+                {
+                    type: 'OnPlayerJoined',
+                    created_at: '2026-11-24T02:00:05.000Z',
+                    displayName: 'Alice',
+                    userId: 'usr_alice',
+                    location: 'wrld_room1:100'
+                }
+            ])
+        );
+        const rows = await db.getGamelogDatabase();
+        expect(fetchSpy.mock.calls[0][0]).toBe('/api/gamelog/current-instance');
+        expect(rows).toHaveLength(2);
+        expect(rows[0].type).toBe('Location');
+        expect(rows[1].userId).toBe('usr_alice');
+
+        const nowMs = Date.now();
+        const refreshSpy = vi.fn();
+        globalThis.window = /** @type {any} */ ({
+            $bridge: {
+                updateCloudGameStartTimes: vi.fn(),
+                updateIsGameRunning: vi.fn(),
+                refreshCloudPlayerList: refreshSpy
+            }
+        });
+        try {
+            applyCloudPresenceUpdate({
+                deviceLastSeen: { pc_1: nowMs - 2_000 },
+                deviceStates: {
+                    pc_1: {
+                        state: {
+                            vrcRunning: true,
+                            currentLocation: 'wrld_room1:100',
+                            currentWorldName: 'Sakura Shrine',
+                            playerCount: 1,
+                            currentPlayers: [{ displayName: 'Alice', userId: 'usr_alice' }]
+                        },
+                        updatedAt: new Date(nowMs - 2_000).toISOString()
+                    }
+                },
+                replaceDeviceMap: true
+            });
+            expect(refreshSpy).toHaveBeenCalledTimes(1);
+
+            // Identical snapshot does not spam refreshes
+            applyCloudPresenceUpdate({
+                deviceLastSeen: { pc_1: nowMs - 2_000 },
+                replaceDeviceMap: false
+            });
+            expect(refreshSpy).toHaveBeenCalledTimes(1);
+
+            // Player list change triggers immediate refresh
+            applyCloudPresenceUpdate({
+                deviceStates: {
+                    pc_1: {
+                        state: {
+                            vrcRunning: true,
+                            currentLocation: 'wrld_room1:100',
+                            currentWorldName: 'Sakura Shrine',
+                            playerCount: 2,
+                            currentPlayers: [
+                                { displayName: 'Alice', userId: 'usr_alice' },
+                                { displayName: 'Bob', userId: 'usr_bob' }
+                            ]
+                        },
+                        updatedAt: new Date(nowMs).toISOString()
+                    }
+                }
+            });
+            expect(refreshSpy).toHaveBeenCalledTimes(2);
+        } finally {
+            delete (/** @type {any} */ (globalThis).window);
+        }
+    });
 });

@@ -9,7 +9,7 @@ namespace VRCX.Agent.Core;
 /// </summary>
 public static class AgentMetadata
 {
-    public const string Version = "1.10.4";
+    public const string Version = "1.10.5";
 }
 
 /// <summary>
@@ -138,6 +138,18 @@ public sealed class GameLogEventItem
     public string? LocalScreenshotPath { get; set; }
 }
 
+public sealed class AgentPlayerSnapshot
+{
+    [JsonProperty("displayName")]
+    public string DisplayName { get; set; } = string.Empty;
+
+    [JsonProperty("userId")]
+    public string UserId { get; set; } = string.Empty;
+
+    [JsonProperty("joinedAt", NullValueHandling = NullValueHandling.Ignore)]
+    public string? JoinedAt { get; set; }
+}
+
 public sealed class LiveAgentState
 {
     [JsonProperty("vrcRunning")]
@@ -166,6 +178,9 @@ public sealed class LiveAgentState
 
     [JsonProperty("playerCount")]
     public int PlayerCount { get; set; }
+
+    [JsonProperty("currentPlayers", NullValueHandling = NullValueHandling.Ignore)]
+    public List<AgentPlayerSnapshot>? CurrentPlayers { get; set; }
 
     [JsonProperty("agentVersion")]
     public string AgentVersion { get; set; } = AgentMetadata.Version;

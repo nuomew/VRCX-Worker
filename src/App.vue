@@ -25,13 +25,14 @@
 <script setup>
     import { computed, onBeforeMount, onMounted } from 'vue';
 
-    import { addGameLogEvent, getGameLogTable } from './coordinators/gameLogCoordinator';
+    import { addGameLogEvent, getGameLogTable, tryLoadPlayerList } from './coordinators/gameLogCoordinator';
     import {
         runCheckVRChatDebugLoggingFlow,
         runUpdateCloudGameStartTimesFlow,
         runUpdateIsGameRunningFlow,
         runUpdateIsHmdAfkFlow
     } from './coordinators/gameCoordinator';
+    import { watchState } from './services/watchState';
     import { Toaster } from './components/ui/sonner';
     import { TooltipProvider } from './components/ui/tooltip';
     import { createGlobalStores } from './stores';
@@ -76,6 +77,11 @@
             updateCloudGameStartTimes: runUpdateCloudGameStartTimesFlow,
             updateIsGameRunning: runUpdateIsGameRunningFlow,
             updateIsHmdAfk: runUpdateIsHmdAfkFlow,
+            refreshCloudPlayerList: () => {
+                if (watchState.isFriendsLoaded) {
+                    tryLoadPlayerList();
+                }
+            },
             addGameLogEvent
         };
         if (isWeb && typeof AppApi !== 'undefined' && typeof AppApi.CheckGameRunning === 'function') {

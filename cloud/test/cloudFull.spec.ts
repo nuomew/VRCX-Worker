@@ -1098,4 +1098,137 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
             fetchSpy.mockRestore();
         }
     });
+
+    it('reconstructs chronological /api/gamelog/current-instance via created_at index for both legacy v1.10.4 logs and v1.10.5 live snapshots', async () => {
+        // Verify ORDER BY created_at DESC / ASC queries use UNIQUE(created_at, ...) indexes without temp B-tree sort
+        const locPlan = await env.DB_GAMELOG.prepare(
+            'EXPLAIN QUERY PLAN SELECT * FROM gamelog_location ORDER BY created_at DESC LIMIT 1'
+        ).all<{ detail: string }>();
+        const jlPlan = await env.DB_GAMELOG.prepare(
+            'EXPLAIN QUERY PLAN SELECT * FROM gamelog_join_leave WHERE created_at >= ? ORDER BY created_at ASC LIMIT 500'
+        )
+            .bind('2026-01-01T00:00:00.000Z')
+            .all<{ detail: string }>();
+        const locDetails = (locPlan.results ?? []).map((r) => r.detail).join(' | ');
+        const jlDetails = (jlPlan.results ?? []).map((r) => r.detail).join(' | ');
+        expect(locDetails).not.toContain('USE TEMP B-TREE');
+        expect(jlDetails).not.toContain('USE TEMP B-TREE');
+
+        // 1. Simulate legacy v1.10.4 Agent: Location has empty location string (Entering Room arrived before Joining),
+        // followed by chronological join/leave rows with real location, PLUS an older backfilled row inserted later (higher id!)
+        const now = Date.now();
+        const tLoc = new Date(now - 90_000).toISOString();
+        const tJoinA = new Date(now - 85_000).toISOString();
+        const tJoinB = new Date(now - 80_000).toISOString();
+        const tLeftB = new Date(now - 60_000).toISOString();
+        const tOldBackfill = new Date(now - 5 * 86400_000).toISOString();
+        const realLoc = 'wrld_aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa:77777~region(jp)';
+
+        await exports.default.fetch('http://example.com/api/gamelog', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                items: [
+                    { type: 'Location', created_at: tLoc, location: '', worldId: '', worldName: 'Sakura Lounge' },
+                    {
+                        type: 'OnPlayerJoined',
+                        created_at: tJoinA,
+                        displayName: 'Alice',
+                        userId: 'usr_alice_inst',
+                        location: realLoc
+                    },
+                    {
+                        type: 'OnPlayerJoined',
+                        created_at: tJoinB,
+                        displayName: 'Bob',
+                        userId: 'usr_bob_inst',
+                        location: realLoc
+                    },
+                    {
+                        type: 'OnPlayerLeft',
+                        created_at: tLeftB,
+                        displayName: 'Bob',
+                        userId: 'usr_bob_inst',
+                        location: realLoc
+                    },
+                    // Backfilled historical event inserted AFTER current room (higher SQLite autoincrement id!)
+                    {
+                        type: 'Location',
+                        created_at: tOldBackfill,
+                        location: 'wrld_old:1',
+                        worldId: 'wrld_old',
+                        worldName: 'Ancient Backfill Room'
+                    }
+                ]
+            })
+        });
+
+        // Clear any existing device states so Path B (D1 replay) is exercised cleanly
+        await env.DB_CORE.prepare('DELETE FROM cloud_device_states').run();
+
+        const replayRes = await exports.default.fetch('http://example.com/api/gamelog/current-instance');
+        expect(replayRes.status).toBe(200);
+        const replayJson = (await replayRes.json()) as {
+            ok: boolean;
+            data: Array<{ type: string; location: string; worldName?: string; displayName?: string; userId?: string }>;
+        };
+        expect(replayJson.ok).toBe(true);
+        // Must be strictly chronological: index 0 is Location with resolved realLoc, followed by JoinA -> JoinB -> LeftB
+        expect(replayJson.data.map((r) => r.type)).toEqual([
+            'Location',
+            'OnPlayerJoined',
+            'OnPlayerJoined',
+            'OnPlayerLeft'
+        ]);
+        expect(replayJson.data[0]?.location).toBe(realLoc);
+        expect(replayJson.data[0]?.worldName).toBe('Sakura Lounge');
+        expect(replayJson.data[1]?.userId).toBe('usr_alice_inst');
+        expect(replayJson.data[2]?.userId).toBe('usr_bob_inst');
+        expect(replayJson.data[3]?.userId).toBe('usr_bob_inst');
+
+        // 2. Simulate v1.10.5 Agent uploading authoritative live currentPlayers snapshot via /api/agent/sync
+        const keyRes = await exports.default.fetch('http://example.com/api/agent/sync-key', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ deviceName: 'Test-PC-PlayerList' })
+        });
+        expect(keyRes.status).toBe(200);
+        const keyJson = (await keyRes.json()) as { ok: boolean; data: { syncKey: string; deviceId: string } };
+        const v105Room = 'wrld_bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb:88888~region(jp)';
+        const syncRes = await exports.default.fetch('http://example.com/api/agent/sync', {
+            method: 'POST',
+            headers: {
+                Authorization: `Bearer ${keyJson.data.syncKey}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                deviceId: keyJson.data.deviceId,
+                deviceName: 'Test-PC-PlayerList',
+                agentVersion: '1.10.5',
+                state: {
+                    vrcRunning: true,
+                    currentLocation: v105Room,
+                    currentWorldId: 'wrld_bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb',
+                    currentWorldName: 'Moonlight Cafe',
+                    playerCount: 2,
+                    currentPlayers: [
+                        { displayName: 'Miku', userId: 'usr_miku', joinedAt: new Date(now - 30_000).toISOString() },
+                        { displayName: 'Rin', userId: 'usr_rin', joinedAt: new Date(now - 10_000).toISOString() }
+                    ]
+                }
+            })
+        });
+        expect(syncRes.status).toBe(200);
+
+        const snapRes = await exports.default.fetch('http://example.com/api/gamelog/current-instance');
+        expect(snapRes.status).toBe(200);
+        const snapJson = (await snapRes.json()) as {
+            ok: boolean;
+            data: Array<{ type: string; location: string; worldName?: string; displayName?: string; userId?: string }>;
+        };
+        expect(snapJson.data.map((r) => r.type)).toEqual(['Location', 'OnPlayerJoined', 'OnPlayerJoined']);
+        expect(snapJson.data[0]?.location).toBe(v105Room);
+        expect(snapJson.data[0]?.worldName).toBe('Moonlight Cafe');
+        expect(snapJson.data.slice(1).map((r) => r.userId)).toEqual(['usr_miku', 'usr_rin']);
+    });
 });

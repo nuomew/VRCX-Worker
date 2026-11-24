@@ -1,9 +1,9 @@
-﻿; Inno Setup 6 installer script for VRCX.Agent (Windows Companion for VRCX-Worker)
+; Inno Setup 6 installer script for VRCX.Agent (Windows Companion for VRCX-Worker)
 ; Built per-user (zero UAC elevation) into %LocalAppData%\Programs\VRCX.Agent
 ; with default-enabled background auto-start (HKCU Run) and clean upgrade/uninstall.
 
 #ifndef AppVersion
-  #define AppVersion "1.10.4"
+  #define AppVersion "1.10.5"
 #endif
 #ifndef SourceDir
   #define SourceDir "..\..\..\build\VRCX-Agent"

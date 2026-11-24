@@ -17,6 +17,8 @@ import { useUpdateLoopStore } from '../stores/updateLoop';
 import { useUserStore } from '../stores/user';
 import { useVrStore } from '../stores/vr';
 import { useWorldStore } from '../stores/world';
+import { watchState } from '../services/watchState';
+import { tryLoadPlayerList } from './gameLogCoordinator';
 
 import configRepository from '../services/config';
 
@@ -64,6 +66,9 @@ export async function runGameRunningChangedFlow(isGameRunning) {
     gameLogStore.clearNowPlaying();
     gameLogStore.resetNowPlayingProducers();
     vrStore.updateVRLastLocation();
+    if (typeof WEB !== 'undefined' && WEB && isGameRunning && watchState.isFriendsLoaded) {
+        tryLoadPlayerList();
+    }
     workerTimers.setTimeout(() => runCheckVRChatDebugLoggingFlow(), 60000);
     updateLoopStore.setNextDiscordUpdate(0);
 }

@@ -1173,6 +1173,72 @@ public sealed class AgentCoreTests
         Assert.Contains("\"steamVrStartedAt\":\"2026-11-24T02:00:00.0000000+00:00\"", json);
     }
 
+    [Fact]
+    public void VrcLogParser_HandlesRealVrChatEnteringBeforeJoiningOrder_OnLeftRoom_AndStartupWarmup()
+    {
+        var parser = new VrcLogParser();
+
+        // Real VRChat output_log order: Entering Room precedes Joining (matching Dotnet/LogWatcher.cs)
+        Assert.Null(parser.ParseLine("2026.11.24 14:00:01 Log        -  [Behaviour] Entering Room: VRChat Home"));
+        GameLogEventItem? room1 = parser.ParseLine("2026.11.24 14:00:01 Log        -  [Behaviour] Joining wrld_11111111-1111-1111-1111-111111111111:1001~private(usr_self)");
+        Assert.NotNull(room1);
+        Assert.Equal("Location", room1!.Type);
+        Assert.Equal("wrld_11111111-1111-1111-1111-111111111111:1001~private(usr_self)", room1.Location);
+        Assert.Equal("VRChat Home", room1.WorldName);
+
+        parser.ParseLine("2026.11.24 14:00:05 Log        -  [Behaviour] OnPlayerJoined Alice (usr_aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa)");
+        parser.ParseLine("2026.11.24 14:00:06 Log        -  [Behaviour] OnPlayerJoined Bob (usr_bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb)");
+        Assert.Equal(2, parser.CurrentPlayerCount);
+        List<AgentPlayerSnapshot> details = parser.SnapshotCurrentPlayerDetails();
+        Assert.Equal(2, details.Count);
+        Assert.Contains(details, p => p.DisplayName == "Alice" && p.UserId == "usr_aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa" && !string.IsNullOrEmpty(p.JoinedAt));
+
+        // OnLeftRoom clears current room players cleanly
+        Assert.Null(parser.ParseLine("2026.11.24 14:05:00 Debug      -  [Behaviour] OnLeftRoom"));
+        Assert.Equal(0, parser.CurrentPlayerCount);
+
+        // Entering second room must pair Room 2's name with Room 2's location (never Room 1's location)
+        Assert.Null(parser.ParseLine("2026.11.24 14:05:05 Log        -  [Behaviour] Entering Room: Sakura Shrine"));
+        GameLogEventItem? room2 = parser.ParseLine("2026.11.24 14:05:05 Log        -  [Behaviour] Joining wrld_22222222-2222-2222-2222-222222222222:2002~region(jp)");
+        Assert.NotNull(room2);
+        Assert.Equal("wrld_22222222-2222-2222-2222-222222222222:2002~region(jp)", room2!.Location);
+        Assert.Equal("Sakura Shrine", room2.WorldName);
+
+        // Verify LogTailCollector warms up live room & player state on Agent restart without re-enqueueing events
+        string tempRoot = Path.Combine(Path.GetTempPath(), "vrcx-warmup-test-" + Guid.NewGuid().ToString("N"));
+        string logDir = Path.Combine(tempRoot, "logs");
+        string stateDir = Path.Combine(tempRoot, "state");
+        Directory.CreateDirectory(logDir);
+        Directory.CreateDirectory(stateDir);
+        try
+        {
+            string logFile = Path.Combine(logDir, "output_log_2026-11-24_14-00-00.txt");
+            File.WriteAllLines(logFile, new[]
+            {
+                "2026.11.24 14:05:05 Log        -  [Behaviour] Entering Room: Sakura Shrine",
+                "2026.11.24 14:05:05 Log        -  [Behaviour] Joining wrld_22222222-2222-2222-2222-222222222222:2002~region(jp)",
+                "2026.11.24 14:05:08 Log        -  [Behaviour] OnPlayerJoined Charlie (usr_cccccccc-cccc-cccc-cccc-cccccccccccc)"
+            });
+
+            var c1 = new LogTailCollector(stateDir);
+            Assert.Equal(2, c1.PollLogDirectory(logDir));
+            c1.AcknowledgeBatch(2);
+
+            // Simulate Agent restart: fresh collector sees cursor at EOF, warms up Parser state, enqueues 0 duplicates
+            var c2 = new LogTailCollector(stateDir);
+            Assert.Equal(0, c2.PollLogDirectory(logDir));
+            Assert.Equal(0, c2.OfflineQueueCount);
+            Assert.Equal("wrld_22222222-2222-2222-2222-222222222222:2002~region(jp)", c2.Parser.CurrentLocation);
+            Assert.Equal("Sakura Shrine", c2.Parser.CurrentWorldName);
+            Assert.Equal(1, c2.Parser.CurrentPlayerCount);
+            Assert.Contains(c2.Parser.SnapshotCurrentPlayerDetails(), p => p.UserId == "usr_cccccccc-cccc-cccc-cccc-cccccccccccc");
+        }
+        finally
+        {
+            if (Directory.Exists(tempRoot)) Directory.Delete(tempRoot, recursive: true);
+        }
+    }
+
     private sealed class StubHttpHandler : HttpMessageHandler
     {
         private readonly Func<HttpRequestMessage, Task<HttpResponseMessage>> _responder;

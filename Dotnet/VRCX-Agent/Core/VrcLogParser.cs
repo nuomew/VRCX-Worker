@@ -24,6 +24,10 @@ public sealed class VrcLogParser
         @"^\[Behaviour\]\s+Entering Room:\s+(.+)$",
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
+    private static readonly Regex LeftRoomRegex = new(
+        @"^\[Behaviour\]\s+OnLeftRoom\b",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+
     private static readonly Regex PlayerJoinedRegex = new(
         @"^\[Behaviour\]\s+OnPlayerJoined\s+(.+?)(?:\s+\((usr_[0-9a-f-]{36})\))?$",
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
@@ -45,11 +49,13 @@ public sealed class VrcLogParser
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
     private readonly Dictionary<string, DateTimeOffset> _recentEventDedupe = new(StringComparer.Ordinal);
-    private string _pendingLocation = string.Empty;
+    private string _pendingWorldName = string.Empty;
     private string _currentLocation = string.Empty;
     private string _currentWorldId = string.Empty;
     private string _currentWorldName = string.Empty;
-    private readonly Dictionary<string, string> _currentPlayers = new(StringComparer.OrdinalIgnoreCase);
+    private DateTimeOffset _lastJoiningAt = DateTimeOffset.MinValue;
+    private bool _lastJoiningHadWorldName;
+    private readonly Dictionary<string, (string UserId, string JoinedAt)> _currentPlayers = new(StringComparer.OrdinalIgnoreCase);
 
     public string CurrentLocation => _currentLocation;
     public string CurrentWorldId => _currentWorldId;
@@ -64,7 +70,22 @@ public sealed class VrcLogParser
             list.Add(new Dictionary<string, string>
             {
                 ["displayName"] = kvp.Key,
-                ["userId"] = kvp.Value
+                ["userId"] = kvp.Value.UserId
+            });
+        }
+        return list;
+    }
+
+    public List<AgentPlayerSnapshot> SnapshotCurrentPlayerDetails()
+    {
+        var list = new List<AgentPlayerSnapshot>(_currentPlayers.Count);
+        foreach (var kvp in _currentPlayers)
+        {
+            list.Add(new AgentPlayerSnapshot
+            {
+                DisplayName = kvp.Key,
+                UserId = kvp.Value.UserId,
+                JoinedAt = kvp.Value.JoinedAt
             });
         }
         return list;
@@ -109,45 +130,87 @@ public sealed class VrcLogParser
         DateTimeOffset eventTime = ParseVrcTimestamp(rawTs);
         string isoTs = eventTime.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ", CultureInfo.InvariantCulture);
 
-        // 1. Joining wrld_xxx:instance (buffers location until "Entering Room: <name>" arrives)
-        Match joinMatch = JoiningWorldRegex.Match(body);
-        if (joinMatch.Success)
+        // 0. OnLeftRoom -> clear current instance players when leaving/switching worlds (matches Dotnet/LogWatcher.cs)
+        if (LeftRoomRegex.IsMatch(body))
         {
-            string loc = joinMatch.Groups[1].Value.Trim();
-            if (!loc.StartsWith("local:", StringComparison.OrdinalIgnoreCase))
-            {
-                _pendingLocation = loc;
-                _currentLocation = loc;
-                _currentWorldId = ExtractWorldId(loc);
-                _currentPlayers.Clear();
-            }
+            _currentPlayers.Clear();
             return null;
         }
 
-        // 2. Entering Room: <worldName> -> emits normalized Location event
+        // 1. Entering Room: <worldName>
+        // In real VRChat output_log_*.txt (see Dotnet/LogWatcher.cs), "Entering Room: <name>" precedes
+        // "Joining wrld_xxx:instance". Buffer the world name for the upcoming Joining line, while also
+        // supporting reverse-order logs where Joining arrived immediately before Entering Room.
         Match enterMatch = EnteringRoomRegex.Match(body);
         if (enterMatch.Success)
         {
             string worldName = enterMatch.Groups[1].Value.Trim();
             _currentWorldName = worldName;
-            string loc = string.IsNullOrEmpty(_pendingLocation) ? _currentLocation : _pendingLocation;
-            _pendingLocation = string.Empty;
-            string worldId = ExtractWorldId(loc);
-            _currentWorldId = worldId;
+            if (!_lastJoiningHadWorldName &&
+                !string.IsNullOrEmpty(_currentLocation) &&
+                Math.Abs((eventTime - _lastJoiningAt).TotalSeconds) <= 10)
+            {
+                _lastJoiningHadWorldName = true;
+                _pendingWorldName = string.Empty;
+                if (IsFloodDuplicate($"Location:{_currentLocation}:{worldName}", eventTime, TimeSpan.FromSeconds(5)))
+                {
+                    return null;
+                }
+                return new GameLogEventItem
+                {
+                    Type = "Location",
+                    CreatedAt = isoTs,
+                    Location = _currentLocation,
+                    WorldId = _currentWorldId,
+                    WorldName = worldName
+                };
+            }
 
-            if (IsFloodDuplicate($"Location:{loc}:{worldName}", eventTime, TimeSpan.FromSeconds(5)))
+            _pendingWorldName = worldName;
+            return null;
+        }
+
+        // 2. Joining wrld_xxx:instance -> emits normalized Location event using buffered Entering Room world name
+        Match joinMatch = JoiningWorldRegex.Match(body);
+        if (joinMatch.Success)
+        {
+            string loc = joinMatch.Groups[1].Value.Trim();
+            if (loc.StartsWith("local:", StringComparison.OrdinalIgnoreCase))
             {
                 return null;
             }
 
-            return new GameLogEventItem
+            string worldId = ExtractWorldId(loc);
+            _currentLocation = loc;
+            _currentWorldId = worldId;
+            _currentPlayers.Clear();
+            _lastJoiningAt = eventTime;
+
+            if (!string.IsNullOrEmpty(_pendingWorldName))
             {
-                Type = "Location",
-                CreatedAt = isoTs,
-                Location = loc,
-                WorldId = worldId,
-                WorldName = worldName
-            };
+                string worldName = _pendingWorldName;
+                _pendingWorldName = string.Empty;
+                _currentWorldName = worldName;
+                _lastJoiningHadWorldName = true;
+
+                if (IsFloodDuplicate($"Location:{loc}:{worldName}", eventTime, TimeSpan.FromSeconds(5)))
+                {
+                    return null;
+                }
+
+                return new GameLogEventItem
+                {
+                    Type = "Location",
+                    CreatedAt = isoTs,
+                    Location = loc,
+                    WorldId = worldId,
+                    WorldName = worldName
+                };
+            }
+
+            // World name has not arrived yet (reverse-order log or world without Entering Room line)
+            _lastJoiningHadWorldName = false;
+            return null;
         }
 
         // 3. OnPlayerJoined
@@ -156,7 +219,7 @@ public sealed class VrcLogParser
         {
             string displayName = pjMatch.Groups[1].Value.Trim();
             string userId = pjMatch.Groups[2].Success ? pjMatch.Groups[2].Value.Trim() : string.Empty;
-            _currentPlayers[displayName] = userId;
+            _currentPlayers[displayName] = (userId, isoTs);
 
             if (IsFloodDuplicate($"Join:{displayName}:{userId}", eventTime, TimeSpan.FromSeconds(3)))
             {

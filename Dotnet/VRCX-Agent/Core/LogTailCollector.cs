@@ -229,6 +229,67 @@ public sealed class LogTailCollector
         return batch.Count;
     }
 
+    private bool _liveParserWarmupDone;
+
+    private sealed class BoundedReadStream : Stream
+    {
+        private readonly Stream _inner;
+        private long _remaining;
+
+        public BoundedReadStream(Stream inner, long maxBytes)
+        {
+            _inner = inner;
+            _remaining = Math.Max(0, maxBytes);
+        }
+
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => throw new NotSupportedException();
+        public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
+        public override void Flush() { }
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+        public override int Read(byte[] buffer, int offset, int count)
+        {
+            if (_remaining <= 0) return 0;
+            int toRead = (int)Math.Min(count, _remaining);
+            int read = _inner.Read(buffer, offset, toRead);
+            _remaining -= read;
+            return read;
+        }
+    }
+
+    private void WarmUpLiveParserFromPrefix(string latestFile, long upToOffset)
+    {
+        if (_liveParserWarmupDone || upToOffset <= 0)
+        {
+            _liveParserWarmupDone = true;
+            return;
+        }
+        _liveParserWarmupDone = true;
+
+        try
+        {
+            using var fs = new FileStream(latestFile, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            long limit = Math.Min(upToOffset, fs.Length);
+            using var bounded = new BoundedReadStream(fs, limit);
+            using var reader = new StreamReader(bounded, Encoding.UTF8, detectEncodingFromByteOrderMarks: true, bufferSize: 8192, leaveOpen: true);
+
+            string? line;
+            while ((line = reader.ReadLine()) != null)
+            {
+                _parser.ParseLine(line);
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.Warn(ex, "Failed to warm up live parser room state from {File}", Path.GetFileName(latestFile));
+        }
+    }
+
     private int ReadLatestLogFile(string latestFile, out bool cursorUpdated)
     {
         cursorUpdated = false;
@@ -255,6 +316,15 @@ public sealed class LogTailCollector
         else
         {
             offset = 0;
+        }
+
+        if (offset > 0 && !_liveParserWarmupDone)
+        {
+            WarmUpLiveParserFromPrefix(latestFile, offset);
+        }
+        else
+        {
+            _liveParserWarmupDone = true;
         }
 
         if (!string.Equals(_cursor.FileName, fileName, StringComparison.OrdinalIgnoreCase))

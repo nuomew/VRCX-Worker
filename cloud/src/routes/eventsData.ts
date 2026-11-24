@@ -1,6 +1,13 @@
 import type { Env } from '../env';
 import { buildSafeTrigramMatch, searchGameLogByEntity } from '../search/entityFts';
-import { incrementCounter, upsertEntityUser, upsertEntityWorld } from './coreData';
+import {
+    getAgentOnlineWindowMs,
+    incrementCounter,
+    parseCloudSyncIntervalSeconds,
+    resolveRecentHttpAgents,
+    upsertEntityUser,
+    upsertEntityWorld
+} from './coreData';
 
 const MAX_LIMIT = 100;
 
@@ -368,17 +375,224 @@ function normalizeGameLogRows(results: D1Result<Record<string, unknown>>[]): Arr
 
 export async function handleEventsDataRoutes(request: Request, env: Env, url: URL): Promise<Response | null> {
     // ===== GAMELOG =====
+    if (url.pathname === '/api/gamelog/current-instance' && request.method === 'GET') {
+        const nowMs = Date.now();
+        const nowIso = new Date(nowMs).toISOString();
+        const cutoffMs = nowMs - 24 * 3600_000;
+        const cutoffIso = new Date(cutoffMs).toISOString();
+
+        const [cfgRes, devicesRes, statesRes] = await env.DB_CORE.batch([
+            env.DB_CORE.prepare("SELECT payload_json FROM config_bundles WHERE bundle_key = 'vrcx_config' LIMIT 1"),
+            env.DB_CORE.prepare('SELECT device_id, last_seen_at FROM cloud_devices'),
+            env.DB_CORE.prepare('SELECT device_id, state_json, updated_at FROM cloud_device_states')
+        ]);
+
+        let syncIntervalSeconds = 60;
+        const cfgRow = (cfgRes?.results?.[0] ?? null) as { payload_json?: string } | null;
+        if (cfgRow?.payload_json) {
+            try {
+                const parsed = JSON.parse(cfgRow.payload_json) as Record<string, unknown>;
+                syncIntervalSeconds = parseCloudSyncIntervalSeconds(parsed['cloud:syncIntervalSeconds']);
+            } catch {
+                // Keep default
+            }
+        }
+        const { httpAgentsOnline } = resolveRecentHttpAgents(
+            (devicesRes?.results ?? []) as Array<{ device_id: string; last_seen_at?: string | null }>,
+            nowMs,
+            getAgentOnlineWindowMs(syncIntervalSeconds)
+        );
+        const onlineSet = new Set(httpAgentsOnline);
+
+        interface ActiveDeviceSnapshot {
+            location: string;
+            worldName: string;
+            updatedAt: string;
+            currentPlayers: Array<{ displayName: string; userId: string; joinedAt?: string }> | null;
+        }
+        let activeSnapshot: ActiveDeviceSnapshot | null = null;
+        for (const rawRow of (statesRes?.results ?? []) as Array<{
+            device_id?: string;
+            state_json?: string;
+            updated_at?: string;
+        }>) {
+            const devId = rawRow.device_id ?? '';
+            if (!devId || !onlineSet.has(devId) || !rawRow.state_json) continue;
+            try {
+                const st = JSON.parse(rawRow.state_json) as Record<string, unknown>;
+                if (st.vrcRunning !== true && st.isGameRunning !== true) continue;
+                const loc = typeof st.currentLocation === 'string' ? st.currentLocation.trim() : '';
+                const worldName = typeof st.currentWorldName === 'string' ? st.currentWorldName.trim() : '';
+                const players = Array.isArray(st.currentPlayers)
+                    ? st.currentPlayers
+                          .filter((p): p is Record<string, unknown> => Boolean(p && typeof p === 'object'))
+                          .map((p) => ({
+                              displayName: typeof p.displayName === 'string' ? p.displayName : '',
+                              userId: typeof p.userId === 'string' ? p.userId : '',
+                              joinedAt: typeof p.joinedAt === 'string' ? p.joinedAt : undefined
+                          }))
+                          .filter((p) => Boolean(p.displayName || p.userId))
+                    : null;
+                const updatedAt = rawRow.updated_at || nowIso;
+                if (
+                    !activeSnapshot ||
+                    (Boolean(loc) && !activeSnapshot.location) ||
+                    (Boolean(loc) === Boolean(activeSnapshot.location) && updatedAt > activeSnapshot.updatedAt)
+                ) {
+                    activeSnapshot = { location: loc, worldName, updatedAt, currentPlayers: players };
+                }
+            } catch {
+                // Skip malformed device state
+            }
+        }
+
+        const [latestLocRes, latestJlRes] = await env.DB_GAMELOG.batch([
+            env.DB_GAMELOG.prepare('SELECT * FROM gamelog_location ORDER BY created_at DESC LIMIT 1'),
+            env.DB_GAMELOG.prepare('SELECT * FROM gamelog_join_leave ORDER BY created_at DESC LIMIT 1')
+        ]);
+        const latestLoc = (latestLocRes?.results?.[0] ?? null) as Record<string, unknown> | null;
+        const latestJl = (latestJlRes?.results?.[0] ?? null) as Record<string, unknown> | null;
+
+        const latestLocCreatedAt = typeof latestLoc?.created_at === 'string' ? latestLoc.created_at : '';
+        const latestLocValid24h = Boolean(latestLocCreatedAt && latestLocCreatedAt >= cutoffIso);
+        const latestLocTag = typeof latestLoc?.location === 'string' ? latestLoc.location.trim() : '';
+        const latestJlCreatedAt = typeof latestJl?.created_at === 'string' ? latestJl.created_at : '';
+        const latestJlValid24h = Boolean(latestJlCreatedAt && latestJlCreatedAt >= cutoffIso);
+        const latestJlTag = typeof latestJl?.location === 'string' ? latestJl.location.trim() : '';
+
+        // Path A: Online v1.10.5+ Agent provided an authoritative live currentPlayers snapshot for an active room.
+        if (activeSnapshot?.location && activeSnapshot.currentPlayers !== null) {
+            const worldId = activeSnapshot.location.split(':')[0] ?? '';
+            const earliestJoin = activeSnapshot.currentPlayers
+                .map((p) => p.joinedAt || '')
+                .filter(Boolean)
+                .sort()[0];
+            const locCreatedAt =
+                latestLocValid24h && (!latestLocTag || latestLocTag === activeSnapshot.location)
+                    ? latestLocCreatedAt
+                    : earliestJoin || activeSnapshot.updatedAt;
+            const out: Array<Record<string, unknown>> = [
+                {
+                    rowId: Number(latestLoc?.id ?? 0),
+                    created_at: locCreatedAt,
+                    type: 'Location',
+                    location: activeSnapshot.location,
+                    worldId,
+                    worldName: activeSnapshot.worldName || String(latestLoc?.world_name ?? ''),
+                    time: Number(latestLoc?.time ?? 0),
+                    groupName: String(latestLoc?.group_name ?? '')
+                }
+            ];
+            const sortedPlayers = [...activeSnapshot.currentPlayers].sort((a, b) =>
+                String(a.joinedAt || locCreatedAt).localeCompare(String(b.joinedAt || locCreatedAt))
+            );
+            for (const p of sortedPlayers) {
+                out.push({
+                    rowId: 0,
+                    created_at: p.joinedAt || locCreatedAt,
+                    type: 'OnPlayerJoined',
+                    displayName: p.displayName,
+                    location: activeSnapshot.location,
+                    userId: p.userId,
+                    time: 0
+                });
+            }
+            return Response.json({ ok: true, data: out });
+        }
+
+        // Path B: Replay DB_GAMELOG join/leave events chronologically (also handles legacy v1.10.4 empty/shifted Location rows).
+        let resolvedLocation = activeSnapshot?.location || '';
+        if (!resolvedLocation && latestJlValid24h && latestJlTag) {
+            if (!latestLocValid24h || !latestLocTag || latestJlCreatedAt >= latestLocCreatedAt) {
+                resolvedLocation = latestJlTag;
+            }
+        }
+        if (!resolvedLocation && latestLocValid24h && latestLocTag) {
+            resolvedLocation = latestLocTag;
+        }
+        if (!resolvedLocation) {
+            return Response.json({ ok: true, data: [] });
+        }
+
+        const locTimeMs = latestLocValid24h ? Date.parse(latestLocCreatedAt) : NaN;
+        const querySinceIso = Number.isFinite(locTimeMs)
+            ? new Date(Math.max(locTimeMs - 2000, cutoffMs)).toISOString()
+            : cutoffIso;
+
+        const jlRangeRes = await env.DB_GAMELOG.prepare(
+            'SELECT * FROM gamelog_join_leave WHERE created_at >= ? ORDER BY created_at ASC LIMIT 500'
+        )
+            .bind(querySinceIso)
+            .all<Record<string, unknown>>();
+
+        let jlRows = (jlRangeRes.results ?? []).filter((r) => {
+            const rLoc = typeof r.location === 'string' ? r.location.trim() : '';
+            return !rLoc || rLoc === resolvedLocation;
+        });
+
+        if (jlRows.length === 0) {
+            const byLocRes = await env.DB_GAMELOG.prepare(
+                'SELECT * FROM gamelog_join_leave WHERE location = ? AND created_at >= ? ORDER BY id DESC LIMIT 200'
+            )
+                .bind(resolvedLocation, cutoffIso)
+                .all<Record<string, unknown>>();
+            jlRows = [...(byLocRes.results ?? [])].sort((a, b) =>
+                String(a.created_at ?? '').localeCompare(String(b.created_at ?? ''))
+            );
+        }
+
+        const worldId = resolvedLocation.split(':')[0] ?? '';
+        const locCreatedAt =
+            (latestLocValid24h ? latestLocCreatedAt : '') ||
+            (typeof jlRows[0]?.created_at === 'string' ? jlRows[0].created_at : '') ||
+            nowIso;
+        const worldName = activeSnapshot?.worldName || (latestLocValid24h ? String(latestLoc?.world_name ?? '') : '');
+
+        const out: Array<Record<string, unknown>> = [
+            {
+                rowId: Number(latestLoc?.id ?? 0),
+                created_at: locCreatedAt,
+                type: 'Location',
+                location: resolvedLocation,
+                worldId,
+                worldName,
+                time: Number(latestLoc?.time ?? 0),
+                groupName: String(latestLoc?.group_name ?? '')
+            }
+        ];
+        for (const r of jlRows) {
+            out.push({
+                rowId: r.id,
+                created_at: r.created_at,
+                type: r.type,
+                displayName: r.display_name,
+                location: r.location || resolvedLocation,
+                userId: r.user_id,
+                time: r.time
+            });
+        }
+        return Response.json({ ok: true, data: out });
+    }
+
     if (url.pathname === '/api/gamelog') {
         if (request.method === 'GET') {
             const limit = clampLimit(url.searchParams.get('limit'), 100);
             const perTable = Math.max(10, Math.min(limit, 50));
             const results = await env.DB_GAMELOG.batch([
-                env.DB_GAMELOG.prepare('SELECT * FROM gamelog_location ORDER BY id DESC LIMIT ?').bind(perTable),
-                env.DB_GAMELOG.prepare('SELECT * FROM gamelog_join_leave ORDER BY id DESC LIMIT ?').bind(perTable),
-                env.DB_GAMELOG.prepare('SELECT * FROM gamelog_portal_spawn ORDER BY id DESC LIMIT ?').bind(perTable),
-                env.DB_GAMELOG.prepare('SELECT * FROM gamelog_video_play ORDER BY id DESC LIMIT ?').bind(perTable),
-                env.DB_GAMELOG.prepare('SELECT * FROM gamelog_event ORDER BY id DESC LIMIT ?').bind(perTable),
-                env.DB_GAMELOG.prepare('SELECT * FROM gamelog_external ORDER BY id DESC LIMIT ?').bind(perTable)
+                env.DB_GAMELOG.prepare('SELECT * FROM gamelog_location ORDER BY created_at DESC LIMIT ?').bind(
+                    perTable
+                ),
+                env.DB_GAMELOG.prepare('SELECT * FROM gamelog_join_leave ORDER BY created_at DESC LIMIT ?').bind(
+                    perTable
+                ),
+                env.DB_GAMELOG.prepare('SELECT * FROM gamelog_portal_spawn ORDER BY created_at DESC LIMIT ?').bind(
+                    perTable
+                ),
+                env.DB_GAMELOG.prepare('SELECT * FROM gamelog_video_play ORDER BY created_at DESC LIMIT ?').bind(
+                    perTable
+                ),
+                env.DB_GAMELOG.prepare('SELECT * FROM gamelog_event ORDER BY created_at DESC LIMIT ?').bind(perTable),
+                env.DB_GAMELOG.prepare('SELECT * FROM gamelog_external ORDER BY created_at DESC LIMIT ?').bind(perTable)
             ]);
             const rows = normalizeGameLogRows(results as D1Result<Record<string, unknown>>[]).slice(0, limit);
             return Response.json({ ok: true, data: rows });
