@@ -628,19 +628,52 @@ export async function handleAgentWebRoutes(request: Request, env: Env, url: URL)
         }
     }
 
-    // Cloud screenshot gallery search & private R2 streaming
+    // Cloud screenshot gallery search & private R2 streaming (indexed keyset pagination)
     if (url.pathname === '/api/screenshots' && request.method === 'GET') {
-        const limit = Math.min(Number(url.searchParams.get('limit') ?? '50'), 100);
-        const worldId = url.searchParams.get('worldId')?.trim();
-        const res = worldId
-            ? await env.DB_CORE.prepare(
-                  'SELECT * FROM cloud_screenshots WHERE world_id = ? ORDER BY taken_at DESC LIMIT ?'
-              )
-                  .bind(worldId, limit)
-                  .all()
-            : await env.DB_CORE.prepare('SELECT * FROM cloud_screenshots ORDER BY taken_at DESC LIMIT ?')
-                  .bind(limit)
-                  .all();
+        const rawLimit = Number(url.searchParams.get('limit') ?? '60');
+        const limit = Number.isFinite(rawLimit) && rawLimit > 0 ? Math.min(Math.floor(rawLimit), 200) : 60;
+        const worldId = url.searchParams.get('worldId')?.trim() ?? '';
+        const before = url.searchParams.get('before')?.trim() ?? '';
+        const beforeId = url.searchParams.get('beforeId')?.trim() ?? '';
+
+        let res;
+        if (worldId && before) {
+            res = beforeId
+                ? await env.DB_CORE.prepare(
+                      'SELECT * FROM cloud_screenshots WHERE world_id = ? AND (taken_at < ? OR (taken_at = ? AND id < ?)) ORDER BY taken_at DESC, id DESC LIMIT ?'
+                  )
+                      .bind(worldId, before, before, beforeId, limit)
+                      .all()
+                : await env.DB_CORE.prepare(
+                      'SELECT * FROM cloud_screenshots WHERE world_id = ? AND taken_at < ? ORDER BY taken_at DESC, id DESC LIMIT ?'
+                  )
+                      .bind(worldId, before, limit)
+                      .all();
+        } else if (worldId) {
+            res = await env.DB_CORE.prepare(
+                'SELECT * FROM cloud_screenshots WHERE world_id = ? ORDER BY taken_at DESC, id DESC LIMIT ?'
+            )
+                .bind(worldId, limit)
+                .all();
+        } else if (before) {
+            res = beforeId
+                ? await env.DB_CORE.prepare(
+                      'SELECT * FROM cloud_screenshots WHERE (taken_at < ? OR (taken_at = ? AND id < ?)) ORDER BY taken_at DESC, id DESC LIMIT ?'
+                  )
+                      .bind(before, before, beforeId, limit)
+                      .all()
+                : await env.DB_CORE.prepare(
+                      'SELECT * FROM cloud_screenshots WHERE taken_at < ? ORDER BY taken_at DESC, id DESC LIMIT ?'
+                  )
+                      .bind(before, limit)
+                      .all();
+        } else {
+            res = await env.DB_CORE.prepare(
+                'SELECT * FROM cloud_screenshots ORDER BY taken_at DESC, id DESC LIMIT ?'
+            )
+                .bind(limit)
+                .all();
+        }
         return Response.json({ ok: true, data: res.results ?? [] });
     }
 

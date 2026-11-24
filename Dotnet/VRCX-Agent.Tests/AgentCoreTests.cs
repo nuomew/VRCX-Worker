@@ -967,6 +967,103 @@ public sealed class AgentCoreTests
         }
     }
 
+    [Fact]
+    public async Task ScreenshotPipeline_ScansHistoricalPhotosReadsConfigAndExistingMetadataOnceOnly()
+    {
+        string tempRoot = Path.Combine(Path.GetTempPath(), "vrcx-hist-scan-" + Guid.NewGuid().ToString("N"));
+        string logDir = Path.Combine(tempRoot, "vrc-log");
+        string customPhotosDir = Path.Combine(tempRoot, "MyCustomPhotos");
+        string monthDir = Path.Combine(customPhotosDir, "2026-11");
+        string printsDir = Path.Combine(customPhotosDir, "Prints");
+        string stateDir = Path.Combine(tempRoot, "state");
+        Directory.CreateDirectory(logDir);
+        Directory.CreateDirectory(monthDir);
+        Directory.CreateDirectory(printsDir);
+        Directory.CreateDirectory(stateDir);
+
+        try
+        {
+            // 1. VRChat config.json picture_output_folder takes precedence
+            await File.WriteAllTextAsync(
+                Path.Combine(logDir, "config.json"),
+                Newtonsoft.Json.JsonConvert.SerializeObject(new { picture_output_folder = customPhotosDir }),
+                Encoding.UTF8);
+            Assert.Equal(customPhotosDir, ScreenshotPipeline.ResolveVrChatPhotosDirectory(logDir));
+
+            // 2. Create two historical VRChat photos (one with embedded VRCX PNG metadata) + one Print that must be ignored
+            string olderPhoto = Path.Combine(monthDir, "VRChat_2026-11-10_08-15-30.500_1920x1080.png");
+            string newerPhoto = Path.Combine(monthDir, "VRChat_2026-11-24_21-35-00.000_1920x1080.png");
+            string ignoredPrint = Path.Combine(printsDir, "VRChat_2026-11-24_22-00-00.000_1920x1080.png");
+
+            using (var img = new Image<Rgba32>(20, 20, new Rgba32(10, 20, 30, 255)))
+            {
+                img.SaveAsPng(olderPhoto);
+            }
+            using (var img = new Image<Rgba32>(20, 20, new Rgba32(200, 100, 50, 255)))
+            {
+                img.SaveAsPng(newerPhoto);
+            }
+            using (var img = new Image<Rgba32>(20, 20, new Rgba32(99, 99, 99, 255)))
+            {
+                img.SaveAsPng(ignoredPrint);
+            }
+
+            ScreenshotPipeline.WriteVrcxPngMetadata(newerPhoto, new ScreenshotMetaPayload
+            {
+                WorldId = "wrld_sakura_123",
+                WorldName = "Sakura Shrine",
+                InstanceId = "12345"
+            });
+
+            var cfg = new AgentConfig
+            {
+                CloudUrl = "https://vrcx.example.workers.dev",
+                SyncSecret = "vrcx_sync_test_secret_key",
+                AutoUploadScreenshots = true,
+                CompressScreenshots = false
+            };
+
+            int putCount = 0;
+            using var http = new HttpClient(new StubHttpHandler(_ =>
+            {
+                Interlocked.Increment(ref putCount);
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent("{\"ok\":true,\"data\":{\"duplicate\":false}}", Encoding.UTF8, "application/json")
+                });
+            }));
+
+            var pipeline = new ScreenshotPipeline(() => cfg, http, stateDir);
+            List<PendingScreenshotTask> scanned = pipeline.ScanUnsyncedScreenshots(customPhotosDir, maxResults: 50);
+
+            // Must find both VRChat photos newest-first, ignore Prints/, parse exact timestamps, and extract WorldName
+            Assert.Equal(2, scanned.Count);
+            Assert.Equal(newerPhoto, scanned[0].LocalPath);
+            Assert.Equal(olderPhoto, scanned[1].LocalPath);
+            Assert.Equal("Sakura Shrine", scanned[0].WorldName);
+            Assert.Equal("wrld_sakura_123", scanned[0].WorldId);
+
+            DateTimeOffset parsedNewerLocal = DateTimeOffset.Parse(scanned[0].TakenAtIso).ToLocalTime();
+            Assert.Equal(2026, parsedNewerLocal.Year);
+            Assert.Equal(11, parsedNewerLocal.Month);
+            Assert.Equal(24, parsedNewerLocal.Day);
+            Assert.Equal(21, parsedNewerLocal.Hour);
+            Assert.Equal(35, parsedNewerLocal.Minute);
+
+            // Uploading both marks them persisted so a second scan returns 0 items
+            foreach (PendingScreenshotTask t in scanned)
+            {
+                Assert.True(await pipeline.UploadQueuedTaskAsync(t, CancellationToken.None));
+            }
+            Assert.Equal(2, putCount);
+            Assert.Empty(pipeline.ScanUnsyncedScreenshots(customPhotosDir, maxResults: 50));
+        }
+        finally
+        {
+            if (Directory.Exists(tempRoot)) Directory.Delete(tempRoot, recursive: true);
+        }
+    }
+
     private sealed class StubHttpHandler : HttpMessageHandler
     {
         private readonly Func<HttpRequestMessage, Task<HttpResponseMessage>> _responder;

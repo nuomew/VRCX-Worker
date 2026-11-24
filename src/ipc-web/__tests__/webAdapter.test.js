@@ -5,6 +5,7 @@ import { createAppApiBridge } from '../appApiWeb.js';
 import { createWebApiBridge } from '../webApiRemote.js';
 import { createCloudDatabase } from '../../services/database/cloud/index.js';
 import { formatTotalUptime } from '../../components/statusBarUtils.js';
+import { formatCloudPhotoDateTime, groupCloudScreenshotsByDate } from '../cloudGalleryUtils.js';
 
 function mockOk(data, status = 200) {
     return new Response(JSON.stringify({ ok: true, data }), {
@@ -300,5 +301,34 @@ describe('WEB cloud adapter (stateless)', () => {
 
         expect(formatTotalUptime(3661)).toBe('01:01:01');
         expect(formatTotalUptime(90_061)).toBe('1d 01:01:01');
+    });
+
+    it('groups Cloud Gallery screenshots by local calendar date with Chinese YYYY年MM月DD日 HH:mm timestamps', () => {
+        const d1a = new Date(2026, 10, 24, 21, 35, 0).toISOString();
+        const d1b = new Date(2026, 10, 24, 14, 5, 0).toISOString();
+        const d2 = new Date(2026, 10, 20, 9, 8, 0).toISOString();
+
+        expect(formatCloudPhotoDateTime(d1a, 'zh-CN')).toBe('2026年11月24日 21:35');
+        expect(formatCloudPhotoDateTime(d2, 'en')).toBe('2026-11-20 09:08');
+
+        const groups = groupCloudScreenshotsByDate(
+            [
+                { id: 's1', taken_at: d1a },
+                { id: 's2', taken_at: d1b },
+                { id: 's3', taken_at: d2 }
+            ],
+            'zh-CN',
+            '未知日期'
+        );
+        expect(groups).toHaveLength(2);
+        expect(groups[0].dateLabel).toBe('2026年11月24日');
+        expect(groups[0].timeRange).toBe('14:05 – 21:35');
+        expect(groups[0].items.map((i) => i.dateTimeLabel)).toEqual([
+            '2026年11月24日 21:35',
+            '2026年11月24日 14:05'
+        ]);
+        expect(groups[1].dateLabel).toBe('2026年11月20日');
+        expect(groups[1].timeRange).toBe('09:08');
+        expect(groups[1].items[0].dateTimeLabel).toBe('2026年11月20日 09:08');
     });
 });

@@ -1,12 +1,16 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
+using System.Linq;
 using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 using NLog;
 using SixLabors.ImageSharp;
 using SixLabors.ImageSharp.Formats.Webp;
@@ -405,6 +409,255 @@ public sealed class ScreenshotPipeline
             ["compressed"] = compressed
         }
     };
+
+    private static readonly Regex VrChatTimestampRegex = new(
+        @"(?<!\d)(\d{4})-(\d{2})-(\d{2})_(\d{2})-(\d{2})-(\d{2})(?:\.(\d{1,3}))?(?!\d)",
+        RegexOptions.Compiled);
+
+    private static readonly HashSet<string> SupportedPhotoExtensions = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".webp"
+    };
+
+    private static readonly HashSet<string> ExcludedSubfolderNames = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "Prints",
+        "Stickers",
+        "Emojis"
+    };
+
+    /// <summary>
+    /// Resolves the local VRChat photos directory matching upstream VRCX behavior:
+    /// checks `picture_output_folder` in VRChat's `config.json` first, then falls back to `MyPictures\VRChat`.
+    /// </summary>
+    public static string ResolveVrChatPhotosDirectory(string? vrChatLogDirectory = null)
+    {
+        string defaultPath = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.MyPictures),
+            "VRChat");
+        try
+        {
+            string logDir = string.IsNullOrWhiteSpace(vrChatLogDirectory)
+                ? LogTailCollector.ResolveDefaultVrChatLogDirectory()
+                : vrChatLogDirectory;
+            if (!string.IsNullOrWhiteSpace(logDir))
+            {
+                string configPath = Path.Combine(logDir, "config.json");
+                if (File.Exists(configPath))
+                {
+                    string json = File.ReadAllText(configPath, Encoding.UTF8);
+                    JObject? obj = JsonConvert.DeserializeObject<JObject>(json);
+                    string? customDir = obj?["picture_output_folder"]?.Value<string>()?.Trim();
+                    if (!string.IsNullOrEmpty(customDir) && Directory.Exists(customDir))
+                    {
+                        return customDir;
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.Warn(ex, "Failed to read picture_output_folder from VRChat config.json; using default folder.");
+        }
+        return defaultPath;
+    }
+
+    /// <summary>
+    /// Extracts the original capture timestamp in UTC from standard VRChat filenames
+    /// (`VRChat_YYYY-MM-DD_HH-mm-ss.fff_...` or legacy `VRChat_WxH_YYYY-MM-DD_HH-mm-ss.fff`),
+    /// falling back to the earliest valid file timestamp when the filename has no embedded date.
+    /// </summary>
+    public static DateTimeOffset ResolveScreenshotTakenAtUtc(string filePath)
+    {
+        string name = Path.GetFileName(filePath) ?? string.Empty;
+        Match m = VrChatTimestampRegex.Match(name);
+        if (m.Success
+            && int.TryParse(m.Groups[1].Value, NumberStyles.None, CultureInfo.InvariantCulture, out int year)
+            && int.TryParse(m.Groups[2].Value, NumberStyles.None, CultureInfo.InvariantCulture, out int month)
+            && int.TryParse(m.Groups[3].Value, NumberStyles.None, CultureInfo.InvariantCulture, out int day)
+            && int.TryParse(m.Groups[4].Value, NumberStyles.None, CultureInfo.InvariantCulture, out int hour)
+            && int.TryParse(m.Groups[5].Value, NumberStyles.None, CultureInfo.InvariantCulture, out int minute)
+            && int.TryParse(m.Groups[6].Value, NumberStyles.None, CultureInfo.InvariantCulture, out int second))
+        {
+            int ms = 0;
+            if (m.Groups[7].Success)
+            {
+                string frac = m.Groups[7].Value.PadRight(3, '0');
+                int.TryParse(frac, NumberStyles.None, CultureInfo.InvariantCulture, out ms);
+            }
+            try
+            {
+                var localDt = new DateTime(year, month, day, hour, minute, second, ms, DateTimeKind.Local);
+                return new DateTimeOffset(localDt).ToUniversalTime();
+            }
+            catch
+            {
+                // Fall back to filesystem timestamps if filename date is out of range
+            }
+        }
+
+        try
+        {
+            DateTime writeUtc = File.GetLastWriteTimeUtc(filePath);
+            DateTime createUtc = File.GetCreationTimeUtc(filePath);
+            DateTime chosen = createUtc.Year >= 2014 && createUtc < writeUtc ? createUtc : writeUtc;
+            if (chosen.Year >= 2014)
+            {
+                return new DateTimeOffset(DateTime.SpecifyKind(chosen, DateTimeKind.Utc));
+            }
+        }
+        catch
+        {
+            // Ignore IO errors and fall back to UtcNow
+        }
+        return DateTimeOffset.UtcNow;
+    }
+
+    /// <summary>
+    /// Builds a read-only upload task for an existing local VRChat screenshot,
+    /// preserving its true capture timestamp and any existing embedded VRCX PNG metadata.
+    /// </summary>
+    public static PendingScreenshotTask BuildTaskFromExistingFile(string filePath)
+    {
+        DateTimeOffset takenUtc = ResolveScreenshotTakenAtUtc(filePath);
+        var task = new PendingScreenshotTask
+        {
+            LocalPath = filePath,
+            TakenAtIso = takenUtc.ToString("O", CultureInfo.InvariantCulture)
+        };
+
+        if (string.Equals(Path.GetExtension(filePath), ".png", StringComparison.OrdinalIgnoreCase))
+        {
+            TryPopulateFromExistingPngMetadata(filePath, task);
+        }
+        return task;
+    }
+
+    private static void TryPopulateFromExistingPngMetadata(string pngPath, PendingScreenshotTask task)
+    {
+        try
+        {
+            using var pngFile = new VRCX.PNGFile(pngPath, writeAccess: false);
+            string? raw = VRCX.PNGHelper.ReadTextChunk("Description", pngFile)
+                ?? VRCX.PNGHelper.ReadTextChunk("Description", pngFile, legacySearch: true);
+            if (string.IsNullOrWhiteSpace(raw) || !raw.TrimStart().StartsWith('{'))
+            {
+                return;
+            }
+            JObject? meta = JsonConvert.DeserializeObject<JObject>(raw);
+            if (meta == null) return;
+
+            JToken? world = meta["world"];
+            if (world != null)
+            {
+                task.WorldId = world["id"]?.Value<string>() ?? string.Empty;
+                task.WorldName = world["name"]?.Value<string>() ?? string.Empty;
+                task.InstanceId = world["instanceId"]?.Value<string>() ?? string.Empty;
+            }
+
+            if (meta["players"] is JArray playersArr)
+            {
+                foreach (JToken entry in playersArr)
+                {
+                    if (entry is not JObject pObj) continue;
+                    string id = pObj["id"]?.Value<string>() ?? string.Empty;
+                    string displayName = pObj["displayName"]?.Value<string>() ?? string.Empty;
+                    if (!string.IsNullOrEmpty(id) || !string.IsNullOrEmpty(displayName))
+                    {
+                        task.Players.Add(new Dictionary<string, string>
+                        {
+                            ["id"] = id,
+                            ["displayName"] = displayName
+                        });
+                    }
+                }
+            }
+        }
+        catch
+        {
+            // Non-VRCX or malformed PNG metadata should never prevent syncing the photo itself
+        }
+    }
+
+    private static bool IsInsideExcludedSubfolder(string rootDir, string filePath)
+    {
+        try
+        {
+            string relative = Path.GetRelativePath(rootDir, filePath);
+            string? dirPart = Path.GetDirectoryName(relative);
+            if (string.IsNullOrEmpty(dirPart)) return false;
+            string[] segments = dirPart.Split(new[] { Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar }, StringSplitOptions.RemoveEmptyEntries);
+            foreach (string seg in segments)
+            {
+                if (ExcludedSubfolderNames.Contains(seg))
+                {
+                    return true;
+                }
+            }
+        }
+        catch
+        {
+            // Ignore path parsing failures
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Scans the local VRChat photos folder recursively for historical screenshots that have not yet been uploaded.
+    /// Returns up to <paramref name="maxResults"/> tasks ordered newest-first so recent memories appear immediately.
+    /// </summary>
+    public List<PendingScreenshotTask> ScanUnsyncedScreenshots(string photosDirectory, int maxResults = 50)
+    {
+        var results = new List<PendingScreenshotTask>();
+        if (maxResults <= 0 || string.IsNullOrWhiteSpace(photosDirectory) || !Directory.Exists(photosDirectory))
+        {
+            return results;
+        }
+
+        var candidates = new List<(string Path, DateTimeOffset TakenUtc)>();
+        try
+        {
+            var opts = new EnumerationOptions
+            {
+                RecurseSubdirectories = true,
+                IgnoreInaccessible = true,
+                AttributesToSkip = FileAttributes.Hidden | FileAttributes.System
+            };
+            foreach (string filePath in Directory.EnumerateFiles(photosDirectory, "*.*", opts))
+            {
+                string ext = Path.GetExtension(filePath);
+                if (!SupportedPhotoExtensions.Contains(ext)) continue;
+                if (IsInsideExcludedSubfolder(photosDirectory, filePath)) continue;
+                if (HasAlreadyUploaded(filePath)) continue;
+
+                try
+                {
+                    var fi = new FileInfo(filePath);
+                    if (!fi.Exists || fi.Length < 64) continue;
+                }
+                catch
+                {
+                    continue;
+                }
+
+                candidates.Add((filePath, ResolveScreenshotTakenAtUtc(filePath)));
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.Warn(ex, "Failed to scan VRChat photos directory {Dir}", photosDirectory);
+            return results;
+        }
+
+        foreach (var item in candidates.OrderByDescending(c => c.TakenUtc).Take(maxResults))
+        {
+            results.Add(BuildTaskFromExistingFile(item.Path));
+        }
+        return results;
+    }
 
     private static async Task WaitForFileReadyAsync(string path, CancellationToken ct)
     {

@@ -447,6 +447,8 @@ public sealed class TrayApplicationContext : ApplicationContext
     {
         if (!_config.AutoUploadScreenshots) return;
 
+        EnqueueExistingUnsyncedScreenshots(maxBatch: 30);
+
         int attempts = 0;
         while (attempts < 10 && !ct.IsCancellationRequested)
         {
@@ -473,6 +475,45 @@ public sealed class TrayApplicationContext : ApplicationContext
                 }
             }
             attempts++;
+        }
+    }
+
+    private void EnqueueExistingUnsyncedScreenshots(int maxBatch)
+    {
+        if (!_config.AutoUploadScreenshots) return;
+
+        int currentQueued;
+        lock (_pendingScreenshots)
+        {
+            currentQueued = _pendingScreenshots.Count;
+        }
+        if (currentQueued >= 10) return;
+
+        string logDir = string.IsNullOrWhiteSpace(_config.VrChatLogDirectory)
+            ? LogTailCollector.ResolveDefaultVrChatLogDirectory()
+            : _config.VrChatLogDirectory;
+        string photosDir = ScreenshotPipeline.ResolveVrChatPhotosDirectory(logDir);
+        List<PendingScreenshotTask> discovered = _screenshotPipeline.ScanUnsyncedScreenshots(photosDir, maxBatch);
+        if (discovered.Count == 0) return;
+
+        int enqueued = 0;
+        lock (_pendingScreenshots)
+        {
+            foreach (PendingScreenshotTask item in discovered)
+            {
+                if (_pendingScreenshots.Count >= 200) break;
+                string normalized = ScreenshotPipeline.NormalizeScreenshotPath(item.LocalPath);
+                if (_queuedScreenshotPaths.Add(normalized))
+                {
+                    _pendingScreenshots.Enqueue(item);
+                    enqueued++;
+                }
+            }
+        }
+
+        if (enqueued > 0)
+        {
+            Log.Info("Discovered {Count} unsynced historical VRChat photos in {Dir}.", enqueued, photosDir);
         }
     }
 
@@ -561,6 +602,7 @@ public sealed class TrayApplicationContext : ApplicationContext
         {
             if (dialog.ShowDialog() == DialogResult.OK && dialog.SavedConfig != null)
             {
+                bool wasScreenshotSyncEnabled = _config.AutoUploadScreenshots;
                 _config = dialog.SavedConfig;
                 _configStore.SaveConfig(_config);
                 AgentConfigStore.SetAutoStartEnabled(dialog.AutoStartEnabled);
@@ -585,6 +627,11 @@ public sealed class TrayApplicationContext : ApplicationContext
                 }
 
                 UpdateTrayStatus();
+
+                if (_config.AutoUploadScreenshots && _config.IsConfigured && (!wasScreenshotSyncEnabled || dialog.InitialSyncResponse != null))
+                {
+                    _ = RunSyncCycleAsync(force: true, _cts.Token);
+                }
 
                 string nextLocal = _scheduleGate.NextSyncAtUtc == DateTimeOffset.MinValue
                     ? AgentStrings.NextSyncNowLabel
@@ -615,6 +662,10 @@ public sealed class TrayApplicationContext : ApplicationContext
         _configStore.SaveConfig(_config);
         _compressScreenshotsItem.Enabled = enabled;
         UpdateTrayStatus();
+        if (enabled && _config.IsConfigured)
+        {
+            _ = RunSyncCycleAsync(force: true, _cts.Token);
+        }
         _balloonPointsToUpdate = false;
         _trayIcon.ShowBalloonTip(
             2500,

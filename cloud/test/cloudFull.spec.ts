@@ -661,6 +661,45 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
             .first<{ cnt: number }>();
         expect(countRow?.cnt).toBe(1);
 
+        // 2b. Upload an older historical screenshot and verify keyset pagination on GET /api/screenshots
+        const olderMetaB64 = btoa(
+            JSON.stringify({
+                takenAt: '2026-11-20T09:15:00.000Z',
+                localFilename: 'VRChat_2026-11-20_09-15-00.000_1920x1080.png',
+                worldId: 'wrld_older',
+                worldName: 'Older World'
+            })
+        );
+        const olderUpload = await exports.default.fetch(
+            'http://example.com/api/agent/media/screenshots/1111222233334444aaaabbbbccccdddd',
+            {
+                method: 'PUT',
+                headers: {
+                    Authorization: `Bearer ${syncKey}`,
+                    'Content-Type': 'image/png',
+                    'X-Screenshot-Meta': olderMetaB64
+                },
+                body: new Uint8Array([137, 80, 78, 71, 5, 6, 7, 8])
+            }
+        );
+        expect(olderUpload.status).toBe(200);
+
+        const page1Res = await exports.default.fetch('http://example.com/api/screenshots?limit=1');
+        const page1Json = (await page1Res.json()) as {
+            ok: boolean;
+            data: Array<{ id: string; taken_at: string }>;
+        };
+        expect(page1Json.data).toHaveLength(1);
+        const page2Res = await exports.default.fetch(
+            `http://example.com/api/screenshots?limit=5&before=${encodeURIComponent(page1Json.data[0]!.taken_at)}&beforeId=${encodeURIComponent(page1Json.data[0]!.id)}`
+        );
+        const page2Json = (await page2Res.json()) as {
+            ok: boolean;
+            data: Array<{ id: string; taken_at: string }>;
+        };
+        expect(page2Json.data.some((s) => s.id === '1111222233334444aaaabbbbccccdddd')).toBe(true);
+        expect(page2Json.data.some((s) => s.id === page1Json.data[0]!.id)).toBe(false);
+
         // 3. Agent performs HTTP sync -> bootstrap must surface device in agentsOnline while keeping wsAgentsOnline empty
         const syncRes = await exports.default.fetch('http://example.com/api/agent/sync', {
             method: 'POST',

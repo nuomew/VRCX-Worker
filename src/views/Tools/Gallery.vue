@@ -196,43 +196,85 @@
                         class="rounded-lg border border-dashed border-border p-8 text-center text-xs text-muted-foreground">
                         {{ t('cloud_hub.gallery.empty') }}
                     </div>
-                    <ItemGroup
-                        v-else
-                        class="grid gap-3"
-                        style="grid-template-columns: repeat(auto-fill, minmax(220px, 1fr))">
-                        <Item
-                            v-for="shot in cloudScreenshots"
-                            :key="shot.id"
-                            variant="outline"
-                            size="sm"
-                            class="p-0 x-hover-card hover:bg-accent hover:shadow-sm"
-                            as-child>
-                            <div class="overflow-hidden rounded-[inherit]">
-                                <ItemHeader
-                                    v-if="shot.r2_thumb_key && cloudState.r2Enabled"
-                                    class="cursor-pointer"
-                                    @click="
-                                        showFullscreenImageDialog(
-                                            `/api/media/screenshots/${encodeURIComponent(shot.id)}`
-                                        )
-                                    ">
-                                    <img
-                                        :src="`/api/media/screenshots/${encodeURIComponent(shot.id)}`"
-                                        :alt="shot.world_name || shot.local_filename"
-                                        loading="lazy"
-                                        class="aspect-video w-full rounded-t-md object-cover bg-muted" />
-                                </ItemHeader>
-                                <ItemContent class="min-w-0 px-2.5 py-2">
-                                    <ItemTitle class="truncate text-sm">
-                                        {{ shot.world_name || shot.local_filename }}
-                                    </ItemTitle>
-                                    <ItemDescription class="text-[11px] truncate font-mono">
-                                        {{ formatDateFilter(shot.taken_at, 'long') }}
-                                    </ItemDescription>
-                                </ItemContent>
+                    <div v-else class="space-y-6">
+                        <section
+                            v-for="group in groupedCloudScreenshots"
+                            :key="group.dateKey"
+                            class="space-y-3">
+                            <div class="flex items-center gap-2.5 pt-1">
+                                <span class="text-sm font-semibold text-foreground tabular-nums">
+                                    {{ group.dateLabel }}
+                                </span>
+                                <span
+                                    v-if="group.timeRange"
+                                    class="text-xs text-muted-foreground font-mono tabular-nums">
+                                    {{ group.timeRange }}
+                                </span>
+                                <span class="rounded bg-muted px-2 py-0.5 text-[11px] text-muted-foreground">
+                                    {{ t('cloud_hub.gallery.photo_count', { count: group.items.length }) }}
+                                </span>
+                                <div class="h-px flex-1 bg-border" />
                             </div>
-                        </Item>
-                    </ItemGroup>
+                            <ItemGroup
+                                class="grid gap-3"
+                                style="grid-template-columns: repeat(auto-fill, minmax(230px, 1fr))">
+                                <Item
+                                    v-for="shot in group.items"
+                                    :key="shot.id"
+                                    variant="outline"
+                                    size="sm"
+                                    class="p-0 x-hover-card hover:bg-accent hover:shadow-sm"
+                                    as-child>
+                                    <div class="overflow-hidden rounded-[inherit]">
+                                        <div
+                                            class="border-b border-border/60 bg-muted/30 px-2.5 py-1.5"
+                                            :title="
+                                                shot.world_name
+                                                    ? `${shot.dateTimeLabel} · ${shot.world_name}`
+                                                    : `${shot.dateTimeLabel} · ${shot.local_filename}`
+                                            ">
+                                            <div class="text-xs font-medium text-foreground tabular-nums truncate">
+                                                {{ shot.dateTimeLabel }}
+                                            </div>
+                                            <div
+                                                v-if="shot.world_name"
+                                                class="text-[11px] text-muted-foreground truncate mt-0.5">
+                                                {{ shot.world_name }}
+                                            </div>
+                                        </div>
+                                        <ItemHeader
+                                            v-if="shot.r2_thumb_key && cloudState.r2Enabled"
+                                            class="cursor-pointer"
+                                            @click="
+                                                showFullscreenImageDialog(
+                                                    `/api/media/screenshots/${encodeURIComponent(shot.id)}`
+                                                )
+                                            ">
+                                            <img
+                                                :src="`/api/media/screenshots/${encodeURIComponent(shot.id)}`"
+                                                :alt="shot.world_name || shot.local_filename"
+                                                loading="lazy"
+                                                class="aspect-video w-full object-cover bg-muted" />
+                                        </ItemHeader>
+                                        <div
+                                            v-else
+                                            class="px-2.5 py-3 text-[11px] text-muted-foreground truncate font-mono">
+                                            {{ shot.local_filename }}
+                                        </div>
+                                    </div>
+                                </Item>
+                            </ItemGroup>
+                        </section>
+                        <div v-if="cloudScreenshotsHasMore" class="flex justify-center pt-2">
+                            <Button
+                                variant="outline"
+                                size="sm"
+                                :disabled="cloudScreenshotsLoading"
+                                @click="loadMoreCloudScreenshots">
+                                {{ t('cloud_hub.gallery.load_more') }}
+                            </Button>
+                        </div>
+                    </div>
                 </div>
             </template>
 
@@ -758,8 +800,9 @@
     import ImageCropDialog from '../../components/dialogs/ImageCropDialog.vue';
     import { database } from '../../services/database';
     import { cloudState } from '../../ipc-web/cloudState';
+    import { groupCloudScreenshotsByDate } from '../../ipc-web/cloudGalleryUtils';
 
-    const { t } = useI18n();
+    const { t, locale } = useI18n();
     const router = useRouter();
     const route = useRoute();
     const activeTab = ref(String(route.query.tab || 'gallery'));
@@ -804,9 +847,15 @@
     const { currentUser, isLocalUserVrcPlusSupporter } = storeToRefs(useUserStore());
     const { cachedPermissions } = storeToRefs(useAuthStore());
     const isWeb = typeof WEB !== 'undefined' && WEB;
+    const CLOUD_GALLERY_PAGE_SIZE = 60;
     const cloudScreenshots = ref([]);
     const cloudScreenshotsLoading = ref(false);
+    const cloudScreenshotsHasMore = ref(false);
     const copiedR2Var = ref(false);
+
+    const groupedCloudScreenshots = computed(() =>
+        groupCloudScreenshotsByDate(cloudScreenshots.value, locale.value, t('cloud_hub.gallery.unknown_date'))
+    );
 
     async function loadCloudScreenshots() {
         if (!isWeb) {
@@ -815,7 +864,41 @@
         cloudScreenshotsLoading.value = true;
         try {
             const { cloudFetch } = await import('../../ipc-web/apiClient');
-            cloudScreenshots.value = await cloudFetch('/api/screenshots?limit=120').catch(() => []);
+            const rows = await cloudFetch(`/api/screenshots?limit=${CLOUD_GALLERY_PAGE_SIZE}`).catch(() => []);
+            cloudScreenshots.value = Array.isArray(rows) ? rows : [];
+            cloudScreenshotsHasMore.value = cloudScreenshots.value.length >= CLOUD_GALLERY_PAGE_SIZE;
+        } finally {
+            cloudScreenshotsLoading.value = false;
+        }
+    }
+
+    async function loadMoreCloudScreenshots() {
+        if (!isWeb || cloudScreenshotsLoading.value || cloudScreenshots.value.length === 0) {
+            return;
+        }
+        const last = cloudScreenshots.value[cloudScreenshots.value.length - 1];
+        if (!last?.taken_at) {
+            cloudScreenshotsHasMore.value = false;
+            return;
+        }
+        cloudScreenshotsLoading.value = true;
+        try {
+            const { cloudFetch } = await import('../../ipc-web/apiClient');
+            const query = new URLSearchParams({
+                limit: String(CLOUD_GALLERY_PAGE_SIZE),
+                before: String(last.taken_at),
+                beforeId: String(last.id || '')
+            });
+            const rows = await cloudFetch(`/api/screenshots?${query.toString()}`).catch(() => []);
+            const nextList = Array.isArray(rows) ? rows : [];
+            const seen = new Set(cloudScreenshots.value.map((s) => s.id));
+            for (const item of nextList) {
+                if (item?.id && !seen.has(item.id)) {
+                    seen.add(item.id);
+                    cloudScreenshots.value.push(item);
+                }
+            }
+            cloudScreenshotsHasMore.value = nextList.length >= CLOUD_GALLERY_PAGE_SIZE;
         } finally {
             cloudScreenshotsLoading.value = false;
         }
