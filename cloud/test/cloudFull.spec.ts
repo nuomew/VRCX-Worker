@@ -351,4 +351,141 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
         );
         expect(authed.status).toBe(200);
     });
+
+    it('supports periodic HTTP sync with URL + Sync Key, queued command pickup, and AGENT_SYNC_KEY secret', async () => {
+        // 1. Web creates a persistent Sync Key
+        const keyRes = await exports.default.fetch('http://example.com/api/agent/sync-key', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ deviceName: 'Office-Win11' })
+        });
+        expect(keyRes.status).toBe(200);
+        const keyJson = (await keyRes.json()) as {
+            ok: boolean;
+            data: { deviceId: string; deviceName: string; syncKey: string };
+        };
+        expect(keyJson.ok).toBe(true);
+        expect(keyJson.data.syncKey).toMatch(/^vrcx_sync_[0-9a-f]{48}$/);
+        const { deviceId, syncKey } = keyJson.data;
+
+        // Wrong Sync Key must be rejected with 401
+        const badKeyRes = await exports.default.fetch('http://example.com/api/agent/sync', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                Authorization: 'Bearer vrcx_sync_invalid_secret'
+            },
+            body: JSON.stringify({ events: [] })
+        });
+        expect(badKeyRes.status).toBe(401);
+
+        // 2. Web queues a remote command while no WebSocket agent is online -> queued for HTTP sync
+        const queueRes = await exports.default.fetch('http://example.com/api/commands', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                action: 'send_vr_notify',
+                targetDeviceId: deviceId,
+                params: { target: 'xsoverlay', title: 'Sync Test', content: 'Hello from HTTP queue' }
+            })
+        });
+        expect(queueRes.status).toBe(200);
+        const queueJson = (await queueRes.json()) as {
+            ok: boolean;
+            data: { cmdId: string; status: string; delivery: string };
+        };
+        expect(queueJson.data.status).toBe('queued');
+        expect(queueJson.data.delivery).toBe('http_sync_queue');
+
+        // 3. Windows Agent performs periodic HTTP upload using only URL + Sync Key (even with its own X-Device-Id)
+        const syncRes = await exports.default.fetch('http://example.com/api/agent/sync', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                Authorization: `Bearer ${syncKey}`,
+                'X-Device-Id': 'local-pc-ignored-for-sync-key'
+            },
+            body: JSON.stringify({
+                deviceName: 'Office-Win11-Renamed',
+                agentVersion: '1.1.0',
+                cursor: { fileName: 'output_log_http.txt', byteOffset: 2048, lastEventDt: '2026-11-24T01:00:00.000Z' },
+                events: [
+                    {
+                        type: 'Location',
+                        created_at: '2026-11-24T01:00:00.000Z',
+                        location: 'wrld_22222222-2222-2222-2222-222222222222:99999',
+                        worldId: 'wrld_22222222-2222-2222-2222-222222222222',
+                        worldName: 'HTTP Sync Plaza'
+                    }
+                ],
+                state: { isGameRunning: true, isVrRunning: false }
+            })
+        });
+        expect(syncRes.status).toBe(200);
+        const syncJson = (await syncRes.json()) as {
+            ok: boolean;
+            data: {
+                deviceId: string;
+                deviceName: string;
+                ingest: { inserted: number };
+                pendingCommands: Array<{ cmdId: string; action: string }>;
+            };
+        };
+        expect(syncJson.data.deviceId).toBe(deviceId);
+        expect(syncJson.data.deviceName).toBe('Office-Win11-Renamed');
+        expect(syncJson.data.ingest.inserted).toBe(1);
+        expect(syncJson.data.pendingCommands).toHaveLength(1);
+        expect(syncJson.data.pendingCommands[0]!.cmdId).toBe(queueJson.data.cmdId);
+
+        // 4. Agent reports command execution result via HTTP
+        const resultRes = await exports.default.fetch(
+            `http://example.com/api/agent/commands/${queueJson.data.cmdId}/result`,
+            {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    Authorization: `Bearer ${syncKey}`
+                },
+                body: JSON.stringify({ status: 'succeeded', message: 'Sent via XSOverlay' })
+            }
+        );
+        expect(resultRes.status).toBe(200);
+
+        const historyRes = await exports.default.fetch('http://example.com/api/commands?limit=5');
+        const historyJson = (await historyRes.json()) as {
+            ok: boolean;
+            data: Array<{ cmd_id: string; status: string }>;
+        };
+        expect(historyJson.data.some((c) => c.cmd_id === queueJson.data.cmdId && c.status === 'succeeded')).toBe(true);
+
+        // 5. Shared env.AGENT_SYNC_KEY Bearer authentication works without pre-creating a device
+        const envKeyEnv: Env = { ...env, AGENT_SYNC_KEY: 'princess-shared-secret-key' };
+        const envBlocked = await worker.fetch(
+            new Request('http://example.com/api/agent/sync', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ events: [] })
+            }),
+            envKeyEnv
+        );
+        expect(envBlocked.status).toBe(401);
+
+        const envOk = await worker.fetch(
+            new Request('http://example.com/api/agent/sync', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    Authorization: 'Bearer princess-shared-secret-key',
+                    'X-Device-Id': 'win-home-pc',
+                    'X-Device-Name': 'Home-Gaming-PC'
+                },
+                body: JSON.stringify({ events: [] })
+            }),
+            envKeyEnv
+        );
+        expect(envOk.status).toBe(200);
+        const envOkJson = (await envOk.json()) as { ok: boolean; data: { deviceId: string; deviceName: string } };
+        expect(envOkJson.data.deviceId).toBe('win-home-pc');
+        expect(envOkJson.data.deviceName).toBe('Home-Gaming-PC');
+    });
 });

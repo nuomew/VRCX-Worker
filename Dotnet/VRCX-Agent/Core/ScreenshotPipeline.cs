@@ -18,7 +18,7 @@ namespace VRCX.Agent.Core;
 /// Processes new VRChat PNG screenshots locally:
 /// 1) Writes VRCX `Description` iTXt metadata into the local PNG reusing upstream `PNGFile` + `PNGHelper`.
 /// 2) Resizes to <= 1600px max dimension and encodes a compact WebP thumbnail via ImageSharp.
-/// 3) Uploads to `PUT /api/agent/media/screenshots/{sha256}` with Base64 `X-Screenshot-Meta` & HMAC auth.
+/// 3) Uploads to `PUT /api/agent/media/screenshots/{sha256}` with Base64 `X-Screenshot-Meta` & Bearer Sync Secret auth.
 /// </summary>
 public sealed class ScreenshotPipeline
 {
@@ -133,7 +133,7 @@ public sealed class ScreenshotPipeline
             }
         }
 
-        if (!cfg.IsPaired || !cfg.AutoUploadScreenshots)
+        if (!cfg.IsConfigured || !cfg.AutoUploadScreenshots)
         {
             return true;
         }
@@ -154,8 +154,7 @@ public sealed class ScreenshotPipeline
             string metaB64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(JsonConvert.SerializeObject(meta)));
             req.Headers.Add("X-Screenshot-Meta", metaB64);
 
-            // Worker verifies binary screenshot uploads with empty signed body string (`authenticateAgent(request, env, '')`).
-            HmacSigner.ApplyAgentAuthHeaders(req, cfg, string.Empty);
+            HmacSigner.ApplySyncAuthHeaders(req, cfg);
 
             using HttpResponseMessage res = await _http.SendAsync(req, ct).ConfigureAwait(false);
             if (!res.IsSuccessStatusCode)

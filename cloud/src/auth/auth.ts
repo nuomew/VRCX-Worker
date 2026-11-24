@@ -192,22 +192,33 @@ export async function authenticateAgent(
     rawBodyText = ''
 ): Promise<AgentAuthResult> {
     const authHeader = request.headers.get('Authorization') ?? '';
+    const syncKeyHeader = request.headers.get('X-Sync-Key')?.trim() ?? '';
     const deviceIdHeader = request.headers.get('X-Device-Id')?.trim();
     const url = new URL(request.url);
     const tokenFromQuery = url.pathname.startsWith('/ws/') ? url.searchParams.get('token')?.trim() : undefined;
 
-    const rawToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : tokenFromQuery || '';
+    const rawToken = authHeader.startsWith('Bearer ')
+        ? authHeader.slice(7).trim()
+        : syncKeyHeader || tokenFromQuery || '';
 
-    // Allow open_setup / POC token fallback when no paired devices exist yet
+    // Allow open_setup / POC token fallback when no paired devices or AGENT_SYNC_KEY exist yet
     if (!rawToken) {
-        if (detectAuthMode(env) === 'open_setup') {
+        if (detectAuthMode(env) === 'open_setup' && !env.AGENT_SYNC_KEY?.trim()) {
             return {
                 authenticated: true,
                 deviceId: deviceIdHeader || url.searchParams.get('deviceId')?.trim() || 'default-win-agent',
-                deviceName: 'Unpaired Local Agent'
+                deviceName: 'Windows Sync Agent'
             };
         }
-        return { authenticated: false, reason: 'Missing agent token' };
+        return { authenticated: false, reason: 'Missing agent sync key' };
+    }
+
+    if (env.AGENT_SYNC_KEY?.trim() && timingSafeEqual(rawToken, env.AGENT_SYNC_KEY.trim())) {
+        return {
+            authenticated: true,
+            deviceId: deviceIdHeader || url.searchParams.get('deviceId')?.trim() || 'win-sync-agent',
+            deviceName: request.headers.get('X-Device-Name')?.trim() || 'Windows PC'
+        };
     }
 
     if (env.POC_ADMIN_TOKEN?.trim() && timingSafeEqual(rawToken, env.POC_ADMIN_TOKEN.trim())) {
@@ -228,14 +239,14 @@ export async function authenticateAgent(
     if (!device) {
         return { authenticated: false, reason: 'Unknown device token' };
     }
-    if (deviceIdHeader && deviceIdHeader !== device.device_id) {
-        return { authenticated: false, reason: 'Device ID mismatch' };
-    }
 
-    // Verify HMAC signature when present (mandatory for non-WS HTTP agent calls carrying X-Signature)
+    // Verify HMAC signature when present (legacy paired devices sending X-Signature / X-Timestamp)
     const sigHeader = request.headers.get('X-Signature')?.trim();
     const tsHeader = request.headers.get('X-Timestamp')?.trim();
     if (sigHeader || tsHeader) {
+        if (deviceIdHeader && deviceIdHeader !== device.device_id) {
+            return { authenticated: false, reason: 'Device ID mismatch' };
+        }
         const tsNum = Number(tsHeader);
         const nowSec = Math.floor(Date.now() / 1000);
         if (!Number.isFinite(tsNum) || Math.abs(nowSec - tsNum) > AGENT_REPLAY_WINDOW_SEC) {

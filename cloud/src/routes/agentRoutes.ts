@@ -272,11 +272,212 @@ export async function handleAgentPublicRoutes(request: Request, env: Env, url: U
         });
     }
 
+    // 4. Unified periodic HTTP sync endpoint (URL + Sync Secret; no WebSocket required)
+    if (url.pathname === '/api/agent/sync' && request.method === 'POST') {
+        const rawText = await request.text();
+        if (rawText.length > 262_144) {
+            return Response.json(
+                { ok: false, error: { code: 'PAYLOAD_TOO_LARGE', message: 'Sync payload exceeds 256 KiB limit' } },
+                { status: 413 }
+            );
+        }
+
+        const auth = await authenticateAgent(request, env, rawText);
+        if (!auth.authenticated || !auth.deviceId) {
+            return Response.json(
+                { ok: false, error: { code: 'UNAUTHORIZED_AGENT', message: auth.reason ?? 'Invalid sync key' } },
+                { status: 401 }
+            );
+        }
+
+        let body: {
+            deviceName?: string;
+            agentVersion?: string;
+            events?: GameLogIngestItem[];
+            cursor?: { fileName?: string; byteOffset?: number; lastEventDt?: string };
+            state?: Record<string, unknown>;
+        };
+        try {
+            body = (rawText ? JSON.parse(rawText) : {}) as typeof body;
+        } catch {
+            return Response.json(
+                { ok: false, error: { code: 'BAD_REQUEST', message: 'Invalid JSON body' } },
+                { status: 400 }
+            );
+        }
+
+        const events = (body.events ?? []).slice(0, 100);
+        const ingest = events.length > 0 ? await ingestGameLogItems(env, events) : { inserted: 0, skipped: 0 };
+        const nowIso = new Date().toISOString();
+        const deviceName = (body.deviceName || auth.deviceName || 'Windows PC').slice(0, 64);
+        const agentVersion = (body.agentVersion || '1.0.0').slice(0, 32);
+
+        const coreWrites: D1PreparedStatement[] = [
+            env.DB_CORE.prepare(
+                `INSERT INTO cloud_devices
+                 (device_id, device_name, token_hash, hmac_secret_enc, agent_version, capabilities_json, last_seen_at, created_at)
+                 VALUES (?, ?, ?, '', ?, '["http_sync","gamelog","screenshots","commands"]', ?, ?)
+                 ON CONFLICT(device_id) DO UPDATE SET
+                    device_name = excluded.device_name,
+                    agent_version = excluded.agent_version,
+                    last_seen_at = excluded.last_seen_at`
+            ).bind(auth.deviceId, deviceName, `sync:${auth.deviceId}`, agentVersion, nowIso, nowIso)
+        ];
+
+        if (body.cursor) {
+            coreWrites.push(
+                env.DB_CORE.prepare(
+                    `INSERT INTO cloud_sync_cursors (device_id, stream_name, file_name, byte_offset, last_event_dt, updated_at)
+                     VALUES (?, 'gamelog', ?, ?, ?, ?)
+                     ON CONFLICT(device_id, stream_name) DO UPDATE SET
+                        file_name = excluded.file_name,
+                        byte_offset = excluded.byte_offset,
+                        last_event_dt = excluded.last_event_dt,
+                        updated_at = excluded.updated_at`
+                ).bind(
+                    auth.deviceId,
+                    body.cursor.fileName ?? '',
+                    body.cursor.byteOffset ?? 0,
+                    body.cursor.lastEventDt ?? '',
+                    nowIso
+                )
+            );
+        }
+
+        // Pull pending remote commands queued for this device (or any device)
+        const pendingRes = await env.DB_CORE.prepare(
+            `SELECT cmd_id, action, payload_json, expires_at
+             FROM cloud_commands
+             WHERE status = 'pending' AND expires_at > ? AND (target_device_id = '' OR target_device_id = ?)
+             ORDER BY created_at ASC LIMIT 10`
+        )
+            .bind(nowIso, auth.deviceId)
+            .all<{ cmd_id: string; action: string; payload_json: string; expires_at: string }>();
+
+        const pendingCommands = (pendingRes.results ?? []).map((row) => {
+            let params: Record<string, unknown> = {};
+            try {
+                params = JSON.parse(row.payload_json || '{}') as Record<string, unknown>;
+            } catch {
+                params = {};
+            }
+            coreWrites.push(
+                env.DB_CORE.prepare(
+                    "UPDATE cloud_commands SET status = 'dispatched', target_device_id = ? WHERE cmd_id = ?"
+                ).bind(auth.deviceId, row.cmd_id)
+            );
+            return {
+                cmdId: row.cmd_id,
+                action: row.action,
+                params,
+                expiresAt: row.expires_at
+            };
+        });
+
+        await env.DB_CORE.batch(coreWrites);
+
+        // Broadcast fresh GameLog events or live state snapshot to any open browser tabs
+        if (events.length > 0 || body.state) {
+            const hub = env.AGENT_HUB.get(env.AGENT_HUB.idFromName('primary'));
+            if (events.length > 0) {
+                await hub.fetch(
+                    new Request('https://agent-hub.internal/broadcast', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            type: 'gamelog.batch',
+                            payload: { deviceId: auth.deviceId, events }
+                        })
+                    })
+                );
+            }
+            if (body.state) {
+                await hub.fetch(
+                    new Request('https://agent-hub.internal/broadcast', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            type: 'agent.state',
+                            payload: { deviceId: auth.deviceId, syncMode: 'http', ...body.state }
+                        })
+                    })
+                );
+            }
+        }
+
+        return Response.json({
+            ok: true,
+            data: {
+                deviceId: auth.deviceId,
+                deviceName,
+                syncedAt: nowIso,
+                ingest,
+                pendingCommands
+            }
+        });
+    }
+
+    // 5. HTTP command execution result report from periodic sync Agent
+    const cmdResultMatch = url.pathname.match(/^\/api\/agent\/commands\/([A-Za-z0-9_-]{4,64})\/result$/);
+    if (cmdResultMatch && request.method === 'POST') {
+        const cmdId = cmdResultMatch[1]!;
+        const rawText = await request.text();
+        const auth = await authenticateAgent(request, env, rawText);
+        if (!auth.authenticated || !auth.deviceId) {
+            return Response.json(
+                { ok: false, error: { code: 'UNAUTHORIZED_AGENT', message: auth.reason ?? 'Invalid sync key' } },
+                { status: 401 }
+            );
+        }
+        let body: { status?: string; message?: string; data?: unknown };
+        try {
+            body = (rawText ? JSON.parse(rawText) : {}) as typeof body;
+        } catch {
+            body = {};
+        }
+        const status = body.status === 'succeeded' ? 'succeeded' : 'failed';
+        const nowIso = new Date().toISOString();
+        await env.DB_CORE.prepare(
+            'UPDATE cloud_commands SET status = ?, result_json = ?, finished_at = ? WHERE cmd_id = ?'
+        )
+            .bind(status, JSON.stringify({ status, message: body.message ?? '', data: body.data }), nowIso, cmdId)
+            .run();
+
+        return Response.json({ ok: true, data: { cmdId, status } });
+    }
+
     return null;
 }
 
 export async function handleAgentWebRoutes(request: Request, env: Env, url: URL): Promise<Response | null> {
-    // Generate 5-minute single-use 6-digit pairing code
+    // Create a persistent Sync Key (Bearer secret) for URL + Secret HTTP sync in VRCX.Agent
+    if (url.pathname === '/api/agent/sync-key' && request.method === 'POST') {
+        const body = (await request.json().catch(() => ({}))) as { deviceName?: string };
+        const deviceId = `win-${randomHex(8)}`;
+        const syncKey = `vrcx_sync_${randomHex(24)}`;
+        const tokenHash = await sha256Hex(syncKey);
+        const nowIso = new Date().toISOString();
+        const deviceName = (body.deviceName || 'Windows PC').slice(0, 64);
+
+        await env.DB_CORE.prepare(
+            `INSERT INTO cloud_devices
+             (device_id, device_name, token_hash, hmac_secret_enc, agent_version, capabilities_json, last_seen_at, created_at)
+             VALUES (?, ?, ?, '', '1.0.0', '["http_sync","gamelog","screenshots","commands"]', '', ?)`
+        )
+            .bind(deviceId, deviceName, tokenHash, nowIso)
+            .run();
+
+        return Response.json({
+            ok: true,
+            data: {
+                deviceId,
+                deviceName,
+                syncKey
+            }
+        });
+    }
+
+    // Generate 5-minute single-use 6-digit pairing code (legacy / optional)
     if (url.pathname === '/api/agent/pair-code' && request.method === 'POST') {
         const body = (await request.json().catch(() => ({}))) as { deviceLabel?: string };
         const code = generateSixDigitCode();
@@ -336,7 +537,8 @@ export async function handleAgentWebRoutes(request: Request, env: Env, url: URL)
             }
 
             const cmdId = `cmd_${randomHex(8)}`;
-            const ttlMs = Math.min(Math.max((body.ttlSec ?? 60) * 1000, 10_000), 300_000);
+            // Default 10-minute queue TTL so periodic HTTP-sync agents reliably pick up queued commands.
+            const ttlMs = Math.min(Math.max((body.ttlSec ?? 600) * 1000, 30_000), 1_800_000);
             const now = Date.now();
             const createdAt = new Date(now).toISOString();
             const expiresAt = new Date(now + ttlMs).toISOString();
@@ -364,19 +566,16 @@ export async function handleAgentWebRoutes(request: Request, env: Env, url: URL)
             );
 
             if (!dispatchRes.ok) {
-                await env.DB_CORE.prepare(
-                    "UPDATE cloud_commands SET status = 'failed', result_json = ?, finished_at = ? WHERE cmd_id = ?"
-                )
-                    .bind(JSON.stringify({ code: 'AGENT_OFFLINE' }), new Date().toISOString(), cmdId)
-                    .run();
-                return Response.json(
-                    {
-                        ok: false,
-                        data: { cmdId, status: 'failed' },
-                        error: { code: 'AGENT_OFFLINE', message: 'Windows companion agent is offline' }
-                    },
-                    { status: 503 }
-                );
+                // Keep command pending in D1 so periodic HTTP sync agents execute it on their next poll.
+                return Response.json({
+                    ok: true,
+                    data: {
+                        cmdId,
+                        status: 'queued',
+                        delivery: 'http_sync_queue',
+                        expiresAt
+                    }
+                });
             }
 
             const dispatchData = (await dispatchRes.json()) as { data?: { deviceId?: string } };

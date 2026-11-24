@@ -10,7 +10,7 @@ using VRCX.Agent.Core;
 namespace VRCX.Agent.Platform;
 
 /// <summary>
-/// Persists VRCX.Agent credentials and VRChat cookies encrypted at rest with Windows DPAPI
+/// Persists VRCX.Agent sync URL and secret encrypted at rest with Windows DPAPI
 /// (`DataProtectionScope.CurrentUser`) under `%LocalAppData%\VRCX-Agent\`.
 /// </summary>
 public sealed class AgentConfigStore
@@ -21,7 +21,6 @@ public sealed class AgentConfigStore
 
     public string DataDirectory { get; }
     private readonly string _configPath;
-    private readonly string _cookiesPath;
 
     public AgentConfigStore(string? customDataDir = null)
     {
@@ -30,7 +29,6 @@ public sealed class AgentConfigStore
             : customDataDir;
         Directory.CreateDirectory(DataDirectory);
         _configPath = Path.Combine(DataDirectory, "agent-config.dpapi");
-        _cookiesPath = Path.Combine(DataDirectory, "vrc-cookies.dpapi");
     }
 
     public AgentConfig LoadConfig()
@@ -47,7 +45,7 @@ public sealed class AgentConfigStore
         }
         catch (Exception ex)
         {
-            Log.Warn(ex, "Could not decrypt agent config; returning default unpaired configuration.");
+            Log.Warn(ex, "Could not decrypt agent config; returning default configuration.");
             return new AgentConfig();
         }
     }
@@ -59,28 +57,6 @@ public sealed class AgentConfigStore
         string tmp = _configPath + ".tmp";
         File.WriteAllBytes(tmp, cipher);
         File.Move(tmp, _configPath, overwrite: true);
-    }
-
-    public string LoadCookiesJson()
-    {
-        try
-        {
-            if (!File.Exists(_cookiesPath)) return string.Empty;
-            byte[] cipher = File.ReadAllBytes(_cookiesPath);
-            return Encoding.UTF8.GetString(UnprotectBytes(cipher));
-        }
-        catch
-        {
-            return string.Empty;
-        }
-    }
-
-    public void SaveCookiesJson(string cookiesJson)
-    {
-        byte[] cipher = ProtectBytes(Encoding.UTF8.GetBytes(cookiesJson ?? string.Empty));
-        string tmp = _cookiesPath + ".tmp";
-        File.WriteAllBytes(tmp, cipher);
-        File.Move(tmp, _cookiesPath, overwrite: true);
     }
 
     public static bool IsAutoStartEnabled()

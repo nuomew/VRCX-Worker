@@ -6,6 +6,8 @@ export interface Env {
     R2_MEDIA?: R2Bucket;
     /** Optional bearer token for API/POC access. */
     POC_ADMIN_TOKEN?: string;
+    /** Optional shared sync secret for Windows VRCX.Agent periodic HTTP uploads. */
+    AGENT_SYNC_KEY?: string;
     /** Optional single-user admin passcode (plain secret or pbkdf2$<saltHex>$<hashHex>). */
     ADMIN_PASSCODE?: string;
     /** Optional Base32 RFC-6238 TOTP secret paired with ADMIN_PASSCODE. */

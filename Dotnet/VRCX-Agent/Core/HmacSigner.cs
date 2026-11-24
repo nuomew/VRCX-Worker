@@ -7,8 +7,7 @@ using System.Text;
 namespace VRCX.Agent.Core;
 
 /// <summary>
-/// Computes SHA-256 and HMAC-SHA256 request signatures byte-for-byte identical to
-/// `cloud/src/auth/auth.ts` (`ts\nMETHOD\npathname\nsha256(rawBody)`).
+/// Provides SHA-256 hashing and Bearer Sync Secret header attachment for VRCX.Agent HTTP API calls.
 /// </summary>
 public static class HmacSigner
 {
@@ -23,42 +22,20 @@ public static class HmacSigner
         return Convert.ToHexString(hash).ToLowerInvariant();
     }
 
-    public static string SignCanonical(
-        string hmacSecret,
-        long unixTimestampSeconds,
-        string httpMethod,
-        string pathname,
-        string rawBodyText)
-    {
-        string bodyHash = Sha256Hex(rawBodyText ?? string.Empty);
-        string canonical = $"{unixTimestampSeconds}\n{httpMethod.ToUpperInvariant()}\n{pathname}\n{bodyHash}";
-        byte[] keyBytes = Encoding.UTF8.GetBytes(hmacSecret);
-        byte[] msgBytes = Encoding.UTF8.GetBytes(canonical);
-        byte[] mac = HMACSHA256.HashData(keyBytes, msgBytes);
-        return Convert.ToHexString(mac).ToLowerInvariant();
-    }
-
     /// <summary>
-    /// Attaches Bearer token, X-Device-Id, X-Timestamp, and X-Signature headers to an outgoing cloud request.
-    /// For binary media uploads (e.g., PUT /api/agent/media/screenshots/*), pass empty string for `signedBodyText`
-    /// to match `authenticateAgent(request, env, '')` on the Cloudflare Worker.
+    /// Attaches ASCII-safe Bearer Sync Secret and X-Device-Id headers to outgoing Worker API calls.
+    /// Human-readable UTF-8 device names are sent in the JSON body to avoid non-ASCII HTTP header errors on Windows.
     /// </summary>
-    public static void ApplyAgentAuthHeaders(
-        HttpRequestMessage request,
-        AgentConfig config,
-        string signedBodyText,
-        long? unixTimestampOverride = null)
+    public static void ApplySyncAuthHeaders(HttpRequestMessage request, AgentConfig config)
     {
-        long ts = unixTimestampOverride ?? DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-        string pathname = request.RequestUri?.AbsolutePath ?? "/";
-        string signature = SignCanonical(config.HmacSecret, ts, request.Method.Method, pathname, signedBodyText);
+        string secret = (config.SyncSecret ?? string.Empty).Trim();
+        if (!string.IsNullOrEmpty(secret))
+        {
+            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", secret);
+        }
 
-        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", config.DeviceToken);
+        string deviceId = config.EnsureDeviceId();
         request.Headers.Remove("X-Device-Id");
-        request.Headers.Add("X-Device-Id", config.DeviceId);
-        request.Headers.Remove("X-Timestamp");
-        request.Headers.Add("X-Timestamp", ts.ToString());
-        request.Headers.Remove("X-Signature");
-        request.Headers.Add("X-Signature", signature);
+        request.Headers.Add("X-Device-Id", deviceId);
     }
 }

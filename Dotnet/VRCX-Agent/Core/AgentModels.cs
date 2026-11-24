@@ -5,16 +5,20 @@ using Newtonsoft.Json;
 namespace VRCX.Agent.Core;
 
 /// <summary>
-/// Persisted configuration and credentials for a paired Windows VRCX.Agent instance.
-/// Sensitive fields are encrypted at rest via Windows DPAPI by AgentConfigStore.
+/// Persisted configuration and sync secret for a Windows VRCX.Agent instance.
+/// Encrypted at rest via Windows DPAPI by AgentConfigStore.
 /// </summary>
 public sealed class AgentConfig
 {
+    public const int DefaultSyncIntervalSeconds = 60;
+    public const int MinSyncIntervalSeconds = 15;
+    public const int MaxSyncIntervalSeconds = 3600;
+
     public string CloudUrl { get; set; } = string.Empty;
+    public string SyncSecret { get; set; } = string.Empty;
     public string DeviceId { get; set; } = string.Empty;
     public string DeviceName { get; set; } = Environment.MachineName;
-    public string DeviceToken { get; set; } = string.Empty;
-    public string HmacSecret { get; set; } = string.Empty;
+    public int SyncIntervalSeconds { get; set; } = DefaultSyncIntervalSeconds;
     public bool AutoUploadScreenshots { get; set; } = true;
     public bool WritePngMetadata { get; set; } = true;
     public bool AutoLaunchAppsEnabled { get; set; } = true;
@@ -23,11 +27,25 @@ public sealed class AgentConfig
     public string VrChatExecutableOverride { get; set; } = string.Empty;
 
     [JsonIgnore]
-    public bool IsPaired =>
-        !string.IsNullOrWhiteSpace(CloudUrl) &&
-        !string.IsNullOrWhiteSpace(DeviceId) &&
-        !string.IsNullOrWhiteSpace(DeviceToken) &&
-        !string.IsNullOrWhiteSpace(HmacSecret);
+    public bool IsConfigured => !string.IsNullOrWhiteSpace(CloudUrl);
+
+    public int EffectiveSyncIntervalSeconds =>
+        Math.Clamp(SyncIntervalSeconds <= 0 ? DefaultSyncIntervalSeconds : SyncIntervalSeconds, MinSyncIntervalSeconds, MaxSyncIntervalSeconds);
+
+    /// <summary>
+    /// Ensures a stable ASCII-safe device identifier for multi-PC identification when using shared AGENT_SYNC_KEY.
+    /// When authenticating with a Web-generated per-device Sync Key, the server binds the authoritative deviceId.
+    /// </summary>
+    public string EnsureDeviceId()
+    {
+        if (!string.IsNullOrWhiteSpace(DeviceId))
+        {
+            return DeviceId.Trim();
+        }
+        string seed = $"{Environment.MachineName}:{Environment.UserName}";
+        DeviceId = "win-" + HmacSigner.Sha256Hex(seed).Substring(0, 12);
+        return DeviceId;
+    }
 }
 
 public sealed class LogCursorState
@@ -35,6 +53,13 @@ public sealed class LogCursorState
     public string FileName { get; set; } = string.Empty;
     public long ByteOffset { get; set; }
     public string LastEventDt { get; set; } = string.Empty;
+
+    public LogCursorState Clone() => new()
+    {
+        FileName = FileName,
+        ByteOffset = ByteOffset,
+        LastEventDt = LastEventDt
+    };
 }
 
 /// <summary>
@@ -110,7 +135,7 @@ public sealed class LiveAgentState
     public int PlayerCount { get; set; }
 
     [JsonProperty("agentVersion")]
-    public string AgentVersion { get; set; } = "1.0.0";
+    public string AgentVersion { get; set; } = "1.1.0";
 
     [JsonProperty("machineName")]
     public string MachineName { get; set; } = Environment.MachineName;
@@ -119,61 +144,46 @@ public sealed class LiveAgentState
     public int OfflineQueueCount { get; set; }
 }
 
-public sealed class VrcHttpRpcRequest
+public sealed class PendingRemoteCommand
 {
-    [JsonProperty("url")]
-    public string Url { get; set; } = string.Empty;
+    [JsonProperty("cmdId")]
+    public string CmdId { get; set; } = string.Empty;
 
-    [JsonProperty("method")]
-    public string? Method { get; set; }
+    [JsonProperty("action")]
+    public string Action { get; set; } = string.Empty;
 
-    [JsonProperty("headers")]
-    public Dictionary<string, string>? Headers { get; set; }
+    [JsonProperty("params")]
+    public Dictionary<string, object?> Params { get; set; } = new();
 
-    [JsonProperty("body")]
-    public string? Body { get; set; }
-
-    [JsonProperty("uploadImage")]
-    public bool UploadImage { get; set; }
-
-    [JsonProperty("uploadImageLegacy")]
-    public bool UploadImageLegacy { get; set; }
-
-    [JsonProperty("uploadFilePUT")]
-    public bool UploadFilePUT { get; set; }
-
-    [JsonProperty("uploadPrintImage")]
-    public bool UploadPrintImage { get; set; }
-
-    [JsonProperty("postData")]
-    public string? PostData { get; set; }
-
-    [JsonProperty("imageData")]
-    public string? ImageData { get; set; }
-
-    [JsonProperty("fileData")]
-    public string? FileData { get; set; }
-
-    [JsonProperty("fileMIME")]
-    public string? FileMIME { get; set; }
-
-    [JsonProperty("fileMD5")]
-    public string? FileMD5 { get; set; }
+    [JsonProperty("expiresAt")]
+    public string ExpiresAt { get; set; } = string.Empty;
 }
 
-public sealed class VrcHttpRpcResponse
+public sealed class AgentSyncIngestResult
 {
-    [JsonProperty("reqId")]
-    public string ReqId { get; set; } = string.Empty;
+    [JsonProperty("inserted")]
+    public int Inserted { get; set; }
 
-    [JsonProperty("status")]
-    public int Status { get; set; }
+    [JsonProperty("skipped")]
+    public int Skipped { get; set; }
+}
 
-    [JsonProperty("data")]
-    public string Data { get; set; } = string.Empty;
+public sealed class AgentSyncResponse
+{
+    [JsonProperty("deviceId")]
+    public string DeviceId { get; set; } = string.Empty;
 
-    [JsonProperty("error", NullValueHandling = NullValueHandling.Ignore)]
-    public string? Error { get; set; }
+    [JsonProperty("deviceName")]
+    public string DeviceName { get; set; } = string.Empty;
+
+    [JsonProperty("syncedAt")]
+    public string SyncedAt { get; set; } = string.Empty;
+
+    [JsonProperty("ingest")]
+    public AgentSyncIngestResult Ingest { get; set; } = new();
+
+    [JsonProperty("pendingCommands")]
+    public List<PendingRemoteCommand> PendingCommands { get; set; } = new();
 }
 
 public sealed class CommandExecutionResult

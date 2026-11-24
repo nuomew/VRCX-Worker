@@ -55,10 +55,20 @@
                 <div class="flex items-center gap-2.5">
                     <span
                         class="inline-block size-2.5 rounded-full"
-                        :class="cloudState.agentsOnline.length > 0 ? 'bg-status-online' : 'bg-status-offline-alt'" />
+                        :class="
+                            cloudState.agentsOnline.length > 0 || recentSyncedCount > 0
+                                ? 'bg-status-online'
+                                : 'bg-status-offline-alt'
+                        " />
                     <h2 class="text-sm font-semibold">VRCX Cloud Hub</h2>
                     <span class="rounded bg-muted px-2 py-0.5 text-[11px] text-muted-foreground">
-                        {{ cloudState.agentsOnline.length > 0 ? `Win Agent Online (${cloudState.agentsOnline.length})` : 'Win Agent Offline' }}
+                        <template v-if="cloudState.agentsOnline.length > 0">
+                            Win Agent Online ({{ cloudState.agentsOnline.length }})
+                        </template>
+                        <template v-else-if="recentSyncedCount > 0">
+                            Win Agent Synced ({{ recentSyncedCount }})
+                        </template>
+                        <template v-else>Win Agent Idle</template>
                     </span>
                 </div>
                 <button
@@ -87,45 +97,98 @@
             </div>
 
             <div class="flex-1 overflow-y-auto p-5 text-xs space-y-4">
-                <!-- Tab 1: Devices & Pairing -->
+                <!-- Tab 1: Windows Agent Periodic HTTP Sync (URL + Sync Secret) -->
                 <div v-if="activeTab === 'devices'" class="space-y-4">
                     <div class="rounded-lg border border-border bg-background/50 p-4 space-y-3">
-                        <div class="flex flex-wrap items-center justify-between gap-2">
-                            <div>
-                                <div class="font-medium text-foreground">Pair Windows Companion (VRCX.Agent)</div>
-                                <div class="text-muted-foreground">
-                                    Generates a single-use 6-digit pairing code valid for 5 minutes.
-                                </div>
+                        <div>
+                            <div class="font-medium text-foreground">Windows Companion HTTP Sync (VRCX.Agent)</div>
+                            <div class="text-muted-foreground">
+                                Paste the Cloud URL and a Sync Secret into VRCX.Agent on Windows. The agent will periodically
+                                upload local VRChat logs, state, and screenshots over HTTPS (no persistent WebSocket needed).
                             </div>
-                            <button
-                                type="button"
-                                class="rounded-md bg-primary px-3 py-1.5 font-medium text-primary-foreground"
-                                @click="generatePairCode">
-                                Generate 6-Digit Code
-                            </button>
                         </div>
-                        <div v-if="pairCode" class="flex items-center gap-3 rounded-md bg-muted/60 px-3 py-2">
-                            <span class="font-mono text-lg font-bold tracking-widest text-primary">{{ pairCode }}</span>
-                            <span class="text-muted-foreground">Expires: {{ pairExpiresAt }}</span>
+
+                        <div class="space-y-1">
+                            <div class="text-[11px] font-medium text-muted-foreground">Cloud URL</div>
+                            <div class="flex items-center gap-2">
+                                <input
+                                    :value="cloudOriginUrl"
+                                    type="text"
+                                    readonly
+                                    class="flex-1 rounded-md border border-input bg-muted/40 px-3 py-1.5 font-mono text-xs text-foreground" />
+                                <button
+                                    type="button"
+                                    class="rounded-md border border-border px-3 py-1.5 font-medium hover:bg-accent"
+                                    @click="copyText(cloudOriginUrl, 'url')">
+                                    {{ copiedField === 'url' ? 'Copied' : 'Copy URL' }}
+                                </button>
+                            </div>
+                        </div>
+
+                        <div class="space-y-1.5 pt-1">
+                            <div class="text-[11px] font-medium text-muted-foreground">Create Sync Secret</div>
+                            <div class="flex flex-wrap items-center gap-2">
+                                <input
+                                    v-model="newDeviceName"
+                                    type="text"
+                                    maxlength="64"
+                                    placeholder="Device Name (e.g. Gaming-PC)"
+                                    class="min-w-[180px] flex-1 rounded-md border border-input bg-background px-3 py-1.5 text-xs text-foreground" />
+                                <button
+                                    type="button"
+                                    class="rounded-md bg-primary px-3 py-1.5 font-medium text-primary-foreground"
+                                    @click="createSyncSecret">
+                                    Create Sync Secret
+                                </button>
+                            </div>
+                        </div>
+
+                        <div v-if="createdSyncKey" class="space-y-1.5 rounded-md border border-primary/30 bg-muted/60 p-3">
+                            <div class="flex items-center justify-between gap-2">
+                                <span class="font-medium text-foreground">
+                                    Sync Secret for {{ createdDeviceName }} (shown once):
+                                </span>
+                                <button
+                                    type="button"
+                                    class="rounded bg-primary px-2.5 py-1 text-[11px] font-medium text-primary-foreground"
+                                    @click="copyText(createdSyncKey, 'secret')">
+                                    {{ copiedField === 'secret' ? 'Copied' : 'Copy Secret' }}
+                                </button>
+                            </div>
+                            <div class="break-all rounded bg-background/80 px-2.5 py-1.5 font-mono text-[11px] text-primary">
+                                {{ createdSyncKey }}
+                            </div>
+                        </div>
+
+                        <div class="text-[11px] text-muted-foreground">
+                            Tip: You can also configure a static <code class="font-mono">AGENT_SYNC_KEY</code> in Cloudflare
+                            Worker Secrets instead of generating per-device keys here.
                         </div>
                     </div>
 
                     <div class="space-y-2">
-                        <div class="font-medium text-foreground">Paired Devices ({{ devices.length }})</div>
-                        <div v-if="devices.length === 0" class="rounded-lg border border-dashed border-border p-4 text-muted-foreground">
-                            No Windows companion paired yet. Install VRCX.Agent on your Windows PC and enter a pairing code.
+                        <div class="font-medium text-foreground">Configured Sync Devices ({{ devices.length }})</div>
+                        <div
+                            v-if="devices.length === 0"
+                            class="rounded-lg border border-dashed border-border p-4 text-muted-foreground">
+                            No Windows sync device configured yet. Create a Sync Secret above, install VRCX.Agent on Windows,
+                            and enter the Cloud URL and Secret.
                         </div>
                         <div
                             v-for="dev in devices"
                             :key="dev.device_id"
                             class="flex items-center justify-between rounded-lg border border-border p-3">
-                            <div>
-                                <div class="font-medium">
-                                    {{ dev.device_name }}
-                                    <span class="ml-1.5 font-mono text-[11px] text-muted-foreground">{{ dev.device_id }}</span>
+                            <div class="space-y-0.5">
+                                <div class="flex items-center gap-2 font-medium">
+                                    <span
+                                        class="inline-block size-2 rounded-full"
+                                        :class="isRecentlySynced(dev.last_seen_at) ? 'bg-status-online' : 'bg-status-offline-alt'" />
+                                    <span>{{ dev.device_name }}</span>
+                                    <span class="font-mono text-[11px] text-muted-foreground">{{ dev.device_id }}</span>
                                 </div>
                                 <div class="text-muted-foreground">
-                                    v{{ dev.agent_version || '0.1.0' }} · Last seen: {{ dev.last_seen_at || 'Never' }}
+                                    v{{ dev.agent_version || '1.1.0' }} · Last sync:
+                                    {{ dev.last_seen_at || 'Never synced yet' }}
                                 </div>
                             </div>
                             <button
@@ -273,12 +336,13 @@
 </template>
 
 <script setup>
-    import { ref, watch } from 'vue';
+    import { computed, ref, watch } from 'vue';
     import { cloudFetch, connectCloudHubWs } from '../../ipc-web/apiClient';
     import { loadBootstrap } from '../../ipc-web/bootstrapCache';
     import { cloudState } from '../../ipc-web/cloudState';
 
     const isWeb = typeof WEB !== 'undefined' && WEB;
+    const cloudOriginUrl = typeof window !== 'undefined' ? window.location.origin : '';
 
     const passcode = ref('');
     const totpCode = ref('');
@@ -286,15 +350,17 @@
     const unlocking = ref(false);
 
     const tabs = [
-        { id: 'devices', label: 'Win Agent & Pairing' },
+        { id: 'devices', label: 'Win Agent (HTTP Sync)' },
         { id: 'commands', label: 'Remote Control' },
         { id: 'gallery', label: 'Cloud Gallery (R2)' },
         { id: 'quota', label: 'Free-Tier Quota & WAF' }
     ];
     const activeTab = ref('devices');
 
-    const pairCode = ref('');
-    const pairExpiresAt = ref('');
+    const newDeviceName = ref('Windows PC');
+    const createdSyncKey = ref('');
+    const createdDeviceName = ref('');
+    const copiedField = ref('');
     const devices = ref([]);
     const launchUrlInput = ref('');
     const commandNotice = ref('');
@@ -302,6 +368,27 @@
     const screenshots = ref([]);
     const quotaInfo = ref(null);
     const wafProbeResult = ref('');
+
+    const recentSyncedCount = computed(() => devices.value.filter((d) => isRecentlySynced(d.last_seen_at)).length);
+
+    function isRecentlySynced(lastSeenIso) {
+        if (!lastSeenIso) return false;
+        const ts = Date.parse(lastSeenIso);
+        return Number.isFinite(ts) && Date.now() - ts <= 5 * 60 * 1000;
+    }
+
+    async function copyText(text, field) {
+        if (!text) return;
+        try {
+            await navigator.clipboard.writeText(text);
+            copiedField.value = field;
+            setTimeout(() => {
+                if (copiedField.value === field) copiedField.value = '';
+            }, 2000);
+        } catch {
+            // Clipboard permission unavailable
+        }
+    }
 
     async function submitUnlock() {
         unlockError.value = '';
@@ -333,13 +420,15 @@
         devices.value = await cloudFetch('/api/agent/devices').catch(() => []);
     }
 
-    async function generatePairCode() {
-        const data = await cloudFetch('/api/agent/pair-code', {
+    async function createSyncSecret() {
+        const name = (newDeviceName.value || '').trim() || 'Windows PC';
+        const data = await cloudFetch('/api/agent/sync-key', {
             method: 'POST',
-            json: { deviceLabel: 'Windows PC' }
+            json: { deviceName: name }
         });
-        pairCode.value = data.code;
-        pairExpiresAt.value = data.expiresAt;
+        createdSyncKey.value = data.syncKey;
+        createdDeviceName.value = data.deviceName || name;
+        await loadDevices();
     }
 
     async function revokeDevice(deviceId) {
@@ -358,7 +447,10 @@
                 method: 'POST',
                 json: { action, params }
             });
-            commandNotice.value = `Dispatched ${action} (${res.cmdId})`;
+            commandNotice.value =
+                res.status === 'queued'
+                    ? `Queued ${action} for next Agent HTTP sync (${res.cmdId})`
+                    : `Dispatched ${action} (${res.cmdId})`;
         } catch (err) {
             commandNotice.value = `Failed: ${err?.message || 'Unknown error'}`;
         }

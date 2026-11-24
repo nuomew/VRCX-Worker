@@ -2,43 +2,34 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
-using System.Net.Http;
 using System.Text;
-using System.Threading;
-using System.Threading.Tasks;
 using Newtonsoft.Json;
 using NLog;
 
 namespace VRCX.Agent.Core;
 
 /// <summary>
-/// Incrementally tails VRChat `output_log_*.txt` using a persisted byte-offset cursor,
-/// buffers unsent events to a local JSONL offline queue, and flushes batches to
-/// `POST /api/agent/ingest/gamelog` with HMAC-SHA256 authentication and exponential backoff.
+/// Incrementally tails VRChat `output_log_*.txt` using a persisted byte-offset cursor
+/// and buffers unsent events in a durable local JSONL offline queue until periodic HTTP sync succeeds.
 /// </summary>
 public sealed class LogTailCollector
 {
     private static readonly Logger Log = LogManager.GetCurrentClassLogger();
-    private const int MaxBatchSize = 30;
     private const int MaxOfflineQueueEntries = 5000;
 
     private readonly string _stateDir;
     private readonly string _cursorPath;
     private readonly string _queuePath;
-    private readonly Func<AgentConfig> _configProvider;
-    private readonly HttpClient _http;
     private readonly VrcLogParser _parser;
-    private readonly SemaphoreSlim _flushLock = new(1, 1);
 
     private LogCursorState _cursor = new();
     private readonly List<GameLogEventItem> _queue = new();
-    private DateTimeOffset _nextFlushAllowedAt = DateTimeOffset.MinValue;
-    private int _consecutiveFailures;
 
     public event Action<GameLogEventItem>? ScreenshotCaptured;
     public event Action? WorldStateChanged;
 
     public VrcLogParser Parser => _parser;
+
     public int OfflineQueueCount
     {
         get
@@ -50,18 +41,12 @@ public sealed class LogTailCollector
         }
     }
 
-    public LogTailCollector(
-        string stateDir,
-        Func<AgentConfig> configProvider,
-        HttpClient httpClient,
-        VrcLogParser? parser = null)
+    public LogTailCollector(string stateDir, VrcLogParser? parser = null)
     {
         _stateDir = stateDir;
         Directory.CreateDirectory(_stateDir);
         _cursorPath = Path.Combine(_stateDir, "cursor.json");
         _queuePath = Path.Combine(_stateDir, "offline-queue.jsonl");
-        _configProvider = configProvider;
-        _http = httpClient;
         _parser = parser ?? new VrcLogParser();
 
         LoadPersistedState();
@@ -85,6 +70,41 @@ public sealed class LogTailCollector
             }
         }
         return Path.Combine(localAppData, "VRChat", "VRChat");
+    }
+
+    public LogCursorState SnapshotCursor()
+    {
+        lock (_queue)
+        {
+            return _cursor.Clone();
+        }
+    }
+
+    /// <summary>
+    /// Reads up to `maxCount` queued events without removing them so failed HTTP uploads retain durability.
+    /// </summary>
+    public List<GameLogEventItem> PeekBatch(int maxCount = 50)
+    {
+        lock (_queue)
+        {
+            int count = Math.Min(Math.Max(maxCount, 1), _queue.Count);
+            return count == 0 ? new List<GameLogEventItem>() : _queue.GetRange(0, count);
+        }
+    }
+
+    /// <summary>
+    /// Removes the oldest `count` events after the cloud Worker confirms HTTP 200 ingest.
+    /// </summary>
+    public void AcknowledgeBatch(int count)
+    {
+        if (count <= 0) return;
+        lock (_queue)
+        {
+            int removeCount = Math.Min(count, _queue.Count);
+            if (removeCount <= 0) return;
+            _queue.RemoveRange(0, removeCount);
+            PersistQueueLocked();
+        }
     }
 
     /// <summary>
@@ -181,103 +201,6 @@ public sealed class LogTailCollector
             }
             _queue.Add(item);
             PersistQueueLocked();
-        }
-    }
-
-    /// <summary>
-    /// Flushes queued events to the Cloudflare Worker in bounded batches (<= 30 events).
-    /// Keeps events persisted on disk if offline or transient HTTP failure occurs.
-    /// </summary>
-    public async Task<bool> FlushAsync(bool force, CancellationToken ct)
-    {
-        AgentConfig cfg = _configProvider();
-        if (!cfg.IsPaired)
-        {
-            return false;
-        }
-
-        if (!force && DateTimeOffset.UtcNow < _nextFlushAllowedAt)
-        {
-            return false;
-        }
-
-        await _flushLock.WaitAsync(ct).ConfigureAwait(false);
-        try
-        {
-            while (!ct.IsCancellationRequested)
-            {
-                List<GameLogEventItem> batch;
-                lock (_queue)
-                {
-                    if (_queue.Count == 0)
-                    {
-                        return true;
-                    }
-                    int count = Math.Min(_queue.Count, MaxBatchSize);
-                    batch = _queue.GetRange(0, count);
-                }
-
-                string endpoint = cfg.CloudUrl.TrimEnd('/') + "/api/agent/ingest/gamelog";
-                string jsonBody = JsonConvert.SerializeObject(new
-                {
-                    events = batch,
-                    cursor = new
-                    {
-                        fileName = _cursor.FileName,
-                        byteOffset = _cursor.ByteOffset,
-                        lastEventDt = _cursor.LastEventDt
-                    }
-                });
-
-                using var req = new HttpRequestMessage(HttpMethod.Post, endpoint)
-                {
-                    Content = new StringContent(jsonBody, Encoding.UTF8, "application/json")
-                };
-                HmacSigner.ApplyAgentAuthHeaders(req, cfg, jsonBody);
-
-                using HttpResponseMessage res = await _http.SendAsync(req, ct).ConfigureAwait(false);
-                if (!res.IsSuccessStatusCode)
-                {
-                    string errText = await res.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
-                    _consecutiveFailures = Math.Min(_consecutiveFailures + 1, 6);
-                    int backoffSec = Math.Min(120, (int)Math.Pow(2, _consecutiveFailures) * 3);
-                    _nextFlushAllowedAt = DateTimeOffset.UtcNow.AddSeconds(backoffSec);
-                    Log.Warn("GameLog batch flush failed ({Status}): {Error}. Retry in {Sec}s.", (int)res.StatusCode, errText, backoffSec);
-                    return false;
-                }
-
-                _consecutiveFailures = 0;
-                _nextFlushAllowedAt = DateTimeOffset.MinValue;
-
-                lock (_queue)
-                {
-                    int removeCount = Math.Min(batch.Count, _queue.Count);
-                    _queue.RemoveRange(0, removeCount);
-                    PersistQueueLocked();
-                }
-
-                if (batch.Count < MaxBatchSize)
-                {
-                    return true;
-                }
-            }
-            return true;
-        }
-        catch (OperationCanceledException)
-        {
-            return false;
-        }
-        catch (Exception ex)
-        {
-            _consecutiveFailures = Math.Min(_consecutiveFailures + 1, 6);
-            int backoffSec = Math.Min(120, (int)Math.Pow(2, _consecutiveFailures) * 3);
-            _nextFlushAllowedAt = DateTimeOffset.UtcNow.AddSeconds(backoffSec);
-            Log.Warn(ex, "GameLog batch flush network error. Retry in {Sec}s.", backoffSec);
-            return false;
-        }
-        finally
-        {
-            _flushLock.Release();
         }
     }
 

@@ -25,11 +25,11 @@
   - **Sharded D1 + FTS5 `trigram` Entity Dictionary**: Avoids 500 MB single-DB caps, unindexed `LIKE '%term%'` scans, and full-table `COUNT(*)` queries to stay comfortably inside Free-tier `rows_read` / `rows_written` ceilings.
   - **WebSocket Hibernation**: `AgentHubDO` uses `ctx.acceptWebSocket` and zero-cost `ping`/`pong` auto-responses so idle connections consume zero compute duration.
 - **Lightweight Windows Companion Agent (`Dotnet/VRCX-Agent/`, zero CEF/Electron)**:
-  - Incremental VRChat `output_log_*.txt` GameLog sync with persisted byte-offset cursor & offline queue
-  - Residential-IP VRChat API relay over `AgentHubDO` WebSocket RPC
+  - Simple **Cloud URL + Sync Secret** configuration with configurable periodic HTTPS upload interval (default 60s, no persistent WebSocket needed)
+  - Incremental VRChat `output_log_*.txt` GameLog sync with persisted byte-offset cursor & durable offline JSONL queue (`POST /api/agent/sync`)
   - Local PNG metadata embedding (`Dotnet/ScreenshotMetadata`) + ≤1600px WebP thumbnail upload to optional private R2 gallery
   - Discord Rich Presence, VRChat/SteamVR process monitoring, AutoAppLaunch, XSOverlay / OVRToolkit VR notifications
-  - Strict 6-action allowlisted remote commands (`launch_vrc`, `quit_vrc`, `clear_cache`, `send_vr_notify`, `discord_update`, `sync_now`)
+  - Strict 6-action allowlisted remote commands queued in D1 and executed on the next periodic sync (`launch_vrc`, `quit_vrc`, `clear_cache`, `send_vr_notify`, `discord_update`, `sync_now`)
 
 ---
 
@@ -39,9 +39,9 @@
 2. Keep the repository root (`.`) and default deploy command `npx wrangler deploy`.
    - Root [`wrangler.jsonc`](./wrangler.jsonc) includes `"build": { "command": "npm run build:web" }`, so the full Web SPA builds automatically even if the Dashboard Build command is left blank.
    - Cloudflare automatically provisions `vrcx-core`, `vrcx-gamelog`, `vrcx-feed` D1 databases and `AgentHubDO`, and initializes all tables on the first request.
-3. For personal use, configure optional access protection and encryption secrets (`ADMIN_PASSCODE`, `ADMIN_TOTP_SECRET`, `COOKIE_MASTER_KEY`, or Cloudflare Access) in **Worker -> Settings -> Variables and Secrets**.
+3. For personal use, configure optional access protection and sync secrets (`ADMIN_PASSCODE`, `ADMIN_TOTP_SECRET`, `COOKIE_MASTER_KEY`, `AGENT_SYNC_KEY`, or Cloudflare Access) in **Worker -> Settings -> Variables and Secrets**.
 
-See the full deployment, security secret, R2 gallery, and Windows companion pairing guide in **[`docs/cloud-architecture/DEPLOY.md`](./docs/cloud-architecture/DEPLOY.md)** and the architecture specification in **[`docs/cloud-architecture/Tech-Spec.md`](./docs/cloud-architecture/Tech-Spec.md)**.
+See the full deployment, security secret, R2 gallery, and Windows companion sync guide in **[`docs/cloud-architecture/DEPLOY.md`](./docs/cloud-architecture/DEPLOY.md)** and the architecture specification in **[`docs/cloud-architecture/Tech-Spec.md`](./docs/cloud-architecture/Tech-Spec.md)**.
 
 ---
 
@@ -51,10 +51,10 @@ See the full deployment, security secret, R2 gallery, and Windows companion pair
 |---|---|
 | `src/` | Upstream VRCX Vue 3 frontend with guarded `WEB` mode adapters (`src/ipc-web/`, `src/services/database/cloud/`, `src/components/cloud/`) |
 | `cloud/` | Cloudflare Worker backend (`src/auth/`, `src/crypto/`, `src/db/`, `src/hub/AgentHubDO.ts`, `src/routes/`, `src/search/`, `migrations/`, `test/`) |
-| `Dotnet/VRCX-Agent/` | Lightweight .NET 10 Windows tray companion reusing upstream `Dotnet/Discord.cs` & `Dotnet/ScreenshotMetadata/` |
-| `Dotnet/VRCX-Agent.Tests/` | Cross-platform xUnit tests for Agent HMAC signing, command/SSRF allowlist, log parser, offline queue, and PNG/WebP pipeline |
+| `Dotnet/VRCX-Agent/` | Lightweight .NET 10 Windows tray companion performing periodic HTTPS sync and reusing upstream `Dotnet/Discord.cs` & `Dotnet/ScreenshotMetadata/` |
+| `Dotnet/VRCX-Agent.Tests/` | Cross-platform xUnit tests for periodic HTTP sync, command/SSRF allowlist, log parser, offline queue, and PNG/WebP pipeline |
 | `Dotnet/` & `src-electron/` | Original upstream desktop CEF and Electron shells (preserved unmodified in behavior) |
-| `docs/cloud-architecture/` | Technical specification (`Tech-Spec.md`) and deployment/pairing guide (`DEPLOY.md`) |
+| `docs/cloud-architecture/` | Technical specification (`Tech-Spec.md`) and deployment/sync guide (`DEPLOY.md`) |
 
 ---
 

@@ -27,9 +27,10 @@ By default, a fresh deployment boots in `open_setup` mode so you can immediately
 |---|---|---|
 | `ADMIN_PASSCODE` | Enables Passcode unlock screen + HMAC-signed `HttpOnly` session cookie | Recommended (or use Cloudflare Access) |
 | `ADMIN_TOTP_SECRET` | Base32 RFC-6238 TOTP secret for 2FA on unlock | Optional |
-| `COOKIE_MASTER_KEY` | 32+ char master key encrypting VRChat cookies & Agent HMAC secrets (AES-256-GCM) | Recommended for production |
+| `COOKIE_MASTER_KEY` | 32+ char master key encrypting VRChat cookies (AES-256-GCM) | Recommended for production |
+| `AGENT_SYNC_KEY` | Optional static Bearer sync secret for `VRCX.Agent` periodic HTTP upload (alternative to per-device keys generated in Cloud Hub) | Optional |
 | `CF_ACCESS_TEAM_DOMAIN` & `CF_ACCESS_AUD` | Enables Cloudflare Access Zero Trust JWT verification | Optional (alternative to Passcode) |
-| `VRC_ALLOW_CLOUD_FALLBACK` | Set `"false"` to restrict VRChat API requests strictly to your online Windows Agent residential IP | Optional (default `"true"`) |
+| `VRC_ALLOW_CLOUD_FALLBACK` | Set `"false"` to disable direct Worker -> VRChat API requests | Optional (default `"true"`) |
 
 ### Optional Private Cloud Screenshot Gallery (R2)
 To store compressed WebP screenshot thumbnails in Cloudflare R2 (10 GB/month Free Tier):
@@ -37,14 +38,14 @@ To store compressed WebP screenshot thumbnails in Cloudflare R2 (10 GB/month Fre
 2. Uncomment the `r2_buckets` section in root `wrangler.jsonc` and redeploy.
    Without R2, screenshot metadata still syncs to D1 cleanly.
 
-## 3. Building & Pairing the Windows Companion Tray Agent (`Dotnet/VRCX-Agent`)
+## 3. Building & Configuring the Windows Companion Tray Agent (`Dotnet/VRCX-Agent`)
 
-`VRCX.Agent` is a lightweight .NET 10 Windows Forms tray companion (zero CEF, zero Electron) that provides:
-- Incremental VRChat `output_log_*.txt` GameLog sync with persisted byte-offset cursor & offline queue
-- Residential-IP VRChat API relay via `AgentHubDO` WebSocket RPC
-- Local PNG VRCX metadata embedding + ≤1600px WebP thumbnail upload
+`VRCX.Agent` is a lightweight .NET 10 Windows Forms tray companion (zero CEF, zero Electron) using a simple **periodic HTTPS upload** model:
+- Incremental VRChat `output_log_*.txt` GameLog tailing with persisted byte-offset cursor & durable offline JSONL queue
+- Periodic HTTPS upload (`POST /api/agent/sync`, default every 60 seconds, configurable 15–3600s) using only **Cloud URL + Sync Secret**
+- Local PNG VRCX metadata embedding + ≤1600px WebP thumbnail upload (`PUT /api/agent/media/screenshots/{sha256}`)
 - Discord Rich Presence, VRChat/SteamVR process monitoring, AutoAppLaunch, XSOverlay/OVRToolkit notifications
-- Strict 6-action allowlisted remote commands (`launch_vrc`, `quit_vrc`, `clear_cache`, `send_vr_notify`, `discord_update`, `sync_now`)
+- Strict 6-action allowlisted remote commands (`launch_vrc`, `quit_vrc`, `clear_cache`, `send_vr_notify`, `discord_update`, `sync_now`) queued in D1 and executed on the next sync interval
 
 ### Build on Windows (requires .NET 10 SDK)
 ```powershell
@@ -52,8 +53,8 @@ dotnet publish Dotnet/VRCX-Agent/VRCX-Agent.csproj -c Release -r win-x64 --self-
 ```
 The compiled executable is written to `build/VRCX-Agent/VRCX.Agent.exe`.
 
-### Zero-Config 6-Digit Pairing
-1. Open your deployed VRCX Cloud Web URL and click **Cloud** in the bottom status bar to open **Cloud Hub -> Win Agent**.
-2. Click **Generate 6-Digit Pairing Code** (single-use, expires in 5 minutes).
-3. Launch `VRCX.Agent.exe` on your Windows PC, right-click the tray icon -> **Pair with VRCX Cloud...**, enter your Cloud URL and the 6-digit code, and click **Pair Device**.
-4. Device token and HMAC secret are encrypted locally using Windows DPAPI (`CurrentUser`), and VRChat logs/status begin syncing automatically.
+### Setup with Cloud URL & Sync Secret
+1. Open your deployed VRCX Cloud Web URL and click **Cloud** in the bottom status bar to open **Cloud Hub -> Win Agent (HTTP Sync)**.
+2. Copy the **Cloud URL**, enter a device name, and click **Create Sync Secret** to generate a persistent `vrcx_sync_...` secret (stored SHA-256 hashed in D1, revocable anytime). Alternatively, set a static `AGENT_SYNC_KEY` in Cloudflare Worker Secrets.
+3. Launch `VRCX.Agent.exe` on your Windows PC, right-click the tray icon -> **Sync Settings (URL & Secret)...**, paste the **Cloud URL** and **Sync Secret**, pick your preferred **Sync Interval (seconds)** (default `60`), and click **Test & Save**.
+4. The URL and secret are encrypted locally using Windows DPAPI (`CurrentUser`), and VRChat logs, state, and screenshots begin uploading automatically every interval.

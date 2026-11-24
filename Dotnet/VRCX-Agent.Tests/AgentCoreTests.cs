@@ -16,33 +16,6 @@ namespace VRCX.Agent.Tests;
 public sealed class AgentCoreTests
 {
     [Fact]
-    public void HmacSigner_MatchesCloudflareWorkerCanonicalVector()
-    {
-        // Known deterministic vector matching cloud/src/auth/auth.ts:
-        // canonical = `${ts}\n${METHOD}\n${pathname}\n${sha256Hex(rawBody)}`
-        string body = "{\"events\":[]}";
-        string sig = HmacSigner.SignCanonical(
-            hmacSecret: "test-secret-key",
-            unixTimestampSeconds: 1700000000,
-            httpMethod: "post",
-            pathname: "/api/agent/ingest/gamelog",
-            rawBodyText: body);
-
-        Assert.Equal(64, sig.Length);
-        Assert.Equal(sig, sig.ToLowerInvariant());
-
-        // Recomputing with uppercase method yields identical signature
-        string sigUpper = HmacSigner.SignCanonical(
-            "test-secret-key", 1700000000, "POST", "/api/agent/ingest/gamelog", body);
-        Assert.Equal(sig, sigUpper);
-
-        // Tampered body produces a different signature
-        string sigTampered = HmacSigner.SignCanonical(
-            "test-secret-key", 1700000000, "POST", "/api/agent/ingest/gamelog", "{\"events\":[1]}");
-        Assert.NotEqual(sig, sigTampered);
-    }
-
-    [Fact]
     public void CommandValidator_EnforcesAllowlistAndBlocksInjectionAndSsrf()
     {
         Assert.True(CommandValidator.ValidateRemoteCommand("sync_now", null).Ok);
@@ -107,7 +80,7 @@ public sealed class AgentCoreTests
     }
 
     [Fact]
-    public async Task LogTailCollector_PersistsCursorOfflineQueueAndFlushesWithHmac()
+    public async Task PeriodicHttpSync_TailsCursorUploadsWithBearerSecretPullsCommandsAndReportsResult()
     {
         string tempRoot = Path.Combine(Path.GetTempPath(), "vrcx-agent-test-" + Guid.NewGuid().ToString("N"));
         string logDir = Path.Combine(tempRoot, "logs");
@@ -127,28 +100,14 @@ public sealed class AgentCoreTests
             var cfg = new AgentConfig
             {
                 CloudUrl = "https://vrcx-cloud.example.workers.dev",
-                DeviceId = "win-test01",
-                DeviceToken = "tok-abc",
-                HmacSecret = "sec-xyz"
+                SyncSecret = "vrcx_sync_secret_token_123",
+                DeviceName = "公主的台式机",
+                SyncIntervalSeconds = 45
             };
+            Assert.True(cfg.IsConfigured);
+            Assert.Equal(45, cfg.EffectiveSyncIntervalSeconds);
 
-            string? capturedAuth = null;
-            string? capturedSig = null;
-            string? capturedBody = null;
-
-            using var handler = new StubHttpHandler(async (req) =>
-            {
-                capturedAuth = req.Headers.Authorization?.ToString();
-                capturedSig = string.Join("", req.Headers.GetValues("X-Signature"));
-                capturedBody = await req.Content!.ReadAsStringAsync();
-                return new HttpResponseMessage(HttpStatusCode.OK)
-                {
-                    Content = new StringContent("{\"ok\":true,\"data\":{\"inserted\":1}}", Encoding.UTF8, "application/json")
-                };
-            });
-            using var http = new HttpClient(handler);
-
-            var collector = new LogTailCollector(stateDir, () => cfg, http);
+            var collector = new LogTailCollector(stateDir);
             int parsed = collector.PollLogDirectory(logDir);
             Assert.Equal(1, parsed);
             Assert.Equal(1, collector.OfflineQueueCount);
@@ -156,14 +115,67 @@ public sealed class AgentCoreTests
             // Second poll without new lines reads 0 bytes
             Assert.Equal(0, collector.PollLogDirectory(logDir));
 
-            // Flush succeeds and empties offline queue
-            bool flushed = await collector.FlushAsync(force: true, CancellationToken.None);
-            Assert.True(flushed);
-            Assert.Equal(0, collector.OfflineQueueCount);
-            Assert.Equal("Bearer tok-abc", capturedAuth);
-            Assert.NotNull(capturedSig);
-            Assert.Equal(64, capturedSig!.Length);
+            string? capturedSyncPath = null;
+            string? capturedAuth = null;
+            string? capturedBody = null;
+            string? capturedResultPath = null;
+
+            using var handler = new StubHttpHandler(async (req) =>
+            {
+                string path = req.RequestUri!.AbsolutePath;
+                if (path == "/api/agent/sync")
+                {
+                    capturedSyncPath = path;
+                    capturedAuth = req.Headers.Authorization?.ToString();
+                    capturedBody = await req.Content!.ReadAsStringAsync();
+                    return new HttpResponseMessage(HttpStatusCode.OK)
+                    {
+                        Content = new StringContent(
+                            "{\"ok\":true,\"data\":{\"deviceId\":\"win-srv-01\",\"deviceName\":\"公主的台式机\",\"syncedAt\":\"2026-11-24T01:05:00Z\",\"ingest\":{\"inserted\":1,\"skipped\":0},\"pendingCommands\":[{\"cmdId\":\"cmd_abc123\",\"action\":\"quit_vrc\",\"params\":{},\"expiresAt\":\"2026-11-24T01:15:00Z\"}]}}",
+                            Encoding.UTF8,
+                            "application/json")
+                    };
+                }
+                if (path == "/api/agent/commands/cmd_abc123/result")
+                {
+                    capturedResultPath = path;
+                    return new HttpResponseMessage(HttpStatusCode.OK)
+                    {
+                        Content = new StringContent("{\"ok\":true}", Encoding.UTF8, "application/json")
+                    };
+                }
+                return new HttpResponseMessage(HttpStatusCode.NotFound);
+            });
+            using var http = new HttpClient(handler);
+            var syncClient = new HttpSyncClient(http);
+
+            var batch = collector.PeekBatch(50);
+            Assert.Single(batch);
+
+            AgentSyncResponse res = await syncClient.SyncOnceAsync(
+                cfg,
+                batch,
+                collector.SnapshotCursor(),
+                new LiveAgentState { VrcRunning = true, CurrentWorldName = "Test Shrine" },
+                CancellationToken.None);
+
+            collector.AcknowledgeBatch(batch.Count);
+
+            Assert.Equal("/api/agent/sync", capturedSyncPath);
+            Assert.Equal("Bearer vrcx_sync_secret_token_123", capturedAuth);
             Assert.Contains("Test Shrine", capturedBody);
+            Assert.Contains("公主的台式机", capturedBody);
+            Assert.Equal(0, collector.OfflineQueueCount);
+            Assert.Equal(1, res.Ingest.Inserted);
+            Assert.Single(res.PendingCommands);
+            Assert.Equal("cmd_abc123", res.PendingCommands[0].CmdId);
+
+            bool reported = await syncClient.ReportCommandResultAsync(
+                cfg,
+                new CommandExecutionResult { CmdId = "cmd_abc123", Status = "succeeded", Message = "Done" },
+                CancellationToken.None);
+            Assert.True(reported);
+            Assert.Equal("/api/agent/commands/cmd_abc123/result", capturedResultPath);
         }
         finally
         {
