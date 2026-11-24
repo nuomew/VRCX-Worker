@@ -321,6 +321,46 @@
                         </button>
                     </div>
                     <div
+                        v-if="!cloudState.r2Enabled"
+                        class="rounded-lg border border-border bg-background/50 p-3.5 space-y-2 text-[11px]">
+                        <div class="font-medium text-foreground text-xs">{{ t('cloud_hub.gallery.r2_setup_title') }}</div>
+                        <div class="space-y-1 text-muted-foreground">
+                            <div>
+                                <span class="font-medium text-foreground">{{
+                                    t('cloud_hub.gallery.r2_binding_type_label')
+                                }}</span>
+                                {{ t('cloud_hub.gallery.r2_binding_type_value') }}
+                            </div>
+                            <div class="flex flex-wrap items-center gap-2">
+                                <span class="font-medium text-foreground">{{
+                                    t('cloud_hub.gallery.r2_var_name_label')
+                                }}</span>
+                                <code class="rounded bg-muted px-1.5 py-0.5 font-mono text-primary">R2_MEDIA</code>
+                                <button
+                                    type="button"
+                                    class="rounded border border-border px-2 py-0.5 text-[11px] text-foreground hover:bg-accent"
+                                    @click="copyText('R2_MEDIA', 'r2_var')">
+                                    {{
+                                        copiedField === 'r2_var'
+                                            ? t('cloud_hub.devices.copied')
+                                            : t('cloud_hub.gallery.r2_copy_var')
+                                    }}
+                                </button>
+                            </div>
+                            <div>
+                                <span class="font-medium text-foreground">{{
+                                    t('cloud_hub.gallery.r2_bucket_name_label')
+                                }}</span>
+                                {{ t('cloud_hub.gallery.r2_bucket_name_value') }}
+                            </div>
+                        </div>
+                        <div class="space-y-1 border-t border-border/60 pt-2 text-muted-foreground leading-relaxed">
+                            <div>{{ t('cloud_hub.gallery.r2_step_dashboard') }}</div>
+                            <div>{{ t('cloud_hub.gallery.r2_step_wrangler') }}</div>
+                        </div>
+                        <pre class="overflow-x-auto rounded bg-muted/60 p-2 font-mono text-[11px] text-foreground">"r2_buckets": [{ "binding": "R2_MEDIA", "bucket_name": "vrcx-media" }]</pre>
+                    </div>
+                    <div
                         v-if="screenshots.length === 0"
                         class="rounded-lg border border-dashed border-border p-6 text-center text-muted-foreground">
                         {{ t('cloud_hub.gallery.empty') }}

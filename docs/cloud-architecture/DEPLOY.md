@@ -33,10 +33,21 @@ By default, a fresh deployment boots in `open_setup` mode so you can immediately
 | `VRC_ALLOW_CLOUD_FALLBACK` | Set `"false"` to disable direct Worker -> VRChat API requests | Optional (default `"true"`) |
 
 ### Optional Private Cloud Screenshot Gallery (R2)
-To store compressed WebP screenshot thumbnails in Cloudflare R2 (10 GB/month Free Tier):
-1. Create an R2 bucket named `vrcx-media` in Cloudflare Dashboard.
-2. Uncomment the `r2_buckets` section in root `wrangler.jsonc` and redeploy.
-   Without R2, screenshot metadata still syncs to D1 cleanly.
+To store compressed WebP screenshot thumbnails in Cloudflare R2 (10 GB/month Free Tier), attach an **R2 Bucket Binding** (not a plain text environment variable):
+
+| Parameter | Value | Notes |
+|---|---|---|
+| Binding Type | `R2 bucket` | Configured under Worker **Bindings** (or `r2_buckets` in `wrangler.jsonc`) |
+| Variable Name (`binding`) | `R2_MEDIA` | **Exact required name** read by `cloud/src/env.ts` (`env.R2_MEDIA`) |
+| Bucket Name (`bucket_name`) | `vrcx-media` (recommended) | Any private R2 bucket created in your Cloudflare account |
+
+**Setup (choose one):**
+1. **Git Auto-Deploy (Recommended — preserved across redeploys):**
+   Create a private R2 bucket (e.g. `vrcx-media`) in Cloudflare Dashboard -> **R2 Object Storage**, uncomment the `r2_buckets` block in root `wrangler.jsonc` (`"binding": "R2_MEDIA"`, `"bucket_name": "<your-bucket-name>"`), and push to redeploy.
+2. **Cloudflare Dashboard Manual Binding:**
+   Go to **Workers & Pages -> your Worker -> Settings -> Bindings -> Add -> R2 bucket**, set **Variable name** to `R2_MEDIA`, select your bucket, and save. *(Note: if your Worker deploys automatically via Git `npx wrangler deploy`, Dashboard-only bindings not declared in `wrangler.jsonc` may be overwritten on subsequent deploys.)*
+
+Without `R2_MEDIA` bound, screenshot metadata still syncs to D1 cleanly.
 
 ## 3. Building & Configuring the Windows Companion Tray Agent (`Dotnet/VRCX-Agent`)
 

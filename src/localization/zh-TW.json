@@ -3395,7 +3395,16 @@
             "r2_enabled": "已啟用（私有儲存桶）",
             "r2_disabled": "尚未繫結（目前僅同步截圖中繼資料）",
             "refresh": "重新整理",
-            "empty": "尚無雲端同步截圖。執行 VRCX.Agent 時在 VRChat 中拍照即可定時同步至此。"
+            "empty": "尚無雲端同步截圖。執行 VRCX.Agent 時在 VRChat 中拍照即可定時同步至此。",
+            "r2_setup_title": "如何繫結 Cloudflare R2 儲存桶（選用 · 免費 10 GB）",
+            "r2_binding_type_label": "繫結類型：",
+            "r2_binding_type_value": "R2 儲存桶繫結（Worker Bindings，非一般純文字環境變數）",
+            "r2_var_name_label": "變數名稱（固定）：",
+            "r2_bucket_name_label": "儲存桶名稱：",
+            "r2_bucket_name_value": "在 R2 建立的私有儲存桶名稱（建議 vrcx-media，可自訂）",
+            "r2_copy_var": "複製",
+            "r2_step_dashboard": "方式一（Cloudflare 後台）：進入 Workers & Pages -> 目前 Worker -> 設定 -> 繫結 -> 新增 -> R2 儲存桶，變數名稱填 R2_MEDIA 並選擇儲存桶。",
+            "r2_step_wrangler": "方式二（Git 自動部署建議，避免下次部署覆蓋）：在倉庫根目錄 wrangler.jsonc 取消 r2_buckets 註解，保持 binding 為 \"R2_MEDIA\" 並填入 bucket_name 後推送部署。"
         },
         "quota": {
             "shard_percent": "佔免費單庫上限 {percent}%",

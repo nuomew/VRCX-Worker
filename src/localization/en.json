@@ -3732,7 +3732,16 @@
             "r2_enabled": "Enabled (Private Bucket)",
             "r2_disabled": "Not bound yet (Metadata-only mode)",
             "refresh": "Refresh",
-            "empty": "No cloud screenshots synced yet. Take a screenshot in VRChat while VRCX.Agent is running."
+            "empty": "No cloud screenshots synced yet. Take a screenshot in VRChat while VRCX.Agent is running.",
+            "r2_setup_title": "How to Bind Cloudflare R2 Bucket (Optional · 10 GB Free)",
+            "r2_binding_type_label": "Binding Type:",
+            "r2_binding_type_value": "R2 Bucket (Worker Binding, not a plain text env var)",
+            "r2_var_name_label": "Variable Name (Required):",
+            "r2_bucket_name_label": "Bucket Name:",
+            "r2_bucket_name_value": "Any private R2 bucket you created (e.g. vrcx-media)",
+            "r2_copy_var": "Copy",
+            "r2_step_dashboard": "Cloudflare Dashboard: Workers & Pages -> your Worker -> Settings -> Bindings -> Add -> R2 bucket, set Variable name to R2_MEDIA and choose your bucket.",
+            "r2_step_wrangler": "Git Auto-Deploy (Recommended so redeploys do not overwrite Dashboard bindings): uncomment r2_buckets in root wrangler.jsonc with binding \"R2_MEDIA\" and your bucket_name, then push."
         },
         "quota": {
             "shard_percent": "{percent}% of Free shard",
