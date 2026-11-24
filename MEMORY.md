@@ -34,4 +34,5 @@
     2. `PUT /api/agent/media/screenshots/{sha256}` validates Agent HMAC with an empty signed body string (`""`) so binary WebP payloads are not double-hashed.
     3. Upstream `Discord.SetAssets` takes 17 parameters (including `detailsUrl`, `startUnixMilliseconds`, `endUnixMilliseconds`, `statusDisplayType`); both `src/ipc-web/appApiWeb.js` and `RemoteCommandExecutor.cs` match this exact parameter order.
     4. Added `docs/cloud-architecture/DEPLOY.md` for one-click Cloudflare deploy, optional secrets/R2, and Windows Agent build & 6-digit pairing.
+    5. Added `"build": { "command": "npm run build:web" }` to root `wrangler.jsonc` so Cloudflare Workers Builds succeeds even when Dashboard Build command is left blank (verified from clean `rm -rf build/web` via `wrangler deploy --dry-run`).
 

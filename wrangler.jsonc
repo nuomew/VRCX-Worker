@@ -3,6 +3,10 @@
     "name": "vrcx-cloud",
     "main": "cloud/src/index.ts",
     "compatibility_date": "2026-11-01",
+    // Automatically build the VRCX Web SPA during `npx wrangler deploy` so zero Dashboard build-command config is required.
+    "build": {
+        "command": "npm run build:web"
+    },
     // Serves the full built VRCX Vue SPA (--mode web) directly from Cloudflare edge at zero Worker request cost.
     "assets": {
         "directory": "./build/web",
