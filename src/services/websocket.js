@@ -27,6 +27,7 @@ import * as workerTimers from 'worker-timers';
 let webSocket = null;
 let lastWebSocketMessage = '';
 let webSocketClosedGracefully = true;
+let wsReconnectDelayMs = 5000;
 
 const refreshOwnedItems = debounce(() => useUserStore().getAllProductPurchases(), 5000);
 
@@ -75,6 +76,7 @@ function connectWebSocket(token) {
     const socket = new WebSocket(`${AppDebug.websocketDomain}/?auth=${token}`);
     socket.onopen = () => {
         wsState.connected = true;
+        wsReconnectDelayMs = 5000;
         if (!webSocketClosedGracefully && watchState.isLoggedIn && watchState.isFriendsLoaded) {
             console.warn('WebSocket reconnected after unexpected closure');
             webSocketClosedGracefully = true;
@@ -100,11 +102,15 @@ function connectWebSocket(token) {
         if (!webSocketClosedGracefully || AppDebug.debugWebSocket) {
             console.log('WebSocket closed', { code, reason });
         }
+        const delayMs = typeof WEB !== 'undefined' && WEB ? wsReconnectDelayMs : 5000;
+        if (typeof WEB !== 'undefined' && WEB) {
+            wsReconnectDelayMs = Math.min(wsReconnectDelayMs * 2, 60000);
+        }
         workerTimers.setTimeout(() => {
             if (watchState.isLoggedIn && watchState.isFriendsLoaded && webSocket === null) {
                 initWebsocket();
             }
-        }, 5000);
+        }, delayMs);
     };
     socket.onerror = () => {
         if (AppDebug.errorNoty) {

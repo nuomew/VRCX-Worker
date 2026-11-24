@@ -300,14 +300,19 @@ export async function handleVrcProxyRoutes(request: Request, env: Env, url: URL)
             );
         }
 
-        const jar = await loadCookieJar(env);
-        const init = buildUpstreamRequestInit(payload, buildCookieHeader(jar));
+        const isPublicUnauthTarget =
+            payload.url.startsWith('https://status.vrchat.com/') ||
+            payload.url === 'https://api.vrchat.cloud/api/1/config';
+        const jar = isPublicUnauthTarget ? {} : await loadCookieJar(env);
+        const init = buildUpstreamRequestInit(payload, isPublicUnauthTarget ? '' : buildCookieHeader(jar));
 
         try {
             const upstream = await fetch(payload.url, init);
-            const cookieChanged = mergeSetCookies(jar, upstream.headers);
-            if (cookieChanged) {
-                await saveCookieJar(env, jar);
+            if (!isPublicUnauthTarget) {
+                const cookieChanged = mergeSetCookies(jar, upstream.headers);
+                if (cookieChanged) {
+                    await saveCookieJar(env, jar);
+                }
             }
             const text = await upstream.text();
             const wafBlocked =

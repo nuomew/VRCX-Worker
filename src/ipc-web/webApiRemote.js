@@ -32,9 +32,17 @@ export function createWebApiBridge() {
             }
 
             try {
+                const payload =
+                    options &&
+                    typeof options === 'object' &&
+                    cloudState.agentsOnline.length === 0 &&
+                    cloudState.cloudFallbackAllowed &&
+                    options.preferCloudDirect === undefined
+                        ? { ...options, preferCloudDirect: true }
+                        : options;
                 const data = await cloudFetch('/api/vrc/execute', {
                     method: 'POST',
-                    json: options
+                    json: payload
                 });
                 if (data?.route) {
                     cloudState.lastVrcRoute = data.route;
