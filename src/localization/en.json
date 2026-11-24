@@ -3719,19 +3719,6 @@
             "never_synced": "Never synced yet",
             "revoke": "Revoke"
         },
-        "bg_feed": {
-            "heading": "Cloud Background Feed Sync (When Web Tab Is Closed)",
-            "desc": "Automatically records friend online/offline, world changes, status, bio updates, and notifications every {seconds}s via Cloudflare Cron while the page is closed (follows Cloud Sync Interval in Settings -> System, default 5 min).",
-            "enabled_btn": "Enabled",
-            "disabled_btn": "Paused",
-            "run_now_btn": "Sync Now",
-            "running_btn": "Syncing...",
-            "session_ok": "VRChat session active",
-            "session_missing": "No VRChat session stored yet",
-            "never_run": "Not yet run in background",
-            "last_run": "Last sync: {time} · Online {online} · Feed +{feed} · Notifs +{notif}",
-            "run_done": "Synced: {online} friends in-game, +{feed} feed events, +{notif} notifications ({bio} bios checked)"
-        },
         "commands": {
             "launch_heading": "Launch VRChat Instance on Windows PC",
             "launch_btn": "Launch Instance",

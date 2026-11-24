@@ -3717,19 +3717,6 @@
             "never_synced": "尚未同步",
             "revoke": "撤销"
         },
-        "bg_feed": {
-            "heading": "云端后台好友动态同步（关闭网页生效）",
-            "desc": "关闭网页后，Cloudflare 按「云端同步间隔」（默认 5 分钟，当前每 {seconds} 秒，可在设置 -> 系统中修改）自动记录好友上下线、切房、改状态、签名变化与通知。",
-            "enabled_btn": "已开启",
-            "disabled_btn": "已关闭",
-            "run_now_btn": "立即同步一次",
-            "running_btn": "同步中...",
-            "session_ok": "VRChat 会话有效",
-            "session_missing": "尚未检测到 VRChat 登录会话",
-            "never_run": "尚未执行后台同步",
-            "last_run": "上次成功：{time} · 在线 {online} · 动态 +{feed} · 通知 +{notif}",
-            "run_done": "同步完成：游戏在线好友 {online} 人，新增动态 {feed} 条、通知 {notif} 条（检查签名 {bio} 人）"
-        },
         "commands": {
             "launch_heading": "在 Windows 电脑远程启动 VRChat 房间",
             "launch_btn": "启动房间",
