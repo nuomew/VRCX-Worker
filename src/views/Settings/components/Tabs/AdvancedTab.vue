@@ -153,17 +153,22 @@
         </SettingsGroup>
 
         <SettingsGroup :title="t('view.settings.advanced.advanced.cache_debug.header')">
-            <div class="flex gap-2 flex-wrap">
-                <Button v-if="!isWeb" size="sm" variant="outline" @click="clearVRCXCache">{{
+            <div v-if="!isWeb" class="flex gap-2 flex-wrap">
+                <Button size="sm" variant="outline" @click="clearVRCXCache">{{
                     t('view.settings.advanced.advanced.cache_debug.clear_cache')
                 }}</Button>
-                <Button v-if="!isWeb" size="sm" variant="outline" @click="promptAutoClearVRCXCacheFrequency">{{
+                <Button size="sm" variant="outline" @click="promptAutoClearVRCXCacheFrequency">{{
                     t('view.settings.advanced.advanced.cache_debug.auto_clear_cache')
                 }}</Button>
                 <Button size="sm" variant="outline" @click="refreshCacheSize">{{
                     t('view.settings.advanced.advanced.cache_debug.refresh_cache')
                 }}</Button>
             </div>
+            <SettingsItem v-else :label="t('view.settings.advanced.advanced.cache_debug.refresh_cache')">
+                <Button size="sm" variant="outline" @click="refreshCacheSize">{{
+                    t('view.settings.advanced.advanced.cache_debug.refresh_cache')
+                }}</Button>
+            </SettingsItem>
 
             <SettingsItem
                 v-if="!isWeb"
