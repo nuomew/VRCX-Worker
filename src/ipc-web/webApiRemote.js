@@ -122,13 +122,16 @@ export function createWebApiBridge() {
      *     options: Record<string, any>;
      *     cacheKey: string;
      *     tier: 'static' | 'entity' | 'dynamic' | 'volatile';
+     *     startGen: number;
      *     resolve: (val: string) => void;
      * }[]}
      */
     let pendingBatch = [];
     let batchScheduled = false;
+    let writeGeneration = 0;
 
     function clearReadCache() {
+        writeGeneration++;
         getCache.clear();
     }
 
@@ -139,6 +142,7 @@ export function createWebApiBridge() {
      * @param {string} writeUrl
      */
     function invalidateCacheForWrite(writeUrl) {
+        writeGeneration++;
         let writePath = '';
         try {
             writePath = new URL(writeUrl).pathname;
@@ -221,7 +225,7 @@ export function createWebApiBridge() {
         );
     }
 
-    async function executeSingleRequest(options, cacheTier, cacheKey) {
+    async function executeSingleRequest(options, cacheTier, cacheKey, startGen = writeGeneration) {
         try {
             const payload = shouldPreferCloudDirect(options) ? { ...options, preferCloudDirect: true } : options;
             const data = await cloudFetch('/api/vrc/execute', {
@@ -236,7 +240,7 @@ export function createWebApiBridge() {
                 status,
                 message: data?.data ?? ''
             });
-            if (cacheTier && status >= 200 && status < 300) {
+            if (cacheTier && status >= 200 && status < 300 && startGen === writeGeneration) {
                 setCachedResponse(cacheKey, serialized, cacheTier);
             }
             return serialized;
@@ -260,7 +264,7 @@ export function createWebApiBridge() {
         // Single request in this microtask turn -> send via standard /api/vrc/execute with zero batch overhead.
         if (queued.length === 1) {
             const item = queued[0];
-            executeSingleRequest(item.options, item.tier, item.cacheKey).then(item.resolve);
+            executeSingleRequest(item.options, item.tier, item.cacheKey, item.startGen).then(item.resolve);
             return;
         }
 
@@ -269,7 +273,7 @@ export function createWebApiBridge() {
             const chunk = queued.slice(i, i + MAX_BATCH_SIZE);
             if (chunk.length === 1) {
                 const item = chunk[0];
-                executeSingleRequest(item.options, item.tier, item.cacheKey).then(item.resolve);
+                executeSingleRequest(item.options, item.tier, item.cacheKey, item.startGen).then(item.resolve);
                 continue;
             }
 
@@ -299,7 +303,7 @@ export function createWebApiBridge() {
                             status,
                             message: r.error ? String(r.error) : (r.data ?? '')
                         });
-                        if (status >= 200 && status < 300) {
+                        if (status >= 200 && status < 300 && item.startGen === writeGeneration) {
                             setCachedResponse(item.cacheKey, serialized, item.tier);
                         }
                         item.resolve(serialized);
@@ -372,17 +376,18 @@ export function createWebApiBridge() {
                 }
             }
 
+            const startGen = writeGeneration;
             let execPromise;
             if (cacheTier && shouldPreferCloudDirect(options)) {
                 execPromise = new Promise((resolve) => {
-                    pendingBatch.push({ options, cacheKey, tier: cacheTier, resolve });
+                    pendingBatch.push({ options, cacheKey, tier: cacheTier, startGen, resolve });
                     if (!batchScheduled) {
                         batchScheduled = true;
                         Promise.resolve().then(flushGetBatch);
                     }
                 });
             } else {
-                execPromise = executeSingleRequest(options, cacheTier, cacheKey);
+                execPromise = executeSingleRequest(options, cacheTier, cacheKey, startGen);
             }
 
             if (cacheTier) {

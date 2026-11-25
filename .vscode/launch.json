@@ -13,9 +13,9 @@
             "name": "C#: Cef/Electron Debug",
             "type": "dotnet",
             "request": "launch",
-            "projectPath": "${workspaceFolder}/Dotnet/VRCX-Cef.csproj",
+            "projectPath": "${workspaceFolder}/desktop/Dotnet/VRCX-Cef.csproj",
             "linux": {
-                "projectPath": "${workspaceFolder}/Dotnet/VRCX-Electron.csproj"
+                "projectPath": "${workspaceFolder}/desktop/Dotnet/VRCX-Electron.csproj"
             },
             "preLaunchTask": "dotnet: build"
         },

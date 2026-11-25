@@ -41,16 +41,16 @@ jobs:
       - name: Set version
         run: |
           echo "${{ needs.set_version.outputs.version }}" > Version
-          echo "!define PRODUCT_VERSION_FROM_FILE \"${{ needs.set_version.outputs.date }}.0\"" > Installer/version_define.nsh
+          echo "!define PRODUCT_VERSION_FROM_FILE \"${{ needs.set_version.outputs.date }}.0\"" > desktop/Installer/version_define.nsh
           cat Version
       - uses: actions/cache@v5
         with:
           path: ~/.nuget/packages
-          key: ${{ runner.os }}-nuget-${{ hashFiles('**/Dotnet/VRCX-Cef.csproj') }}
+          key: ${{ runner.os }}-nuget-${{ hashFiles('**/desktop/Dotnet/VRCX-Cef.csproj') }}
           restore-keys: |
             ${{ runner.os }}-nuget-
       - name: Build Cef .NET win-x64 Application
-        run: dotnet build Dotnet/VRCX-Cef.csproj -p:Configuration=Release -p:WarningLevel=0 -p:Platform=x64 -p:PlatformTarget=x64 -t:"Clean;Build" -maxcpucount --runtime win-x64 --self-contained
+        run: dotnet build desktop/Dotnet/VRCX-Cef.csproj -p:Configuration=Release -p:WarningLevel=0 -p:Platform=x64 -p:PlatformTarget=x64 -t:"Clean;Build" -maxcpucount --runtime win-x64 --self-contained
       - name: Check if we want to sign
         id: check_sign
         run: |
@@ -98,13 +98,13 @@ jobs:
       - name: Create NSIS installer
         uses: joncloud/makensis-action@v5.0
         with:
-          script-file: Installer/installer.nsi
-          additional-plugin-paths: Installer/Plugins
+          script-file: desktop/Installer/installer.nsi
+          additional-plugin-paths: desktop/Installer/Plugins
       - name: Rename setup
         run: |
           file_name="VRCX_${{ needs.set_version.outputs.version }}_Setup_x64.exe"
           echo "Setup FileName: ${file_name}"
-          mv Installer/VRCX_Setup_x64.exe $file_name
+          mv desktop/Installer/VRCX_Setup_x64.exe $file_name
       - name: Sign Cef setup
         uses: azure/trusted-signing-action@v1
         if: steps.check_sign.outputs.sign == 'true'

@@ -1,12 +1,14 @@
 import type { Env } from '../env';
 import { buildSafeTrigramMatch, searchGameLogByEntity } from '../search/entityFts';
 import {
+    clampQueryLimit,
     getAgentOnlineWindowMs,
     incrementCounter,
+    incrementCountersBatch,
     parseCloudSyncIntervalSeconds,
     resolveRecentHttpAgents,
-    upsertEntityUser,
-    upsertEntityWorld
+    upsertEntityUsersBatch,
+    upsertEntityWorldsBatch
 } from './coreData';
 
 const MAX_LIMIT = 100;
@@ -161,8 +163,8 @@ export async function ingestGameLogItems(
     let inserted = 0;
     let lastRowId = 0;
     const counterDeltas = new Map<string, number>();
-    for (let i = 0; i < stmts.length; i += 25) {
-        const chunk = stmts.slice(i, i + 25);
+    for (let i = 0; i < stmts.length; i += 50) {
+        const chunk = stmts.slice(i, i + 50);
         const results = await env.DB_GAMELOG.batch(chunk.map((c) => c.stmt));
         for (let j = 0; j < results.length; j++) {
             const r = results[j]!;
@@ -178,19 +180,10 @@ export async function ingestGameLogItems(
         }
     }
 
-    // Update deduplicated entities and counters in DB_CORE (capped to stay under Free subrequest cap)
-    let dictOps = 0;
-    for (const [uid, name] of userEntities) {
-        if (dictOps++ >= 10) break;
-        await upsertEntityUser(env.DB_CORE, uid, name);
-    }
-    for (const [wid, name] of worldEntities) {
-        if (dictOps++ >= 15) break;
-        await upsertEntityWorld(env.DB_CORE, wid, name);
-    }
-    for (const [key, delta] of counterDeltas) {
-        await incrementCounter(env.DB_CORE, key, delta);
-    }
+    // Batch-update deduplicated entities and counters in DB_CORE (<= 5 subrequests total vs 35+ previously)
+    await upsertEntityUsersBatch(env.DB_CORE, userEntities, 50);
+    await upsertEntityWorldsBatch(env.DB_CORE, worldEntities, 50);
+    await incrementCountersBatch(env.DB_CORE, counterDeltas);
 
     return { inserted, lastRowId };
 }
@@ -282,8 +275,8 @@ export async function ingestFeedItems(
     let inserted = 0;
     let lastRowId = 0;
     const counterDeltas = new Map<string, number>();
-    for (let i = 0; i < stmts.length; i += 25) {
-        const chunk = stmts.slice(i, i + 25);
+    for (let i = 0; i < stmts.length; i += 50) {
+        const chunk = stmts.slice(i, i + 50);
         const results = await env.DB_FEED.batch(chunk.map((c) => c.stmt));
         for (let j = 0; j < results.length; j++) {
             const r = results[j]!;
@@ -297,14 +290,8 @@ export async function ingestFeedItems(
         }
     }
 
-    let ops = 0;
-    for (const [uid, name] of users) {
-        if (ops++ >= 8) break;
-        await upsertEntityUser(env.DB_CORE, uid, name);
-    }
-    for (const [k, delta] of counterDeltas) {
-        await incrementCounter(env.DB_CORE, k, delta);
-    }
+    await upsertEntityUsersBatch(env.DB_CORE, users, 50);
+    await incrementCountersBatch(env.DB_CORE, counterDeltas);
 
     return { count: stmts.length, inserted, lastRowId };
 }
@@ -736,6 +723,7 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
         if (request.method === 'PATCH') {
             const body = (await request.json()) as {
                 op: 'update_location_time' | 'update_video_name';
+                rowId?: number;
                 created_at?: string;
                 location?: string;
                 time?: number;
@@ -755,12 +743,27 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
                         .bind(body.time ?? 0, body.created_at)
                         .run();
                 }
-            } else if (body.op === 'update_video_name' && body.videoUrl) {
-                await env.DB_GAMELOG.prepare(
-                    'UPDATE gamelog_video_play SET video_name = ?, video_id = ? WHERE video_url = ?'
-                )
-                    .bind(body.videoName ?? '', body.videoId ?? '', body.videoUrl)
-                    .run();
+            } else if (body.op === 'update_video_name') {
+                const rowId = Number(body.rowId ?? 0);
+                if (Number.isFinite(rowId) && rowId > 0) {
+                    if (body.videoId !== undefined) {
+                        await env.DB_GAMELOG.prepare(
+                            'UPDATE gamelog_video_play SET video_name = ?, video_id = ? WHERE id = ?'
+                        )
+                            .bind(body.videoName ?? '', body.videoId ?? '', Math.floor(rowId))
+                            .run();
+                    } else {
+                        await env.DB_GAMELOG.prepare('UPDATE gamelog_video_play SET video_name = ? WHERE id = ?')
+                            .bind(body.videoName ?? '', Math.floor(rowId))
+                            .run();
+                    }
+                } else if (body.videoUrl) {
+                    await env.DB_GAMELOG.prepare(
+                        'UPDATE gamelog_video_play SET video_name = ?, video_id = ? WHERE video_url = ?'
+                    )
+                        .bind(body.videoName ?? '', body.videoId ?? '', body.videoUrl)
+                        .run();
+                }
             }
             return Response.json({ ok: true });
         }
@@ -1341,15 +1344,39 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
         }
 
         if (kind === 'top_worlds') {
+            const rawDays = Number(url.searchParams.get('days') ?? '0');
+            const days = Number.isFinite(rawDays) && rawDays > 0 ? Math.min(Math.floor(rawDays), 3650) : 0;
+            const sortBy = (url.searchParams.get('sortBy') ?? 'time').trim().toLowerCase();
+            const excludeWorldId = (url.searchParams.get('excludeWorldId') ?? '').trim();
+            const orderBySql =
+                sortBy === 'count' ? 'visits DESC, total_time DESC' : 'total_time DESC, visits DESC';
+
+            const conds: string[] = ["world_id != ''"];
+            const binds: unknown[] = [];
+            if (days > 0) {
+                const sinceIso = new Date(Date.now() - days * 86400_000).toISOString();
+                conds.push('created_at >= ?');
+                binds.push(sinceIso);
+            }
+            if (excludeWorldId) {
+                conds.push('world_id != ?');
+                binds.push(excludeWorldId);
+            }
+            const whereSql = conds.join(' AND ');
             const rows = await env.DB_GAMELOG.prepare(
                 `SELECT world_id, MAX(world_name) AS world_name, COUNT(*) AS visits, COALESCE(SUM(time), 0) AS total_time
-                 FROM (SELECT world_id, world_name, time FROM gamelog_location ORDER BY id DESC LIMIT 500)
-                 WHERE world_id != ''
+                 FROM (
+                     SELECT world_id, world_name, time
+                     FROM gamelog_location
+                     WHERE ${whereSql}
+                     ORDER BY id DESC
+                     LIMIT 5000
+                 )
                  GROUP BY world_id
-                 ORDER BY total_time DESC
+                 ORDER BY ${orderBySql}
                  LIMIT ?`
             )
-                .bind(Math.min(limit, 20))
+                .bind(...binds, Math.min(limit, 20))
                 .all();
             return Response.json({ ok: true, data: rows.results ?? [] });
         }
@@ -1573,6 +1600,27 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
         const playerKey = (uid: string, name: string): string =>
             uid ? `id:${uid}` : `name:${name.trim().toLowerCase()}`;
 
+        // Match primary key first; if one side lacked userId, fall back to case-insensitive displayName match.
+        const takeActivePlayer = (
+            primaryKey: string,
+            rawDisplayName: string
+        ): { id: number; display_name: string; user_id: string; location: string; joinMs: number } | undefined => {
+            const direct = activePlayers.get(primaryKey);
+            if (direct) {
+                activePlayers.delete(primaryKey);
+                return direct;
+            }
+            const lowerName = rawDisplayName.trim().toLowerCase();
+            if (!lowerName) return undefined;
+            for (const [k, candidate] of activePlayers.entries()) {
+                if (candidate.display_name.trim().toLowerCase() === lowerName) {
+                    activePlayers.delete(k);
+                    return candidate;
+                }
+            }
+            return undefined;
+        };
+
         const flushActiveRoom = (closeMs: number) => {
             if (activePlayers.size > 0) {
                 let effectiveCloseMs = closeMs;
@@ -1680,7 +1728,7 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
 
             // OnPlayerLeft
             if (ev.time > 0) {
-                activePlayers.delete(key);
+                takeActivePlayer(key, ev.display_name);
                 emitted.push({
                     id: ev.id,
                     created_at: ev.created_at,
@@ -1697,9 +1745,8 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
                 continue;
             }
 
-            const active = activePlayers.get(key);
+            const active = takeActivePlayer(key, ev.display_name);
             if (active) {
-                activePlayers.delete(key);
                 const dur = Math.max(1000, ev.ms - active.joinMs);
                 emitted.push({
                     id: ev.id,
@@ -2362,18 +2409,9 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
                 );
             }
 
-            // Include VRChat quit events in the same window so zero-duration VRCX.Agent
-            // Location rows are bounded accurately instead of stretching up to 24 hours.
-            locQueries.push(
-                env.DB_GAMELOG.prepare(
-                    'SELECT created_at, data FROM gamelog_event WHERE created_at >= ? ORDER BY created_at ASC LIMIT 500'
-                ).bind(eventFloorIso)
-            );
-
             const batch = await env.DB_GAMELOG.batch(locQueries);
-            const quitEventRes = batch[batch.length - 1];
             const rawLocRows: Array<{ created_at: string; time: number; ms: number }> = [];
-            for (let i = 0; i < batch.length - 1; i++) {
+            for (let i = 0; i < batch.length; i++) {
                 for (const r of (batch[i]?.results ?? []) as Array<{ created_at?: string; time?: number }>) {
                     const ts = String(r.created_at ?? '').trim();
                     const ms = Date.parse(ts);
@@ -2383,15 +2421,30 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
             }
             rawLocRows.sort((a, b) => a.ms - b.ms || a.created_at.localeCompare(b.created_at));
 
+            // Push the gamelog_event floor back to the preceding Location row (capped at 6h prior)
+            // so a pre-window zero-duration Location row sees any VRChat quit event occurring before fromDateIso.
+            const MAX_SELF_GAP_MS = 6 * 3600_000;
+            const baseFloorMs = Date.parse(eventFloorIso);
+            const earliestLocMs = rawLocRows.length > 0 ? rawLocRows[0]!.ms : baseFloorMs;
+            const effectiveQuitFloorIso =
+                Number.isFinite(baseFloorMs) && Number.isFinite(earliestLocMs) && earliestLocMs < baseFloorMs
+                    ? new Date(Math.max(earliestLocMs, baseFloorMs - MAX_SELF_GAP_MS)).toISOString()
+                    : eventFloorIso;
+
+            const quitEventRes = await env.DB_GAMELOG.prepare(
+                'SELECT created_at, data FROM gamelog_event WHERE created_at >= ? ORDER BY created_at ASC LIMIT 500'
+            )
+                .bind(effectiveQuitFloorIso)
+                .all<{ created_at?: string; data?: string }>();
+
             const quitTimestamps: number[] = [];
-            for (const r of (quitEventRes?.results ?? []) as Array<{ created_at?: string; data?: string }>) {
+            for (const r of quitEventRes.results ?? []) {
                 if (!String(r.data ?? '').includes('VRChat closed')) continue;
                 const ms = Date.parse(String(r.created_at ?? ''));
                 if (Number.isFinite(ms)) quitTimestamps.push(ms);
             }
             quitTimestamps.sort((a, b) => a - b);
 
-            const MAX_SELF_GAP_MS = 6 * 3600_000;
             const nowMs = Date.now();
             let quitIdx = 0;
             const normalized: Array<{ created_at: string; time: number }> = [];
@@ -2433,9 +2486,18 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
     if (url.pathname === '/api/activity/sessions') {
         if (request.method === 'GET') {
             const userId = url.searchParams.get('userId') ?? '';
-            const limit = clampLimit(url.searchParams.get('limit'), 500);
+            const limit = clampQueryLimit(url.searchParams.get('limit'), 500, 2000);
+            // Select the latest N sessions then order ascending so newer sessions are never truncated off.
             const res = await env.DB_FEED.prepare(
-                'SELECT session_id, user_id, start_at, end_at, is_open_tail, source_revision FROM activity_sessions_v2 WHERE user_id = ? ORDER BY start_at ASC LIMIT ?'
+                `SELECT session_id, user_id, start_at, end_at, is_open_tail, source_revision
+                 FROM (
+                     SELECT session_id, user_id, start_at, end_at, is_open_tail, source_revision
+                     FROM activity_sessions_v2
+                     WHERE user_id = ?
+                     ORDER BY start_at DESC
+                     LIMIT ?
+                 )
+                 ORDER BY start_at ASC`
             )
                 .bind(userId, limit)
                 .all();
@@ -2455,6 +2517,19 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
                     sourceRevision?: string;
                 }>;
             };
+            const rawSessions = Array.isArray(body.sessions) ? body.sessions : [];
+            if (rawSessions.length > 1000) {
+                return Response.json(
+                    {
+                        ok: false,
+                        error: {
+                            code: 'PAYLOAD_TOO_LARGE',
+                            message: 'Too many activity sessions in a single request (max 1000)'
+                        }
+                    },
+                    { status: 413 }
+                );
+            }
             const stmts: D1PreparedStatement[] = [];
             if (body.replace) {
                 stmts.push(env.DB_FEED.prepare('DELETE FROM activity_sessions_v2 WHERE user_id = ?').bind(body.userId));
@@ -2466,7 +2541,7 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
                     )
                 );
             }
-            for (const s of (body.sessions ?? []).slice(0, 200)) {
+            for (const s of rawSessions) {
                 const startAt = Number(s.start ?? s.startAt ?? 0);
                 const endAt = Number(s.end ?? s.endAt ?? 0);
                 if (!Number.isFinite(startAt) || !Number.isFinite(endAt) || endAt <= startAt) continue;
@@ -2476,8 +2551,8 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
                     ).bind(body.userId, startAt, endAt, s.isOpenTail ? 1 : 0, s.sourceRevision ?? '')
                 );
             }
-            if (stmts.length > 0) {
-                await env.DB_FEED.batch(stmts);
+            for (let i = 0; i < stmts.length; i += 100) {
+                await env.DB_FEED.batch(stmts.slice(i, i + 100));
             }
             return Response.json({ ok: true });
         }

@@ -16,7 +16,7 @@
         "type": "git",
         "url": "git+https://github.com/nuomew/VRCX-Worker.git"
     },
-    "main": "src-electron/main.js",
+    "main": "desktop/src-electron/main.js",
     "scripts": {
         "dev": "vite serve src",
         "dev:web": "vite serve src --mode web",
@@ -25,8 +25,8 @@
         "localization": "node ./src/shared/utils/localizationHelperCLI.js",
         "format": "oxfmt",
         "format:check": "oxfmt --check",
-        "dotnet_format": "dotnet format",
-        "dotnet_format:check": "dotnet format --verify-no-changes --verbosity diagnostic",
+        "dotnet_format": "dotnet format desktop/VRCX.slnx",
+        "dotnet_format:check": "dotnet format desktop/VRCX.slnx --verify-no-changes --verbosity diagnostic",
         "lint": "oxlint",
         "lint:fix": "oxlint --fix --fix-suggestions",
         "lint:fix-danger": "oxlint --fix --fix-suggestions --fix-dangerously",
@@ -35,12 +35,12 @@
         "typecheck:node": "tsc -p tsconfig.node.json",
         "test": "vitest run",
         "test:coverage": "vitest run --coverage",
-        "build:licenses": "node ./build-scripts/generate-third-party-licenses.js",
+        "build:licenses": "node ./desktop/build-scripts/generate-third-party-licenses.js",
         "prod": "vite build src && npm run build:licenses",
-        "build-electron": "node ./build-scripts/download-dotnet-runtime.js --arch=x64 && node ./build-scripts/patch-package-version.js && cross-env DEBUG=electron-builder electron-builder --config electron-builder.config.js --x64 --publish never",
-        "build-electron-arm64": "node ./build-scripts/download-dotnet-runtime.js --arch=arm64 && node ./build-scripts/patch-package-version.js && electron-builder --config electron-builder.config.js --arm64 --publish never",
-        "postbuild-electron": "node ./build-scripts/rename-builds.js --arch=x64",
-        "postbuild-electron-arm64": "node ./build-scripts/rename-builds.js --arch=arm64",
+        "build-electron": "node ./desktop/build-scripts/download-dotnet-runtime.js --arch=x64 && node ./desktop/build-scripts/patch-package-version.js && cross-env DEBUG=electron-builder electron-builder --config desktop/electron-builder.config.js --x64 --publish never",
+        "build-electron-arm64": "node ./desktop/build-scripts/download-dotnet-runtime.js --arch=arm64 && node ./desktop/build-scripts/patch-package-version.js && electron-builder --config desktop/electron-builder.config.js --arm64 --publish never",
+        "postbuild-electron": "node ./desktop/build-scripts/rename-builds.js --arch=x64",
+        "postbuild-electron-arm64": "node ./desktop/build-scripts/rename-builds.js --arch=arm64",
         "start-electron": "electron . --hot-reload"
     },
     "dependencies": {

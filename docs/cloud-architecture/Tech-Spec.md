@@ -33,8 +33,8 @@
    - `DB_FEED` (`vrcx-feed`): `feed_gps`, `feed_online_offline`, `feed_status`, `feed_bio`, `activity_sessions_v2`.
    - Excluded from D1: `gamelog_resource_load`, `cache_world`, `cache_avatar`, `activity_bucket_cache_v2`, `mutual_graph_*`, default `feed_avatar`.
    - `AgentHubDO`: Single-instance Durable Object (`"primary"`) managing Hibernatable WebSockets for both `agent` and `web` clients, live instance player snapshot, residential IP VRChat HTTP RPC relay, and allowlisted remote command dispatch.
-3. **Windows Companion Agent (`Dotnet/VRCX-Agent/`, .NET 10 Tray App)**:
-   - Reuses `Dotnet/LogWatcher.cs`, `ProcessMonitor.cs`, `WebApi.cs`, `Discord.cs`, `AutoAppLaunchManager.cs`, `AssetBundleManager.cs`, `ScreenshotMetadata/`, `XSOverlay.cs`, `OVRToolkit.cs`.
+3. **Windows Companion Agent (`VRCX-Agent/`, .NET 10 Tray App)**:
+   - Reuses `desktop/Dotnet/Discord.cs` and `desktop/Dotnet/ScreenshotMetadata/`.
    - Batches log events every 5-10s (0 requests when idle), buffers offline in local queue, protects credentials with Windows DPAPI, and maintains full local backup archive.
 
 ---
@@ -71,6 +71,6 @@
 
 - **Phase 0 (POC & Risk Validation)**: Minimal `cloud/` Worker, 3 D1 schemas + `FTS5 trigram`, `AgentHubDO` WebSocket Hibernation, VRChat API reachability probe endpoint, and automated Miniflare/Vitest benchmarks verifying `EXPLAIN QUERY PLAN`, `rows_read < 100`, and WS Hibernation routing.
 - **Phase 1 (Cloud Core + Stateless Web Frontend)**: Full auth, `/api/bootstrap`, structured cloud repositories (`src/services/database/cloud/`), `src/ipc-web/`, `--mode web` build, and zero-regression desktop checks.
-- **Phase 2 (`VRCX.Agent` Core Collector + R2 Gallery)**: Lightweight .NET 10 tray app reusing `Dotnet/` modules, pairing, offline queue, batch ingest, PNG metadata + optional R2 WebP thumbnail gallery.
+- **Phase 2 (`VRCX.Agent` Core Collector + R2 Gallery)**: Lightweight .NET 10 tray app reusing `desktop/Dotnet/` modules, pairing, offline queue, batch ingest, PNG metadata + optional R2 WebP thumbnail gallery.
 - **Phase 3 (Residential IP Relay + Remote Commands)**: Bidirectional `AgentHubDO` RPC for VRChat HTTP relay and allowlisted remote command execution with audit log.
 - **Phase 4 (Local Integrations & Mobile Polish)**: Discord RPC, AutoAppLaunch, XSOverlay/OVRToolkit wiring, D1 quota alerts, and mobile narrow-viewport fixes.

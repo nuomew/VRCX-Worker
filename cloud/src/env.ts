@@ -10,7 +10,7 @@ export interface Env {
     POC_ADMIN_TOKEN?: string;
     /** Optional shared sync secret for Windows VRCX.Agent periodic HTTP uploads. */
     AGENT_SYNC_KEY?: string;
-    /** Optional single-user admin passcode (plain secret or pbkdf2$<saltHex>$<hashHex>). */
+    /** Optional single-user admin passcode (plain secret or pbkdf2$<iterations>$<saltHex>$<hashHex>, max 100000 iterations). */
     ADMIN_PASSCODE?: string;
     /** Optional Base32 RFC-6238 TOTP secret paired with ADMIN_PASSCODE. */
     ADMIN_TOTP_SECRET?: string;

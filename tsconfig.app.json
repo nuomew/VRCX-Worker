@@ -22,6 +22,6 @@
             "@/*": ["./src/*"]
         }
     },
-    "include": ["src/**/*", "src-electron/**/*"],
+    "include": ["src/**/*", "desktop/src-electron/**/*"],
     "exclude": ["node_modules", "build"]
 }

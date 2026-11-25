@@ -11,7 +11,7 @@ import {
     incrementCounter,
     parseCloudSyncIntervalSeconds,
     parseWebSyncIntervalSeconds,
-    upsertEntityWorld
+    upsertEntityWorldsBatch
 } from '../routes/coreData';
 import { ingestFeedItems } from '../routes/eventsData';
 import { buildCookieHeader, loadCookieJar, mergeSetCookies, saveCookieJar, VRC_USER_AGENT } from '../routes/vrcProxy';
@@ -19,6 +19,9 @@ import { buildCookieHeader, loadCookieJar, mergeSetCookies, saveCookieJar, VRC_U
 const VRC_API_BASE = 'https://api.vrchat.cloud/api/1';
 const STATE_KEY_SNAPSHOT = 'friends_snapshot';
 const STATE_KEY_META = 'poller_meta';
+const STATE_KEY_WEB_ACTIVITY = 'web_activity';
+const STATE_KEY_LOCK = 'poller_lock';
+const POLLER_LOCK_TTL_MS = 90_000;
 export const BG_FEED_SYNC_CONFIG_KEY = 'cloud:bgFeedSyncEnabled';
 
 // Strict Cloudflare Workers Free-tier subrequest guardrails (max 50 external fetch/invocation; keep <= 16 here).
@@ -225,9 +228,9 @@ export function diffFriendSnapshot(
                 });
                 nextLocationAt = nowMs;
             } else if (isGameOnline && wasGameOnline && prev && !isTraveling) {
-                // 2. GPS (world/instance change)
+                // 2. GPS (world/instance change, including first arrival after coming online while traveling)
                 const prevLoc = prev.l;
-                if (prevLoc && prevLoc !== rawLoc) {
+                if (prevLoc !== rawLoc) {
                     const elapsedMs = prev.la > 0 ? Math.max(0, nowMs - prev.la) : 0;
                     feedItems.push({
                         created_at: nowIso,
@@ -309,9 +312,10 @@ async function readPollerState(env: Env): Promise<{
 }> {
     const [cfgRes, stateRes, vaultRes] = await env.DB_CORE.batch([
         env.DB_CORE.prepare("SELECT payload_json FROM config_bundles WHERE bundle_key = 'vrcx_config' LIMIT 1"),
-        env.DB_CORE.prepare('SELECT state_key, payload_json FROM cloud_bg_sync_state WHERE state_key IN (?, ?)').bind(
+        env.DB_CORE.prepare('SELECT state_key, payload_json FROM cloud_bg_sync_state WHERE state_key IN (?, ?, ?)').bind(
             STATE_KEY_META,
-            STATE_KEY_SNAPSHOT
+            STATE_KEY_SNAPSHOT,
+            STATE_KEY_WEB_ACTIVITY
         ),
         env.DB_CORE.prepare("SELECT updated_at FROM cloud_cookie_vault WHERE account_key = 'default' LIMIT 1")
     ]);
@@ -325,6 +329,7 @@ async function readPollerState(env: Env): Promise<{
 
     let meta = defaultPollerMeta();
     let snapshot: FriendSnapshotMap | null = null;
+    let dedicatedWebLastActiveAt: string | null = null;
 
     for (const row of (stateRes?.results ?? []) as Array<{ state_key: string; payload_json: string }>) {
         if (row.state_key === STATE_KEY_META) {
@@ -334,7 +339,15 @@ async function readPollerState(env: Env): Promise<{
             if (parsed && typeof parsed === 'object') {
                 snapshot = parsed;
             }
+        } else if (row.state_key === STATE_KEY_WEB_ACTIVITY) {
+            const parsed = safeJsonParse<{ webLastActiveAt?: string }>(row.payload_json, {});
+            if (typeof parsed.webLastActiveAt === 'string') {
+                dedicatedWebLastActiveAt = parsed.webLastActiveAt;
+            }
         }
+    }
+    if (dedicatedWebLastActiveAt !== null) {
+        meta.webLastActiveAt = dedicatedWebLastActiveAt;
     }
 
     const vaultRow = (vaultRes?.results?.[0] ?? null) as { updated_at?: string } | null;
@@ -361,19 +374,46 @@ async function writePollerMeta(env: Env, meta: PollerMeta, nowIso: string): Prom
 }
 
 /**
- * Records whether a Web UI tab is actively connected (or closing via `pagehide`) so the Cron poller
- * stays idle while the browser's live Pipeline WebSocket is running and takes over immediately on close.
+ * Records whether a Web UI tab is actively connected (or closing via `pagehide`) in a dedicated
+ * state row so heartbeats never race with or overwrite Cron `poller_meta` updates.
  */
 export async function markWebClientActive(env: Env, nowIso: string, closing = false): Promise<void> {
-    const row = await env.DB_CORE.prepare('SELECT payload_json FROM cloud_bg_sync_state WHERE state_key = ? LIMIT 1')
-        .bind(STATE_KEY_META)
-        .first<{ payload_json: string }>();
-    const meta: PollerMeta = {
-        ...defaultPollerMeta(),
-        ...safeJsonParse<Partial<PollerMeta>>(row?.payload_json, {})
-    };
-    meta.webLastActiveAt = closing ? '' : nowIso;
-    await writePollerMeta(env, meta, nowIso);
+    await env.DB_CORE.prepare(
+        `INSERT INTO cloud_bg_sync_state (state_key, payload_json, updated_at)
+         VALUES (?, ?, ?)
+         ON CONFLICT(state_key) DO UPDATE SET
+            payload_json = excluded.payload_json,
+            updated_at = excluded.updated_at`
+    )
+        .bind(STATE_KEY_WEB_ACTIVITY, JSON.stringify({ webLastActiveAt: closing ? '' : nowIso }), nowIso)
+        .run();
+}
+
+async function tryAcquirePollerLease(env: Env, nowMs: number, lockToken: string): Promise<boolean> {
+    const nowIso = new Date(nowMs).toISOString();
+    const expiredBeforeIso = new Date(nowMs - POLLER_LOCK_TTL_MS).toISOString();
+    const [, acquireRes] = await env.DB_CORE.batch([
+        env.DB_CORE.prepare(
+            "INSERT OR IGNORE INTO cloud_bg_sync_state (state_key, payload_json, updated_at) VALUES (?, '', '')"
+        ).bind(STATE_KEY_LOCK),
+        env.DB_CORE.prepare(
+            `UPDATE cloud_bg_sync_state
+             SET payload_json = ?, updated_at = ?
+             WHERE state_key = ? AND (updated_at = '' OR updated_at < ?)`
+        ).bind(lockToken, nowIso, STATE_KEY_LOCK, expiredBeforeIso)
+    ]);
+    return (acquireRes?.meta?.changes ?? 0) === 1;
+}
+
+async function releasePollerLease(env: Env, lockToken: string): Promise<void> {
+    await env.DB_CORE.prepare(
+        `UPDATE cloud_bg_sync_state
+         SET payload_json = '', updated_at = ''
+         WHERE state_key = ? AND payload_json = ?`
+    )
+        .bind(STATE_KEY_LOCK, lockToken)
+        .run()
+        .catch(() => {});
 }
 
 /**
@@ -479,8 +519,8 @@ async function resolveWorldNames(
     }
 
     // 1. Check cached entity_worlds dictionary in DB_CORE first (zero external requests)
-    for (let i = 0; i < unique.length; i += 25) {
-        const chunk = unique.slice(i, i + 25);
+    for (let i = 0; i < unique.length; i += 60) {
+        const chunk = unique.slice(i, i + 60);
         const ph = chunk.map(() => '?').join(', ');
         const res = await env.DB_CORE.prepare(
             `SELECT world_id, world_name FROM entity_worlds WHERE world_id IN (${ph})`
@@ -495,6 +535,7 @@ async function resolveWorldNames(
     }
 
     // 2. Check dedicated DB_CACHE for any remaining world JSON before hitting api.vrchat.cloud
+    const worldsToUpsert = new Map<string, string>();
     const missingForCache = unique.filter((id) => !names.has(id));
     if (missingForCache.length > 0) {
         const cacheUrls = missingForCache.map((id) => `${VRC_API_BASE}/worlds/${encodeURIComponent(id)}`);
@@ -507,7 +548,7 @@ async function resolveWorldNames(
             const name = String(parsed.name ?? '').trim();
             if (name) {
                 names.set(worldId, name);
-                await upsertEntityWorld(env.DB_CORE, worldId, name).catch(() => {});
+                worldsToUpsert.set(worldId, name);
             }
         }
     }
@@ -533,7 +574,7 @@ async function resolveWorldNames(
                 const name = String((res.data as { name?: unknown }).name ?? '').trim();
                 if (name) {
                     names.set(worldId, name);
-                    await upsertEntityWorld(env.DB_CORE, worldId, name);
+                    worldsToUpsert.set(worldId, name);
                 }
                 if (res.rawText) {
                     cacheWrites.push({
@@ -548,6 +589,9 @@ async function resolveWorldNames(
         } catch {
             // Non-fatal: leave worldName blank if lookup transiently fails
         }
+    }
+    if (worldsToUpsert.size > 0) {
+        await upsertEntityWorldsBatch(env.DB_CORE, worldsToUpsert, 60).catch(() => {});
     }
     if (cacheWrites.length > 0) {
         await putCachedVrcResponses(env, cacheWrites).catch(() => {});
@@ -575,8 +619,8 @@ async function pollRotatingFriendBios(
 
     // Load existing cached profiles for online friends in batched IN queries
     const existingMap = new Map<string, { bio: string; bioLinks: string[]; updatedAtMs: number }>();
-    for (let i = 0; i < candidates.length; i += 25) {
-        const chunk = candidates.slice(i, i + 25).map((c) => c.id);
+    for (let i = 0; i < candidates.length; i += 60) {
+        const chunk = candidates.slice(i, i + 60).map((c) => c.id);
         const ph = chunk.map(() => '?').join(', ');
         const res = await env.DB_CORE.prepare(
             `SELECT user_id, bio, bio_links, updated_at FROM user_profile WHERE user_id IN (${ph})`
@@ -1151,6 +1195,17 @@ export async function runBackgroundFeedSync(
     options: { force?: boolean; trigger?: 'cron' | 'manual' } = {}
 ): Promise<BackgroundFeedSyncResult> {
     const force = Boolean(options.force);
+    if (env.VRC_ALLOW_CLOUD_FALLBACK === 'false') {
+        return {
+            ran: false,
+            status: 'skipped_disabled',
+            onlineCount: 0,
+            feedInserted: 0,
+            notificationsInserted: 0,
+            bioChecked: 0,
+            error: 'Cloud direct fallback is disabled (VRC_ALLOW_CLOUD_FALLBACK=false)'
+        };
+    }
     const nowMs = Date.now();
     const nowIso = new Date(nowMs).toISOString();
 
@@ -1201,37 +1256,50 @@ export async function runBackgroundFeedSync(
         }
     }
 
-    const jar = await loadCookieJar(env);
-    if (!jar.auth?.trim()) {
-        meta.lastRunAt = nowIso;
-        meta.lastStatus = 'no_session';
-        meta.lastError = 'No VRChat session cookie in cloud vault';
-        await writePollerMeta(env, meta, nowIso);
+    const lockToken = crypto.randomUUID();
+    const acquired = await tryAcquirePollerLease(env, nowMs, lockToken).catch(() => true);
+    if (!acquired) {
         return {
             ran: false,
-            status: 'no_session',
-            onlineCount: 0,
+            status: 'skipped_interval',
+            onlineCount: meta.lastOnlineCount,
             feedInserted: 0,
             notificationsInserted: 0,
-            bioChecked: 0,
-            error: meta.lastError
+            bioChecked: 0
         };
     }
 
-    let cookieDirty = false;
-    const onlineFriends: VrcFriendApiRecord[] = [];
-    const rawOnlineFriendRecords: Array<Record<string, unknown>> = [];
-    const seenIds = new Set<string>();
-    const friendsCacheWrites: Array<{
-        url: string;
-        tier: 'friends_online';
-        status: number;
-        bodyText: string;
-        ttlMs: number;
-    }> = [];
-    const friendsTtlMs = Math.max(60, webSyncIntervalSeconds) * 1000;
-
     try {
+        const jar = await loadCookieJar(env);
+        if (!jar.auth?.trim()) {
+            meta.lastRunAt = nowIso;
+            meta.lastStatus = 'no_session';
+            meta.lastError = 'No VRChat session cookie in cloud vault';
+            await writePollerMeta(env, meta, nowIso);
+            return {
+                ran: false,
+                status: 'no_session',
+                onlineCount: 0,
+                feedInserted: 0,
+                notificationsInserted: 0,
+                bioChecked: 0,
+                error: meta.lastError
+            };
+        }
+
+        let cookieDirty = false;
+        const onlineFriends: VrcFriendApiRecord[] = [];
+        const rawOnlineFriendRecords: Array<Record<string, unknown>> = [];
+        const seenIds = new Set<string>();
+        const friendsCacheWrites: Array<{
+            url: string;
+            tier: 'friends_online';
+            status: number;
+            bodyText: string;
+            ttlMs: number;
+        }> = [];
+        const friendsTtlMs = Math.max(60, webSyncIntervalSeconds) * 1000;
+
         for (let page = 0; page < MAX_FRIEND_PAGES; page++) {
             const offset = page * FRIEND_PAGE_SIZE;
             const pathWithQuery = `auth/user/friends?offline=false&n=${FRIEND_PAGE_SIZE}&offset=${offset}`;
@@ -1349,7 +1417,7 @@ export async function runBackgroundFeedSync(
         if (friendLogRes.cookieChanged) cookieDirty = true;
 
         if (cookieDirty) {
-            await saveCookieJar(env, jar);
+            await saveCookieJar(env, jar, 'default', { requireExisting: true });
         }
 
         const inGameCount = Object.values(nextSnapshot).filter((entry) => entry.o).length;
@@ -1418,6 +1486,8 @@ export async function runBackgroundFeedSync(
             friendLogInserted: 0,
             error: meta.lastError
         };
+    } finally {
+        await releasePollerLease(env, lockToken);
     }
 }
 

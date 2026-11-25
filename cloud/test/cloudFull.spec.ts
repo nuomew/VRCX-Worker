@@ -1,9 +1,12 @@
 import { env as rawEnv, exports as rawExports } from 'cloudflare:workers';
 import { beforeAll, describe, expect, it, vi } from 'vitest';
-import { hmacSha256Hex, sha256Hex } from '../src/crypto/vault';
+import { getMasterKey } from '../src/auth/auth';
+import { hmacSha256Hex, sha256Hex, verifyPasscode } from '../src/crypto/vault';
 import type { Env } from '../src/env';
 import worker from '../src/index';
-import { runBackgroundFeedSync } from '../src/sync/backgroundFeedSync';
+import { incrementCounter } from '../src/routes/coreData';
+import { mergeSetCookies } from '../src/routes/vrcProxy';
+import { diffFriendSnapshot, runBackgroundFeedSync } from '../src/sync/backgroundFeedSync';
 
 const env = rawEnv as unknown as Env;
 const exports = rawExports as unknown as { default: Fetcher };
@@ -2720,5 +2723,573 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
         expect(errReply.type).toBe('error');
         expect((errReply.payload as Record<string, unknown>)?.code).toBe('FORBIDDEN_WS_RELAY');
         webSocket.close(1000, 'done');
+    });
+
+    it('covers Wave 3 P0 fixes: savedCredentials stripping, notes validation, atomic rate-limit & TOTP replay, revoke WS disconnect, mandatory paired HMAC, and batch limits', async () => {
+        // 1. P0-1: PUT /api/config/bundle and GET /api/bootstrap strip plaintext password & cookies from savedCredentials
+        const credRes = await exports.default.fetch('http://example.com/api/config/bundle', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                bundleKey: 'vrcx_config',
+                patch: {
+                    'config:savedcredentials': JSON.stringify({
+                        usr_leak: {
+                            user: { id: 'usr_leak' },
+                            loginParams: { username: 'user@example.com', password: 'super-secret-password' },
+                            cookies: 'YXV0aD1zZWNyZXQ='
+                        }
+                    })
+                }
+            })
+        });
+        expect(credRes.status).toBe(200);
+        const bootRes = await exports.default.fetch('http://example.com/api/bootstrap');
+        const bootJson = (await bootRes.json()) as { ok: boolean; data: { configs: Record<string, string> } };
+        const sanitizedCreds = JSON.parse(bootJson.data.configs['config:savedcredentials'] ?? '{}') as Record<
+            string,
+            { loginParams?: { username?: string; password?: string }; cookies?: string }
+        >;
+        expect(sanitizedCreds.usr_leak?.loginParams?.username).toBe('user@example.com');
+        expect(sanitizedCreds.usr_leak?.loginParams?.password).toBe('');
+        expect(sanitizedCreds.usr_leak?.cookies).toBeUndefined();
+
+        // 2. P0-2: PUT /api/notes rejects non-string userId cleanly with 400 BAD_NOTE (never D1 500)
+        const badNoteRes = await exports.default.fetch('http://example.com/api/notes', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ userId: { userId: 'usr_nested' }, note: 'oops' })
+        });
+        expect(badNoteRes.status).toBe(400);
+
+        // 3. P0-4: Concurrent login failures increment atomically -> 429; spoofed X-Forwarded-For cannot bypass; uniform error + TOTP single-use replay protection
+        const totpSecret = 'JBSWY3DPEHPK3PXP'; // standard RFC 6238 base32 test secret
+        const securedEnv: Env = {
+            ...env,
+            ADMIN_PASSCODE: 'wave3-strong-pass',
+            ADMIN_TOTP_SECRET: totpSecret
+        };
+        const concurrentAttempts = await Promise.all(
+            Array.from({ length: 6 }, () =>
+                worker.fetch(
+                    new Request('http://example.com/api/auth/login', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': '203.0.113.55' },
+                        body: JSON.stringify({ passcode: 'wrong-pass', totp: '000000' })
+                    }),
+                    securedEnv
+                )
+            )
+        );
+        expect(concurrentAttempts.every((r) => r.status === 401 || r.status === 429)).toBe(true);
+        const lockedAfterConcurrent = await worker.fetch(
+            new Request('http://example.com/api/auth/login', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': '203.0.113.55' },
+                body: JSON.stringify({ passcode: 'wave3-strong-pass', totp: '000000' })
+            }),
+            securedEnv
+        );
+        expect(lockedAfterConcurrent.status).toBe(429);
+
+        // Without CF-Connecting-IP, rotating spoofed X-Forwarded-For values still hits the same no-cf-ip bucket
+        for (let i = 0; i < 5; i++) {
+            await worker.fetch(
+                new Request('http://example.com/api/auth/login', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'X-Forwarded-For': `10.0.0.${i + 1}` },
+                    body: JSON.stringify({ passcode: 'bad-xff-pass', totp: '000000' })
+                }),
+                securedEnv
+            );
+        }
+        const xffBlocked = await worker.fetch(
+            new Request('http://example.com/api/auth/login', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'X-Forwarded-For': '10.0.0.99' },
+                body: JSON.stringify({ passcode: 'bad-xff-pass', totp: '000000' })
+            }),
+            securedEnv
+        );
+        expect(xffBlocked.status).toBe(429);
+
+        // Uniform error code whether passcode is wrong or only TOTP is wrong (no passcode oracle)
+        const wrongPassRes = await worker.fetch(
+            new Request('http://example.com/api/auth/login', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': '203.0.113.70' },
+                body: JSON.stringify({ passcode: 'wrong', totp: '000000' })
+            }),
+            securedEnv
+        );
+        const wrongTotpRes = await worker.fetch(
+            new Request('http://example.com/api/auth/login', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': '203.0.113.71' },
+                body: JSON.stringify({ passcode: 'wave3-strong-pass', totp: '000000' })
+            }),
+            securedEnv
+        );
+        const wrongPassJson = (await wrongPassRes.json()) as { error: { code: string } };
+        const wrongTotpJson = (await wrongTotpRes.json()) as { error: { code: string } };
+        expect(wrongPassJson.error.code).toBe('INVALID_CREDENTIALS');
+        expect(wrongTotpJson.error.code).toBe('INVALID_CREDENTIALS');
+
+        // Generate valid current TOTP for JBSWY3DPEHPK3PXP ("Hello!" -> bytes 0x48,0x65,0x6c,0x6c,0x6f,0x21,0xde,0xad,0xbe,0xef)
+        const keyBytes = new Uint8Array([0x48, 0x65, 0x6c, 0x6c, 0x6f, 0x21, 0xde, 0xad, 0xbe, 0xef]);
+        const hmacKey = await crypto.subtle.importKey('raw', keyBytes, { name: 'HMAC', hash: 'SHA-1' }, false, ['sign']);
+        const step = Math.floor(Date.now() / 30_000);
+        const stepBuf = new ArrayBuffer(8);
+        const stepView = new DataView(stepBuf);
+        stepView.setUint32(0, Math.floor(step / 0x100000000));
+        stepView.setUint32(4, step >>> 0);
+        const mac = new Uint8Array(await crypto.subtle.sign('HMAC', hmacKey, stepBuf));
+        const off = mac[mac.length - 1]! & 0x0f;
+        const bin =
+            ((mac[off]! & 0x7f) << 24) |
+            ((mac[off + 1]! & 0xff) << 16) |
+            ((mac[off + 2]! & 0xff) << 8) |
+            (mac[off + 3]! & 0xff);
+        const validOtp = String(bin % 1_000_000).padStart(6, '0');
+
+        const firstTotpLogin = await worker.fetch(
+            new Request('http://example.com/api/auth/login', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': '203.0.113.72' },
+                body: JSON.stringify({ passcode: 'wave3-strong-pass', totp: validOtp })
+            }),
+            securedEnv
+        );
+        expect(firstTotpLogin.status).toBe(200);
+        // Replaying the exact same TOTP code immediately must fail (single-use step claim)
+        const replayTotpLogin = await worker.fetch(
+            new Request('http://example.com/api/auth/login', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': '203.0.113.72' },
+                body: JSON.stringify({ passcode: 'wave3-strong-pass', totp: validOtp })
+            }),
+            securedEnv
+        );
+        expect(replayTotpLogin.status).toBe(401);
+
+        // 4. P0-5 & P0-6: Paired device enforces mandatory HMAC on HTTP endpoints (including screenshot upload) and DELETE revokes live WS
+        const codeRes = await exports.default.fetch('http://example.com/api/agent/pair-code', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ deviceLabel: 'Wave3-Paired-PC' })
+        });
+        const pairCode = ((await codeRes.json()) as { data: { code: string } }).data.code;
+        const pairRes = await exports.default.fetch('http://example.com/api/agent/pair', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': '203.0.113.80' },
+            body: JSON.stringify({ code: pairCode, deviceName: 'Wave3-Paired-PC' })
+        });
+        expect(pairRes.status).toBe(200);
+        const { deviceId, deviceToken, hmacSecret } = ((await pairRes.json()) as {
+            data: { deviceId: string; deviceToken: string; hmacSecret: string };
+        }).data;
+
+        // Omitting X-Signature / X-Timestamp on paired device MUST be rejected with 401 (no downgrade to bare Bearer)
+        const unsignedIngest = await exports.default.fetch('http://example.com/api/agent/ingest/gamelog', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${deviceToken}` },
+            body: JSON.stringify({ events: [] })
+        });
+        expect(unsignedIngest.status).toBe(401);
+
+        const shotPath = '/api/agent/media/screenshots/wave3hmacshot0001';
+        const shotBytes = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
+        const unsignedShot = await exports.default.fetch(`http://example.com${shotPath}`, {
+            method: 'PUT',
+            headers: { Authorization: `Bearer ${deviceToken}`, 'Content-Type': 'image/png' },
+            body: shotBytes
+        });
+        expect(unsignedShot.status).toBe(401);
+
+        // Signed screenshot upload with actual body bytes hash succeeds
+        const shotTs = String(Math.floor(Date.now() / 1000));
+        const shotHash = await sha256Hex(shotBytes);
+        const shotSig = await hmacSha256Hex(hmacSecret, `${shotTs}\nPUT\n${shotPath}\n${shotHash}`);
+        const signedShot = await exports.default.fetch(`http://example.com${shotPath}`, {
+            method: 'PUT',
+            headers: {
+                Authorization: `Bearer ${deviceToken}`,
+                'Content-Type': 'image/png',
+                'X-Device-Id': deviceId,
+                'X-Timestamp': shotTs,
+                'X-Signature': shotSig
+            },
+            body: shotBytes
+        });
+        expect(signedShot.status).toBe(200);
+
+        // Connect WS agent + WS web, then revoke device via DELETE /api/agent/devices -> live WS closed & state removed
+        const agentWsRes = await exports.default.fetch(
+            `http://example.com/ws/agent?deviceId=${encodeURIComponent(deviceId)}`,
+            { headers: { Upgrade: 'websocket', Authorization: `Bearer ${deviceToken}` } }
+        );
+        expect(agentWsRes.status).toBe(101);
+        const agentWs = agentWsRes.webSocket!;
+        agentWs.accept();
+
+        const webWsRes = await exports.default.fetch('http://example.com/ws/web', {
+            headers: { Upgrade: 'websocket' }
+        });
+        expect(webWsRes.status).toBe(101);
+        const webWs = webWsRes.webSocket!;
+        webWs.accept();
+
+        const offlineBroadcast = waitForMessage(webWs, (m) => m.includes('"agent.offline"') && m.includes(deviceId));
+        const agentClosed = new Promise<number>((resolve) => {
+            agentWs.addEventListener('close', (ev) => resolve(ev.code));
+        });
+
+        const revokeRes = await exports.default.fetch(
+            `http://example.com/api/agent/devices?deviceId=${encodeURIComponent(deviceId)}`,
+            { method: 'DELETE' }
+        );
+        expect(revokeRes.status).toBe(200);
+        expect(await offlineBroadcast).toContain('"revoked":true');
+        expect(await agentClosed).toBe(4001);
+
+        const statusAfterRevoke = await exports.default.fetch('http://example.com/api/agent/status');
+        const statusJson = (await statusAfterRevoke.json()) as {
+            data: { agentsOnline: string[]; deviceStates: Record<string, unknown> };
+        };
+        expect(statusJson.data.agentsOnline).not.toContain(deviceId);
+        expect(statusJson.data.deviceStates[deviceId]).toBeUndefined();
+        webWs.close(1000, 'done');
+
+        // 5. P0-7: Batch endpoints enforce 500-entry ceiling (413) and GameLog entity upserts succeed in batched D1 calls
+        const oversizeRes = await exports.default.fetch('http://example.com/api/friend-log/history', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                entries: Array.from({ length: 501 }, (_, idx) => ({
+                    type: 'DisplayName',
+                    user_id: `usr_over_${idx}`
+                }))
+            })
+        });
+        expect(oversizeRes.status).toBe(413);
+
+        const bulkGamelogItems = [
+            ...Array.from({ length: 15 }, (_, idx) => ({
+                type: 'Location',
+                created_at: `2026-11-25T00:00:${String(idx).padStart(2, '0')}.000Z`,
+                location: `wrld_w3_${idx}:100`,
+                worldId: `wrld_w3_${idx}`,
+                worldName: `Wave3 World ${idx}`
+            })),
+            ...Array.from({ length: 25 }, (_, idx) => ({
+                type: 'OnPlayerJoined',
+                created_at: `2026-11-25T00:01:${String(idx).padStart(2, '0')}.000Z`,
+                location: 'wrld_w3_0:100',
+                userId: `usr_w3_${idx}`,
+                displayName: `Wave3User${idx}`
+            }))
+        ];
+        const bulkGamelogRes = await exports.default.fetch('http://example.com/api/gamelog', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ items: bulkGamelogItems })
+        });
+        expect(bulkGamelogRes.status).toBe(200);
+        const worldEntityCnt = await env.DB_CORE.prepare(
+            "SELECT COUNT(*) AS cnt FROM entity_worlds WHERE world_id LIKE 'wrld_w3_%'"
+        ).first<{ cnt: number }>();
+        const userEntityCnt = await env.DB_CORE.prepare(
+            "SELECT COUNT(*) AS cnt FROM entity_users WHERE user_id LIKE 'usr_w3_%'"
+        ).first<{ cnt: number }>();
+        expect(worldEntityCnt?.cnt).toBe(15);
+        expect(userEntityCnt?.cnt).toBe(25);
+    });
+
+    it('covers Wave 3 P1 & P2 backend fixes: CSWSH/CSRF Origin check, activity sessions ceiling, SSRF redirect+IPv6/fc2, fallback guard, cookie cache purge, master key fail-closed, PBKDF2 cap, counter decrement, bypassCache refresh, traveling GPS, video rowId, notifV2 expire+seen, top_worlds params', async () => {
+        // 1. P1-1: Cross-origin WS upgrade and state-changing Web request blocked with 403 FORBIDDEN_ORIGIN
+        const evilWs = await exports.default.fetch('http://example.com/ws/web', {
+            headers: { Upgrade: 'websocket', Origin: 'https://evil.attacker.example' }
+        });
+        expect(evilWs.status).toBe(403);
+        const evilPost = await exports.default.fetch('http://example.com/api/commands', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Origin: 'https://evil.attacker.example' },
+            body: JSON.stringify({ action: 'sync_now', params: {} })
+        });
+        expect(evilPost.status).toBe(403);
+
+        // 2. P1-2: Activity sessions persist >100 items, return newest ordered ASC, and reject >1000 with 413
+        const manySessions = Array.from({ length: 120 }, (_, i) => ({
+            start: 1_700_000_000_000 + i * 3600_000,
+            end: 1_700_000_000_000 + i * 3600_000 + 1800_000
+        }));
+        const postSess = await exports.default.fetch('http://example.com/api/activity/sessions', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ userId: 'usr_w3_sess', replace: true, sessions: manySessions })
+        });
+        expect(postSess.status).toBe(200);
+        const getSess = await exports.default.fetch('http://example.com/api/activity/sessions?userId=usr_w3_sess');
+        const sessJson = (await getSess.json()) as { data: Array<{ start_at: number }> };
+        expect(sessJson.data).toHaveLength(120);
+        expect(sessJson.data[0]?.start_at).toBe(manySessions[0]!.start);
+        expect(sessJson.data[119]?.start_at).toBe(manySessions[119]!.start);
+
+        const overSess = await exports.default.fetch('http://example.com/api/activity/sessions', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                userId: 'usr_w3_sess_over',
+                sessions: Array.from({ length: 1001 }, (_, i) => ({ start: i * 10 + 1, end: i * 10 + 5 }))
+            })
+        });
+        expect(overSess.status).toBe(413);
+
+        // 3. P1-3 & P1-15 & P2-2: SSRF 3xx redirect blocked, fc2.com translation allowed, IPv6 ULA blocked, bypassCache refreshes DB_CACHE
+        await exports.default.fetch('http://example.com/api/config/bundle', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                bundleKey: 'vrcx_config',
+                patch: { 'config:vrcx_translationapiendpoint': 'https://translate.fc2.com/v1/translate' }
+            })
+        });
+        const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+            const u = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+            if (u.includes('api.vrchat.cloud/api/1/worlds/wrld_redir')) {
+                return new Response(null, { status: 302, headers: { Location: 'https://169.254.169.254/latest/meta-data/' } });
+            }
+            if (u.startsWith('https://translate.fc2.com/')) {
+                return new Response(JSON.stringify({ translated: 'ok' }), {
+                    status: 200,
+                    headers: { 'Content-Type': 'application/json' }
+                });
+            }
+            if (u.includes('api.vrchat.cloud/api/1/worlds/wrld_bypass_test')) {
+                return new Response(JSON.stringify({ id: 'wrld_bypass_test', rev: Date.now() }), {
+                    status: 200,
+                    headers: { 'Content-Type': 'application/json' }
+                });
+            }
+            return new Response('{}', { status: 200 });
+        });
+        try {
+            const redirRes = await exports.default.fetch('http://example.com/api/vrc/execute', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    url: 'https://api.vrchat.cloud/api/1/worlds/wrld_redir',
+                    method: 'GET',
+                    preferCloudDirect: true
+                })
+            });
+            expect(redirRes.status).toBe(502);
+
+            const fc2Res = await exports.default.fetch('http://example.com/api/vrc/execute', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    url: 'https://translate.fc2.com/v1/translate',
+                    method: 'POST',
+                    body: '{"text":"hi"}',
+                    preferCloudDirect: true
+                })
+            });
+            expect(fc2Res.status).toBe(200);
+
+            const ipv6Blocked = await exports.default.fetch('http://example.com/api/vrc/execute', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    url: 'https://[fd00::1]/v1/translate',
+                    method: 'GET',
+                    preferCloudDirect: true
+                })
+            });
+            expect(ipv6Blocked.status).toBe(403);
+
+            // P2-2: bypassCache forces fresh fetch and writes fresh value back into DB_CACHE
+            const firstWorld = await exports.default.fetch('http://example.com/api/vrc/execute', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    url: 'https://api.vrchat.cloud/api/1/worlds/wrld_bypass_test',
+                    method: 'GET',
+                    preferCloudDirect: true
+                })
+            });
+            const firstBody = ((await firstWorld.json()) as { data: { data: string } }).data.data;
+            await new Promise((r) => setTimeout(r, 5));
+            const refreshedWorld = await exports.default.fetch('http://example.com/api/vrc/execute', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    url: 'https://api.vrchat.cloud/api/1/worlds/wrld_bypass_test',
+                    method: 'GET',
+                    preferCloudDirect: true,
+                    bypassCache: true
+                })
+            });
+            const refreshedBody = ((await refreshedWorld.json()) as { data: { data: string } }).data.data;
+            expect(refreshedBody).not.toBe(firstBody);
+            // Subsequent normal GET hits refreshed cache
+            const cachedAfterBypass = await exports.default.fetch('http://example.com/api/vrc/execute', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    url: 'https://api.vrchat.cloud/api/1/worlds/wrld_bypass_test',
+                    method: 'GET',
+                    preferCloudDirect: true
+                })
+            });
+            const cachedJson = (await cachedAfterBypass.json()) as { data: { data: string; cached?: boolean } };
+            expect(cachedJson.data.cached).toBe(true);
+            expect(cachedJson.data.data).toBe(refreshedBody);
+        } finally {
+            fetchSpy.mockRestore();
+        }
+
+        // 4. P1-4: VRC_ALLOW_CLOUD_FALLBACK=false blocks /api/vrc/pipeline and runBackgroundFeedSync
+        const noFallbackEnv: Env = { ...env, VRC_ALLOW_CLOUD_FALLBACK: 'false' };
+        const pipeBlocked = await worker.fetch(
+            new Request('http://example.com/api/vrc/pipeline', { headers: { Upgrade: 'websocket' } }),
+            noFallbackEnv
+        );
+        expect(pipeBlocked.status).toBe(503);
+        const bgBlocked = await runBackgroundFeedSync(noFallbackEnv, { force: true, trigger: 'manual' });
+        expect(bgBlocked.ran).toBe(false);
+        expect(bgBlocked.status).toBe('skipped_disabled');
+
+        // 5. P1-5: DELETE /api/vrc/cookies purges DB_CACHE and friends_snapshot
+        await env.DB_CORE.prepare(
+            "INSERT OR REPLACE INTO cloud_bg_sync_state (state_key, payload_json, updated_at) VALUES ('friends_snapshot', '{\"u\":{}}', ?)"
+        )
+            .bind(new Date().toISOString())
+            .run();
+        const delCookieRes = await exports.default.fetch('http://example.com/api/vrc/cookies', { method: 'DELETE' });
+        expect(delCookieRes.status).toBe(200);
+        const snapRow = await env.DB_CORE.prepare(
+            "SELECT state_key FROM cloud_bg_sync_state WHERE state_key = 'friends_snapshot'"
+        ).first();
+        expect(snapRow).toBeNull();
+
+        // 6. P1-7 & P1-9: Non-open_setup rejects missing master key (fail-closed); PBKDF2 iterations > 100_000 rejected
+        expect(() =>
+            getMasterKey({
+                ...env,
+                COOKIE_MASTER_KEY: '',
+                ADMIN_PASSCODE: '',
+                POC_ADMIN_TOKEN: '',
+                CF_ACCESS_TEAM_DOMAIN: 'team.cloudflareaccess.com',
+                CF_ACCESS_AUD: 'aud-test'
+            })
+        ).toThrow();
+        expect(await verifyPasscode('anything', 'pbkdf2$500000$0011223344556677$aabbccdd')).toBe(false);
+
+        // 7. P1-10: POST /api/commands sanitizes non-finite ttlSec
+        const cmdRes = await exports.default.fetch('http://example.com/api/commands', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ action: 'sync_now', params: {}, ttlSec: null })
+        });
+        expect(cmdRes.status).toBe(200);
+        const cmdJson = (await cmdRes.json()) as { data: { expiresAt: string } };
+        expect(Number.isFinite(Date.parse(cmdJson.data.expiresAt))).toBe(true);
+
+        // 8. P2-1: incrementCounter accurately decrements with negative delta
+        await incrementCounter(env.DB_CORE, 'w3_dec_test', 5);
+        await incrementCounter(env.DB_CORE, 'w3_dec_test', -2);
+        const decRow = await env.DB_CORE.prepare(
+            "SELECT row_count FROM stats_counters WHERE counter_key = 'w3_dec_test'"
+        ).first<{ row_count: number }>();
+        expect(decRow?.row_count).toBe(3);
+
+        // 9. P2-3: diffFriendSnapshot emits first GPS when friend lands from traveling; mergeSetCookies honors negative Max-Age and past Expires
+        const t1 = '2026-11-25T03:00:00.000Z';
+        const t2 = '2026-11-25T03:02:00.000Z';
+        const step1 = diffFriendSnapshot(
+            {},
+            [{ id: 'usr_trav', displayName: 'Traveler', location: 'traveling', status: 'active' }],
+            t1
+        );
+        expect(step1.feedItems.some((f) => f.type === 'Online')).toBe(true);
+        const step2 = diffFriendSnapshot(
+            step1.nextSnapshot,
+            [
+                {
+                    id: 'usr_trav',
+                    displayName: 'Traveler',
+                    location: 'wrld_12345678-1234-1234-1234-1234567890ab:100',
+                    status: 'active'
+                }
+            ],
+            t2,
+            new Map([['wrld_12345678-1234-1234-1234-1234567890ab', 'Landing World']])
+        );
+        expect(step2.feedItems.some((f) => f.type === 'GPS' && f.worldName === 'Landing World')).toBe(true);
+
+        const testJar: Record<string, string> = { auth: 'keep', a: '1', b: '2' };
+        const expHeaders = new Headers();
+        expHeaders.append('Set-Cookie', 'a=1; Max-Age=-1; Path=/');
+        expHeaders.append('Set-Cookie', 'b=2; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Path=/');
+        expect(mergeSetCookies(testJar, expHeaders)).toBe(true);
+        expect(testJar).toEqual({ auth: 'keep' });
+
+        // 10. P2-6 & P2-10: PATCH /api/gamelog update_video_name by rowId, notifications_v2 expire sets seen=1, top_worlds filters by days/sortBy/excludeWorldId
+        const vpIns = await env.DB_GAMELOG.prepare(
+            "INSERT INTO gamelog_video_play (created_at, video_url, video_name, location) VALUES ('2026-11-25T04:00:00Z', 'https://youtu.be/w3row', '', 'wrld_v:1')"
+        ).run();
+        const vpRowId = Number(vpIns.meta?.last_row_id ?? 0);
+        expect(vpRowId).toBeGreaterThan(0);
+        await exports.default.fetch('http://example.com/api/gamelog', {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ op: 'update_video_name', rowId: vpRowId, videoName: 'Updated By RowId' })
+        });
+        const vpCheck = await env.DB_GAMELOG.prepare('SELECT video_name FROM gamelog_video_play WHERE id = ?')
+            .bind(vpRowId)
+            .first<{ video_name: string }>();
+        expect(vpCheck?.video_name).toBe('Updated By RowId');
+
+        await exports.default.fetch('http://example.com/api/notifications', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ version: 2, entry: { id: 'not_v2_w3_exp', type: 'boop', seen: false } })
+        });
+        await exports.default.fetch('http://example.com/api/notifications', {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ version: 2, id: 'not_v2_w3_exp', expired: true })
+        });
+        const n2Row = await env.DB_CORE.prepare("SELECT seen, expires_at FROM notifications_v2 WHERE id = 'not_v2_w3_exp'").first<{
+            seen: number;
+            expires_at: string;
+        }>();
+        expect(n2Row?.seen).toBe(1);
+        expect(n2Row?.expires_at).toBeTruthy();
+
+        const nowIso = new Date().toISOString();
+        const oldIso = new Date(Date.now() - 40 * 86400_000).toISOString();
+        await env.DB_GAMELOG.batch([
+            env.DB_GAMELOG.prepare(
+                "INSERT OR IGNORE INTO gamelog_location (created_at, location, world_id, world_name, time) VALUES (?, 'wrld_tw_old:1', 'wrld_tw_old', 'Old World', 999999)"
+            ).bind(oldIso),
+            env.DB_GAMELOG.prepare(
+                "INSERT OR IGNORE INTO gamelog_location (created_at, location, world_id, world_name, time) VALUES (?, 'wrld_tw_cnt:1', 'wrld_tw_cnt', 'Frequent World', 10)"
+            ).bind(nowIso),
+            env.DB_GAMELOG.prepare(
+                "INSERT OR IGNORE INTO gamelog_location (created_at, location, world_id, world_name, time) VALUES (?, 'wrld_tw_cnt:2', 'wrld_tw_cnt', 'Frequent World', 10)"
+            ).bind(new Date(Date.now() + 1000).toISOString()),
+            env.DB_GAMELOG.prepare(
+                "INSERT OR IGNORE INTO gamelog_location (created_at, location, world_id, world_name, time) VALUES (?, 'wrld_tw_excl:1', 'wrld_tw_excl', 'Excluded World', 500000)"
+            ).bind(nowIso)
+        ]);
+        const twRes = await exports.default.fetch(
+            'http://example.com/api/gamelog/stats?kind=top_worlds&days=7&sortBy=count&excludeWorldId=wrld_tw_excl&limit=10'
+        );
+        const twJson = (await twRes.json()) as { data: Array<{ world_id: string; visits: number }> };
+        expect(twJson.data.some((w) => w.world_id === 'wrld_tw_old')).toBe(false);
+        expect(twJson.data.some((w) => w.world_id === 'wrld_tw_excl')).toBe(false);
+        expect(twJson.data[0]?.world_id).toBe('wrld_tw_cnt');
     });
 });

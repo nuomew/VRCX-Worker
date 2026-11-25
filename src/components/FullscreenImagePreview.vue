@@ -303,15 +303,51 @@
     }
     useEventListener(window, 'keydown', onKeydown);
 
+    async function fetchCloudMediaBlob(url) {
+        const res = await fetch(url, { credentials: 'include' });
+        if (!res.ok) {
+            throw new Error(`HTTP ${res.status}`);
+        }
+        return await res.blob();
+    }
+
+    async function convertBlobToPng(blob) {
+        if (blob.type === 'image/png') {
+            return blob;
+        }
+        const bitmap = await createImageBitmap(blob);
+        try {
+            const canvas = document.createElement('canvas');
+            canvas.width = bitmap.width;
+            canvas.height = bitmap.height;
+            const ctx = canvas.getContext('2d');
+            if (!ctx) {
+                throw new Error('Canvas 2D context unavailable');
+            }
+            ctx.drawImage(bitmap, 0, 0);
+            const pngBlob = await new Promise((resolve, reject) => {
+                canvas.toBlob((out) => (out ? resolve(out) : reject(new Error('PNG encode failed'))), 'image/png');
+            });
+            return pngBlob;
+        } finally {
+            bitmap.close();
+        }
+    }
+
     async function copyImageToClipboard(url) {
         if (!url) return;
         const msg = toast.info(t('message.image.downloading'));
         try {
-            const response = await webApiService.execute({ url, method: 'GET' });
-            if (response.status !== 200 || !String(response.data).startsWith('data:image/png')) {
-                throw new Error(`Error: ${response.data}`);
+            let blob;
+            if (url.startsWith('/api/media/')) {
+                blob = await convertBlobToPng(await fetchCloudMediaBlob(url));
+            } else {
+                const response = await webApiService.execute({ url, method: 'GET' });
+                if (response.status !== 200 || !String(response.data).startsWith('data:image/png')) {
+                    throw new Error(`Error: ${response.data}`);
+                }
+                blob = await (await fetch(response.data)).blob();
             }
-            const blob = await (await fetch(response.data)).blob();
             await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })]);
             toast.success(t('message.image.copied_to_clipboard'));
         } catch (error) {
@@ -326,24 +362,39 @@
         if (!url) return;
         const msg = toast.info(t('message.image.downloading'));
         try {
-            const response = await webApiService.execute({ url, method: 'GET' });
-            if (response.status !== 200 || !String(response.data).startsWith('data:image/png')) {
-                throw new Error(`Error: ${response.data}`);
+            let href = '';
+            let objectUrl = '';
+            let inferredExt = 'png';
+            if (url.startsWith('/api/media/')) {
+                const blob = await fetchCloudMediaBlob(url);
+                if (blob.type === 'image/webp') inferredExt = 'webp';
+                else if (blob.type === 'image/jpeg') inferredExt = 'jpg';
+                objectUrl = URL.createObjectURL(blob);
+                href = objectUrl;
+            } else {
+                const response = await webApiService.execute({ url, method: 'GET' });
+                if (response.status !== 200 || !String(response.data).startsWith('data:image/png')) {
+                    throw new Error(`Error: ${response.data}`);
+                }
+                href = response.data;
             }
 
             const link = document.createElement('a');
-            link.href = response.data;
+            link.href = href;
 
             const fileId = extractFileId(url);
             let name = fileName;
-            if (!name && fileId) name = `${fileId}.png`;
-            if (!name) name = `${url.split('/').pop()}.png`;
-            if (!name) name = 'image.png';
+            if (!name && fileId) name = `${fileId}.${inferredExt}`;
+            if (!name) name = `${url.split('/').pop()}.${inferredExt}`;
+            if (!name) name = `image.${inferredExt}`;
 
             link.setAttribute('download', name);
             document.body.appendChild(link);
             link.click();
             document.body.removeChild(link);
+            if (objectUrl) {
+                setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+            }
         } catch (error) {
             console.error('Error downloading image:', error);
             toast.error(`Failed to download image. ${url}`);

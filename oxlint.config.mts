@@ -17,7 +17,7 @@ export default defineConfig({
     categories: {
         correctness: 'off'
     },
-    ignorePatterns: ['build/**', 'Dotnet/**'],
+    ignorePatterns: ['build/**', 'desktop/Dotnet/**', 'VRCX-Agent/**', 'VRCX-Agent.Tests/**'],
     env: {
         // specified in overrides
     },
@@ -138,10 +138,10 @@ export default defineConfig({
         {
             // electron build, and util and build scripts that run on node, excluding tests
             files: [
-                'src-electron/**',
+                'desktop/src-electron/**',
                 'src/localization/**',
                 'src/shared/utils/localizationHelperCLI.*',
-                'build-scripts/**'
+                'desktop/build-scripts/**'
             ],
             excludeFiles: ['**/__tests__/**', '**/*.spec.*', '**/*.test.*'],
             env: {

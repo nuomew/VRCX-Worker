@@ -501,18 +501,23 @@
     }
 
     async function loadDevices() {
-        const list = await cloudFetch('/api/agent/devices').catch(() => []);
-        devices.value = list;
-        const deviceLastSeen = {};
-        for (const dev of list) {
-            if (dev?.device_id && dev?.last_seen_at) {
-                const ts = Date.parse(dev.last_seen_at);
-                if (Number.isFinite(ts)) {
-                    deviceLastSeen[dev.device_id] = ts;
+        try {
+            const list = await cloudFetch('/api/agent/devices');
+            if (!Array.isArray(list)) return;
+            devices.value = list;
+            const deviceLastSeen = {};
+            for (const dev of list) {
+                if (dev?.device_id && dev?.last_seen_at) {
+                    const ts = Date.parse(dev.last_seen_at);
+                    if (Number.isFinite(ts)) {
+                        deviceLastSeen[dev.device_id] = ts;
+                    }
                 }
             }
+            applyCloudPresenceUpdate({ deviceLastSeen, replaceDeviceMap: true });
+        } catch (err) {
+            console.warn('[cloud] Failed to load paired devices:', err);
         }
-        applyCloudPresenceUpdate({ deviceLastSeen, replaceDeviceMap: true });
     }
 
     async function createSyncSecret() {
@@ -528,6 +533,9 @@
 
     async function revokeDevice(deviceId) {
         await cloudFetch(`/api/agent/devices?deviceId=${encodeURIComponent(deviceId)}`, { method: 'DELETE' });
+        delete cloudState.deviceStates[deviceId];
+        delete cloudState.deviceLastSeen[deviceId];
+        cloudState.wsAgentsOnline = cloudState.wsAgentsOnline.filter((id) => id !== deviceId);
         await loadDevices();
     }
 

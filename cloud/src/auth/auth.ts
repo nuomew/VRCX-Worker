@@ -7,7 +7,7 @@ import {
     timingSafeEqual,
     verifyPasscode,
     verifySessionCookie,
-    verifyTotp
+    verifyTotpStep
 } from '../crypto/vault';
 import type { Env } from '../env';
 
@@ -32,14 +32,32 @@ export interface AgentAuthResult {
 }
 
 export function getMasterKey(env: Env): string {
-    // Derive a deterministic signing/encryption key from configured secrets.
     // Production deployments should always configure COOKIE_MASTER_KEY via `wrangler secret put`.
-    return (
-        env.COOKIE_MASTER_KEY?.trim() ||
-        env.ADMIN_PASSCODE?.trim() ||
-        env.POC_ADMIN_TOKEN?.trim() ||
-        'vrcx-cloud-dev-fallback-key-change-in-prod'
-    );
+    const configured =
+        env.COOKIE_MASTER_KEY?.trim() || env.ADMIN_PASSCODE?.trim() || env.POC_ADMIN_TOKEN?.trim() || '';
+    if (configured) {
+        return configured;
+    }
+    if (detectAuthMode(env) !== 'open_setup') {
+        throw new Error('COOKIE_MASTER_KEY secret is required when authentication is enabled');
+    }
+    return 'vrcx-cloud-dev-fallback-key-change-in-prod';
+}
+
+/**
+ * Blocks cross-origin browser WebSocket handshakes (CSWSH) and cross-site state-changing requests (CSRF)
+ * while permitting same-origin browsers and non-browser clients that omit Origin.
+ */
+export function isSameOriginRequest(request: Request, url: URL): boolean {
+    const origin = request.headers.get('Origin')?.trim();
+    if (origin) {
+        return origin.toLowerCase() === url.origin.toLowerCase();
+    }
+    const fetchSite = request.headers.get('Sec-Fetch-Site')?.trim().toLowerCase();
+    if (fetchSite === 'cross-site') {
+        return false;
+    }
+    return true;
 }
 
 export function detectAuthMode(env: Env): AuthMode {
@@ -85,6 +103,17 @@ function base64UrlDecode(str: string): Uint8Array {
 }
 
 let cachedAccessJwks: { domain: string; fetchedAt: number; keys: JsonWebKey[] } | null = null;
+let lastJwksForcedRefreshAt = 0;
+
+async function fetchCloudflareAccessJwks(normalizedDomain: string, now: number): Promise<JsonWebKey[] | null> {
+    const certsUrl = `https://${normalizedDomain}/cdn-cgi/access/certs`;
+    const res = await fetch(certsUrl);
+    if (!res.ok) return null;
+    const json = (await res.json()) as { keys?: JsonWebKey[] };
+    const keys = Array.isArray(json.keys) ? json.keys : [];
+    cachedAccessJwks = { domain: normalizedDomain, fetchedAt: now, keys };
+    return keys;
+}
 
 async function verifyCloudflareAccessJwt(jwt: string, teamDomain: string, expectedAud: string): Promise<string | null> {
     const parts = jwt.split('.');
@@ -97,28 +126,50 @@ async function verifyCloudflareAccessJwt(jwt: string, teamDomain: string, expect
         const payload = JSON.parse(new TextDecoder().decode(base64UrlDecode(parts[1]!))) as {
             aud?: string | string[];
             exp?: number;
+            nbf?: number;
+            iss?: string;
             email?: string;
             sub?: string;
         };
 
+        if (header.alg !== 'RS256' || typeof header.kid !== 'string' || !header.kid.trim()) {
+            return null;
+        }
+        const normalizedDomain = teamDomain.replace(/^https?:\/\//i, '').replace(/\/+$/, '');
+        if (!normalizedDomain) return null;
+
         const audList = Array.isArray(payload.aud) ? payload.aud : payload.aud ? [payload.aud] : [];
         if (!audList.includes(expectedAud)) return null;
-        if (!payload.exp || payload.exp < Math.floor(Date.now() / 1000)) return null;
+
+        const nowSec = Math.floor(Date.now() / 1000);
+        if (!payload.exp || payload.exp < nowSec) return null;
+        if (typeof payload.nbf === 'number' && payload.nbf > nowSec + 60) return null;
+        if (payload.iss) {
+            const normalizedIss = payload.iss.replace(/\/+$/, '').toLowerCase();
+            if (normalizedIss !== `https://${normalizedDomain.toLowerCase()}`) {
+                return null;
+            }
+        }
 
         const now = Date.now();
         if (
             !cachedAccessJwks ||
-            cachedAccessJwks.domain !== teamDomain ||
+            cachedAccessJwks.domain !== normalizedDomain ||
             now - cachedAccessJwks.fetchedAt > 3_600_000
         ) {
-            const certsUrl = `https://${teamDomain.replace(/^https?:\/\//, '')}/cdn-cgi/access/certs`;
-            const res = await fetch(certsUrl);
-            if (!res.ok) return null;
-            const json = (await res.json()) as { keys?: JsonWebKey[] };
-            cachedAccessJwks = { domain: teamDomain, fetchedAt: now, keys: json.keys ?? [] };
+            const loaded = await fetchCloudflareAccessJwks(normalizedDomain, now);
+            if (!loaded) return null;
         }
 
-        const jwk = cachedAccessJwks.keys.find((k) => (k as { kid?: string }).kid === header.kid);
+        let jwk = cachedAccessJwks?.keys.find((k) => (k as { kid?: string }).kid === header.kid);
+        // Handle Cloudflare Access key rotation promptly by refreshing JWKS once per 60s cooldown on unknown kid.
+        if (!jwk && now - lastJwksForcedRefreshAt > 60_000) {
+            lastJwksForcedRefreshAt = now;
+            const refreshed = await fetchCloudflareAccessJwks(normalizedDomain, now);
+            if (refreshed) {
+                jwk = refreshed.find((k) => (k as { kid?: string }).kid === header.kid);
+            }
+        }
         if (!jwk) return null;
 
         const cryptoKey = await crypto.subtle.importKey(
@@ -195,9 +246,13 @@ export async function authenticateWeb(request: Request, env: Env): Promise<WebAu
 
 /**
  * Verifies Windows VRCX.Agent requests using per-device Bearer token (SHA-256 hash stored in D1)
- * plus optional HMAC-SHA256 request signature with ±60s replay protection.
+ * plus mandatory HMAC-SHA256 request signature with ±60s replay protection for paired devices.
  */
-export async function authenticateAgent(request: Request, env: Env, rawBodyText = ''): Promise<AgentAuthResult> {
+export async function authenticateAgent(
+    request: Request,
+    env: Env,
+    rawBody: string | Uint8Array = ''
+): Promise<AgentAuthResult> {
     const authHeader = request.headers.get('Authorization') ?? '';
     const syncKeyHeader = request.headers.get('X-Sync-Key')?.trim() ?? '';
     const deviceIdHeader = request.headers.get('X-Device-Id')?.trim();
@@ -247,10 +302,19 @@ export async function authenticateAgent(request: Request, env: Env, rawBodyText 
         return { authenticated: false, reason: 'Unknown device token' };
     }
 
-    // Verify HMAC signature when present (legacy paired devices sending X-Signature / X-Timestamp)
+    // Enforce mandatory HMAC-SHA256 + replay-window validation for paired devices (non-empty hmac_secret_enc)
+    // on HTTP endpoints so omitting X-Signature/X-Timestamp can never downgrade auth to bare Bearer.
+    const hasPairedHmac = Boolean(device.hmac_secret_enc?.trim());
+    const isWsUpgrade = url.pathname.startsWith('/ws/');
     const sigHeader = request.headers.get('X-Signature')?.trim();
     const tsHeader = request.headers.get('X-Timestamp')?.trim();
-    if (sigHeader || tsHeader) {
+    if ((hasPairedHmac && !isWsUpgrade) || sigHeader || tsHeader) {
+        if (!hasPairedHmac) {
+            return { authenticated: false, reason: 'Device is not configured for HMAC authentication' };
+        }
+        if (!sigHeader || !tsHeader) {
+            return { authenticated: false, reason: 'Missing HMAC signature headers' };
+        }
         if (deviceIdHeader && deviceIdHeader !== device.device_id) {
             return { authenticated: false, reason: 'Device ID mismatch' };
         }
@@ -263,11 +327,16 @@ export async function authenticateAgent(request: Request, env: Env, rawBodyText 
         if (!ivB64 || !cipherB64) {
             return { authenticated: false, reason: 'Corrupted device HMAC key' };
         }
-        const hmacSecret = await decryptAesGcm(getMasterKey(env), cipherB64, ivB64);
-        const bodyHash = await sha256Hex(rawBodyText);
+        let hmacSecret: string;
+        try {
+            hmacSecret = await decryptAesGcm(getMasterKey(env), cipherB64, ivB64);
+        } catch {
+            return { authenticated: false, reason: 'Failed to decrypt device HMAC key' };
+        }
+        const bodyHash = await sha256Hex(rawBody);
         const canonical = `${tsHeader}\n${request.method.toUpperCase()}\n${url.pathname}\n${bodyHash}`;
         const expectedSig = await hmacSha256Hex(hmacSecret, canonical);
-        if (!sigHeader || !timingSafeEqual(expectedSig, sigHeader.toLowerCase())) {
+        if (!timingSafeEqual(expectedSig, sigHeader.toLowerCase())) {
             return { authenticated: false, reason: 'Invalid HMAC signature' };
         }
     }
@@ -283,10 +352,8 @@ const MAX_AUTH_FAILURES_BEFORE_LOCK = 5;
 const AUTH_LOCKOUT_MS = 10 * 60 * 1000; // 10-minute lockout after 5 consecutive failures
 
 export function resolveClientRateBucket(request: Request, scope: string): string {
-    const ip =
-        request.headers.get('CF-Connecting-IP')?.trim() ||
-        request.headers.get('X-Forwarded-For')?.split(',')[0]?.trim() ||
-        'unknown';
+    // Trust only Cloudflare's edge-injected CF-Connecting-IP; never trust spoofable X-Forwarded-For.
+    const ip = request.headers.get('CF-Connecting-IP')?.trim() || 'no-cf-ip';
     return `${scope}:${ip.slice(0, 64)}`;
 }
 
@@ -314,32 +381,42 @@ export async function checkAuthRateLimit(
     return { blocked: false, retryAfterSec: 0 };
 }
 
-export async function recordAuthFailure(env: Env, bucketKey: string): Promise<void> {
+/**
+ * Atomically increments failure count in SQLite to eliminate concurrent TOCTOU rate-limit bypass.
+ * Returns the updated failure count after incrementing.
+ */
+export async function recordAuthFailure(
+    env: Env,
+    bucketKey: string,
+    maxFailures = MAX_AUTH_FAILURES_BEFORE_LOCK
+): Promise<number> {
     try {
         const nowMs = Date.now();
         const nowIso = new Date(nowMs).toISOString();
-        const existing = await env.DB_CORE.prepare(
-            'SELECT failures, locked_until FROM cloud_auth_rate_limits WHERE bucket_key = ? LIMIT 1'
-        )
-            .bind(bucketKey)
-            .first<{ failures: number; locked_until: string }>();
-        const prevLockMs = existing?.locked_until ? Date.parse(existing.locked_until) : 0;
-        const prevFailures = prevLockMs > 0 && prevLockMs <= nowMs ? 0 : Number(existing?.failures ?? 0);
-        const nextFailures = prevFailures + 1;
-        const lockedUntil =
-            nextFailures >= MAX_AUTH_FAILURES_BEFORE_LOCK ? new Date(nowMs + AUTH_LOCKOUT_MS).toISOString() : '';
-        await env.DB_CORE.prepare(
+        const lockUntilIso = new Date(nowMs + AUTH_LOCKOUT_MS).toISOString();
+        const row = await env.DB_CORE.prepare(
             `INSERT INTO cloud_auth_rate_limits (bucket_key, failures, locked_until, updated_at)
-             VALUES (?, ?, ?, ?)
+             VALUES (?, 1, ?, ?)
              ON CONFLICT(bucket_key) DO UPDATE SET
-                failures = excluded.failures,
-                locked_until = excluded.locked_until,
-                updated_at = excluded.updated_at`
+                failures = CASE
+                    WHEN locked_until != '' AND locked_until <= excluded.updated_at THEN 1
+                    ELSE failures + 1
+                END,
+                locked_until = CASE
+                    WHEN (CASE WHEN locked_until != '' AND locked_until <= excluded.updated_at THEN 1 ELSE failures + 1 END) >= ?
+                        THEN ?
+                    WHEN locked_until != '' AND locked_until <= excluded.updated_at
+                        THEN ''
+                    ELSE locked_until
+                END,
+                updated_at = excluded.updated_at
+             RETURNING failures`
         )
-            .bind(bucketKey, nextFailures, lockedUntil, nowIso)
-            .run();
+            .bind(bucketKey, maxFailures <= 1 ? lockUntilIso : '', nowIso, maxFailures, lockUntilIso)
+            .first<{ failures: number }>();
+        return Number(row?.failures ?? 1);
     } catch {
-        // Non-fatal
+        return 0;
     }
 }
 
@@ -368,13 +445,32 @@ export async function handleAuthRoutes(request: Request, env: Env, url: URL): Pr
     }
 
     if (url.pathname === '/api/auth/login' && request.method === 'POST') {
-        const configured = env.ADMIN_PASSCODE?.trim();
-        if (!configured) {
+        if (!isSameOriginRequest(request, url)) {
+            return Response.json(
+                { ok: false, error: { code: 'FORBIDDEN_ORIGIN', message: 'Cross-origin login request blocked' } },
+                { status: 403 }
+            );
+        }
+        const authMode = detectAuthMode(env);
+        if (authMode === 'open_setup') {
             return Response.json({
                 ok: true,
-                data: { authenticated: true, authMode: detectAuthMode(env) }
+                data: { authenticated: true, authMode }
             });
         }
+        if (authMode !== 'passcode_session') {
+            return Response.json(
+                {
+                    ok: false,
+                    error: {
+                        code: 'PASSCODE_LOGIN_DISABLED',
+                        message: `Passcode login is unavailable in ${authMode} mode`
+                    }
+                },
+                { status: 403 }
+            );
+        }
+        const configured = env.ADMIN_PASSCODE!.trim();
 
         const rateBucket = resolveClientRateBucket(request, 'login');
         const rateCheck = await checkAuthRateLimit(env, rateBucket);
@@ -402,21 +498,43 @@ export async function handleAuthRoutes(request: Request, env: Env, url: URL): Pr
         }
 
         const passcodeOk = typeof body.passcode === 'string' && (await verifyPasscode(configured, body.passcode));
-        if (!passcodeOk) {
+        const totpSecret = env.ADMIN_TOTP_SECRET?.trim();
+        let totpOk = true;
+        let matchedTotpStep = 0;
+        if (totpSecret) {
+            const stepCheck =
+                typeof body.totp === 'string'
+                    ? await verifyTotpStep(totpSecret, body.totp)
+                    : { valid: false, step: 0 };
+            totpOk = stepCheck.valid;
+            matchedTotpStep = stepCheck.step;
+        }
+
+        // Evaluate both passcode and TOTP before responding with a uniform error to eliminate passcode oracle.
+        if (!passcodeOk || !totpOk) {
             await recordAuthFailure(env, rateBucket);
             return Response.json(
-                { ok: false, error: { code: 'INVALID_CREDENTIALS', message: 'Invalid passcode' } },
+                { ok: false, error: { code: 'INVALID_CREDENTIALS', message: 'Invalid credentials' } },
                 { status: 401 }
             );
         }
 
-        const totpSecret = env.ADMIN_TOTP_SECRET?.trim();
-        if (totpSecret) {
-            const totpOk = typeof body.totp === 'string' && (await verifyTotp(totpSecret, body.totp));
-            if (!totpOk) {
+        // Enforce single-use TOTP replay protection via atomic monotonic step claim in DB_CORE.
+        if (totpSecret && matchedTotpStep > 0) {
+            const claimRes = await env.DB_CORE.prepare(
+                `INSERT INTO cloud_auth_rate_limits (bucket_key, failures, locked_until, updated_at)
+                 VALUES ('totp:last_step', ?, '', ?)
+                 ON CONFLICT(bucket_key) DO UPDATE SET
+                    failures = excluded.failures,
+                    updated_at = excluded.updated_at
+                 WHERE excluded.failures > failures`
+            )
+                .bind(matchedTotpStep, new Date().toISOString())
+                .run();
+            if ((claimRes.meta?.changes ?? 0) !== 1) {
                 await recordAuthFailure(env, rateBucket);
                 return Response.json(
-                    { ok: false, error: { code: 'INVALID_TOTP', message: 'Valid 6-digit TOTP code required' } },
+                    { ok: false, error: { code: 'INVALID_CREDENTIALS', message: 'Invalid credentials' } },
                     { status: 401 }
                 );
             }
@@ -444,6 +562,12 @@ export async function handleAuthRoutes(request: Request, env: Env, url: URL): Pr
     }
 
     if (url.pathname === '/api/auth/logout' && request.method === 'POST') {
+        if (!isSameOriginRequest(request, url)) {
+            return Response.json(
+                { ok: false, error: { code: 'FORBIDDEN_ORIGIN', message: 'Cross-origin logout request blocked' } },
+                { status: 403 }
+            );
+        }
         const isSecure = url.protocol === 'https:';
         const clearCookie = [
             `${SESSION_COOKIE_NAME}=`,

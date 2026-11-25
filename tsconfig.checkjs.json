@@ -9,7 +9,7 @@
         "src/**/*.jsx",
         "src/**/*.vue",
         "src/types/**/*.d.ts",
-        "src-electron/**/*.js"
+        "desktop/src-electron/**/*.js"
     ],
     "exclude": [
         "node_modules",

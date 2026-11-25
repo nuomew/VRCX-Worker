@@ -19,6 +19,7 @@ interface HubEnvelope {
 
 interface PendingRpc {
     deviceId: string;
+    ws: WebSocket;
     resolve: (payload: Record<string, unknown>) => void;
     reject: (err: Error) => void;
     timer: ReturnType<typeof setTimeout>;
@@ -98,6 +99,42 @@ export class AgentHubDO extends DurableObject<Env> {
             return this.handleDispatchCommand(request);
         }
 
+        if (url.pathname === '/revoke-device' && request.method === 'POST') {
+            const body = (await request.json().catch(() => ({}))) as { deviceId?: string };
+            const deviceId = typeof body.deviceId === 'string' ? body.deviceId.trim() : '';
+            if (!deviceId) {
+                return Response.json(
+                    { ok: false, error: { code: 'BAD_REQUEST', message: 'deviceId is required' } },
+                    { status: 400 }
+                );
+            }
+            const sockets = this.ctx.getWebSockets(`dev:${deviceId}`).filter((s) => {
+                const a = s.deserializeAttachment() as SocketAttachment | null;
+                return a?.role === 'agent';
+            });
+            for (const sock of sockets) {
+                try {
+                    sock.close(4001, 'Device revoked');
+                } catch {
+                    // Ignore already-closed sockets
+                }
+            }
+            for (const [id, pending] of this.pendingRpcs.entries()) {
+                if (pending.deviceId !== deviceId) continue;
+                clearTimeout(pending.timer);
+                pending.reject(new Error('Agent device revoked'));
+                this.pendingRpcs.delete(id);
+            }
+            this.ctx.storage.sql.exec('DELETE FROM live_device_state WHERE device_id = ?', deviceId);
+            this.broadcastToRole('web', {
+                v: 1,
+                type: 'agent.offline',
+                ts: Date.now(),
+                payload: { deviceId, revoked: true }
+            });
+            return Response.json({ ok: true, data: { deviceId, closedSockets: sockets.length } });
+        }
+
         if (url.pathname === '/ws/agent' || url.pathname === '/ws/web') {
             if (request.headers.get('Upgrade')?.toLowerCase() !== 'websocket') {
                 return new Response('Expected WebSocket Upgrade', { status: 426 });
@@ -118,8 +155,8 @@ export class AgentHubDO extends DurableObject<Env> {
                 connectedAt: new Date().toISOString()
             };
 
-            // Mandatory hibernation acceptance; never call server.accept().
-            this.ctx.acceptWebSocket(server, [role, deviceId]);
+            // Mandatory hibernation acceptance; prefix tags to prevent role/deviceId namespace collisions.
+            this.ctx.acceptWebSocket(server, [`role:${role}`, `dev:${deviceId}`]);
             server.serializeAttachment(attachment);
 
             if (role === 'agent') {
@@ -142,12 +179,13 @@ export class AgentHubDO extends DurableObject<Env> {
 
     private pickAgentSocket(targetDeviceId?: string): WebSocket | null {
         const candidates = targetDeviceId
-            ? this.ctx.getWebSockets(targetDeviceId).filter((s) => {
+            ? this.ctx.getWebSockets(`dev:${targetDeviceId}`).filter((s) => {
                   const a = s.deserializeAttachment() as SocketAttachment | null;
                   return a?.role === 'agent';
               })
-            : this.ctx.getWebSockets('agent');
-        return candidates[0] ?? null;
+            : this.ctx.getWebSockets('role:agent');
+        // Prefer the newest accepted socket during reconnect overlap so stale closing sockets are avoided.
+        return candidates.length > 0 ? candidates[candidates.length - 1]! : null;
     }
 
     private async handleVrcHttpRpc(request: Request): Promise<Response> {
@@ -169,7 +207,7 @@ export class AgentHubDO extends DurableObject<Env> {
                 this.pendingRpcs.delete(reqId);
                 reject(new Error('Agent RPC timeout'));
             }, RPC_TIMEOUT_MS);
-            this.pendingRpcs.set(reqId, { deviceId: agentDeviceId, resolve, reject, timer });
+            this.pendingRpcs.set(reqId, { deviceId: agentDeviceId, ws: agentSocket, resolve, reject, timer });
         });
 
         try {
@@ -325,10 +363,13 @@ export class AgentHubDO extends DurableObject<Env> {
                 const reqId =
                     envelope.id || (typeof envelope.payload?.reqId === 'string' ? envelope.payload.reqId : '');
                 const pending = reqId ? this.pendingRpcs.get(reqId) : undefined;
-                if (pending) {
+                if (pending && pending.deviceId === attachment.deviceId) {
                     clearTimeout(pending.timer);
                     this.pendingRpcs.delete(reqId);
                     pending.resolve(envelope.payload ?? {});
+                    return;
+                }
+                if (pending) {
                     return;
                 }
                 this.broadcastToRole('web', {
@@ -347,9 +388,13 @@ export class AgentHubDO extends DurableObject<Env> {
                     const now = new Date().toISOString();
                     this.ctx.waitUntil(
                         this.env.DB_CORE.prepare(
-                            'UPDATE cloud_commands SET status = ?, result_json = ?, finished_at = ? WHERE cmd_id = ?'
+                            `UPDATE cloud_commands
+                             SET status = ?, result_json = ?, finished_at = ?
+                             WHERE cmd_id = ?
+                               AND (target_device_id = '' OR target_device_id = ?)
+                               AND status IN ('pending', 'dispatching', 'dispatched')`
                         )
-                            .bind(status, JSON.stringify(envelope.payload ?? {}), now, cmdId)
+                            .bind(status, JSON.stringify(envelope.payload ?? {}), now, cmdId, attachment.deviceId)
                             .run()
                             .catch(() => {})
                     );
@@ -381,20 +426,23 @@ export class AgentHubDO extends DurableObject<Env> {
         }
     }
 
-    async webSocketClose(ws: WebSocket, code: number, reason: string): Promise<void> {
-        const attachment = ws.deserializeAttachment() as SocketAttachment | null;
-        try {
-            ws.close(code, reason);
-        } catch {
-            // Already closed.
+    private cleanupAgentSocket(ws: WebSocket, attachment: SocketAttachment | null): void {
+        if (attachment?.role !== 'agent') {
+            return;
         }
-        if (attachment?.role === 'agent') {
-            for (const [id, pending] of this.pendingRpcs.entries()) {
-                if (pending.deviceId !== attachment.deviceId) continue;
-                clearTimeout(pending.timer);
-                pending.reject(new Error('Agent disconnected during RPC'));
-                this.pendingRpcs.delete(id);
-            }
+        // Reject only RPCs tied to this specific WebSocket so reconnect overlap never aborts the newer socket's RPCs.
+        for (const [id, pending] of this.pendingRpcs.entries()) {
+            if (pending.ws !== ws) continue;
+            clearTimeout(pending.timer);
+            pending.reject(new Error('Agent disconnected during RPC'));
+            this.pendingRpcs.delete(id);
+        }
+        const stillOnline = this.ctx.getWebSockets(`dev:${attachment.deviceId}`).some((s) => {
+            if (s === ws) return false;
+            const a = s.deserializeAttachment() as SocketAttachment | null;
+            return a?.role === 'agent';
+        });
+        if (!stillOnline) {
             this.broadcastToRole('web', {
                 v: 1,
                 type: 'agent.offline',
@@ -404,12 +452,24 @@ export class AgentHubDO extends DurableObject<Env> {
         }
     }
 
+    async webSocketClose(ws: WebSocket, code: number, reason: string): Promise<void> {
+        const attachment = ws.deserializeAttachment() as SocketAttachment | null;
+        try {
+            ws.close(code, reason);
+        } catch {
+            // Already closed.
+        }
+        this.cleanupAgentSocket(ws, attachment);
+    }
+
     async webSocketError(ws: WebSocket): Promise<void> {
+        const attachment = ws.deserializeAttachment() as SocketAttachment | null;
         try {
             ws.close(1011, 'Socket error');
         } catch {
             // Ignore close errors.
         }
+        this.cleanupAgentSocket(ws, attachment);
     }
 
     private getLiveStatus(): {
@@ -417,7 +477,7 @@ export class AgentHubDO extends DurableObject<Env> {
         webClientsCount: number;
         deviceStates: Record<string, { state: unknown; updatedAt: string }>;
     } {
-        const agentSockets = this.ctx.getWebSockets('agent');
+        const agentSockets = this.ctx.getWebSockets('role:agent');
         const agentsOnline = Array.from(
             new Set(
                 agentSockets
@@ -425,7 +485,7 @@ export class AgentHubDO extends DurableObject<Env> {
                     .filter((id): id is string => Boolean(id))
             )
         );
-        const webClientsCount = this.ctx.getWebSockets('web').length;
+        const webClientsCount = this.ctx.getWebSockets('role:web').length;
 
         const deviceStates: Record<string, { state: unknown; updatedAt: string }> = {};
         const cursor = this.ctx.storage.sql.exec<{
@@ -449,7 +509,7 @@ export class AgentHubDO extends DurableObject<Env> {
     }
 
     private broadcastToRole(role: ClientRole, envelope: HubEnvelope): void {
-        const sockets = this.ctx.getWebSockets(role);
+        const sockets = this.ctx.getWebSockets(`role:${role}`);
         if (sockets.length === 0) {
             return;
         }

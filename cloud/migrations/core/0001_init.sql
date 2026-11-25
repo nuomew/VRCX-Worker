@@ -1,6 +1,11 @@
 -- DB_CORE (vrcx-core, 500 MB Free limit)
 -- Permanent low-churn personal assets, deduplicated entity search dictionaries, and cloud control tables.
 
+CREATE TABLE IF NOT EXISTS schema_meta (
+    meta_key TEXT PRIMARY KEY,
+    meta_value TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS config_bundles (
     bundle_key TEXT PRIMARY KEY,
     version INTEGER NOT NULL DEFAULT 1,
@@ -242,6 +247,12 @@ CREATE TABLE IF NOT EXISTS cloud_devices (
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS cloud_device_states (
+    device_id TEXT PRIMARY KEY,
+    state_json TEXT NOT NULL DEFAULT '{}',
+    updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS cloud_sync_cursors (
     device_id TEXT NOT NULL,
     stream_name TEXT NOT NULL,
@@ -268,6 +279,7 @@ CREATE TABLE IF NOT EXISTS cloud_screenshots (
 );
 CREATE INDEX IF NOT EXISTS idx_screenshots_taken ON cloud_screenshots (taken_at DESC);
 CREATE INDEX IF NOT EXISTS idx_screenshots_world ON cloud_screenshots (world_id, taken_at DESC);
+CREATE INDEX IF NOT EXISTS idx_screenshots_filename ON cloud_screenshots (local_filename COLLATE NOCASE);
 
 CREATE TABLE IF NOT EXISTS cloud_commands (
     cmd_id TEXT PRIMARY KEY,
@@ -287,5 +299,18 @@ CREATE TABLE IF NOT EXISTS cloud_cookie_vault (
     ciphertext_b64 TEXT NOT NULL,
     iv_b64 TEXT NOT NULL,
     source_device_id TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS cloud_bg_sync_state (
+    state_key TEXT PRIMARY KEY,
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS cloud_auth_rate_limits (
+    bucket_key TEXT PRIMARY KEY,
+    failures INTEGER NOT NULL DEFAULT 0,
+    locked_until TEXT NOT NULL DEFAULT '',
     updated_at TEXT NOT NULL
 );

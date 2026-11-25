@@ -1,5 +1,5 @@
 {
-    "dotnet.defaultSolution": "VRCX.slnx",
+    "dotnet.defaultSolution": "desktop/VRCX.slnx",
     "i18n-ally.localesPaths": ["src/localization"],
     "i18n-ally.enabledFrameworks": ["vue"],
     "i18n-ally.keystyle": "nested",

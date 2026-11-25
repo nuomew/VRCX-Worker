@@ -29,12 +29,12 @@ runs:
     - uses: actions/cache@v5
       with:
         path: ~/.nuget/packages
-        key: ${{ runner.os }}-nuget-${{ hashFiles('**/Dotnet/VRCX-Electron.csproj') }}
+        key: ${{ runner.os }}-nuget-${{ hashFiles('**/desktop/Dotnet/VRCX-Electron.csproj') }}
         restore-keys: |
           ${{ runner.os }}-nuget-
     - name: Build Electron dotnet ${{ inputs.runtime-identifier }} Application
       shell: pwsh
-      run: dotnet build 'Dotnet/VRCX-Electron.csproj' -p:Configuration=Release -p:WarningLevel=0 -p:Platform=${{ inputs.platform }} -t:"Clean;Build" -maxcpucount --runtime ${{ inputs.runtime-identifier }}
+      run: dotnet build 'desktop/Dotnet/VRCX-Electron.csproj' -p:Configuration=Release -p:WarningLevel=0 -p:Platform=${{ inputs.platform }} -t:"Clean;Build" -maxcpucount --runtime ${{ inputs.runtime-identifier }}
     - name: Upload Electron dotnet ${{ inputs.runtime-identifier }} artifacts
       uses: actions/upload-artifact@v7
       with:

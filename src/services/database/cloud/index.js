@@ -19,6 +19,68 @@ const sessionActivityBuckets = new Map();
 let pendingFeedBatch = [];
 /** @type {ReturnType<typeof setTimeout> | null} */
 let feedFlushTimer = null;
+let suppressFeedWriteDepth = 0;
+let suppressGameLogWriteDepth = 0;
+
+/**
+ * Suppresses redundant client-side Feed DB writes while applying server-authoritative
+ * Cloud RSS snapshots (which were already persisted by backgroundFeedSync.ts).
+ * @param {boolean} active
+ */
+export function setSuppressCloudFeedWrites(active) {
+    suppressFeedWriteDepth = Math.max(0, suppressFeedWriteDepth + (active ? 1 : -1));
+}
+
+/**
+ * Suppresses redundant client-side GameLog DB writes while applying real-time WS
+ * `gamelog.batch` events that the Windows Agent has already persisted to DB_GAMELOG.
+ * @param {boolean} active
+ */
+export function setSuppressCloudGameLogWrites(active) {
+    suppressGameLogWriteDepth = Math.max(0, suppressGameLogWriteDepth + (active ? 1 : -1));
+}
+
+/**
+ * Resets all module-scoped caches and pending batch queues on VRChat logout/account switch
+ * so a newly logged-in account never sees or flushes stale state from the previous session.
+ */
+export function resetCloudDatabaseState() {
+    sessionWorldCache.clear();
+    sessionAvatarCache.clear();
+    sessionMutualGraph.friends.clear();
+    sessionMutualGraph.links.clear();
+    sessionMutualGraph.meta.clear();
+    sessionActivitySyncState.clear();
+    sessionActivityBuckets.clear();
+    worldStatsCache.clear();
+    worldStatsInflight.clear();
+    userStatsCache.clear();
+    userStatsInflight.clear();
+    groupStatsCache.clear();
+    groupStatsInflight.clear();
+
+    if (feedFlushTimer) {
+        clearTimeout(feedFlushTimer);
+        feedFlushTimer = null;
+    }
+    pendingFeedBatch = [];
+    if (userProfileFlushTimer) {
+        clearTimeout(userProfileFlushTimer);
+        userProfileFlushTimer = null;
+    }
+    pendingUserProfiles.clear();
+    if (friendLogCurrentFlushTimer) {
+        clearTimeout(friendLogCurrentFlushTimer);
+        friendLogCurrentFlushTimer = null;
+    }
+    pendingFriendLogCurrent.clear();
+    if (notificationsFlushTimer) {
+        clearTimeout(notificationsFlushTimer);
+        notificationsFlushTimer = null;
+    }
+    pendingNotificationsV1.clear();
+    pendingNotificationsV2.clear();
+}
 
 /** @type {Map<string, Record<string, any>>} */
 let pendingUserProfiles = new Map();
@@ -133,6 +195,7 @@ function fetchGroupStatsCached(groupId) {
 }
 
 function queueFeedWrite(entry) {
+    if (suppressFeedWriteDepth > 0) return;
     pendingFeedBatch.push(entry);
     if (pendingFeedBatch.length >= 40) {
         flushFeedBatch();
@@ -425,12 +488,15 @@ export function createCloudDatabase(dbVars) {
             bootstrapCache.avatarMemos.delete(avatarId);
             await cloudFetch(`/api/memos?kind=avatar&id=${encodeURIComponent(avatarId)}`, { method: 'DELETE' });
         },
-        async addUserNote(userId, displayName, note) {
+        async addUserNote(noteOrUserId, displayName, note) {
+            const isObj = Boolean(noteOrUserId && typeof noteOrUserId === 'object');
+            const userId = String(isObj ? (noteOrUserId.userId ?? '') : (noteOrUserId ?? '')).trim();
+            if (!userId) return;
             const next = {
                 userId,
-                displayName: displayName || '',
-                note: note || '',
-                createdAt: new Date().toISOString()
+                displayName: String(isObj ? (noteOrUserId.displayName ?? '') : (displayName ?? '')),
+                note: String(isObj ? (noteOrUserId.note ?? '') : (note ?? '')),
+                createdAt: String((isObj && noteOrUserId.createdAt) || new Date().toISOString())
             };
             bootstrapCache.notes.set(userId, next);
             await cloudFetch('/api/notes', { method: 'PUT', json: next });
@@ -569,23 +635,46 @@ export function createCloudDatabase(dbVars) {
                 json: { avatarId, addTime: Number(timeSpent) || 0 }
             }).catch(() => {});
         },
-        async getAvatarHistory(_currentUserId, limit = 100) {
+        async getAvatarHistory(currentUserId = '', limit = 100) {
             const rows = await cloudFetch(`/api/avatar-history?limit=${Math.min(limit, 200)}`).catch(() => []);
-            return rows.map((r) => ({
-                avatarId: r.avatar_id,
-                created_at: r.created_at,
-                time: r.time || 0
-            }));
+            if (!Array.isArray(rows)) return [];
+            const out = [];
+            for (const r of rows) {
+                const id = String(r.avatar_id || r.id || '').trim();
+                if (!id) continue;
+                const cached = sessionAvatarCache.get(id);
+                if (currentUserId && cached?.authorId && cached.authorId === currentUserId) {
+                    continue;
+                }
+                out.push({
+                    ...(cached || {}),
+                    id,
+                    avatarId: id,
+                    authorId: cached?.authorId || '',
+                    authorName: cached?.authorName || '',
+                    name: cached?.name || id,
+                    description: cached?.description || '',
+                    imageUrl: cached?.imageUrl || '',
+                    thumbnailImageUrl: cached?.thumbnailImageUrl || '',
+                    releaseStatus: cached?.releaseStatus || 'public',
+                    created_at: r.created_at || cached?.created_at || '',
+                    time: Number(r.time) || 0
+                });
+            }
+            return out;
         },
         async getAvatarTimeSpent(avatarId) {
             const rows = await this.getAvatarHistory('', 200);
-            const found = rows.find((r) => r.avatarId === avatarId);
-            return found ? found.time : 0;
+            const found = rows.find((r) => r.id === avatarId || r.avatarId === avatarId);
+            return {
+                timeSpent: found ? found.time : 0,
+                avatarId
+            };
         },
         async getAllAvatarTimeSpent() {
             const rows = await this.getAvatarHistory('', 200);
             const map = new Map();
-            for (const r of rows) map.set(r.avatarId, r.time);
+            for (const r of rows) map.set(r.id || r.avatarId, r.time);
             return map;
         },
         async clearAvatarHistory() {
@@ -746,8 +835,10 @@ export function createCloudDatabase(dbVars) {
             return Array.from(bootstrapCache.userProfiles.values());
         },
         async setUserProfile(profile) {
+            const userId = String(profile?.userId || profile?.id || '').trim();
+            if (!userId) return;
             const next = {
-                userId: profile.userId,
+                userId,
                 bio: profile.bio || '',
                 bioLinks: profile.bioLinks || [],
                 updatedAt: profile.updatedAt || new Date().toISOString()
@@ -855,10 +946,11 @@ export function createCloudDatabase(dbVars) {
                 previousTrustLevel: r.previous_trust_level,
                 friendNumber: r.friend_number
             }));
-            if (Array.isArray(types) && types.length > 0) {
-                return mapped.filter((r) => types.includes(r.type));
-            }
-            return mapped;
+            const filtered = Array.isArray(types) && types.length > 0
+                ? mapped.filter((r) => types.includes(r.type))
+                : mapped;
+            // Backend returns newest-first (DESC); desktop friendLogHistory.js contract expects ascending (ASC).
+            return filtered.reverse();
         },
         async deleteFriendLogHistory(entry) {
             if (entry?.rowId) {
@@ -974,7 +1066,10 @@ export function createCloudDatabase(dbVars) {
             queueNotificationWrite(2, entry);
         },
         async expireNotificationV2(id) {
-            await cloudFetch('/api/notifications', { method: 'PATCH', json: { version: 2, id, expired: true } });
+            await cloudFetch('/api/notifications', {
+                method: 'PATCH',
+                json: { version: 2, id, expired: true, seen: true }
+            });
         },
         async seenNotificationV2(id) {
             await cloudFetch('/api/notifications', { method: 'PATCH', json: { version: 2, id, seen: true } });
@@ -1065,6 +1160,7 @@ export function createCloudDatabase(dbVars) {
             });
         },
         async addGamelogLocationToDatabase(entry) {
+            if (suppressGameLogWriteDepth > 0) return { ...entry, rowId: Date.now() };
             const res = await cloudFetch('/api/gamelog', {
                 method: 'POST',
                 json: { item: { ...entry, type: 'Location' } }
@@ -1072,12 +1168,14 @@ export function createCloudDatabase(dbVars) {
             return res?.lastRowId ? { ...entry, rowId: res.lastRowId } : undefined;
         },
         async updateGamelogLocationTimeToDatabase(entry) {
+            if (suppressGameLogWriteDepth > 0) return;
             await cloudFetch('/api/gamelog', {
                 method: 'PATCH',
                 json: { op: 'update_location_time', ...entry }
             }).catch(() => {});
         },
         async addGamelogJoinLeaveToDatabase(entry) {
+            if (suppressGameLogWriteDepth > 0) return { ...entry, rowId: Date.now() };
             const res = await cloudFetch('/api/gamelog', {
                 method: 'POST',
                 json: { item: entry }
@@ -1086,10 +1184,12 @@ export function createCloudDatabase(dbVars) {
         },
         async addGamelogJoinLeaveBulk(entries) {
             if (!Array.isArray(entries) || entries.length === 0) return [];
+            if (suppressGameLogWriteDepth > 0) return entries;
             await cloudFetch('/api/gamelog', { method: 'POST', json: { items: entries } }).catch(() => {});
             return entries;
         },
         async addGamelogPortalSpawnToDatabase(entry) {
+            if (suppressGameLogWriteDepth > 0) return { ...entry, rowId: Date.now() };
             const res = await cloudFetch('/api/gamelog', {
                 method: 'POST',
                 json: { item: { ...entry, type: 'PortalSpawn' } }
@@ -1097,16 +1197,21 @@ export function createCloudDatabase(dbVars) {
             return res?.lastRowId ? { ...entry, rowId: res.lastRowId } : undefined;
         },
         async addGamelogVideoPlayToDatabase(entry) {
+            if (suppressGameLogWriteDepth > 0) return { ...entry, rowId: Date.now() };
             const res = await cloudFetch('/api/gamelog', {
                 method: 'POST',
                 json: { item: { ...entry, type: 'VideoPlay' } }
             }).catch(() => null);
             return res?.lastRowId ? { ...entry, rowId: res.lastRowId } : undefined;
         },
-        async updateGamelogVideoPlayName(entry) {
+        async updateGamelogVideoPlayName(rowIdOrEntry, videoName) {
+            const payload =
+                rowIdOrEntry && typeof rowIdOrEntry === 'object'
+                    ? { op: 'update_video_name', ...rowIdOrEntry }
+                    : { op: 'update_video_name', rowId: rowIdOrEntry, videoName: videoName ?? '' };
             await cloudFetch('/api/gamelog', {
                 method: 'PATCH',
-                json: { op: 'update_video_name', ...entry }
+                json: payload
             }).catch(() => {});
         },
         async addGamelogResourceLoadToDatabase() {
@@ -1114,6 +1219,7 @@ export function createCloudDatabase(dbVars) {
             return undefined;
         },
         async addGamelogEventToDatabase(entry) {
+            if (suppressGameLogWriteDepth > 0) return { ...entry, rowId: Date.now() };
             const res = await cloudFetch('/api/gamelog', {
                 method: 'POST',
                 json: { item: { ...entry, type: 'Event' } }
@@ -1121,6 +1227,7 @@ export function createCloudDatabase(dbVars) {
             return res?.lastRowId ? { ...entry, rowId: res.lastRowId } : undefined;
         },
         async addGamelogExternalToDatabase(entry) {
+            if (suppressGameLogWriteDepth > 0) return { ...entry, rowId: Date.now() };
             const res = await cloudFetch('/api/gamelog', {
                 method: 'POST',
                 json: { item: { ...entry, type: 'External' } }
@@ -1376,9 +1483,21 @@ export function createCloudDatabase(dbVars) {
         async getCurrentUserOnlineSessionsAfter(afterCreatedAt, inclusive = false) {
             return this.getCurrentUserLocationAfterV2(afterCreatedAt, inclusive);
         },
-        async getMyTopWorlds(_days, limit = 5, sortBy = 'time', excludeWorldId = '') {
-            const fetchLimit = Math.min(20, Math.max(Number(limit) || 5, 1) + (excludeWorldId ? 1 : 0));
-            const rows = await cloudFetch(`/api/gamelog/stats?kind=top_worlds&limit=${fetchLimit}`).catch(() => []);
+        async getMyTopWorlds(days, limit = 5, sortBy = 'time', excludeWorldId = '') {
+            const safeLimit = Math.min(20, Math.max(Number(limit) || 5, 1));
+            const params = new URLSearchParams({
+                kind: 'top_worlds',
+                limit: String(safeLimit),
+                sortBy: sortBy === 'count' ? 'count' : 'time'
+            });
+            const numericDays = Number(days);
+            if (Number.isFinite(numericDays) && numericDays > 0) {
+                params.set('days', String(Math.floor(numericDays)));
+            }
+            if (excludeWorldId) {
+                params.set('excludeWorldId', String(excludeWorldId));
+            }
+            const rows = await cloudFetch(`/api/gamelog/stats?${params.toString()}`).catch(() => []);
             const mapped = (Array.isArray(rows) ? rows : [])
                 .filter((r) => !excludeWorldId || r.world_id !== excludeWorldId)
                 .map((r) => ({
@@ -1390,7 +1509,7 @@ export function createCloudDatabase(dbVars) {
             if (sortBy === 'count') {
                 mapped.sort((a, b) => b.visitCount - a.visitCount || b.totalTime - a.totalTime);
             }
-            return mapped.slice(0, Math.max(Number(limit) || 5, 1));
+            return mapped.slice(0, safeLimit);
         },
         async getUserIdFromDisplayName() {
             return '';
@@ -1782,36 +1901,111 @@ export function createCloudDatabase(dbVars) {
             sessionActivityBuckets.set(cacheKey, entry);
         },
 
-        // ===== mutualGraph (kept in session memory, never persisted to D1) =====
+        // ===== mutualGraph (kept in session memory, matching desktop mutualGraph.js Map contracts) =====
         async getMutualGraphSnapshot() {
-            return {
-                friends: Array.from(sessionMutualGraph.friends),
-                links: sessionMutualGraph.links
-            };
+            /** @type {Map<string, string[]>} */
+            const snapshot = new Map();
+            for (const friendId of sessionMutualGraph.friends) {
+                if (friendId && !snapshot.has(friendId)) {
+                    snapshot.set(friendId, []);
+                }
+            }
+            for (const [friendId, mutualSet] of sessionMutualGraph.links.entries()) {
+                if (!friendId) continue;
+                snapshot.set(friendId, Array.from(mutualSet));
+            }
+            return snapshot;
         },
-        async saveMutualGraphSnapshot(snapshot) {
-            sessionMutualGraph.friends = new Set(snapshot?.friends || []);
+        async saveMutualGraphSnapshot(entries) {
+            const pairs = entries instanceof Map ? entries : new Map();
+            // Preserve previously opted-out friends unless refreshed in `pairs` (matches desktop mutualGraph.js)
+            const preservedFriends = new Set();
+            const preservedLinks = new Map();
+            for (const [friendId, meta] of sessionMutualGraph.meta.entries()) {
+                if (meta?.optedOut) {
+                    if (sessionMutualGraph.friends.has(friendId)) {
+                        preservedFriends.add(friendId);
+                    }
+                    const existingLinks = sessionMutualGraph.links.get(friendId);
+                    if (existingLinks) {
+                        preservedLinks.set(friendId, new Set(existingLinks));
+                    }
+                }
+            }
+            sessionMutualGraph.friends = preservedFriends;
+            sessionMutualGraph.links = preservedLinks;
+
+            pairs.forEach((mutualIds, friendId) => {
+                const id = String(friendId || '');
+                if (!id) return;
+                sessionMutualGraph.friends.add(id);
+                const normalized = new Set();
+                if (Array.isArray(mutualIds) || mutualIds instanceof Set) {
+                    for (const m of mutualIds) {
+                        if (m) normalized.add(String(m));
+                    }
+                }
+                sessionMutualGraph.links.set(id, normalized);
+            });
         },
         async updateMutualsForFriend(friendId, mutualIds) {
-            sessionMutualGraph.links.set(friendId, new Set(mutualIds || []));
+            const id = String(friendId || '');
+            if (!id) return;
+            sessionMutualGraph.friends.add(id);
+            const normalized = new Set();
+            if (Array.isArray(mutualIds) || mutualIds instanceof Set) {
+                for (const m of mutualIds) {
+                    if (m) normalized.add(String(m));
+                }
+            }
+            sessionMutualGraph.links.set(id, normalized);
         },
         async getMutualCountForAllUsers() {
+            // Mirrors desktop SQL: SELECT mutual_id, COUNT(*) FROM linkTable GROUP BY mutual_id
             const counts = new Map();
-            for (const [fid, set] of sessionMutualGraph.links.entries()) {
-                counts.set(fid, set.size);
+            for (const mutualSet of sessionMutualGraph.links.values()) {
+                for (const mutualId of mutualSet) {
+                    if (!mutualId) continue;
+                    counts.set(mutualId, (counts.get(mutualId) || 0) + 1);
+                }
             }
             return counts;
         },
         async upsertMutualGraphMeta(friendId, meta) {
-            sessionMutualGraph.meta.set(friendId, meta);
+            const id = String(friendId || '');
+            if (!id) return;
+            sessionMutualGraph.meta.set(id, {
+                lastFetchedAt: meta?.lastFetchedAt || new Date().toISOString(),
+                optedOut: Boolean(meta?.optedOut)
+            });
         },
         async bulkUpsertMutualGraphMeta(entries) {
-            for (const e of entries || []) {
-                if (e?.friendId) sessionMutualGraph.meta.set(e.friendId, e);
+            if (!entries) return;
+            const now = new Date().toISOString();
+            if (entries instanceof Map) {
+                entries.forEach((meta, friendId) => {
+                    const id = String(friendId || '');
+                    if (!id) return;
+                    sessionMutualGraph.meta.set(id, {
+                        lastFetchedAt: meta?.lastFetchedAt || now,
+                        optedOut: Boolean(meta?.optedOut)
+                    });
+                });
+                return;
+            }
+            if (Array.isArray(entries)) {
+                for (const e of entries) {
+                    const id = String(e?.friendId || '');
+                    if (!id) continue;
+                    sessionMutualGraph.meta.set(id, {
+                        lastFetchedAt: e?.lastFetchedAt || now,
+                        optedOut: Boolean(e?.optedOut)
+                    });
+                }
             }
         },
         async getMutualGraphMeta() {
-            return sessionMutualGraph.meta;
+            return new Map(sessionMutualGraph.meta);
         }
     };
 }

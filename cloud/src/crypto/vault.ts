@@ -105,7 +105,16 @@ export async function verifyPasscode(configured: string, candidate: string): Pro
     const iterations = Number(parts[1]);
     const saltHex = parts[2] ?? '';
     const expectedHex = parts[3] ?? '';
-    if (!Number.isFinite(iterations) || iterations < 10_000 || iterations > 600_000) {
+    // Cloudflare Workers Web Crypto enforces a hard 100,000-iteration ceiling on PBKDF2.
+    if (
+        !Number.isInteger(iterations) ||
+        iterations < 10_000 ||
+        iterations > 100_000 ||
+        saltHex.length === 0 ||
+        saltHex.length % 2 !== 0 ||
+        !/^[0-9a-fA-F]+$/.test(saltHex) ||
+        !/^[0-9a-fA-F]{64}$/.test(expectedHex)
+    ) {
         return false;
     }
     const saltBytes = new Uint8Array(saltHex.length / 2);
@@ -140,15 +149,22 @@ function decodeBase32(input: string): Uint8Array {
     return new Uint8Array(out);
 }
 
-/** RFC 6238 SHA-1 6-digit TOTP verification (±1 step drift tolerance). */
-export async function verifyTotp(base32Secret: string, code: string, nowMs = Date.now()): Promise<boolean> {
+/**
+ * RFC 6238 SHA-1 6-digit TOTP verification (±1 step drift tolerance).
+ * Returns the matched 30-second time step so callers can enforce single-use replay protection.
+ */
+export async function verifyTotpStep(
+    base32Secret: string,
+    code: string,
+    nowMs = Date.now()
+): Promise<{ valid: boolean; step: number }> {
     const cleanCode = code.trim();
     if (!/^\d{6}$/.test(cleanCode)) {
-        return false;
+        return { valid: false, step: 0 };
     }
     const keyBytes = decodeBase32(base32Secret);
     if (keyBytes.length === 0) {
-        return false;
+        return { valid: false, step: 0 };
     }
     const hmacKey = await crypto.subtle.importKey(
         'raw',
@@ -173,10 +189,16 @@ export async function verifyTotp(base32Secret: string, code: string, nowMs = Dat
             (mac[offset + 3]! & 0xff);
         const otp = String(binary % 1_000_000).padStart(6, '0');
         if (timingSafeEqual(otp, cleanCode)) {
-            return true;
+            return { valid: true, step };
         }
     }
-    return false;
+    return { valid: false, step: 0 };
+}
+
+/** RFC 6238 SHA-1 6-digit TOTP verification (±1 step drift tolerance). */
+export async function verifyTotp(base32Secret: string, code: string, nowMs = Date.now()): Promise<boolean> {
+    const res = await verifyTotpStep(base32Secret, code, nowMs);
+    return res.valid;
 }
 
 export async function signSessionCookie(secret: string, sessionId: string, expEpochSec: number): Promise<string> {

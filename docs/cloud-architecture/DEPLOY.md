@@ -49,7 +49,7 @@ To store compressed WebP screenshot thumbnails in Cloudflare R2 (10 GB/month Fre
 
 Without `R2_MEDIA` bound, screenshot metadata still syncs to D1 cleanly.
 
-## 3. Installing & Configuring the Windows Companion Tray Agent (`Dotnet/VRCX-Agent`)
+## 3. Installing & Configuring the Windows Companion Tray Agent (`VRCX-Agent`)
 
 `VRCX.Agent` is a lightweight .NET 10 Windows Forms system-tray companion (zero CEF, zero Electron) that auto-detects Simplified Chinese / English from Windows OS locale and runs silently in the background with optional Windows startup:
 - **Recommended Windows Installer (`VRCX.Agent-v*-Setup-win-x64.exe`)**: Download from [GitHub Releases](https://github.com/nuomew/VRCX-Worker/releases). Bundles .NET 10 Desktop Runtime, installs per-user into `%LocalAppData%\Programs\VRCX.Agent` (no admin elevation required), enables **Start with Windows in background** by default, supports in-place upgrades, and registers a standard Windows uninstaller.
@@ -62,9 +62,9 @@ Without `R2_MEDIA` bound, screenshot metadata still syncs to D1 cleanly.
 
 ### Build from Source on Windows (requires .NET 10 SDK)
 ```powershell
-dotnet publish Dotnet/VRCX-Agent/VRCX-Agent.csproj -c Release -r win-x64 --self-contained false
+dotnet publish VRCX-Agent/VRCX-Agent.csproj -c Release -r win-x64 --self-contained false
 ```
-The compiled executable is written to `build/VRCX-Agent/VRCX.Agent.exe`. To build the Windows installer locally, compile `Dotnet/VRCX-Agent/Installer/VRCX-Agent.iss` with Inno Setup 6 (`ISCC.exe`).
+The compiled executable is written to `build/VRCX-Agent/VRCX.Agent.exe`. To build the Windows installer locally, compile `VRCX-Agent/Installer/VRCX-Agent.iss` with Inno Setup 6 (`ISCC.exe`).
 
 ### Setup with Cloud URL, Sync Secret & Network Mode (Overseas / Mainland China)
 1. Open your deployed VRCX Cloud Web URL and click **Cloud** in the bottom status bar to open **Cloud Hub -> Win Agent (HTTP Sync)** (or **Settings -> System -> Cloud Sync Interval**).

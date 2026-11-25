@@ -1,6 +1,7 @@
 import { getMasterKey } from '../auth/auth';
 import {
     classifyVrcCacheUrl,
+    clearAllVrcCache,
     getCachedVrcResponses,
     invalidateVrcCacheOnWrite,
     putCachedVrcResponses
@@ -29,6 +30,58 @@ const ALLOWED_HOST_SUFFIXES = [
 // Matches standard AWS S3 regional & virtual-hosted-style bucket endpoints used by VRChat presigned uploads.
 const AWS_S3_HOST_RE = /^(?:[a-z0-9-]+\.)?s3(?:[.-][a-z0-9-]+)?\.amazonaws\.com$/;
 const MAX_IMAGE_PROXY_BYTES = 15 * 1024 * 1024; // 15 MiB cap for binary image Data URL conversion
+const MAX_TEXT_PROXY_BYTES = 16 * 1024 * 1024; // 16 MiB cap for upstream text responses
+
+function hasHeaderCaseInsensitive(headers: Record<string, string> | undefined, targetName: string): boolean {
+    if (!headers || typeof headers !== 'object') return false;
+    const lower = targetName.toLowerCase();
+    for (const [k, v] of Object.entries(headers)) {
+        if (k.toLowerCase() === lower && Boolean(v)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+async function readResponseBytesWithLimit(res: Response, maxBytes: number, errMessage: string): Promise<Uint8Array> {
+    const declared = Number(res.headers.get('content-length') ?? '0');
+    if (Number.isFinite(declared) && declared > maxBytes) {
+        await res.body?.cancel().catch(() => {});
+        throw new Error(errMessage);
+    }
+    if (!res.body) {
+        const buf = new Uint8Array(await res.arrayBuffer());
+        if (buf.byteLength > maxBytes) {
+            throw new Error(errMessage);
+        }
+        return buf;
+    }
+    const reader = res.body.getReader();
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    try {
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            if (!value) continue;
+            total += value.byteLength;
+            if (total > maxBytes) {
+                await reader.cancel().catch(() => {});
+                throw new Error(errMessage);
+            }
+            chunks.push(value);
+        }
+    } finally {
+        reader.releaseLock();
+    }
+    const out = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+        out.set(chunk, offset);
+        offset += chunk.byteLength;
+    }
+    return out;
+}
 
 interface WebApiExecutePayload {
     url: string;
@@ -49,39 +102,98 @@ interface WebApiExecutePayload {
     bypassCache?: boolean;
 }
 
+function isPrivateIpv4Octets(a: number, b: number): boolean {
+    return (
+        a === 0 ||
+        a === 10 ||
+        a === 127 ||
+        (a === 169 && b === 254) ||
+        (a === 172 && b >= 16 && b <= 31) ||
+        (a === 192 && b === 168) ||
+        (a === 100 && b >= 64 && b <= 127)
+    );
+}
+
 function isPrivateOrLocalHost(hostname: string): boolean {
     const h = hostname.toLowerCase().replace(/^\[|\]$/g, '');
-    if (
-        !h ||
-        h === 'localhost' ||
-        h.endsWith('.localhost') ||
-        h.endsWith('.local') ||
-        h.endsWith('.internal') ||
-        h === '::1' ||
-        h === '0:0:0:0:0:0:0:1' ||
-        h.startsWith('fc') ||
-        h.startsWith('fd') ||
-        h.startsWith('fe80:')
-    ) {
+    if (!h || h === 'localhost' || h.endsWith('.localhost') || h.endsWith('.local') || h.endsWith('.internal')) {
         return true;
     }
-    const ipv4 = h.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
-    if (ipv4) {
-        const a = Number(ipv4[1]);
-        const b = Number(ipv4[2]);
+    if (h.includes(':')) {
+        // IPv6 loopback, unspecified, ULA (fc00::/7), link-local (fe80::/10), and IPv4-mapped addresses.
         if (
-            a === 0 ||
-            a === 10 ||
-            a === 127 ||
-            (a === 169 && b === 254) ||
-            (a === 172 && b >= 16 && b <= 31) ||
-            (a === 192 && b === 168) ||
-            (a === 100 && b >= 64 && b <= 127)
+            h === '::' ||
+            h === '::1' ||
+            h === '0:0:0:0:0:0:0:0' ||
+            h === '0:0:0:0:0:0:0:1' ||
+            /^f[cd][0-9a-f]{2}:/i.test(h) ||
+            /^fe[89ab][0-9a-f]:/i.test(h)
         ) {
             return true;
         }
+        const mappedDotted = h.match(/^::ffff:(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+        if (mappedDotted) {
+            return isPrivateIpv4Octets(Number(mappedDotted[1]), Number(mappedDotted[2]));
+        }
+        const mappedHex = h.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+        if (mappedHex) {
+            const hi = parseInt(mappedHex[1]!, 16);
+            return isPrivateIpv4Octets((hi >> 8) & 0xff, hi & 0xff);
+        }
+        if (h.startsWith('::ffff:')) {
+            return true;
+        }
+        return false;
+    }
+    const ipv4 = h.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+    if (ipv4) {
+        return isPrivateIpv4Octets(Number(ipv4[1]), Number(ipv4[2]));
     }
     return false;
+}
+
+async function fetchWithAllowlistedRedirects(
+    initialUrl: string,
+    init: RequestInit,
+    isUrlAllowed: (candidate: string) => boolean | Promise<boolean>,
+    maxRedirects = 3
+): Promise<Response> {
+    let currentUrl = initialUrl;
+    let currentInit: RequestInit = { ...init, redirect: 'manual' };
+    for (let hop = 0; hop <= maxRedirects; hop++) {
+        const res = await fetch(currentUrl, currentInit);
+        if (![301, 302, 303, 307, 308].includes(res.status)) {
+            return res;
+        }
+        const location = res.headers.get('Location');
+        if (!location) {
+            return res;
+        }
+        if (hop === maxRedirects) {
+            throw new Error('Too many redirects from upstream target');
+        }
+        const prevOrigin = new URL(currentUrl).origin;
+        const nextUrl = new URL(location, currentUrl).toString();
+        const allowed = await isUrlAllowed(nextUrl);
+        if (!allowed) {
+            throw new Error('Redirect target is not in allowlist');
+        }
+        const nextHeaders = new Headers(currentInit.headers);
+        if (new URL(nextUrl).origin !== prevOrigin) {
+            nextHeaders.delete('Cookie');
+            nextHeaders.delete('Authorization');
+        }
+        const nextMethod = res.status === 303 ? 'GET' : currentInit.method;
+        currentInit = {
+            ...currentInit,
+            method: nextMethod,
+            body: res.status === 303 ? undefined : currentInit.body,
+            headers: nextHeaders,
+            redirect: 'manual'
+        };
+        currentUrl = nextUrl;
+    }
+    throw new Error('Too many redirects from upstream target');
 }
 
 function isAllowedTargetUrl(rawUrl: string): boolean {
@@ -121,8 +233,13 @@ async function isConfiguredPublicTranslationUrl(env: Env, rawUrl: string): Promi
         ).first<{ payload_json?: string }>();
         if (!row?.payload_json) return false;
         const cfg = JSON.parse(row.payload_json) as Record<string, unknown>;
-        const configuredRaw =
-            typeof cfg['VRCX_translationApiEndpoint'] === 'string' ? cfg['VRCX_translationApiEndpoint'].trim() : '';
+        // configRepository stores keys as `config:<lowercased>` (e.g. `config:vrcx_translationapiendpoint`);
+        // retain legacy raw keys as fallback.
+        const rawCandidate =
+            cfg['config:vrcx_translationapiendpoint'] ??
+            cfg['VRCX_translationAPIEndpoint'] ??
+            cfg['VRCX_translationApiEndpoint'];
+        const configuredRaw = typeof rawCandidate === 'string' ? rawCandidate.trim() : '';
         if (!configuredRaw) return false;
         const configured = new URL(configuredRaw);
         if (configured.protocol !== 'https:' || isPrivateOrLocalHost(configured.hostname)) {
@@ -189,18 +306,24 @@ function uint8ArrayToBase64(bytes: Uint8Array): string {
 async function readUpstreamResponseBody(upstream: Response): Promise<{ bodyText: string; isBinaryImage: boolean }> {
     const ct = (upstream.headers.get('content-type') ?? '').toLowerCase();
     if (ct.includes('image/') || ct.includes('application/octet-stream')) {
-        const buf = await upstream.arrayBuffer();
-        if (buf.byteLength > MAX_IMAGE_PROXY_BYTES) {
-            throw new Error('Image response exceeds 15 MiB proxy limit');
-        }
-        const b64 = uint8ArrayToBase64(new Uint8Array(buf));
+        const bytes = await readResponseBytesWithLimit(
+            upstream,
+            MAX_IMAGE_PROXY_BYTES,
+            'Image response exceeds 15 MiB proxy limit'
+        );
+        const b64 = uint8ArrayToBase64(bytes);
         return {
             bodyText: `data:image/png;base64,${b64}`,
             isBinaryImage: true
         };
     }
+    const textBytes = await readResponseBytesWithLimit(
+        upstream,
+        MAX_TEXT_PROXY_BYTES,
+        'Upstream text response exceeds 16 MiB proxy limit'
+    );
     return {
-        bodyText: await upstream.text(),
+        bodyText: new TextDecoder().decode(textBytes),
         isBinaryImage: false
     };
 }
@@ -240,9 +363,25 @@ export async function loadCookieJar(env: Env, accountKey = 'default'): Promise<R
     }
 }
 
-export async function saveCookieJar(env: Env, jar: Record<string, string>, accountKey = 'default'): Promise<void> {
+export async function saveCookieJar(
+    env: Env,
+    jar: Record<string, string>,
+    accountKey = 'default',
+    options: { requireExisting?: boolean } = {}
+): Promise<void> {
     const { ciphertextB64, ivB64 } = await encryptAesGcm(getMasterKey(env), JSON.stringify(jar));
     const now = new Date().toISOString();
+    if (options.requireExisting) {
+        // Never resurrect a session that the user logged out and deleted concurrently.
+        await env.DB_CORE.prepare(
+            `UPDATE cloud_cookie_vault
+             SET ciphertext_b64 = ?, iv_b64 = ?, updated_at = ?
+             WHERE account_key = ?`
+        )
+            .bind(ciphertextB64, ivB64, now, accountKey)
+            .run();
+        return;
+    }
     await env.DB_CORE.prepare(
         `INSERT INTO cloud_cookie_vault (account_key, ciphertext_b64, iv_b64, source_device_id, updated_at)
          VALUES (?, ?, ?, 'cloud-worker', ?)
@@ -268,14 +407,42 @@ export function mergeSetCookies(jar: Record<string, string>, headers: Headers): 
         }
     }
 
+    const nowMs = Date.now();
     for (const raw of rawList) {
-        const firstPart = raw.split(';')[0]?.trim();
+        const parts = raw.split(';');
+        const firstPart = parts[0]?.trim();
         if (!firstPart) continue;
         const eqIdx = firstPart.indexOf('=');
         if (eqIdx <= 0) continue;
         const name = firstPart.slice(0, eqIdx).trim();
         const val = firstPart.slice(eqIdx + 1).trim();
-        if (!val || /max-age=0/i.test(raw)) {
+
+        let expired = !val;
+        if (!expired) {
+            for (let i = 1; i < parts.length; i++) {
+                const attr = parts[i]?.trim();
+                if (!attr) continue;
+                const attrEq = attr.indexOf('=');
+                if (attrEq <= 0) continue;
+                const attrName = attr.slice(0, attrEq).trim().toLowerCase();
+                const attrVal = attr.slice(attrEq + 1).trim();
+                if (attrName === 'max-age') {
+                    const maxAge = Number(attrVal);
+                    if (Number.isFinite(maxAge) && maxAge <= 0) {
+                        expired = true;
+                        break;
+                    }
+                } else if (attrName === 'expires') {
+                    const expMs = Date.parse(attrVal);
+                    if (Number.isFinite(expMs) && expMs <= nowMs) {
+                        expired = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (expired) {
             if (name in jar) {
                 delete jar[name];
                 changed = true;
@@ -364,8 +531,15 @@ export async function handleVrcProxyRoutes(request: Request, env: Env, url: URL)
         }
         if (request.method === 'PUT') {
             const body = (await request.json()) as { cookies?: string };
+            const prevJar = await loadCookieJar(env).catch(() => ({}) as Record<string, string>);
             if (!body.cookies) {
                 await saveCookieJar(env, {});
+                if (prevJar.auth) {
+                    await clearAllVrcCache(env).catch(() => {});
+                    await env.DB_CORE.prepare("DELETE FROM cloud_bg_sync_state WHERE state_key = 'friends_snapshot'")
+                        .run()
+                        .catch(() => {});
+                }
                 return Response.json({ ok: true });
             }
             try {
@@ -375,6 +549,12 @@ export async function handleVrcProxyRoutes(request: Request, env: Env, url: URL)
                     if (typeof v === 'string') jar[k] = v;
                 }
                 await saveCookieJar(env, jar);
+                if ((prevJar.auth ?? '') !== (jar.auth ?? '')) {
+                    await clearAllVrcCache(env).catch(() => {});
+                    await env.DB_CORE.prepare("DELETE FROM cloud_bg_sync_state WHERE state_key = 'friends_snapshot'")
+                        .run()
+                        .catch(() => {});
+                }
                 return Response.json({ ok: true });
             } catch {
                 return Response.json(
@@ -384,7 +564,11 @@ export async function handleVrcProxyRoutes(request: Request, env: Env, url: URL)
             }
         }
         if (request.method === 'DELETE') {
-            await env.DB_CORE.prepare('DELETE FROM cloud_cookie_vault WHERE account_key = ?').bind('default').run();
+            await env.DB_CORE.batch([
+                env.DB_CORE.prepare('DELETE FROM cloud_cookie_vault WHERE account_key = ?').bind('default'),
+                env.DB_CORE.prepare("DELETE FROM cloud_bg_sync_state WHERE state_key = 'friends_snapshot'")
+            ]);
+            await clearAllVrcCache(env).catch(() => {});
             return Response.json({ ok: true });
         }
     }
@@ -397,6 +581,18 @@ export async function handleVrcProxyRoutes(request: Request, env: Env, url: URL)
             return Response.json(
                 { ok: false, error: { code: 'UPGRADE_REQUIRED', message: 'Expected WebSocket upgrade' } },
                 { status: 426 }
+            );
+        }
+        if (env.VRC_ALLOW_CLOUD_FALLBACK === 'false') {
+            return Response.json(
+                {
+                    ok: false,
+                    error: {
+                        code: 'AGENT_OFFLINE_READONLY',
+                        message: 'Cloud direct fallback is disabled (VRC_ALLOW_CLOUD_FALLBACK=false)'
+                    }
+                },
+                { status: 503 }
             );
         }
         const jar = await loadCookieJar(env);
@@ -444,7 +640,7 @@ export async function handleVrcProxyRoutes(request: Request, env: Env, url: URL)
         }
 
         const method = (payload.method || 'GET').toUpperCase();
-        const hasAuthHeader = Boolean(payload.headers?.Authorization || payload.headers?.authorization);
+        const hasAuthHeader = hasHeaderCaseInsensitive(payload.headers, 'authorization');
         const isUpload = Boolean(
             payload.uploadImage ||
             payload.uploadImageLegacy ||
@@ -453,13 +649,14 @@ export async function handleVrcProxyRoutes(request: Request, env: Env, url: URL)
             payload.uploadPrintImage
         );
         const isMutation = method !== 'GET' || isUpload;
-        const canUseServerCache = !isMutation && !hasAuthHeader && !payload.bypassCache;
+        const canWriteServerCache = !isMutation && !hasAuthHeader;
+        const canReadServerCache = canWriteServerCache && !payload.bypassCache;
 
         let cacheMeta: ReturnType<typeof classifyVrcCacheUrl> = null;
-        if (canUseServerCache) {
+        if (canWriteServerCache) {
             const webSyncSec = await getConfiguredWebSyncSeconds(env);
             cacheMeta = classifyVrcCacheUrl(payload.url, webSyncSec);
-            if (cacheMeta) {
+            if (canReadServerCache && cacheMeta) {
                 const hitMap = await getCachedVrcResponses(env, [payload.url]);
                 const hit = hitMap.get(payload.url);
                 if (hit) {
@@ -544,11 +741,19 @@ export async function handleVrcProxyRoutes(request: Request, env: Env, url: URL)
         const init = buildUpstreamRequestInit(payload, needsAuthCookie ? buildCookieHeader(jar) : '');
 
         try {
-            const upstream = await fetch(payload.url, init);
+            const upstream = await fetchWithAllowlistedRedirects(
+                payload.url,
+                init,
+                async (candidate) => isAllowedTargetUrl(candidate) || (await isConfiguredPublicTranslationUrl(env, candidate))
+            );
             if (needsAuthCookie) {
                 const cookieChanged = mergeSetCookies(jar, upstream.headers);
                 if (cookieChanged) {
-                    await saveCookieJar(env, jar);
+                    const isLoginOrAuthEstablish =
+                        hasAuthHeader ||
+                        payload.url.includes('/api/1/auth/twofactorauth') ||
+                        payload.url.includes('/api/1/auth/user');
+                    await saveCookieJar(env, jar, 'default', { requireExisting: !isLoginOrAuthEstablish });
                 }
             }
             const { bodyText: text, isBinaryImage } = await readUpstreamResponseBody(upstream);
@@ -626,15 +831,16 @@ export async function handleVrcProxyRoutes(request: Request, env: Env, url: URL)
         }
 
         const webSyncSec = await getConfiguredWebSyncSeconds(env);
-        const cachePlans = items.map((item) => {
+        const writePlans = items.map((item) => {
             const method = (item?.method || 'GET').toUpperCase();
-            const hasAuthHeader = Boolean(item?.headers?.Authorization || item?.headers?.authorization);
-            if (method !== 'GET' || !item?.url || !isAllowedTargetUrl(item.url) || hasAuthHeader || item.bypassCache) {
+            const hasAuthHeader = hasHeaderCaseInsensitive(item?.headers, 'authorization');
+            if (method !== 'GET' || !item?.url || !isAllowedTargetUrl(item.url) || hasAuthHeader) {
                 return null;
             }
             return classifyVrcCacheUrl(item.url, webSyncSec);
         });
-        const lookupUrls = items.map((item, idx) => (cachePlans[idx] ? item.url : '')).filter(Boolean);
+        const readPlans = items.map((item, idx) => (item?.bypassCache ? null : writePlans[idx]!));
+        const lookupUrls = items.map((item, idx) => (readPlans[idx] ? item.url : '')).filter(Boolean);
         const cacheHits = await getCachedVrcResponses(env, lookupUrls);
 
         const missIndexes: number[] = [];
@@ -644,7 +850,7 @@ export async function handleVrcProxyRoutes(request: Request, env: Env, url: URL)
             if (method !== 'GET' || !item?.url || !isAllowedTargetUrl(item.url)) {
                 continue;
             }
-            if (!cachePlans[i] || !cacheHits.has(item.url)) {
+            if (!readPlans[i] || !cacheHits.has(item.url)) {
                 missIndexes.push(i);
             }
         }
@@ -681,8 +887,9 @@ export async function handleVrcProxyRoutes(request: Request, env: Env, url: URL)
                         error: 'Batch only allows read-only GET requests on VRChat allowlist'
                     };
                 }
-                const plan = cachePlans[idx];
-                const hit = plan ? cacheHits.get(item.url) : undefined;
+                const readPlan = readPlans[idx];
+                const writePlan = writePlans[idx];
+                const hit = readPlan ? cacheHits.get(item.url) : undefined;
                 if (hit) {
                     return {
                         status: hit.status,
@@ -696,18 +903,20 @@ export async function handleVrcProxyRoutes(request: Request, env: Env, url: URL)
                     targetNeedsAuthCookie ? cookieHeader : ''
                 );
                 try {
-                    const upstream = await fetch(item.url, init);
+                    const upstream = await fetchWithAllowlistedRedirects(item.url, init, (candidate) =>
+                        isAllowedTargetUrl(candidate)
+                    );
                     if (targetNeedsAuthCookie && mergeSetCookies(jar, upstream.headers)) {
                         cookieChanged = true;
                     }
                     const { bodyText: text, isBinaryImage } = await readUpstreamResponseBody(upstream);
-                    if (plan && !isBinaryImage && upstream.status >= 200 && upstream.status < 300) {
+                    if (writePlan && !isBinaryImage && upstream.status >= 200 && upstream.status < 300) {
                         toWriteCache.push({
                             url: item.url,
-                            tier: plan.tier,
+                            tier: writePlan.tier,
                             status: upstream.status,
                             bodyText: text,
-                            ttlMs: plan.ttlMs
+                            ttlMs: writePlan.ttlMs
                         });
                     }
                     return {
@@ -728,7 +937,7 @@ export async function handleVrcProxyRoutes(request: Request, env: Env, url: URL)
             await putCachedVrcResponses(env, toWriteCache).catch(() => {});
         }
         if (cookieChanged) {
-            await saveCookieJar(env, jar);
+            await saveCookieJar(env, jar, 'default', { requireExisting: true });
         }
 
         return Response.json({

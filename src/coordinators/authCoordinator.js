@@ -14,6 +14,7 @@ import { applyCurrentUser } from './userCoordinator';
 import { watchState } from '../services/watchState';
 
 import configRepository from '../services/config';
+import { resetCloudDatabaseState } from '../services/database/cloud/index.js';
 import webApiService from '../services/webapi';
 
 /**
@@ -47,6 +48,9 @@ export async function runLogoutFlow() {
     authStore.autoLoginAttempts.clear();
     closeWebSocket();
     queryClient.clear();
+    if (typeof WEB !== 'undefined' && WEB) {
+        resetCloudDatabaseState();
+    }
 }
 
 /**

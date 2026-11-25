@@ -40,7 +40,7 @@ export function clampWebSyncIntervalSeconds(raw) {
  */
 export const cloudState = reactive({
     initialized: false,
-    authenticated: true,
+    authenticated: false,
     authMode: 'open_setup',
     requiresTotp: false,
     subject: '',

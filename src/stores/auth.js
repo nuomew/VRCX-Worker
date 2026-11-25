@@ -386,23 +386,46 @@ export const useAuthStore = defineStore('Auth', () => {
      * @param user
      */
     async function updateStoredUser(user) {
+        const isWeb = typeof WEB !== 'undefined' && WEB;
         const savedCredentials = await getAllSavedCredentials();
         if (credentialsToSave.value) {
+            const nextLoginParams = {
+                username: '',
+                password: '',
+                endpoint: '',
+                websocket: '',
+                ...savedCredentials[user.id]?.loginParams,
+                ...credentialsToSave.value
+            };
+            if (isWeb) {
+                // Never persist plaintext VRChat passwords or cookies in unencrypted cloud config_bundles;
+                // WEB sessions are persisted solely by the server-side AES-256-GCM cloud_cookie_vault.
+                nextLoginParams.password = '';
+            }
             savedCredentials[user.id] = {
                 user,
-                loginParams: {
-                    username: '',
-                    password: '',
-                    endpoint: '',
-                    websocket: '',
-                    ...savedCredentials[user.id]?.loginParams,
-                    ...credentialsToSave.value
-                }
+                loginParams: nextLoginParams
             };
             credentialsToSave.value = null;
         } else if (typeof savedCredentials[user.id] !== 'undefined') {
             savedCredentials[user.id].user = user;
-            savedCredentials[user.id].cookies = await webApiService.getCookies();
+            if (isWeb) {
+                delete savedCredentials[user.id].cookies;
+                if (savedCredentials[user.id].loginParams) {
+                    savedCredentials[user.id].loginParams.password = '';
+                }
+            } else {
+                savedCredentials[user.id].cookies = await webApiService.getCookies();
+            }
+        }
+        if (isWeb) {
+            for (const entry of Object.values(savedCredentials)) {
+                if (!entry || typeof entry !== 'object') continue;
+                delete entry.cookies;
+                if (entry.loginParams && typeof entry.loginParams === 'object') {
+                    entry.loginParams.password = '';
+                }
+            }
         }
         const jsonCredentialsArray = JSON.stringify(savedCredentials);
         await configRepository.setString('savedCredentials', jsonCredentialsArray);

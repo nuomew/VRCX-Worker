@@ -113,9 +113,21 @@ export async function handleAgentPublicRoutes(request: Request, env: Env, url: U
             );
         }
 
+        const recordPairFailure = async (): Promise<void> => {
+            await recordAuthFailure(env, rateBucket);
+            const globalFailures = await recordAuthFailure(env, 'pair:global', 15);
+            if (globalFailures >= 15) {
+                // Invalidate all active 6-digit pairing codes against distributed multi-IP brute force
+                await env.DB_CORE.batch([
+                    env.DB_CORE.prepare('UPDATE cloud_pairing_codes SET used = 1 WHERE used = 0'),
+                    env.DB_CORE.prepare("DELETE FROM cloud_auth_rate_limits WHERE bucket_key = 'pair:global'")
+                ]).catch(() => {});
+            }
+        };
+
         const code = (body.code ?? '').trim();
         if (!/^\d{6}$/.test(code)) {
-            await recordAuthFailure(env, rateBucket);
+            await recordPairFailure();
             return Response.json(
                 { ok: false, error: { code: 'INVALID_CODE', message: '6-digit pairing code required' } },
                 { status: 400 }
@@ -130,7 +142,7 @@ export async function handleAgentPublicRoutes(request: Request, env: Env, url: U
             .first<{ code: string; device_label: string; expires_at: string; used: number }>();
 
         if (!row || row.used !== 0 || row.expires_at < nowIso) {
-            await recordAuthFailure(env, rateBucket);
+            await recordPairFailure();
             return Response.json(
                 { ok: false, error: { code: 'PAIR_CODE_INVALID', message: 'Pairing code expired or already used' } },
                 { status: 401 }
@@ -144,7 +156,7 @@ export async function handleAgentPublicRoutes(request: Request, env: Env, url: U
             .bind(code, nowIso)
             .run();
         if ((claimRes.meta?.changes ?? 0) !== 1) {
-            await recordAuthFailure(env, rateBucket);
+            await recordPairFailure();
             return Response.json(
                 { ok: false, error: { code: 'PAIR_CODE_INVALID', message: 'Pairing code expired or already used' } },
                 { status: 401 }
@@ -152,6 +164,7 @@ export async function handleAgentPublicRoutes(request: Request, env: Env, url: U
         }
 
         await clearAuthRateLimit(env, rateBucket);
+        await clearAuthRateLimit(env, 'pair:global');
 
         const deviceId = `win-${randomHex(8)}`;
         const deviceToken = randomHex(32);
@@ -272,19 +285,56 @@ export async function handleAgentPublicRoutes(request: Request, env: Env, url: U
     const mediaUploadMatch = url.pathname.match(/^\/api\/agent\/media\/screenshots\/([A-Za-z0-9_-]{8,64})$/);
     if (mediaUploadMatch && request.method === 'PUT') {
         const screenshotId = mediaUploadMatch[1]!;
-        const auth = await authenticateAgent(request, env, '');
+        const declaredLen = Number(request.headers.get('Content-Length') ?? '0');
+        if (Number.isFinite(declaredLen) && declaredLen > MAX_SCREENSHOT_BYTES) {
+            return Response.json(
+                { ok: false, error: { code: 'PAYLOAD_TOO_LARGE', message: 'Screenshot exceeds 25 MiB ceiling' } },
+                { status: 413 }
+            );
+        }
+        let bytes: Uint8Array;
+        if (request.body) {
+            const reader = request.body.getReader();
+            const chunks: Uint8Array[] = [];
+            let total = 0;
+            try {
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    if (!value) continue;
+                    total += value.byteLength;
+                    if (total > MAX_SCREENSHOT_BYTES) {
+                        await reader.cancel().catch(() => {});
+                        return Response.json(
+                            { ok: false, error: { code: 'PAYLOAD_TOO_LARGE', message: 'Screenshot exceeds 25 MiB ceiling' } },
+                            { status: 413 }
+                        );
+                    }
+                    chunks.push(value);
+                }
+            } finally {
+                reader.releaseLock();
+            }
+            bytes = new Uint8Array(total);
+            let offset = 0;
+            for (const c of chunks) {
+                bytes.set(c, offset);
+                offset += c.byteLength;
+            }
+        } else {
+            bytes = new Uint8Array(await request.arrayBuffer());
+            if (bytes.byteLength > MAX_SCREENSHOT_BYTES) {
+                return Response.json(
+                    { ok: false, error: { code: 'PAYLOAD_TOO_LARGE', message: 'Screenshot exceeds 25 MiB ceiling' } },
+                    { status: 413 }
+                );
+            }
+        }
+        const auth = await authenticateAgent(request, env, bytes);
         if (!auth.authenticated || !auth.deviceId) {
             return Response.json(
                 { ok: false, error: { code: 'UNAUTHORIZED_AGENT', message: auth.reason ?? 'Unauthorized agent' } },
                 { status: 401 }
-            );
-        }
-
-        const bytes = new Uint8Array(await request.arrayBuffer());
-        if (bytes.byteLength > MAX_SCREENSHOT_BYTES) {
-            return Response.json(
-                { ok: false, error: { code: 'PAYLOAD_TOO_LARGE', message: 'Screenshot exceeds 25 MiB ceiling' } },
-                { status: 413 }
             );
         }
 
@@ -610,9 +660,13 @@ export async function handleAgentPublicRoutes(request: Request, env: Env, url: U
         const status = body.status === 'succeeded' ? 'succeeded' : 'failed';
         const nowIso = new Date().toISOString();
         await env.DB_CORE.prepare(
-            'UPDATE cloud_commands SET status = ?, result_json = ?, finished_at = ? WHERE cmd_id = ?'
+            `UPDATE cloud_commands
+             SET status = ?, result_json = ?, finished_at = ?
+             WHERE cmd_id = ?
+               AND (target_device_id = '' OR target_device_id = ?)
+               AND status IN ('pending', 'dispatching', 'dispatched')`
         )
-            .bind(status, JSON.stringify({ status, message: body.message ?? '', data: body.data }), nowIso, cmdId)
+            .bind(status, JSON.stringify({ status, message: body.message ?? '', data: body.data }), nowIso, cmdId, auth.deviceId)
             .run();
 
         return Response.json({ ok: true, data: { cmdId, status } });
@@ -681,6 +735,17 @@ export async function handleAgentWebRoutes(request: Request, env: Env, url: URL)
                     env.DB_CORE.prepare('DELETE FROM cloud_device_states WHERE device_id = ?').bind(deviceId),
                     env.DB_CORE.prepare('DELETE FROM cloud_sync_cursors WHERE device_id = ?').bind(deviceId)
                 ]);
+                // Immediately disconnect any live WebSocket session and drop live_device_state in AgentHubDO
+                const hub = env.AGENT_HUB.get(env.AGENT_HUB.idFromName('primary'));
+                await hub
+                    .fetch(
+                        new Request('https://agent-hub.internal/revoke-device', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ deviceId })
+                        })
+                    )
+                    .catch(() => {});
             }
             return Response.json({ ok: true });
         }
@@ -714,16 +779,19 @@ export async function handleAgentWebRoutes(request: Request, env: Env, url: URL)
 
             const cmdId = `cmd_${randomHex(8)}`;
             // Default 10-minute queue TTL so periodic HTTP-sync agents reliably pick up queued commands.
-            const ttlMs = Math.min(Math.max((body.ttlSec ?? 600) * 1000, 30_000), 1_800_000);
+            const rawTtlSec = typeof body.ttlSec === 'number' && Number.isFinite(body.ttlSec) ? body.ttlSec : 600;
+            const ttlMs = Math.min(Math.max(rawTtlSec * 1000, 30_000), 1_800_000);
             const now = Date.now();
             const createdAt = new Date(now).toISOString();
             const expiresAt = new Date(now + ttlMs).toISOString();
             const pruneBeforeIso = new Date(now - 24 * 3600_000).toISOString();
 
+            // Insert as 'dispatching' first so concurrent HTTP /api/agent/sync polls cannot claim the command
+            // while WebSocket dispatch is in flight (prevents duplicate dual-channel execution).
             await env.DB_CORE.batch([
                 env.DB_CORE.prepare(
                     `INSERT INTO cloud_commands (cmd_id, target_device_id, action, payload_json, status, result_json, created_at, expires_at, finished_at)
-                     VALUES (?, ?, ?, ?, 'pending', '{}', ?, ?, '')`
+                     VALUES (?, ?, ?, ?, 'dispatching', '{}', ?, ?, '')`
                 ).bind(cmdId, body.targetDeviceId ?? '', body.action, JSON.stringify(params), createdAt, expiresAt),
                 env.DB_CORE.prepare('DELETE FROM cloud_commands WHERE expires_at < ?').bind(pruneBeforeIso)
             ]);
@@ -744,7 +812,12 @@ export async function handleAgentWebRoutes(request: Request, env: Env, url: URL)
             );
 
             if (!dispatchRes.ok) {
-                // Keep command pending in D1 so periodic HTTP sync agents execute it on their next poll.
+                // Transition to 'pending' so periodic HTTP sync agents execute it on their next poll.
+                await env.DB_CORE.prepare(
+                    "UPDATE cloud_commands SET status = 'pending' WHERE cmd_id = ? AND status = 'dispatching'"
+                )
+                    .bind(cmdId)
+                    .run();
                 return Response.json({
                     ok: true,
                     data: {
@@ -758,7 +831,7 @@ export async function handleAgentWebRoutes(request: Request, env: Env, url: URL)
 
             const dispatchData = (await dispatchRes.json()) as { data?: { deviceId?: string } };
             await env.DB_CORE.prepare(
-                "UPDATE cloud_commands SET status = 'dispatched', target_device_id = ? WHERE cmd_id = ?"
+                "UPDATE cloud_commands SET status = 'dispatched', target_device_id = ? WHERE cmd_id = ? AND status IN ('pending', 'dispatching')"
             )
                 .bind(dispatchData.data?.deviceId ?? body.targetDeviceId ?? '', cmdId)
                 .run();

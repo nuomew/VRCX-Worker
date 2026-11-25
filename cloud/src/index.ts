@@ -1,4 +1,4 @@
-import { authenticateAgent, authenticateWeb, handleAuthRoutes } from './auth/auth';
+import { authenticateAgent, authenticateWeb, handleAuthRoutes, isSameOriginRequest } from './auth/auth';
 import { ensureSchemaReady } from './db/schemaBootstrap';
 import type { Env } from './env';
 import { AgentHubDO } from './hub/AgentHubDO';
@@ -140,6 +140,16 @@ export default {
             const webAuth = await authenticateWeb(request, env);
             if (!webAuth.authenticated) {
                 return unauthorizedResponse();
+            }
+
+            // Block cross-origin WebSocket upgrades (CSWSH) and cross-site state-changing requests (CSRF)
+            const isWebSocketUpgrade = (request.headers.get('Upgrade') ?? '').toLowerCase() === 'websocket';
+            const isStateChangingMethod = !['GET', 'HEAD', 'OPTIONS'].includes(request.method.toUpperCase());
+            if ((isWebSocketUpgrade || isStateChangingMethod) && !isSameOriginRequest(request, url)) {
+                return Response.json(
+                    { ok: false, error: { code: 'FORBIDDEN_ORIGIN', message: 'Cross-origin request blocked' } },
+                    { status: 403 }
+                );
             }
 
             if (url.pathname === '/ws/web') {

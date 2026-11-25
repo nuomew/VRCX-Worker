@@ -242,6 +242,15 @@ export async function pruneExpiredVrcCache(env: Env, nowMs = Date.now()): Promis
     await db.prepare('DELETE FROM vrc_api_cache WHERE expires_at <= ?').bind(nowMs).run();
 }
 
+/**
+ * Purges all cached VRChat API responses and RSS snapshots on logout or account switch
+ * so another VRChat account can never read stale cached friend/favorite/notification payloads.
+ */
+export async function clearAllVrcCache(env: Env): Promise<void> {
+    const db = getCacheDb(env);
+    await db.batch([db.prepare('DELETE FROM vrc_api_cache'), db.prepare('DELETE FROM cloud_rss_snapshot')]);
+}
+
 export async function readRssSnapshot(env: Env): Promise<RssSnapshotPayload | null> {
     const db = getCacheDb(env);
     const row = await db

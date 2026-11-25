@@ -8,7 +8,8 @@ obj1/
 .vs/
 *.user
 
-Installer/version_define.nsh
+desktop/Installer/version_define.nsh
+desktop/Dotnet/bin/
 bun.lock
 
 .env.sentry-build-plugin

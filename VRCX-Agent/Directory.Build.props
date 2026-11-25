@@ -1,0 +1,7 @@
+<Project>
+  <!-- Keep VRCX-Agent build outputs isolated from desktop/Dotnet/Directory.Build.props so win-x64 builds cleanly on Windows and Linux cross-compile -->
+  <PropertyGroup>
+    <BaseIntermediateOutputPath>obj\</BaseIntermediateOutputPath>
+    <BaseOutputPath>bin\</BaseOutputPath>
+  </PropertyGroup>
+</Project>

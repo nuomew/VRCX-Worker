@@ -1,6 +1,7 @@
 import { cloudFetch, onCloudGameLogEvent } from './apiClient.js';
 import { bootstrapCache, flushStorageNow, scheduleStoragePatch } from './bootstrapCache.js';
 import { cloudState, getAggregatedGameState, getPrimaryAgentState, syncGameRunningBridge } from './cloudState.js';
+import { setSuppressCloudGameLogWrites } from '../services/database/cloud/index.js';
 
 /**
  * Lightweight RFC 1321 MD5 returning Base64 (used by imageUploadCoordinator for VRChat file uploads).
@@ -349,21 +350,54 @@ export function createVrcxStorageBridge() {
 export function createLogWatcherBridge() {
     /** @type {string[][]} */
     const queue = [];
+    const MAX_QUEUED_ROWS = 500;
+
+    /**
+     * Forwards a real-time WS GameLog row into window.$bridge.addGameLogEvent while
+     * suppressing duplicate D1 write-back (the Windows Agent already persisted it).
+     * @param {string[]} row
+     */
+    function dispatchRowToBridge(row) {
+        const bridge = typeof window !== 'undefined' ? /** @type {any} */ (window).$bridge : null;
+        if (!bridge || typeof bridge.addGameLogEvent !== 'function') {
+            return false;
+        }
+        setSuppressCloudGameLogWrites(true);
+        Promise.resolve()
+            .then(() => bridge.addGameLogEvent(JSON.stringify(row)))
+            .catch(() => {})
+            .finally(() => setSuppressCloudGameLogWrites(false));
+        return true;
+    }
 
     onCloudGameLogEvent((ev) => {
         const dt = ev.created_at || new Date().toISOString();
+        /** @type {string[] | null} */
+        let row = null;
         if (ev.type === 'Location') {
-            queue.push(['cloud', dt, 'location', ev.location || '', ev.worldName || '']);
+            row = ['cloud', dt, 'location', ev.location || '', ev.worldName || ''];
         } else if (ev.type === 'OnPlayerJoined') {
-            queue.push(['cloud', dt, 'player-joined', ev.displayName || '', ev.userId || '']);
+            row = ['cloud', dt, 'player-joined', ev.displayName || '', ev.userId || ''];
         } else if (ev.type === 'OnPlayerLeft') {
-            queue.push(['cloud', dt, 'player-left', ev.displayName || '', ev.userId || '']);
+            row = ['cloud', dt, 'player-left', ev.displayName || '', ev.userId || ''];
         } else if (ev.type === 'VideoPlay') {
-            queue.push(['cloud', dt, 'video-play', ev.videoUrl || '', ev.displayName || '']);
+            row = ['cloud', dt, 'video-play', ev.videoUrl || '', ev.displayName || ''];
         } else if (ev.type === 'Event') {
-            queue.push(['cloud', dt, 'event', ev.data || '']);
+            row = ['cloud', dt, 'event', ev.data || ''];
         } else if (ev.type === 'PortalSpawn') {
-            queue.push(['cloud', dt, 'portal-spawn']);
+            row = ['cloud', dt, 'portal-spawn'];
+        }
+        if (!row) return;
+
+        // Drain any early startup-queued rows first once $bridge.addGameLogEvent is ready.
+        while (queue.length > 0 && dispatchRowToBridge(queue[0])) {
+            queue.shift();
+        }
+        if (!dispatchRowToBridge(row)) {
+            if (queue.length >= MAX_QUEUED_ROWS) {
+                queue.shift();
+            }
+            queue.push(row);
         }
     });
 

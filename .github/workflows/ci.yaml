@@ -49,8 +49,8 @@ jobs:
           dotnet-version: '10.0.x'
       - name: Run Dotnet format
         run: |
-          dotnet format whitespace --no-restore --verify-no-changes
-          dotnet format style --no-restore --verify-no-changes
+          dotnet format whitespace desktop/VRCX.slnx --no-restore --verify-no-changes
+          dotnet format style desktop/VRCX.slnx --no-restore --verify-no-changes
 
   test_build_dotnet_windows:
     runs-on: windows-latest
@@ -70,8 +70,8 @@ jobs:
       - uses: actions/cache@v5
         with:
           path: ~/.nuget/packages
-          key: ${{ runner.os }}-nuget-${{ hashFiles('**/Dotnet/VRCX-Cef.csproj') }}
+          key: ${{ runner.os }}-nuget-${{ hashFiles('**/desktop/Dotnet/VRCX-Cef.csproj') }}
           restore-keys: |
             ${{ runner.os }}-nuget-
       - name: Build Cef .NET Application
-        run: dotnet build Dotnet/VRCX-Cef.csproj -p:Configuration=Release -p:WarningLevel=0 -p:Platform=x64 -t:"Clean;Build" -maxcpucount --runtime win-x64 --self-contained
+        run: dotnet build desktop/Dotnet/VRCX-Cef.csproj -p:Configuration=Release -p:WarningLevel=0 -p:Platform=x64 -t:"Clean;Build" -maxcpucount --runtime win-x64 --self-contained

@@ -10,6 +10,41 @@ function safeJsonParse<T>(raw: string | null | undefined, fallback: T): T {
     }
 }
 
+const MAX_CORE_BATCH_ENTRIES = 500;
+
+/**
+ * Strips plaintext VRChat passwords and raw cookies from `savedCredentials` inside `vrcx_config`
+ * so unencrypted config_bundles can never store or leak VRChat session credentials.
+ */
+function sanitizeConfigBundleMap(map: Record<string, string>): void {
+    for (const key of Object.keys(map)) {
+        const lower = key.toLowerCase();
+        if (lower !== 'config:savedcredentials' && lower !== 'savedcredentials') {
+            continue;
+        }
+        const raw = map[key];
+        if (typeof raw !== 'string' || !raw) continue;
+        try {
+            const parsed = JSON.parse(raw) as Record<string, Record<string, unknown>>;
+            if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+                map[key] = '{}';
+                continue;
+            }
+            for (const entry of Object.values(parsed)) {
+                if (!entry || typeof entry !== 'object') continue;
+                delete entry.cookies;
+                const lp = entry.loginParams;
+                if (lp && typeof lp === 'object' && !Array.isArray(lp)) {
+                    (lp as Record<string, unknown>).password = '';
+                }
+            }
+            map[key] = JSON.stringify(parsed);
+        } catch {
+            map[key] = '{}';
+        }
+    }
+}
+
 export function clampQueryLimit(raw: string | null, fallback: number, max: number): number {
     if (raw == null || raw.trim() === '') return fallback;
     const n = Number(raw);
@@ -25,64 +60,130 @@ export async function incrementCounter(db: D1Database, counterKey: string, delta
             `INSERT INTO stats_counters (counter_key, row_count, updated_at)
              VALUES (?, MAX(0, ?), ?)
              ON CONFLICT(counter_key) DO UPDATE SET
-                row_count = MAX(0, row_count + excluded.row_count),
+                row_count = MAX(0, row_count + ?),
                 updated_at = excluded.updated_at`
         )
-        .bind(counterKey, delta, now)
+        .bind(counterKey, delta, now, delta)
         .run();
+}
+
+export async function incrementCountersBatch(db: D1Database, deltas: Map<string, number>): Promise<void> {
+    const entries = Array.from(deltas.entries()).filter(([, d]) => Boolean(d));
+    if (entries.length === 0) return;
+    const now = new Date().toISOString();
+    await db.batch(
+        entries.map(([counterKey, delta]) =>
+            db
+                .prepare(
+                    `INSERT INTO stats_counters (counter_key, row_count, updated_at)
+                     VALUES (?, MAX(0, ?), ?)
+                     ON CONFLICT(counter_key) DO UPDATE SET
+                        row_count = MAX(0, row_count + ?),
+                        updated_at = excluded.updated_at`
+                )
+                .bind(counterKey, delta, now, delta)
+        )
+    );
+}
+
+/**
+ * Batch-upserts deduplicated entity_users rows using at most 2 D1 subrequests (1 IN-query + 1 batch write)
+ * instead of 2 per user, preventing Cloudflare Workers Free-tier 50-subrequest exhaustion.
+ */
+export async function upsertEntityUsersBatch(db: D1Database, entries: Map<string, string>, cap = 50): Promise<void> {
+    const list = Array.from(entries.entries())
+        .filter(([uid, name]) => Boolean(uid && name))
+        .slice(0, cap);
+    if (list.length === 0) return;
+    const now = new Date().toISOString();
+    const ids = list.map(([uid]) => uid);
+    const ph = ids.map(() => '?').join(', ');
+    const existingRes = await db
+        .prepare(`SELECT user_id, display_name, aliases_text FROM entity_users WHERE user_id IN (${ph})`)
+        .bind(...ids)
+        .all<{ user_id: string; display_name: string; aliases_text: string }>();
+    const existingMap = new Map<string, { display_name: string; aliases_text: string }>();
+    for (const r of existingRes.results ?? []) {
+        existingMap.set(r.user_id, r);
+    }
+
+    const writes: D1PreparedStatement[] = [];
+    for (const [userId, displayName] of list) {
+        const existing = existingMap.get(userId);
+        if (!existing) {
+            writes.push(
+                db
+                    .prepare(
+                        'INSERT OR IGNORE INTO entity_users (user_id, display_name, aliases_text, updated_at) VALUES (?, ?, ?, ?)'
+                    )
+                    .bind(userId, displayName, '', now)
+            );
+        } else if (existing.display_name !== displayName) {
+            const aliasSet = new Set(existing.aliases_text.split(' ').filter(Boolean));
+            aliasSet.add(existing.display_name);
+            const aliasesText = Array.from(aliasSet).slice(-10).join(' ');
+            writes.push(
+                db
+                    .prepare('UPDATE entity_users SET display_name = ?, aliases_text = ?, updated_at = ? WHERE user_id = ?')
+                    .bind(displayName, aliasesText, now, userId)
+            );
+        }
+    }
+    if (writes.length > 0) {
+        await db.batch(writes);
+    }
+}
+
+/**
+ * Batch-upserts deduplicated entity_worlds rows using at most 2 D1 subrequests (1 IN-query + 1 batch write).
+ */
+export async function upsertEntityWorldsBatch(db: D1Database, entries: Map<string, string>, cap = 50): Promise<void> {
+    const list = Array.from(entries.entries())
+        .filter(([wid, name]) => Boolean(wid && name))
+        .slice(0, cap);
+    if (list.length === 0) return;
+    const now = new Date().toISOString();
+    const ids = list.map(([wid]) => wid);
+    const ph = ids.map(() => '?').join(', ');
+    const existingRes = await db
+        .prepare(`SELECT world_id, world_name FROM entity_worlds WHERE world_id IN (${ph})`)
+        .bind(...ids)
+        .all<{ world_id: string; world_name: string }>();
+    const existingMap = new Map<string, string>();
+    for (const r of existingRes.results ?? []) {
+        existingMap.set(r.world_id, r.world_name);
+    }
+
+    const writes: D1PreparedStatement[] = [];
+    for (const [worldId, worldName] of list) {
+        const prevName = existingMap.get(worldId);
+        if (prevName === undefined) {
+            writes.push(
+                db
+                    .prepare('INSERT OR IGNORE INTO entity_worlds (world_id, world_name, updated_at) VALUES (?, ?, ?)')
+                    .bind(worldId, worldName, now)
+            );
+        } else if (prevName !== worldName) {
+            writes.push(
+                db
+                    .prepare('UPDATE entity_worlds SET world_name = ?, updated_at = ? WHERE world_id = ?')
+                    .bind(worldName, now, worldId)
+            );
+        }
+    }
+    if (writes.length > 0) {
+        await db.batch(writes);
+    }
 }
 
 export async function upsertEntityUser(db: D1Database, userId: string, displayName: string): Promise<void> {
     if (!userId || !displayName) return;
-    const now = new Date().toISOString();
-    const existing = await db
-        .prepare('SELECT display_name, aliases_text FROM entity_users WHERE user_id = ? LIMIT 1')
-        .bind(userId)
-        .first<{ display_name: string; aliases_text: string }>();
-
-    if (!existing) {
-        await db
-            .prepare(
-                'INSERT OR IGNORE INTO entity_users (user_id, display_name, aliases_text, updated_at) VALUES (?, ?, ?, ?)'
-            )
-            .bind(userId, displayName, '', now)
-            .run();
-        return;
-    }
-
-    if (existing.display_name === displayName) {
-        return;
-    }
-    const aliasSet = new Set(existing.aliases_text.split(' ').filter(Boolean));
-    aliasSet.add(existing.display_name);
-    const aliasesText = Array.from(aliasSet).slice(-10).join(' ');
-    await db
-        .prepare('UPDATE entity_users SET display_name = ?, aliases_text = ?, updated_at = ? WHERE user_id = ?')
-        .bind(displayName, aliasesText, now, userId)
-        .run();
+    await upsertEntityUsersBatch(db, new Map([[userId, displayName]]), 1);
 }
 
 export async function upsertEntityWorld(db: D1Database, worldId: string, worldName: string): Promise<void> {
     if (!worldId || !worldName) return;
-    const now = new Date().toISOString();
-    const existing = await db
-        .prepare('SELECT world_name FROM entity_worlds WHERE world_id = ? LIMIT 1')
-        .bind(worldId)
-        .first<{ world_name: string }>();
-
-    if (!existing) {
-        await db
-            .prepare('INSERT OR IGNORE INTO entity_worlds (world_id, world_name, updated_at) VALUES (?, ?, ?)')
-            .bind(worldId, worldName, now)
-            .run();
-        return;
-    }
-    if (existing.world_name !== worldName) {
-        await db
-            .prepare('UPDATE entity_worlds SET world_name = ?, updated_at = ? WHERE world_id = ?')
-            .bind(worldName, now, worldId)
-            .run();
-    }
+    await upsertEntityWorldsBatch(db, new Map([[worldId, worldName]]), 1);
 }
 
 export const DEFAULT_CLOUD_SYNC_INTERVAL_SECONDS = 60;
@@ -255,6 +356,7 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
         }
 
         const vrcxConfigs = bundles.vrcx_config ?? {};
+        sanitizeConfigBundleMap(vrcxConfigs);
         const syncIntervalSeconds = parseCloudSyncIntervalSeconds(vrcxConfigs['cloud:syncIntervalSeconds']);
         const webSyncIntervalSeconds = parseWebSyncIntervalSeconds(vrcxConfigs['cloud:webSyncIntervalSeconds']);
         const nowIso = new Date().toISOString();
@@ -355,7 +457,7 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
 
         let merged: Record<string, string>;
         if (body.replace) {
-            merged = body.replace;
+            merged = { ...body.replace };
         } else {
             const existing = await env.DB_CORE.prepare(
                 'SELECT payload_json FROM config_bundles WHERE bundle_key = ? LIMIT 1'
@@ -370,6 +472,9 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
                     merged[k] = String(v);
                 }
             }
+        }
+        if (body.bundleKey === 'vrcx_config') {
+            sanitizeConfigBundleMap(merged);
         }
 
         const now = new Date().toISOString();
@@ -438,15 +543,26 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
     if (url.pathname === '/api/notes') {
         if (request.method === 'PUT') {
             const body = (await request.json()) as {
-                userId: string;
-                displayName?: string;
-                note: string;
-                createdAt?: string;
+                userId?: unknown;
+                displayName?: unknown;
+                note?: unknown;
+                createdAt?: unknown;
             };
+            const userId = typeof body.userId === 'string' ? body.userId.trim() : '';
+            if (!userId) {
+                return Response.json(
+                    { ok: false, error: { code: 'BAD_NOTE', message: 'Valid string userId is required' } },
+                    { status: 400 }
+                );
+            }
+            const displayName = typeof body.displayName === 'string' ? body.displayName : '';
+            const note = typeof body.note === 'string' ? body.note : '';
+            const createdAt =
+                typeof body.createdAt === 'string' && body.createdAt ? body.createdAt : new Date().toISOString();
             await env.DB_CORE.prepare(
                 'INSERT OR REPLACE INTO notes (user_id, display_name, note, created_at) VALUES (?, ?, ?, ?)'
             )
-                .bind(body.userId, body.displayName ?? '', body.note, body.createdAt || new Date().toISOString())
+                .bind(userId, displayName, note, createdAt)
                 .run();
             return Response.json({ ok: true });
         }
@@ -667,9 +783,21 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
                 : body?.userId
                   ? [body]
                   : [];
+            if (list.length > MAX_CORE_BATCH_ENTRIES) {
+                return Response.json(
+                    {
+                        ok: false,
+                        error: {
+                            code: 'PAYLOAD_TOO_LARGE',
+                            message: `Batch exceeds ${MAX_CORE_BATCH_ENTRIES} entries limit`
+                        }
+                    },
+                    { status: 413 }
+                );
+            }
             const nowIso = new Date().toISOString();
-            for (let i = 0; i < list.length; i += 25) {
-                const chunk = list.slice(i, i + 25);
+            for (let i = 0; i < list.length; i += 50) {
+                const chunk = list.slice(i, i + 50);
                 await env.DB_CORE.batch(
                     chunk.map((e) =>
                         env.DB_CORE.prepare(
@@ -705,6 +833,18 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
                 }>;
             };
             const list = body.entries ?? [];
+            if (list.length > MAX_CORE_BATCH_ENTRIES) {
+                return Response.json(
+                    {
+                        ok: false,
+                        error: {
+                            code: 'PAYLOAD_TOO_LARGE',
+                            message: `Batch exceeds ${MAX_CORE_BATCH_ENTRIES} entries limit`
+                        }
+                    },
+                    { status: 413 }
+                );
+            }
             for (let i = 0; i < list.length; i += 50) {
                 const chunk = list.slice(i, i + 50);
                 await env.DB_CORE.batch(
@@ -753,8 +893,20 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
                 }>;
             };
             const list = body.entries ?? [];
-            for (let i = 0; i < list.length; i += 25) {
-                const chunk = list.slice(i, i + 25);
+            if (list.length > MAX_CORE_BATCH_ENTRIES) {
+                return Response.json(
+                    {
+                        ok: false,
+                        error: {
+                            code: 'PAYLOAD_TOO_LARGE',
+                            message: `Batch exceeds ${MAX_CORE_BATCH_ENTRIES} entries limit`
+                        }
+                    },
+                    { status: 413 }
+                );
+            }
+            for (let i = 0; i < list.length; i += 50) {
+                const chunk = list.slice(i, i + 50);
                 await env.DB_CORE.batch(
                     chunk.map((e) =>
                         env.DB_CORE.prepare(
@@ -814,10 +966,22 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
             if (list.length === 0) {
                 return Response.json({ ok: true, data: { count: 0 } });
             }
+            if (list.length > MAX_CORE_BATCH_ENTRIES) {
+                return Response.json(
+                    {
+                        ok: false,
+                        error: {
+                            code: 'PAYLOAD_TOO_LARGE',
+                            message: `Batch exceeds ${MAX_CORE_BATCH_ENTRIES} entries limit`
+                        }
+                    },
+                    { status: 413 }
+                );
+            }
             const nowIso = new Date().toISOString();
             if (body.version === 2) {
-                for (let i = 0; i < list.length; i += 25) {
-                    const chunk = list.slice(i, i + 25);
+                for (let i = 0; i < list.length; i += 50) {
+                    const chunk = list.slice(i, i + 50);
                     await env.DB_CORE.batch(
                         chunk.map((e) =>
                             env.DB_CORE.prepare(
@@ -847,8 +1011,8 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
                 }
             } else {
                 let insertedCount = 0;
-                for (let i = 0; i < list.length; i += 25) {
-                    const chunk = list.slice(i, i + 25);
+                for (let i = 0; i < list.length; i += 50) {
+                    const chunk = list.slice(i, i + 50);
                     const results = await env.DB_CORE.batch(
                         chunk.map((e) => {
                             const details = (e.details ?? {}) as Record<string, unknown>;
@@ -892,14 +1056,13 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
                 seen?: boolean;
             };
             if (body.version === 2) {
-                if (typeof body.seen === 'boolean') {
+                if (body.expired) {
+                    await env.DB_CORE.prepare('UPDATE notifications_v2 SET expires_at = ?, seen = 1 WHERE id = ?')
+                        .bind(new Date().toISOString(), body.id)
+                        .run();
+                } else if (typeof body.seen === 'boolean') {
                     await env.DB_CORE.prepare('UPDATE notifications_v2 SET seen = ? WHERE id = ?')
                         .bind(body.seen ? 1 : 0, body.id)
-                        .run();
-                }
-                if (body.expired) {
-                    await env.DB_CORE.prepare('UPDATE notifications_v2 SET expires_at = ? WHERE id = ?')
-                        .bind(new Date().toISOString(), body.id)
                         .run();
                 }
             } else if (typeof body.expired === 'boolean') {

@@ -1,6 +1,7 @@
 import { cloudFetch } from './apiClient.js';
 import { clampWebSyncIntervalSeconds, cloudState } from './cloudState.js';
 import { applyUser } from '../coordinators/userCoordinator.js';
+import { setSuppressCloudFeedWrites } from '../services/database/cloud/index.js';
 import { useFeedStore } from '../stores/feed.js';
 import { useFriendStore } from '../stores/friend.js';
 import { useNotificationStore } from '../stores/notification/index.js';
@@ -34,7 +35,7 @@ export function resetCloudRssSyncState() {
  *     notificationsV2?: Array<Record<string, any>>;
  * }} data
  */
-export function applyCloudRssSnapshot(data) {
+export function applyCloudRssSnapshot(data, storeOverrides = null) {
     if (!data || typeof data !== 'object') return;
     if (data.webSyncIntervalSeconds !== undefined) {
         cloudState.webSyncIntervalSeconds = clampWebSyncIntervalSeconds(data.webSyncIntervalSeconds);
@@ -46,10 +47,10 @@ export function applyCloudRssSnapshot(data) {
         return;
     }
 
-    const friendStore = useFriendStore();
-    const userStore = useUserStore();
-    const feedStore = useFeedStore();
-    const notificationStore = useNotificationStore();
+    const friendStore = storeOverrides?.friendStore ?? useFriendStore();
+    const userStore = storeOverrides?.userStore ?? useUserStore();
+    const feedStore = storeOverrides?.feedStore ?? useFeedStore();
+    const notificationStore = storeOverrides?.notificationStore ?? useNotificationStore();
 
     const onlineFriends = Array.isArray(data.onlineFriends) ? data.onlineFriends : [];
     const onlineIdSet = new Set();
@@ -59,39 +60,46 @@ export function applyCloudRssSnapshot(data) {
             ? (fn) => friendStore.runInSortedFriendsBatch(fn)
             : (fn) => fn();
 
-    runBatch(() => {
-        for (const raw of onlineFriends) {
-            if (!raw || typeof raw !== 'object' || !raw.id) continue;
-            onlineIdSet.add(raw.id);
-            const state = raw.platform === 'web' ? 'active' : raw.platform ? 'online' : 'offline';
-            applyUser(
-                /** @type {any} */ ({
-                    ...raw,
-                    state
-                })
-            );
-        }
-
-        // Transition friends that disappeared from the latest online snapshot cleanly to offline
-        for (const [friendId, ctx] of friendStore.friends.entries()) {
-            if (friendId === userStore.currentUser?.id) continue;
-            if (!onlineIdSet.has(friendId) && ctx.state !== 'offline') {
+    // Suppress client-side Feed DB writes while applying server-authoritative RSS friend snapshots
+    // (backgroundFeedSync already persisted Online/Offline/GPS/Status/Bio rows to DB_FEED).
+    setSuppressCloudFeedWrites(true);
+    try {
+        runBatch(() => {
+            for (const raw of onlineFriends) {
+                if (!raw || typeof raw !== 'object' || !raw.id) continue;
+                onlineIdSet.add(raw.id);
+                const state = raw.platform === 'web' ? 'active' : raw.platform ? 'online' : 'offline';
                 applyUser(
                     /** @type {any} */ ({
-                        id: friendId,
-                        state: 'offline',
-                        platform: '',
-                        location: 'offline',
-                        worldId: 'offline',
-                        instanceId: 'offline',
-                        travelingToLocation: 'offline',
-                        travelingToWorld: 'offline',
-                        travelingToInstance: 'offline'
+                        ...raw,
+                        state
                     })
                 );
             }
-        }
-    });
+
+            // Transition friends that disappeared from the latest online snapshot cleanly to offline
+            for (const [friendId, ctx] of friendStore.friends.entries()) {
+                if (friendId === userStore.currentUser?.id) continue;
+                if (!onlineIdSet.has(friendId) && ctx.state !== 'offline') {
+                    applyUser(
+                        /** @type {any} */ ({
+                            id: friendId,
+                            state: 'offline',
+                            platform: '',
+                            location: 'offline',
+                            worldId: 'offline',
+                            instanceId: 'offline',
+                            travelingToLocation: 'offline',
+                            travelingToWorld: 'offline',
+                            travelingToInstance: 'offline'
+                        })
+                    );
+                }
+            }
+        });
+    } finally {
+        setSuppressCloudFeedWrites(false);
+    }
 
     if (Array.isArray(data.recentFeeds) && data.recentFeeds.length > 0) {
         feedStore.feedTableLookup();
@@ -130,6 +138,7 @@ export function applyCloudRssSnapshot(data) {
                       requestMessage: r.request_message || '',
                       responseMessage: r.response_message || ''
                   },
+        seen: typeof r.seen === 'boolean' ? r.seen : Boolean(r.seen),
         $isExpired: Boolean(r.$isExpired ?? r.expired)
     });
 
@@ -168,19 +177,46 @@ export function applyCloudRssSnapshot(data) {
         for (const row of existing) {
             if (row?.id) byId.set(row.id, row);
         }
+        const unseenList = Array.isArray(notificationStore.unseenNotifications)
+            ? [...notificationStore.unseenNotifications]
+            : [];
+        const unseenSet = new Set(unseenList);
+        const nowMs = Date.now();
+
         for (const row of n1) {
             if (!row?.id) continue;
-            byId.set(row.id, normalizeV1(row));
+            const prev = byId.get(row.id);
+            const norm = normalizeV1(row);
+            if (prev?.seen && !norm.seen) {
+                norm.seen = true;
+            }
+            byId.set(row.id, norm);
+            if (!prev && !norm.$isExpired && !norm.seen && !unseenSet.has(norm.id)) {
+                unseenSet.add(norm.id);
+                unseenList.push(norm.id);
+            }
         }
         for (const row of n2) {
             if (!row?.id) continue;
-            byId.set(row.id, normalizeV2(row));
+            const prev = byId.get(row.id);
+            const norm = normalizeV2(row);
+            if (prev?.seen && !norm.seen && prev.updatedAt === norm.updatedAt) {
+                norm.seen = true;
+            }
+            byId.set(row.id, norm);
+            const expMs = norm.expiresAt ? Date.parse(norm.expiresAt) : NaN;
+            const isExpired = Number.isFinite(expMs) && expMs <= nowMs;
+            if (!norm.seen && !isExpired && !unseenSet.has(norm.id)) {
+                unseenSet.add(norm.id);
+                unseenList.push(norm.id);
+            }
         }
         const merged = Array.from(byId.values());
         merged.sort(
             (a, b) => Date.parse(b.created_at || b.createdAt || '') - Date.parse(a.created_at || a.createdAt || '')
         );
         notificationStore.notificationTable.data = merged;
+        notificationStore.unseenNotifications = unseenList;
     }
 }
 

@@ -50,6 +50,7 @@ export async function initWebInteropApi() {
             }
         }
     } catch (err) {
+        cloudState.authenticated = false;
         console.warn('[cloud] Initial auth/bootstrap check failed:', err);
     } finally {
         cloudState.initialized = true;

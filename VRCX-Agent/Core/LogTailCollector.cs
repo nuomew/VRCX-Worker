@@ -1,0 +1,767 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Text;
+using Newtonsoft.Json;
+using NLog;
+
+namespace VRCX.Agent.Core;
+
+/// <summary>
+/// Incrementally tails VRChat `output_log_*.txt` using a persisted byte-offset cursor
+/// and buffers unsent events in a durable local JSONL offline queue until periodic HTTP sync succeeds.
+/// </summary>
+public sealed class LogTailCollector
+{
+    private static readonly Logger Log = LogManager.GetCurrentClassLogger();
+    private const int MaxOfflineQueueEntries = 20000;
+    private const int BackfillQueueHighWatermark = 3500;
+    private const int MaxTrackedLogFiles = 500;
+    private const int MaxLiveReadChunkBytes = 8 * 1024 * 1024;
+
+    private readonly string _stateDir;
+    private readonly string _cursorPath;
+    private readonly string _queuePath;
+    private readonly VrcLogParser _parser;
+    private readonly object _pollLock = new();
+
+    private LogCursorState _cursor = new();
+    private readonly List<GameLogEventItem> _queue = new();
+
+    public sealed record LiveRoomSnapshot(
+        string CurrentLocation,
+        string CurrentWorldId,
+        string CurrentWorldName,
+        int CurrentPlayerCount,
+        List<AgentPlayerSnapshot> PlayerDetails,
+        List<Dictionary<string, string>> PlayersForMetadata);
+
+    public event Action<GameLogEventItem>? ScreenshotCaptured;
+    public event Action? WorldStateChanged;
+
+    public VrcLogParser Parser => _parser;
+
+    public LiveRoomSnapshot SnapshotLiveRoomState()
+    {
+        lock (_pollLock)
+        {
+            return new LiveRoomSnapshot(
+                _parser.CurrentLocation,
+                _parser.CurrentWorldId,
+                _parser.CurrentWorldName,
+                _parser.CurrentPlayerCount,
+                _parser.SnapshotCurrentPlayerDetails(),
+                new List<Dictionary<string, string>>(_parser.SnapshotCurrentPlayers()));
+        }
+    }
+
+    public int OfflineQueueCount
+    {
+        get
+        {
+            lock (_queue)
+            {
+                return _queue.Count;
+            }
+        }
+    }
+
+    public LogTailCollector(string stateDir, VrcLogParser? parser = null)
+    {
+        _stateDir = stateDir;
+        Directory.CreateDirectory(_stateDir);
+        _cursorPath = Path.Combine(_stateDir, "cursor.json");
+        _queuePath = Path.Combine(_stateDir, "offline-queue.jsonl");
+        _parser = parser ?? new VrcLogParser();
+
+        LoadPersistedState();
+    }
+
+    public static string ResolveDefaultVrChatLogDirectory()
+    {
+        string localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        if (string.IsNullOrEmpty(localAppData))
+        {
+            return string.Empty;
+        }
+        // Standard Windows path: %USERPROFILE%\AppData\LocalLow\VRChat\VRChat
+        string? appDataRoot = Directory.GetParent(localAppData)?.FullName;
+        if (!string.IsNullOrEmpty(appDataRoot))
+        {
+            string localLow = Path.Combine(appDataRoot, "LocalLow", "VRChat", "VRChat");
+            if (Directory.Exists(localLow))
+            {
+                return localLow;
+            }
+        }
+        return Path.Combine(localAppData, "VRChat", "VRChat");
+    }
+
+    public LogCursorState SnapshotCursor()
+    {
+        lock (_pollLock)
+        {
+            return _cursor.Clone();
+        }
+    }
+
+    /// <summary>
+    /// Reads up to `maxCount` queued events without removing them so failed HTTP uploads retain durability.
+    /// </summary>
+    public List<GameLogEventItem> PeekBatch(int maxCount = 50)
+    {
+        lock (_queue)
+        {
+            int count = Math.Min(Math.Max(maxCount, 1), _queue.Count);
+            return count == 0 ? new List<GameLogEventItem>() : _queue.GetRange(0, count);
+        }
+    }
+
+    /// <summary>
+    /// Removes the oldest `count` events after the cloud Worker confirms HTTP 200 ingest.
+    /// </summary>
+    public void AcknowledgeBatch(int count)
+    {
+        if (count <= 0) return;
+        lock (_queue)
+        {
+            int removeCount = Math.Min(count, _queue.Count);
+            if (removeCount <= 0) return;
+            _queue.RemoveRange(0, removeCount);
+            PersistQueueLocked();
+        }
+    }
+
+    /// <summary>
+    /// Scans all `output_log_*.txt` files in chronological order:
+    /// - Historical log files (older than the latest file) are backfilled once each using an isolated parser
+    ///   so they never overwrite live room/player state or trigger duplicate screenshot re-embedding.
+    /// - The latest log file is incrementally tailed using the live `_parser` with persisted byte offsets.
+    /// Returns the total number of newly parsed GameLog events.
+    /// </summary>
+    public int PollLogDirectory(string logDirectory)
+    {
+        if (string.IsNullOrWhiteSpace(logDirectory) || !Directory.Exists(logDirectory))
+        {
+            return 0;
+        }
+
+        var capturedScreenshots = new List<GameLogEventItem>();
+        bool worldStateMutated = false;
+        int totalParsed = 0;
+
+        lock (_pollLock)
+        {
+            List<string> orderedFiles = Directory
+                .EnumerateFiles(logDirectory, "output_log_*.txt", SearchOption.TopDirectoryOnly)
+                .OrderBy(File.GetLastWriteTimeUtc)
+                .ThenBy(Path.GetFileName, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            if (orderedFiles.Count == 0)
+            {
+                return 0;
+            }
+
+            string latestFile = orderedFiles[orderedFiles.Count - 1];
+            string latestName = Path.GetFileName(latestFile);
+            bool cursorDirty = false;
+
+            // 0. If VRChat rotated to a new output_log_*.txt, drain any remaining tail of the previous active file
+            //    through the live parser before resetting transient room/player state for the new session.
+            if (!string.IsNullOrWhiteSpace(_cursor.FileName) &&
+                !string.Equals(_cursor.FileName, latestName, StringComparison.OrdinalIgnoreCase))
+            {
+                string? prevFile = orderedFiles.FirstOrDefault(
+                    f => string.Equals(Path.GetFileName(f), _cursor.FileName, StringComparison.OrdinalIgnoreCase));
+                if (!string.IsNullOrEmpty(prevFile))
+                {
+                    totalParsed += DrainRotatedActiveFileLocked(prevFile, capturedScreenshots, out bool prevUpdated, out bool prevMutated);
+                    cursorDirty |= prevUpdated;
+                    worldStateMutated |= prevMutated;
+                }
+                _parser.ResetSessionState();
+                _liveParserWarmupDone = true;
+            }
+
+            // 1. Backfill any unread historical output_log_*.txt files oldest-first (paused if offline queue is already heavy).
+            for (int i = 0; i < orderedFiles.Count - 1; i++)
+            {
+                if (OfflineQueueCount >= BackfillQueueHighWatermark)
+                {
+                    break;
+                }
+                string histFile = orderedFiles[i];
+                int added = ReadHistoricalLogFile(histFile, out bool fileCursorUpdated);
+                totalParsed += added;
+                cursorDirty |= fileCursorUpdated;
+            }
+
+            // 2. Tail the active/latest output_log_*.txt file using the live parser (complete newline-terminated lines only).
+            totalParsed += ReadLatestLogFile(latestFile, capturedScreenshots, out bool latestCursorUpdated, out bool latestMutated);
+            cursorDirty |= latestCursorUpdated;
+            worldStateMutated |= latestMutated;
+
+            if (cursorDirty)
+            {
+                PruneTrackedOffsets(orderedFiles);
+                SaveCursor();
+            }
+        }
+
+        // Fire events outside _pollLock to avoid re-entrancy deadlocks.
+        foreach (GameLogEventItem shot in capturedScreenshots)
+        {
+            ScreenshotCaptured?.Invoke(shot);
+        }
+
+        if (worldStateMutated)
+        {
+            WorldStateChanged?.Invoke();
+        }
+
+        return totalParsed;
+    }
+
+    private int ReadHistoricalLogFile(string filePath, out bool cursorUpdated)
+    {
+        cursorUpdated = false;
+        string fileName = Path.GetFileName(filePath);
+        long fileLen;
+        try
+        {
+            fileLen = new FileInfo(filePath).Length;
+        }
+        catch
+        {
+            return 0;
+        }
+
+        long startOffset = 0;
+        if (_cursor.FileOffsets.TryGetValue(fileName, out long recordedOffset))
+        {
+            if (fileLen <= recordedOffset)
+            {
+                return 0;
+            }
+            startOffset = recordedOffset;
+        }
+
+        var isolatedParser = new VrcLogParser();
+        var batch = new List<GameLogEventItem>();
+        long endPosition = startOffset;
+
+        try
+        {
+            using var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            if (startOffset > 0)
+            {
+                fs.Seek(startOffset, SeekOrigin.Begin);
+            }
+            using var reader = new StreamReader(fs, Encoding.UTF8, detectEncodingFromByteOrderMarks: true, bufferSize: 8192, leaveOpen: true);
+
+            string? line;
+            while ((line = reader.ReadLine()) != null)
+            {
+                GameLogEventItem? ev = isolatedParser.ParseLine(line);
+                if (ev != null)
+                {
+                    if (ev.Type != "Location")
+                    {
+                        GameLogEventItem? pendingLoc = isolatedParser.FlushPendingLocation();
+                        if (pendingLoc != null)
+                        {
+                            batch.Add(pendingLoc);
+                        }
+                    }
+                    batch.Add(ev);
+                }
+            }
+            GameLogEventItem? trailingLoc = isolatedParser.FlushPendingLocation();
+            if (trailingLoc != null)
+            {
+                batch.Add(trailingLoc);
+            }
+            endPosition = fs.Position;
+        }
+        catch (Exception ex)
+        {
+            Log.Warn(ex, "Failed to read historical VRChat log {File}", fileName);
+            return 0;
+        }
+
+        if (batch.Count > 0)
+        {
+            EnqueueEventsBatch(batch);
+            Log.Info("Backfilled {Count} historical GameLog event(s) from {File}.", batch.Count, fileName);
+        }
+
+        _cursor.FileOffsets[fileName] = endPosition;
+        cursorUpdated = true;
+        return batch.Count;
+    }
+
+    private bool _liveParserWarmupDone;
+
+    private sealed class BoundedReadStream : Stream
+    {
+        private readonly Stream _inner;
+        private long _remaining;
+
+        public BoundedReadStream(Stream inner, long maxBytes)
+        {
+            _inner = inner;
+            _remaining = Math.Max(0, maxBytes);
+        }
+
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => throw new NotSupportedException();
+        public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
+        public override void Flush() { }
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+        public override int Read(byte[] buffer, int offset, int count)
+        {
+            if (_remaining <= 0) return 0;
+            int toRead = (int)Math.Min(count, _remaining);
+            int read = _inner.Read(buffer, offset, toRead);
+            _remaining -= read;
+            return read;
+        }
+    }
+
+    private void WarmUpLiveParserFromPrefix(string latestFile, long upToOffset)
+    {
+        if (_liveParserWarmupDone || upToOffset <= 0)
+        {
+            _liveParserWarmupDone = true;
+            return;
+        }
+        _liveParserWarmupDone = true;
+
+        try
+        {
+            using var fs = new FileStream(latestFile, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            long limit = Math.Min(upToOffset, fs.Length);
+            using var bounded = new BoundedReadStream(fs, limit);
+            using var reader = new StreamReader(bounded, Encoding.UTF8, detectEncodingFromByteOrderMarks: true, bufferSize: 8192, leaveOpen: true);
+
+            string? line;
+            while ((line = reader.ReadLine()) != null)
+            {
+                _parser.ParseLine(line);
+            }
+            _parser.FlushPendingLocation();
+        }
+        catch (Exception ex)
+        {
+            Log.Warn(ex, "Failed to warm up live parser room state from {File}", Path.GetFileName(latestFile));
+        }
+    }
+
+    private int DrainRotatedActiveFileLocked(
+        string prevFile,
+        List<GameLogEventItem> screenshots,
+        out bool cursorUpdated,
+        out bool stateMutated)
+    {
+        cursorUpdated = false;
+        stateMutated = false;
+        string fileName = Path.GetFileName(prevFile);
+        long fileLen;
+        try
+        {
+            fileLen = new FileInfo(prevFile).Length;
+        }
+        catch
+        {
+            return 0;
+        }
+
+        long offset = _cursor.FileOffsets.TryGetValue(fileName, out long mapped)
+            ? (fileLen < mapped ? 0 : mapped)
+            : (fileLen < _cursor.ByteOffset ? 0 : _cursor.ByteOffset);
+
+        if (offset > 0 && !_liveParserWarmupDone)
+        {
+            WarmUpLiveParserFromPrefix(prevFile, offset);
+        }
+
+        var batch = new List<GameLogEventItem>();
+        long endPosition = offset;
+
+        if (fileLen > offset)
+        {
+            try
+            {
+                using var fs = new FileStream(prevFile, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+                fs.Seek(offset, SeekOrigin.Begin);
+                using var reader = new StreamReader(fs, Encoding.UTF8, detectEncodingFromByteOrderMarks: offset == 0, bufferSize: 8192, leaveOpen: true);
+                string? line;
+                while ((line = reader.ReadLine()) != null)
+                {
+                    ProcessLiveLine(line, batch, screenshots, ref stateMutated);
+                }
+                endPosition = fs.Position;
+            }
+            catch (Exception ex)
+            {
+                Log.Warn(ex, "Failed to drain rotated active log {File}", fileName);
+                return 0;
+            }
+        }
+
+        GameLogEventItem? trailingLoc = _parser.FlushPendingLocation();
+        if (trailingLoc != null)
+        {
+            batch.Add(trailingLoc);
+            _cursor.LastEventDt = trailingLoc.CreatedAt;
+        }
+
+        if (batch.Count > 0)
+        {
+            EnqueueEventsBatch(batch);
+        }
+
+        _cursor.FileOffsets[fileName] = endPosition;
+        cursorUpdated = true;
+        return batch.Count;
+    }
+
+    private static List<string> ReadCompleteLinesFromOffset(string filePath, long startOffset, out long nextOffset)
+    {
+        var lines = new List<string>();
+        nextOffset = startOffset;
+
+        using var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+        long remaining = fs.Length - startOffset;
+        if (remaining <= 0)
+        {
+            return lines;
+        }
+
+        int toRead = (int)Math.Min(remaining, MaxLiveReadChunkBytes);
+        byte[] buffer = new byte[toRead];
+        fs.Seek(startOffset, SeekOrigin.Begin);
+        int readTotal = 0;
+        while (readTotal < toRead)
+        {
+            int n = fs.Read(buffer, readTotal, toRead - readTotal);
+            if (n == 0) break;
+            readTotal += n;
+        }
+        if (readTotal <= 0)
+        {
+            return lines;
+        }
+
+        // Only advance through the last newline byte so half-written lines are deferred until complete.
+        int lastNewline = Array.LastIndexOf(buffer, (byte)'\n', readTotal - 1);
+        if (lastNewline < 0)
+        {
+            return lines;
+        }
+
+        int consumeLen = lastNewline + 1;
+        int decodeStart = 0;
+        if (startOffset == 0 && consumeLen >= 3 && buffer[0] == 0xEF && buffer[1] == 0xBB && buffer[2] == 0xBF)
+        {
+            decodeStart = 3;
+        }
+
+        string text = Encoding.UTF8.GetString(buffer, decodeStart, consumeLen - decodeStart);
+        int lineStart = 0;
+        for (int i = 0; i < text.Length; i++)
+        {
+            if (text[i] == '\n')
+            {
+                int len = i - lineStart;
+                if (len > 0 && text[lineStart + len - 1] == '\r')
+                {
+                    len--;
+                }
+                lines.Add(text.Substring(lineStart, len));
+                lineStart = i + 1;
+            }
+        }
+
+        nextOffset = startOffset + consumeLen;
+        return lines;
+    }
+
+    private void ProcessLiveLine(
+        string line,
+        List<GameLogEventItem> batch,
+        List<GameLogEventItem> screenshots,
+        ref bool stateMutated)
+    {
+        string prevLoc = _parser.CurrentLocation;
+        string prevWorld = _parser.CurrentWorldName;
+        int prevPlayers = _parser.CurrentPlayerCount;
+
+        GameLogEventItem? ev = _parser.ParseLine(line);
+        if (ev != null)
+        {
+            if (ev.Type != "Location")
+            {
+                GameLogEventItem? pendingLoc = _parser.FlushPendingLocation();
+                if (pendingLoc != null)
+                {
+                    batch.Add(pendingLoc);
+                }
+            }
+            batch.Add(ev);
+            _cursor.LastEventDt = ev.CreatedAt;
+
+            if (!string.IsNullOrEmpty(ev.LocalScreenshotPath))
+            {
+                screenshots.Add(ev);
+            }
+        }
+
+        if (prevLoc != _parser.CurrentLocation || prevWorld != _parser.CurrentWorldName || prevPlayers != _parser.CurrentPlayerCount)
+        {
+            stateMutated = true;
+        }
+    }
+
+    private int ReadLatestLogFile(
+        string latestFile,
+        List<GameLogEventItem> screenshots,
+        out bool cursorUpdated,
+        out bool stateMutated)
+    {
+        cursorUpdated = false;
+        stateMutated = false;
+        string fileName = Path.GetFileName(latestFile);
+        long fileLen;
+        try
+        {
+            fileLen = new FileInfo(latestFile).Length;
+        }
+        catch
+        {
+            return 0;
+        }
+
+        long offset;
+        if (_cursor.FileOffsets.TryGetValue(fileName, out long mappedOffset))
+        {
+            offset = fileLen < mappedOffset ? 0 : mappedOffset;
+        }
+        else if (string.Equals(_cursor.FileName, fileName, StringComparison.OrdinalIgnoreCase))
+        {
+            offset = fileLen < _cursor.ByteOffset ? 0 : _cursor.ByteOffset;
+        }
+        else
+        {
+            offset = 0;
+        }
+
+        if (offset > 0 && !_liveParserWarmupDone)
+        {
+            WarmUpLiveParserFromPrefix(latestFile, offset);
+        }
+        else
+        {
+            _liveParserWarmupDone = true;
+        }
+
+        if (!string.Equals(_cursor.FileName, fileName, StringComparison.OrdinalIgnoreCase))
+        {
+            _cursor.FileName = fileName;
+            _cursor.ByteOffset = offset;
+            cursorUpdated = true;
+        }
+
+        if (fileLen <= offset)
+        {
+            if (_cursor.ByteOffset != offset || !_cursor.FileOffsets.ContainsKey(fileName))
+            {
+                _cursor.ByteOffset = offset;
+                _cursor.FileOffsets[fileName] = offset;
+                cursorUpdated = true;
+            }
+            return 0;
+        }
+
+        List<string> completeLines;
+        long endPosition;
+        try
+        {
+            completeLines = ReadCompleteLinesFromOffset(latestFile, offset, out endPosition);
+        }
+        catch (Exception ex)
+        {
+            Log.Warn(ex, "Failed to read active VRChat log {File}", fileName);
+            return 0;
+        }
+
+        if (endPosition <= offset)
+        {
+            return 0;
+        }
+
+        var batch = new List<GameLogEventItem>();
+        foreach (string line in completeLines)
+        {
+            ProcessLiveLine(line, batch, screenshots, ref stateMutated);
+        }
+
+        if (batch.Count > 0)
+        {
+            EnqueueEventsBatch(batch);
+        }
+
+        _cursor.FileName = fileName;
+        _cursor.ByteOffset = endPosition;
+        _cursor.FileOffsets[fileName] = endPosition;
+        cursorUpdated = true;
+
+        return batch.Count;
+    }
+
+    private void PruneTrackedOffsets(List<string> existingFilePaths)
+    {
+        if (_cursor.FileOffsets.Count <= MaxTrackedLogFiles) return;
+        var existingNames = new HashSet<string>(
+            existingFilePaths.Select(Path.GetFileName).Where(n => !string.IsNullOrEmpty(n))!,
+            StringComparer.OrdinalIgnoreCase);
+        foreach (string key in _cursor.FileOffsets.Keys.ToList())
+        {
+            if (_cursor.FileOffsets.Count <= MaxTrackedLogFiles) break;
+            if (!existingNames.Contains(key) && !string.Equals(key, _cursor.FileName, StringComparison.OrdinalIgnoreCase))
+            {
+                _cursor.FileOffsets.Remove(key);
+            }
+        }
+    }
+
+    public void EnqueueEvent(GameLogEventItem item)
+    {
+        lock (_queue)
+        {
+            if (_queue.Count >= MaxOfflineQueueEntries)
+            {
+                _queue.RemoveRange(0, _queue.Count - MaxOfflineQueueEntries + 1);
+            }
+            _queue.Add(item);
+            PersistQueueLocked();
+        }
+    }
+
+    private void EnqueueEventsBatch(IReadOnlyList<GameLogEventItem> items)
+    {
+        if (items.Count == 0) return;
+        lock (_queue)
+        {
+            _queue.AddRange(items);
+            if (_queue.Count > MaxOfflineQueueEntries)
+            {
+                _queue.RemoveRange(0, _queue.Count - MaxOfflineQueueEntries);
+            }
+            PersistQueueLocked();
+        }
+    }
+
+    private void LoadPersistedState()
+    {
+        try
+        {
+            if (File.Exists(_cursorPath))
+            {
+                string raw = File.ReadAllText(_cursorPath, Encoding.UTF8);
+                var parsed = JsonConvert.DeserializeObject<LogCursorState>(raw);
+                if (parsed != null)
+                {
+                    _cursor = parsed;
+                    _cursor.FileOffsets = _cursor.FileOffsets != null
+                        ? new Dictionary<string, long>(_cursor.FileOffsets, StringComparer.OrdinalIgnoreCase)
+                        : new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
+                    // Migrate legacy single-file cursor.json cleanly without re-reading the active file.
+                    if (!string.IsNullOrWhiteSpace(_cursor.FileName) && !_cursor.FileOffsets.ContainsKey(_cursor.FileName))
+                    {
+                        _cursor.FileOffsets[_cursor.FileName] = _cursor.ByteOffset;
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.Warn(ex, "Failed to read log cursor state; starting fresh.");
+        }
+
+        try
+        {
+            if (File.Exists(_queuePath))
+            {
+                int corruptedLines = 0;
+                foreach (string line in File.ReadLines(_queuePath, Encoding.UTF8))
+                {
+                    if (string.IsNullOrWhiteSpace(line)) continue;
+                    try
+                    {
+                        var item = JsonConvert.DeserializeObject<GameLogEventItem>(line);
+                        if (item != null)
+                        {
+                            _queue.Add(item);
+                        }
+                    }
+                    catch
+                    {
+                        corruptedLines++;
+                    }
+                }
+                if (corruptedLines > 0)
+                {
+                    Log.Warn("Skipped {Count} corrupted line(s) while loading offline queue; recovered {Valid} valid event(s).", corruptedLines, _queue.Count);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.Warn(ex, "Failed to read offline queue; starting empty.");
+        }
+    }
+
+    private void SaveCursor()
+    {
+        string tmp = $"{_cursorPath}.{Guid.NewGuid():N}.tmp";
+        try
+        {
+            File.WriteAllText(tmp, JsonConvert.SerializeObject(_cursor, Formatting.Indented), Encoding.UTF8);
+            File.Move(tmp, _cursorPath, overwrite: true);
+        }
+        catch (Exception ex)
+        {
+            Log.Debug(ex, "Failed to persist log cursor.");
+            try { if (File.Exists(tmp)) File.Delete(tmp); } catch { /* ignore */ }
+        }
+    }
+
+    private void PersistQueueLocked()
+    {
+        string tmp = $"{_queuePath}.{Guid.NewGuid():N}.tmp";
+        try
+        {
+            using (var sw = new StreamWriter(tmp, append: false, Encoding.UTF8))
+            {
+                foreach (var item in _queue)
+                {
+                    sw.WriteLine(JsonConvert.SerializeObject(item));
+                }
+            }
+            File.Move(tmp, _queuePath, overwrite: true);
+        }
+        catch (Exception ex)
+        {
+            Log.Debug(ex, "Failed to persist offline queue.");
+            try { if (File.Exists(tmp)) File.Delete(tmp); } catch { /* ignore */ }
+        }
+    }
+}

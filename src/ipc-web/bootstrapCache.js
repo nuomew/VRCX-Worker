@@ -149,6 +149,17 @@ export async function loadBootstrap() {
         replaceDeviceMap: true
     });
 
+    if (flushConfigTimer) {
+        clearTimeout(flushConfigTimer);
+        flushConfigTimer = null;
+    }
+    if (flushStorageTimer) {
+        clearTimeout(flushStorageTimer);
+        flushStorageTimer = null;
+    }
+    pendingConfigPatch = {};
+    pendingStoragePatch = {};
+
     bootstrapCache.loaded = true;
 }
 
@@ -165,6 +176,11 @@ function flushPendingBundlesWithKeepalive() {
     }
     const cfgPatch = pendingConfigPatch;
     pendingConfigPatch = {};
+    const stPatch = pendingStoragePatch;
+    pendingStoragePatch = {};
+    if (!cloudState.authenticated || !bootstrapCache.loaded) {
+        return;
+    }
     if (Object.keys(cfgPatch).length > 0) {
         cloudFetch('/api/config/bundle', {
             method: 'PUT',
@@ -172,8 +188,6 @@ function flushPendingBundlesWithKeepalive() {
             json: { bundleKey: 'vrcx_config', patch: cfgPatch }
         }).catch(() => {});
     }
-    const stPatch = pendingStoragePatch;
-    pendingStoragePatch = {};
     if (Object.keys(stPatch).length > 0) {
         cloudFetch('/api/config/bundle', {
             method: 'PUT',
@@ -228,8 +242,38 @@ export async function saveWebSyncIntervalSeconds(rawSeconds) {
     return clamped;
 }
 
+/**
+ * Strips plaintext VRChat passwords and raw cookies from `savedCredentials` before
+ * syncing into the unencrypted cloud `vrcx_config` bundle.
+ * @param {string} key
+ * @param {string} rawValue
+ * @returns {string}
+ */
+function sanitizeConfigPatchValue(key, rawValue) {
+    const lower = String(key || '').toLowerCase();
+    if (lower !== 'config:savedcredentials' && lower !== 'savedcredentials') {
+        return rawValue;
+    }
+    try {
+        const parsed = JSON.parse(rawValue);
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+            return '{}';
+        }
+        for (const entry of Object.values(parsed)) {
+            if (!entry || typeof entry !== 'object') continue;
+            delete entry.cookies;
+            if (entry.loginParams && typeof entry.loginParams === 'object') {
+                entry.loginParams.password = '';
+            }
+        }
+        return JSON.stringify(parsed);
+    } catch {
+        return '{}';
+    }
+}
+
 export function scheduleConfigPatch(key, value) {
-    const normalized = value === null ? null : String(value);
+    const normalized = value === null ? null : sanitizeConfigPatchValue(key, String(value));
     const hasExisting = Object.prototype.hasOwnProperty.call(bootstrapCache.configs, key);
     // Skip no-op writes to avoid unnecessary PUT /api/config/bundle Worker requests.
     if (normalized === null ? !hasExisting : hasExisting && bootstrapCache.configs[key] === normalized) {
@@ -240,13 +284,17 @@ export function scheduleConfigPatch(key, value) {
     } else {
         bootstrapCache.configs[key] = normalized;
     }
+    // Never push cold-start defaults before authentication & bootstrap hydration complete.
+    if (!cloudState.authenticated || !bootstrapCache.loaded) {
+        return;
+    }
     pendingConfigPatch[key] = normalized;
     if (flushConfigTimer) clearTimeout(flushConfigTimer);
     flushConfigTimer = setTimeout(() => {
         const patch = pendingConfigPatch;
         pendingConfigPatch = {};
         flushConfigTimer = null;
-        if (Object.keys(patch).length === 0) return;
+        if (!cloudState.authenticated || !bootstrapCache.loaded || Object.keys(patch).length === 0) return;
         cloudFetch('/api/config/bundle', {
             method: 'PUT',
             json: { bundleKey: 'vrcx_config', patch }
@@ -266,13 +314,16 @@ export function scheduleStoragePatch(key, value) {
     } else {
         bootstrapCache.storage[key] = normalized;
     }
+    if (!cloudState.authenticated || !bootstrapCache.loaded) {
+        return;
+    }
     pendingStoragePatch[key] = normalized;
     if (flushStorageTimer) clearTimeout(flushStorageTimer);
     flushStorageTimer = setTimeout(() => {
         const patch = pendingStoragePatch;
         pendingStoragePatch = {};
         flushStorageTimer = null;
-        if (Object.keys(patch).length === 0) return;
+        if (!cloudState.authenticated || !bootstrapCache.loaded || Object.keys(patch).length === 0) return;
         cloudFetch('/api/config/bundle', {
             method: 'PUT',
             json: { bundleKey: 'vrcx_storage', patch }
@@ -287,7 +338,7 @@ export async function flushStorageNow() {
     }
     const patch = pendingStoragePatch;
     pendingStoragePatch = {};
-    if (Object.keys(patch).length === 0) return;
+    if (!cloudState.authenticated || !bootstrapCache.loaded || Object.keys(patch).length === 0) return;
     await cloudFetch('/api/config/bundle', {
         method: 'PUT',
         json: { bundleKey: 'vrcx_storage', patch }
