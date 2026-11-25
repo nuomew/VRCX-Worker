@@ -31,7 +31,7 @@ VRCX-Worker 以**单个 Cloudflare Worker** 的形态运行，同时托管编译
    - **构建命令（Build command）**：*可留空* —— 根目录 [`wrangler.jsonc`](../../wrangler.jsonc) 已配置 `"build": { "command": "npm run build:web" }`，执行部署时会自动编译前端。
    - **部署命令（Deploy command）**：`npx wrangler deploy`
 3. 点击部署。首次部署时：
-   - Cloudflare 自动资源编排会自动创建 `vrcx-core`、`vrcx-gamelog`、`vrcx-feed`、`vrcx-cache` 4 个 D1 数据库、`AgentHubDO` 与 `R2_MEDIA`。
+   - Cloudflare 自动资源编排会自动创建 `vrcx-core`、`vrcx-gamelog`、`vrcx-feed`、`vrcx-cache` 4 个 D1 数据库与 `AgentHubDO`（`R2_MEDIA` 默认关闭，确保未开通 R2 的账号也能零报错一键部署）。
    - 收到首个 HTTP 请求时，[`cloud/src/db/schemaBootstrap.ts`](../../cloud/src/db/schemaBootstrap.ts) 会自动幂等创建全部数据表、索引与 FTS5 `trigram` 搜索字典，无需手动执行 SQL 迁移。
    - 后续向 `master` 分支推送代码时，Cloudflare 会自动重新编译前端并更新线上 Worker。
 
@@ -87,13 +87,13 @@ python3 -c 'import base64, os; print(base64.b32encode(os.urandom(20)).decode().r
 
 | 配置项 | 要求值 | 说明 |
 |---|---|---|
-| 绑定类型 | `R2 bucket` | 已声明在根目录 [`wrangler.jsonc`](../../wrangler.jsonc) |
+| 绑定类型 | `R2 bucket` | 默认关闭（需要云相册时自行添加绑定） |
 | 变量名（`binding`） | `R2_MEDIA` | 必须严格一致，`cloud/src/env.ts` 读取 `env.R2_MEDIA` |
 
 ### 配置方式
-1. **自动编排绑定（默认已开启）**：根目录 `wrangler.jsonc` 已内置 `"r2_buckets": [{ "binding": "R2_MEDIA" }]`，只要你的 Cloudflare 账号已开通 R2 服务，Git 自动部署会自动创建并持久保留 `R2_MEDIA` 绑定。
-2. **绑定已有自定义私有桶**：若希望固定绑定自行创建的私有桶（例如 `vrcx-media`），在根目录 `wrangler.jsonc` 的 `R2_MEDIA` 项中补充 `"bucket_name": "vrcx-media"` 并提交推送，即可防止后续 Git 自动部署覆盖控制台手工绑定。
-3. 未绑定 `R2_MEDIA` 时，截图元数据与游戏日志依然可正常写入 D1，不影响其他功能。
+1. **默认关闭（零 R2 依赖一键部署）**：根目录 `wrangler.jsonc` 中已默认注释 `r2_buckets`，避免未开通 R2 或 CI 令牌无 R2 建桶权限时首次部署报错 `code: 10057`。
+2. **开启云相册绑定**：在 Cloudflare 控制台开通 R2 并创建私有桶（例如 `vrcx-media`），然后将其绑定为变量名 `R2_MEDIA`，或取消根目录 `wrangler.jsonc` 中 `r2_buckets` 注释并填入 `"bucket_name": "vrcx-media"` 后提交推送（推荐写入 `wrangler.jsonc` 以免后续 Git 自动部署覆盖控制台手工绑定）。
+3. 未绑定 `R2_MEDIA` 时，截图元数据与游戏日志依然可正常写入 D1；待后续绑定 R2 后，伴侣程序会自动回填缺失的缩略图。
 
 ---
 

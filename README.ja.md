@@ -74,7 +74,7 @@ flowchart LR
 1. 上部の **Deploy to Cloudflare** ボタンをクリックするか、**Cloudflare ダッシュボード → Workers & Pages → 作成 → リポジトリをインポート** から **`nuomew/VRCX-Worker`** を選択します。
 2. ルートディレクトリ（`.`）および既定のデプロイコマンド `npx wrangler deploy` をそのまま維持します：
    - ルートの [`wrangler.jsonc`](./wrangler.jsonc) に `"build": { "command": "npm run build:web" }` が定義されているため、ダッシュボードの **ビルドコマンド** を空欄のままにしても `./build/web` へ自動ビルドされます。
-   - Cloudflare Automatic Resource Provisioning により 4 つの D1 シャード（`vrcx-core`、`vrcx-gamelog`、`vrcx-feed`、`vrcx-cache`）、`AgentHubDO`、`R2_MEDIA` が自動的に作成・紐付けされます。
+   - Cloudflare Automatic Resource Provisioning により 4 つの D1 シャード（`vrcx-core`、`vrcx-gamelog`、`vrcx-feed`、`vrcx-cache`）と `AgentHubDO` が自動的に作成・紐付けされます（`R2_MEDIA` は R2 未契約環境でもエラーにならないよう既定オフです。クラウドギャラリー利用時はダッシュボードで手動バインドするか、`wrangler.jsonc` の `r2_buckets` をコメント解除してバケット名を指定してください）。
    - 初回 HTTP リクエスト時に [`cloud/src/db/schemaBootstrap.ts`](./cloud/src/db/schemaBootstrap.ts) が全テーブル・インデックス・FTS5 辞書を冪等に自動初期化します。
 3. **推奨セキュリティ設定**：通常利用を開始する前に、**Worker → 設定 → 変数とシークレット（Variables and Secrets）** にて `ADMIN_PASSCODE`（パスコード保護）、任意の `ADMIN_TOTP_SECRET`（二要素認証）、`COOKIE_MASTER_KEY`（32 文字以上の暗号化マスターキー）、または Cloudflare Access（`CF_ACCESS_TEAM_DOMAIN` + `CF_ACCESS_AUD`）を設定してください。
 4. *(任意)* [GitHub Releases](https://github.com/nuomew/VRCX-Worker/releases/latest) から **`VRCX.Agent-v*-Setup-win-x64.exe`** をダウンロードしてインストールし、Web UI 下部ステータスバーの **Cloud → Win Agent (HTTP Sync)** で同期シークレットを作成して `VRCX.Agent` に入力し、**Test & Save** をクリックします。

@@ -31,7 +31,7 @@ VRCX-Worker は **単一の Cloudflare Worker** として動作し、ビルド�
    - **ビルドコマンド**：*空欄のままで問題ありません* — ルートの [`wrangler.jsonc`](../../wrangler.jsonc) に `"build": { "command": "npm run build:web" }` が定義されているため、デプロイ時にフロントエンドが自動ビルドされます。
    - **デプロイコマンド**：`npx wrangler deploy`
 3. デプロイを実行します。初回デプロイ時は以下が自動で完了します：
-   - Cloudflare Automatic Resource Provisioning により 4 つの D1 データベース（`vrcx-core`、`vrcx-gamelog`、`vrcx-feed`、`vrcx-cache`）、`AgentHubDO`、`R2_MEDIA` が自動作成されます。
+   - Cloudflare Automatic Resource Provisioning により 4 つの D1 データベース（`vrcx-core`、`vrcx-gamelog`、`vrcx-feed`、`vrcx-cache`）と `AgentHubDO` が自動作成されます（`R2_MEDIA` は R2 未契約環境でも初回デプロイが確実に通るよう既定でオフになっています）。
    - 初回 HTTP アクセス時に [`cloud/src/db/schemaBootstrap.ts`](../../cloud/src/db/schemaBootstrap.ts) が全テーブル・インデックス・FTS5 `trigram` 検索辞書を冪等に初期化します（手動 SQL マイグレーション不要）。
    - 以降 `master` ブランチへプッシュするだけでフロントエンドと Worker が自動再デプロイされます。
 
@@ -87,13 +87,13 @@ Cloudflare R2 をバインドすると、どのデバイスのブラウザから
 
 | 項目 | 設定値 | 備考 |
 |---|---|---|
-| バインディング種別 | `R2 bucket` | ルートの [`wrangler.jsonc`](../../wrangler.jsonc) に定義済み |
+| バインディング種別 | `R2 bucket` | 既定では無効（クラウドギャラリー利用時のみ手動追加） |
 | 変数名（`binding`） | `R2_MEDIA` | `cloud/src/env.ts` が参照する正確な名称 |
 
 ### 設定方法
-1. **自動プロビジョニング（既定）**：ルートの `wrangler.jsonc` には既に `"r2_buckets": [{ "binding": "R2_MEDIA" }]` が含まれています。Cloudflare アカウントで R2 を有効にしておけば、Git 自動デプロイ時にもバインディングが維持されます。
-2. **既存のカスタムバケットを指定する場合**：独自のプライベートバケット（例：`vrcx-media`）を使う場合は、ルート `wrangler.jsonc` の `R2_MEDIA` に `"bucket_name": "vrcx-media"` を追記してプッシュしてください。
-3. `R2_MEDIA` 未設定でも、スクリーンショットのメタデータやゲームログはエラーなく D1 に保存されます。
+1. **既定（R2 オフ）**：ルートの `wrangler.jsonc` では `r2_buckets` をコメントアウトしており、R2 未有効アカウントでも初回デプロイが失敗しません。
+2. **クラウドギャラリーを有効化する場合**：Cloudflare ダッシュボードで R2 を有効化してプライベートバケット（例：`vrcx-media`）を作成し、Worker のバインディングに `R2_MEDIA` として手動バインドするか、ルート `wrangler.jsonc` の `r2_buckets` コメントを解除して `"bucket_name": "vrcx-media"` を指定したうえでプッシュしてください（Git 自動デプロイ環境では `wrangler.jsonc` に明記しておくと再デプロイ時もバインディングが維持されます）。
+3. `R2_MEDIA` 未設定でも、スクリーンショットのメタデータやゲームログはエラーなく D1 に保存されます（後日 R2 をバインドすると自動バックフィルされます）。
 
 ---
 

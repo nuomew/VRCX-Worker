@@ -50,13 +50,15 @@
             "new_sqlite_classes": ["AgentHubDO"]
         }
     ],
-    // Omit bucket_name so Cloudflare Automatic Resource Provisioning binds/creates the private R2 bucket
-    // and Git auto-deploys never wipe Dashboard R2_MEDIA bindings.
-    "r2_buckets": [
-        {
-            "binding": "R2_MEDIA"
-        }
-    ],
+    // R2 is disabled by default so first-time Git deploys succeed without an R2 subscription.
+    // To enable Cloud Gallery screenshot storage, create a private R2 bucket in the Cloudflare Dashboard
+    // and either bind it as `R2_MEDIA` there or uncomment below with your own `bucket_name`:
+    // "r2_buckets": [
+    //     {
+    //         "binding": "R2_MEDIA",
+    //         "bucket_name": "vrcx-media"
+    //     }
+    // ],
     // 1-minute cron tick gated inside scheduled() by user-configured syncIntervalSeconds (0 external fetch when idle/web active).
     "triggers": {
         "crons": ["* * * * *"]

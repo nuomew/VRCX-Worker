@@ -31,7 +31,7 @@ VRCX-Worker runs as a **single Cloudflare Worker** serving both the compiled VRC
    - **Build command**: *(may be left blank)* — root [`wrangler.jsonc`](../../wrangler.jsonc) defines `"build": { "command": "npm run build:web" }`, so the full Web SPA builds automatically during deploy.
    - **Deploy command**: `npx wrangler deploy`
 3. Deploy. On first deployment:
-   - Cloudflare Automatic Resource Provisioning creates `vrcx-core`, `vrcx-gamelog`, `vrcx-feed`, `vrcx-cache` D1 databases, `AgentHubDO`, and `R2_MEDIA`.
+   - Cloudflare Automatic Resource Provisioning creates `vrcx-core`, `vrcx-gamelog`, `vrcx-feed`, `vrcx-cache` D1 databases and `AgentHubDO` (`R2_MEDIA` is disabled by default so first-time deploys succeed without an R2 subscription).
    - On the first HTTP request, [`cloud/src/db/schemaBootstrap.ts`](../../cloud/src/db/schemaBootstrap.ts) idempotently initializes all tables, indexes, and FTS5 `trigram` entity dictionaries (zero manual SQL migrations required).
    - Pushing future commits to `master` automatically rebuilds and redeploys both frontend and backend.
 
@@ -87,13 +87,13 @@ Cloud Gallery lets you browse VRChat screenshots grouped by date from any browse
 
 | Parameter | Value | Notes |
 |---|---|---|
-| Binding Type | `R2 bucket` | Declared in root [`wrangler.jsonc`](../../wrangler.jsonc) |
+| Binding Type | `R2 bucket` | Disabled by default (optional — bind manually when enabling Cloud Gallery) |
 | Variable Name (`binding`) | `R2_MEDIA` | Exact name read by `cloud/src/env.ts` (`env.R2_MEDIA`) |
 
 ### Configuration Options
-1. **Automatic Provisioning (Default in `wrangler.jsonc`)**: Root `wrangler.jsonc` already includes `"r2_buckets": [{ "binding": "R2_MEDIA" }]`. Ensure R2 is enabled on your Cloudflare account so automatic deploys preserve the binding.
-2. **Pinning an Existing Named Bucket**: If you created your own private R2 bucket (e.g. `vrcx-media`), add `"bucket_name": "vrcx-media"` inside the `R2_MEDIA` entry in root `wrangler.jsonc` and push so Git auto-deploys never overwrite it.
-3. Without `R2_MEDIA` bound, screenshot metadata and GameLogs still sync to D1 without errors.
+1. **Default (R2 Disabled)**: `r2_buckets` is commented out in root `wrangler.jsonc` so zero-config Git deploys never fail on accounts without R2 enabled or without R2 provisioning token permissions.
+2. **Enabling Cloud Gallery**: Enable R2 in the Cloudflare Dashboard, create a private bucket (e.g. `vrcx-media`), and either bind it as `R2_MEDIA` in the Dashboard or uncomment `r2_buckets` in root `wrangler.jsonc` with `"bucket_name": "vrcx-media"` and push (pinning `bucket_name` in `wrangler.jsonc` keeps the binding intact across future Git auto-deploys).
+3. Without `R2_MEDIA` bound, screenshot metadata and GameLogs still sync to D1 without errors (and previously skipped thumbnails backfill automatically once R2 is bound later).
 
 ---
 

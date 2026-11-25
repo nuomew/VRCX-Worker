@@ -74,7 +74,7 @@ flowchart LR
 1. 点击页面顶部的 **Deploy to Cloudflare** 按钮，或在 **Cloudflare 控制台 → Workers & Pages → 创建 → 导入仓库** 中选择 **`nuomew/VRCX-Worker`**。
 2. 保持默认根目录（`.`）与默认部署命令 `npx wrangler deploy`：
    - 根目录 [`wrangler.jsonc`](./wrangler.jsonc) 已内置 `"build": { "command": "npm run build:web" }`，即使控制台的 **构建命令** 留空，部署时也会自动编译完整的 Web SPA 至 `./build/web`。
-   - Cloudflare 自动资源编排会在首次部署时自动创建 4 个 D1 分片（`vrcx-core`、`vrcx-gamelog`、`vrcx-feed`、`vrcx-cache`）、`AgentHubDO` 与 `R2_MEDIA`。
+   - Cloudflare 自动资源编排会在首次部署时自动创建 4 个 D1 分片（`vrcx-core`、`vrcx-gamelog`、`vrcx-feed`、`vrcx-cache`）与 `AgentHubDO`（`R2_MEDIA` 默认关闭以确保未开通 R2 时可零失败一键部署；如需云相册请自行在控制台绑定或取消 `wrangler.jsonc` 中 `r2_buckets` 注释并填入桶名）。
    - 首次收到 HTTP 请求时，[`cloud/src/db/schemaBootstrap.ts`](./cloud/src/db/schemaBootstrap.ts) 会幂等初始化全部数据表、索引与 FTS5 搜索字典，无需手动执行迁移命令。
 3. **强烈建议配置访问保护与加密密钥**：在 **Worker → 设置 → 变量和机密（Variables and Secrets）** 中配置 `ADMIN_PASSCODE`（访问口令）、可选 `ADMIN_TOTP_SECRET`（两步验证）、`COOKIE_MASTER_KEY`（32 位以上主加密密钥），或绑定 Cloudflare Access（`CF_ACCESS_TEAM_DOMAIN` + `CF_ACCESS_AUD`）。
 4. *(可选)* 前往 [GitHub Releases](https://github.com/nuomew/VRCX-Worker/releases/latest) 下载 **`VRCX.Agent-v*-Setup-win-x64.exe`** 安装；在网页底部状态栏点 **云端 → 云端中心 → Windows 伴侣（HTTP 同步）** 复制云端地址并创建同步密钥，粘贴到 `VRCX.Agent` 设置窗口中点击 **测试连接并保存** 即可后台运行。

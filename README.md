@@ -74,7 +74,7 @@ flowchart LR
 1. Click **Deploy to Cloudflare** above, or open **Cloudflare Dashboard → Workers & Pages → Create → Import a repository** and select **`nuomew/VRCX-Worker`**.
 2. Keep the repository root (`.`) and default deploy command `npx wrangler deploy`:
    - Root [`wrangler.jsonc`](./wrangler.jsonc) defines `"build": { "command": "npm run build:web" }`, so the Web SPA builds into `./build/web` automatically even if the Dashboard **Build command** is left blank.
-   - Cloudflare Automatic Resource Provisioning creates all 4 D1 shards (`vrcx-core`, `vrcx-gamelog`, `vrcx-feed`, `vrcx-cache`), `AgentHubDO`, and `R2_MEDIA` automatically.
+   - Cloudflare Automatic Resource Provisioning creates all 4 D1 shards (`vrcx-core`, `vrcx-gamelog`, `vrcx-feed`, `vrcx-cache`) and `AgentHubDO` automatically (`R2_MEDIA` is disabled by default so deploys succeed without an R2 subscription; bind it manually or uncomment `r2_buckets` in `wrangler.jsonc` if you need Cloud Gallery).
    - On the first HTTP request, [`cloud/src/db/schemaBootstrap.ts`](./cloud/src/db/schemaBootstrap.ts) initializes all tables, indexes, and FTS5 dictionaries idempotently.
 3. **Recommended Security Setup**: Before daily use, configure access protection and encryption secrets (`ADMIN_PASSCODE`, optional `ADMIN_TOTP_SECRET`, `COOKIE_MASTER_KEY`, or Cloudflare Access `CF_ACCESS_TEAM_DOMAIN` + `CF_ACCESS_AUD`) in **Worker → Settings → Variables and Secrets**.
 4. *(Optional)* Download **`VRCX.Agent-v*-Setup-win-x64.exe`** from [GitHub Releases](https://github.com/nuomew/VRCX-Worker/releases/latest), open **Cloud Hub → Win Agent (HTTP Sync)** in the web UI, generate a Sync Secret, paste your Cloud URL and Sync Secret into `VRCX.Agent`, and click **Test & Save**.
