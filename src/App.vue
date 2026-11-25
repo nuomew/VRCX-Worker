@@ -1,6 +1,6 @@
 <template>
     <TooltipProvider>
-        <MacOSTitleBar></MacOSTitleBar>
+        <MacOSTitleBar v-if="!isWeb"></MacOSTitleBar>
 
         <div
             id="x-app"
@@ -33,6 +33,7 @@
         runUpdateIsHmdAfkFlow
     } from './coordinators/gameCoordinator';
     import { watchState } from './services/watchState';
+    import { cloudState } from './ipc-web/cloudState';
     import { Toaster } from './components/ui/sonner';
     import { TooltipProvider } from './components/ui/tooltip';
     import { createGlobalStores } from './stores';
@@ -94,6 +95,9 @@
     });
 
     onMounted(async () => {
+        if (isWeb && !cloudState.authenticated) {
+            return;
+        }
         if (await store.vrcx.waitForDatabaseInit()) {
             getGameLogTable();
             await store.auth.migrateStoredUsers();

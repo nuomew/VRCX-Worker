@@ -186,7 +186,8 @@
         SidebarHeader,
         SidebarMenu,
         SidebarMenuButton,
-        SidebarMenuItem
+        SidebarMenuItem,
+        useSidebar
     } from '@/components/ui/sidebar';
 
     import {
@@ -228,14 +229,23 @@
     const { logout } = useAuthStore();
     const modalStore = useModalStore();
 
+    const { isMobile, setOpenMobile } = useSidebar();
     const appearanceSettingsStore = useAppearanceSettingsStore();
     const {
         themeMode,
         tableDensity,
         isDarkMode,
-        isNavCollapsed: isCollapsed,
+        isNavCollapsed: rawNavCollapsed,
         showNewDashboardButton
     } = storeToRefs(appearanceSettingsStore);
+    // Keep mobile slide-over drawer expanded with full text labels even when desktop nav collapse is synced from cloud.
+    const isCollapsed = computed(() => !isMobile.value && rawNavCollapsed.value);
+
+    const closeMobileDrawerIfNeeded = () => {
+        if (isMobile.value) {
+            setOpenMobile(false);
+        }
+    };
 
     const {
         themes,
@@ -315,9 +325,11 @@
 
     const handleSettingsClick = () => {
         router.push({ name: 'settings' });
+        closeMobileDrawerIfNeeded();
     };
 
     const handleLogoutClick = () => {
+        closeMobileDrawerIfNeeded();
         logout();
     };
 
@@ -367,6 +379,7 @@
         await saveNavLayout(sanitized, nextHiddenKeys);
         await router.push({ name: 'dashboard', params: { id: dashboard.id } });
         dashboardStore.setEditingDashboardId(dashboard.id);
+        closeMobileDrawerIfNeeded();
     };
 
     const handleEditDashboard = async (item) => {
@@ -379,6 +392,7 @@
             await router.push({ name: 'dashboard', params: { id: dashboardId } });
         }
         dashboardStore.setEditingDashboardId(dashboardId);
+        closeMobileDrawerIfNeeded();
     };
 
     const handleDeleteDashboard = async (item) => {
@@ -414,6 +428,7 @@
 
     const handleSubmenuClick = (entry) => {
         triggerNavAction(entry);
+        closeMobileDrawerIfNeeded();
     };
 
     const handleCollapsedDropdownOpenChange = (index, value) => {
@@ -429,6 +444,7 @@
 
     const handleMenuItemClick = (item) => {
         triggerNavAction(item);
+        closeMobileDrawerIfNeeded();
     };
 
     const toggleNavCollapse = () => {

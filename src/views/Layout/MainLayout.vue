@@ -11,25 +11,30 @@
 
                 <div
                     v-show="sidebarOpen"
-                    class="absolute top-0 bottom-0 z-30 w-1 cursor-ew-resize select-none"
+                    class="hidden min-[769px]:block absolute top-0 bottom-0 z-30 w-1 cursor-ew-resize select-none"
                     :style="{ left: 'var(--sidebar-width)' }"
                     @pointerdown.prevent="startNavResize" />
 
                 <SidebarInset class="min-w-0 bg-sidebar">
                     <div
                         v-if="isWeb"
-                        class="flex md:hidden items-center justify-between gap-2 h-10 px-2 border-b border-border bg-sidebar shrink-0">
+                        class="flex min-[769px]:hidden items-center justify-between gap-2 h-10 px-2 border-b border-border bg-sidebar shrink-0">
                         <div class="flex items-center gap-2 min-w-0">
                             <SidebarTrigger class="shrink-0" />
                             <span class="text-xs font-semibold truncate">{{ t('cloud_hub.mobile_title') }}</span>
                         </div>
                         <div class="flex items-center gap-1.5 shrink-0">
                             <Button
+                                v-if="isSideBarTabShow"
                                 variant="ghost"
                                 size="sm"
                                 class="h-7 px-2 text-xs"
                                 @click="toggleMobileFriendsAside">
-                                {{ isAsideCollapsedStatic ? t('cloud_hub.mobile_friends') : t('cloud_hub.mobile_hide') }}
+                                {{
+                                    (isMobileViewport ? !mobileFriendsOpen : isAsideCollapsedStatic)
+                                        ? t('cloud_hub.mobile_friends')
+                                        : t('cloud_hub.mobile_hide')
+                                }}
                             </Button>
                             <Button
                                 variant="outline"
@@ -50,7 +55,7 @@
                         ]"
                         @layout="handleLayout">
                         <template #default="{ layout }">
-                            <ResizablePanel :default-size="mainDefaultSize" :order="1">
+                            <ResizablePanel :default-size="isWeb && isMobileViewport ? 100 : mainDefaultSize" :order="1">
                                 <RouterView v-slot="{ Component }">
                                     <KeepAlive exclude="ChartsInstance, ChartsMutual">
                                         <component :is="Component" />
@@ -58,8 +63,9 @@
                                 </RouterView>
                             </ResizablePanel>
 
-                            <ResizableHandle class="z-20 opacity-0"></ResizableHandle>
+                            <ResizableHandle v-if="!(isWeb && isMobileViewport)" class="z-20 opacity-0"></ResizableHandle>
                             <ResizablePanel
+                                v-if="!(isWeb && isMobileViewport)"
                                 ref="asidePanelRef"
                                 :default-size="asideDefaultSize"
                                 :min-size="asideMinSize"
@@ -71,7 +77,18 @@
                             </ResizablePanel>
                         </template>
                     </ResizablePanelGroup>
-                    <TooltipWrapper v-if="showAsideExpandButton" side="left" :content="t('nav_tooltip.expand_sidebar')">
+                    <div
+                        v-if="isWeb && isMobileViewport && isSideBarTabShow && mobileFriendsOpen"
+                        class="fixed inset-0 z-40 flex justify-end bg-black/50"
+                        @click.self="mobileFriendsOpen = false">
+                        <div class="flex h-full w-[min(85vw,340px)] max-w-full flex-col bg-sidebar border-l border-border shadow-xl">
+                            <Sidebar></Sidebar>
+                        </div>
+                    </div>
+                    <TooltipWrapper
+                        v-if="showAsideExpandButton && !(isWeb && isMobileViewport)"
+                        side="left"
+                        :content="t('nav_tooltip.expand_sidebar')">
                         <Button
                             variant="outline"
                             size="icon-sm"
@@ -217,10 +234,14 @@
     const showAsideExpandButton = computed(() => isSideBarTabShow.value && isAsideCollapsedStatic.value);
     let restoreAsideAfterHiddenRoute = false;
 
+    const isWeb = typeof WEB !== 'undefined' && WEB;
+    const isMobileViewport = ref(typeof window !== 'undefined' && window.innerWidth <= 768);
+    const mobileFriendsOpen = ref(false);
+
     const asideLayoutStorage = {
         getItem: (name) => localStorage.getItem(name),
         setItem: (name, value) => {
-            if (isSideBarTabShow.value) {
+            if (isSideBarTabShow.value && !(isWeb && isMobileViewport.value)) {
                 localStorage.setItem(name, value);
             }
         }
@@ -228,12 +249,13 @@
 
     watch(isSideBarTabShow, async (show) => {
         if (!show) {
+            mobileFriendsOpen.value = false;
             restoreAsideAfterHiddenRoute = asidePanelRef.value?.isCollapsed === false;
         }
 
         await nextTick();
         if (show) {
-            if (restoreAsideAfterHiddenRoute) {
+            if (restoreAsideAfterHiddenRoute && !(isWeb && isMobileViewport.value)) {
                 asidePanelRef.value?.expand();
             }
         } else {
@@ -241,9 +263,19 @@
         }
     });
 
-    const isWeb = typeof WEB !== 'undefined' && WEB;
+    function updateMobileViewport() {
+        const nextMobile = typeof window !== 'undefined' && window.innerWidth <= 768;
+        isMobileViewport.value = nextMobile;
+        if (!nextMobile) {
+            mobileFriendsOpen.value = false;
+        }
+    }
 
     function toggleMobileFriendsAside() {
+        if (isWeb && isMobileViewport.value) {
+            mobileFriendsOpen.value = !mobileFriendsOpen.value;
+            return;
+        }
         if (!asidePanelRef.value) return;
         if (asidePanelRef.value.isCollapsed) {
             asidePanelRef.value.expand();
@@ -252,10 +284,16 @@
         }
     }
 
-    onMounted(async () => {
-        if (isWeb && typeof window !== 'undefined' && window.innerWidth < 768) {
-            await nextTick();
-            asidePanelRef.value?.collapse();
+    onMounted(() => {
+        updateMobileViewport();
+        if (isWeb && typeof window !== 'undefined') {
+            window.addEventListener('resize', updateMobileViewport);
+        }
+    });
+
+    onUnmounted(() => {
+        if (isWeb && typeof window !== 'undefined') {
+            window.removeEventListener('resize', updateMobileViewport);
         }
     });
 

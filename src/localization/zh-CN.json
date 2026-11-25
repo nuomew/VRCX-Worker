@@ -3675,6 +3675,10 @@
         "unlock": {
             "title": "解锁 VRCX 云端",
             "cf_access_desc": "当前站点受 Cloudflare Access 保护，请先通过 Access 登录门户认证后刷新页面。",
+            "cf_access_reload": "重新认证 / 刷新页面",
+            "check_failed_desc": "无法验证云端会话状态，请检查网络连接后重试。",
+            "retry_check": "重试连接",
+            "retrying": "正在重试...",
             "passcode_desc": "请输入私人云端访问口令。",
             "passcode_totp_desc": "请输入私人云端访问口令及 6 位动态验证码（TOTP）。",
             "passcode_placeholder": "云端访问口令",

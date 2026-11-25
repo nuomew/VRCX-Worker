@@ -31,6 +31,7 @@ public sealed class SyncSettingsForm : Form
     private readonly Label _statusLabel;
     private readonly Button _saveButton;
     private readonly Font _uiFont;
+    private readonly CancellationTokenSource _closeCts = new();
     private CancellationTokenSource? _testCts;
 
     public AgentConfig? SavedConfig { get; private set; }
@@ -42,6 +43,9 @@ public sealed class SyncSettingsForm : Form
         _initialConfig = currentConfig;
         _syncClient = syncClient;
 
+        SuspendLayout();
+        AutoScaleDimensions = new SizeF(96F, 96F);
+        AutoScaleMode = AutoScaleMode.Dpi;
         Text = AgentStrings.SettingsWindowTitle;
         if (windowIcon != null)
         {
@@ -51,7 +55,7 @@ public sealed class SyncSettingsForm : Form
         MaximizeBox = false;
         MinimizeBox = false;
         StartPosition = FormStartPosition.CenterScreen;
-        ClientSize = new Size(504, 532);
+        ClientSize = new Size(504, 538);
         _uiFont = new Font(AgentStrings.UiFontFamily, 9.5f);
         Font = _uiFont;
 
@@ -98,7 +102,7 @@ public sealed class SyncSettingsForm : Form
         {
             Text = AgentStrings.FormatWebDeviceAndScheduleHint(currentConfig.DeviceName, currentConfig.EffectiveSyncIntervalSeconds),
             Location = new Point(20, 128),
-            Size = new Size(464, 22),
+            Size = new Size(464, 28),
             ForeColor = Color.SteelBlue
         };
 
@@ -229,21 +233,29 @@ public sealed class SyncSettingsForm : Form
         });
         AcceptButton = _saveButton;
         CancelButton = cancelButton;
+        ResumeLayout(false);
+        PerformLayout();
     }
 
     protected override void OnFormClosing(FormClosingEventArgs e)
     {
+        _closeCts.Cancel();
         _testCts?.Cancel();
         base.OnFormClosing(e);
     }
 
+    private bool _formDisposed;
+
     protected override void Dispose(bool disposing)
     {
-        if (disposing)
+        if (disposing && !_formDisposed)
         {
+            _formDisposed = true;
+            _closeCts.Cancel();
             _testCts?.Cancel();
             _testCts?.Dispose();
             _testCts = null;
+            _closeCts.Dispose();
             _uiFont.Dispose();
         }
         base.Dispose(disposing);
@@ -258,16 +270,21 @@ public sealed class SyncSettingsForm : Form
     {
         if (IsDisposed || Disposing) return;
 
-        string cloudUrl = _urlBox.Text.Trim().TrimEnd('/');
+        string rawCloudUrl = _urlBox.Text.Trim();
         string syncSecret = _secretBox.Text.Trim();
         bool proxyEnabled = _mainlandProxyRadio.Checked;
         string proxyAddress = _proxyAddressBox.Text.Trim();
 
-        if (!Uri.TryCreate(cloudUrl, UriKind.Absolute, out Uri? uri) ||
-            (uri.Scheme != Uri.UriSchemeHttps && uri.Scheme != Uri.UriSchemeHttp))
+        if (!HttpSyncClient.TryNormalizeCloudUrl(rawCloudUrl, out string cloudUrl))
         {
             _statusLabel.ForeColor = Color.Firebrick;
             _statusLabel.Text = AgentStrings.InvalidCloudUrlMessage;
+            return;
+        }
+        if (!HmacSigner.IsValidSyncSecret(syncSecret))
+        {
+            _statusLabel.ForeColor = Color.Firebrick;
+            _statusLabel.Text = AgentStrings.InvalidSyncSecretMessage;
             return;
         }
 
@@ -290,22 +307,28 @@ public sealed class SyncSettingsForm : Form
 
         _testCts?.Cancel();
         _testCts?.Dispose();
-        var localCts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
-        _testCts = localCts;
+        var localAttemptCts = new CancellationTokenSource();
+        _testCts = localAttemptCts;
+        using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(
+            _closeCts.Token,
+            localAttemptCts.Token,
+            timeoutCts.Token);
 
         try
         {
-            string localDeviceId = _initialConfig.EnsureDeviceId();
+            // Clone before calling EnsureDeviceId so the caller's live AgentConfig is never mutated off-lock.
+            string localDeviceId = _initialConfig.Clone().EnsureDeviceId();
             var (ok, message, syncResponse) = await _syncClient.TestConnectionAsync(
                 cloudUrl,
                 syncSecret,
                 localDeviceId,
-                string.Empty,
+                Environment.MachineName,
                 proxyEnabled,
                 proxyAddress,
-                localCts.Token);
+                linkedCts.Token);
 
-            if (IsDisposed || Disposing || localCts.IsCancellationRequested)
+            if (IsDisposed || Disposing || _closeCts.IsCancellationRequested || localAttemptCts.IsCancellationRequested)
             {
                 return;
             }
@@ -343,6 +366,14 @@ public sealed class SyncSettingsForm : Form
 
             DialogResult = DialogResult.OK;
             Close();
+        }
+        catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested && !_closeCts.IsCancellationRequested && !localAttemptCts.IsCancellationRequested)
+        {
+            if (!IsDisposed && !Disposing)
+            {
+                _statusLabel.ForeColor = Color.Firebrick;
+                _statusLabel.Text = AgentStrings.ConnectionTestTimeoutMessage;
+            }
         }
         catch (OperationCanceledException)
         {

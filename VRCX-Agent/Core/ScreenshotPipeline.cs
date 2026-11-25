@@ -1,4 +1,5 @@
 using System;
+using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
@@ -200,6 +201,29 @@ public sealed class ScreenshotPipeline
         {
             return false;
         }
+        if (!string.Equals(Path.GetExtension(pngPath), ".png", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+        try
+        {
+            if ((File.GetAttributes(pngPath) & FileAttributes.ReadOnly) != 0)
+            {
+                Log.Debug("Skipping PNG metadata embedding for read-only screenshot {Path}.", pngPath);
+                return false;
+            }
+            byte[] existingBytes = File.ReadAllBytes(pngPath);
+            if (!IsImageFileComplete(pngPath, existingBytes))
+            {
+                Log.Debug("Skipping PNG metadata embedding for incomplete screenshot {Path}.", pngPath);
+                return false;
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.Debug(ex, "Pre-check failed before PNG metadata embedding for {Path}.", pngPath);
+            return false;
+        }
 
         var normalizedPlayers = new List<Dictionary<string, string>>(meta.Players.Count);
         foreach (Dictionary<string, string> entry in meta.Players)
@@ -231,9 +255,31 @@ public sealed class ScreenshotPipeline
         });
 
         string tmpPath = $"{pngPath}.{Guid.NewGuid():N}.vrcxmeta.tmp";
+        static void TryDeleteTempFile(string path)
+        {
+            try
+            {
+                if (!File.Exists(path)) return;
+                FileAttributes attrs = File.GetAttributes(path);
+                if ((attrs & FileAttributes.ReadOnly) != 0)
+                {
+                    File.SetAttributes(path, attrs & ~FileAttributes.ReadOnly);
+                }
+                File.Delete(path);
+            }
+            catch
+            {
+                /* ignore */
+            }
+        }
         try
         {
             File.Copy(pngPath, tmpPath, overwrite: true);
+            FileAttributes tmpAttrs = File.GetAttributes(tmpPath);
+            if ((tmpAttrs & FileAttributes.ReadOnly) != 0)
+            {
+                File.SetAttributes(tmpPath, tmpAttrs & ~FileAttributes.ReadOnly);
+            }
             bool written;
             using (var pngFile = new VRCX.PNGFile(tmpPath, writeAccess: true))
             {
@@ -243,7 +289,7 @@ public sealed class ScreenshotPipeline
             }
             if (!written)
             {
-                try { if (File.Exists(tmpPath)) File.Delete(tmpPath); } catch { /* ignore */ }
+                TryDeleteTempFile(tmpPath);
                 return false;
             }
             File.Move(tmpPath, pngPath, overwrite: true);
@@ -251,7 +297,7 @@ public sealed class ScreenshotPipeline
         }
         catch
         {
-            try { if (File.Exists(tmpPath)) File.Delete(tmpPath); } catch { /* ignore */ }
+            TryDeleteTempFile(tmpPath);
             throw;
         }
     }
@@ -309,6 +355,17 @@ public sealed class ScreenshotPipeline
     public static byte[] EncodeWebpThumbnail(string sourcePath, int maxDim = MaxThumbnailDimension, int quality = WebpQuality)
     {
         using Image image = Image.Load(sourcePath);
+        return EncodeWebpThumbnailFromImage(image, maxDim, quality);
+    }
+
+    public static byte[] EncodeWebpThumbnail(byte[] sourceBytes, int maxDim = MaxThumbnailDimension, int quality = WebpQuality)
+    {
+        using Image image = Image.Load(sourceBytes);
+        return EncodeWebpThumbnailFromImage(image, maxDim, quality);
+    }
+
+    private static byte[] EncodeWebpThumbnailFromImage(Image image, int maxDim, int quality)
+    {
         if (image.Width > maxDim || image.Height > maxDim)
         {
             image.Mutate(ctx => ctx.Resize(new ResizeOptions
@@ -333,22 +390,37 @@ public sealed class ScreenshotPipeline
     /// </summary>
     public async Task EmbedLocalMetadataOnlyAsync(PendingScreenshotTask task, CancellationToken ct)
     {
-        if (string.IsNullOrWhiteSpace(task.LocalPath) || !File.Exists(task.LocalPath))
+        if (string.IsNullOrWhiteSpace(task.LocalPath) ||
+            !File.Exists(task.LocalPath) ||
+            !string.Equals(Path.GetExtension(task.LocalPath), ".png", StringComparison.OrdinalIgnoreCase))
         {
             return;
         }
-        bool ready = await WaitForFileReadyAsync(task.LocalPath, ct).ConfigureAwait(false);
-        if (!ready)
-        {
-            Log.Warn("Skipping PNG metadata embedding for {Path}: file remained locked or incomplete.", task.LocalPath);
-            return;
-        }
-
         AgentConfig cfg = _configProvider();
         if (!cfg.WritePngMetadata)
         {
             return;
         }
+        try
+        {
+            if ((File.GetAttributes(task.LocalPath) & FileAttributes.ReadOnly) != 0)
+            {
+                Log.Debug("Skipping PNG metadata embedding for read-only file {Path}.", task.LocalPath);
+                return;
+            }
+        }
+        catch
+        {
+            // Proceed to file readiness check if attributes could not be queried
+        }
+
+        bool ready = await WaitForFileReadyAsync(task.LocalPath, ct, requireWriteAccess: true).ConfigureAwait(false);
+        if (!ready)
+        {
+            Log.Warn("Skipping PNG metadata embedding for {Path}: file remained locked, read-only, or incomplete.", task.LocalPath);
+            return;
+        }
+
         try
         {
             WriteVrcxPngMetadata(task.LocalPath, BuildMetaPayload(task));
@@ -393,8 +465,109 @@ public sealed class ScreenshotPipeline
     }
 
     /// <summary>
+    /// Validates structural completeness of common screenshot formats (PNG IEND footer, JPEG EOI, WebP RIFF length)
+    /// so partially-flushed screenshots still being written by VRChat are deferred instead of uploaded corrupted
+    /// or permanently blacklisted as poison pills.
+    /// </summary>
+    public static bool IsImageFileComplete(string path, byte[] bytes)
+    {
+        if (bytes == null || bytes.Length < 16)
+        {
+            return false;
+        }
+        string ext = Path.GetExtension(path).ToLowerInvariant();
+        if (ext == ".png")
+        {
+            if (bytes.Length < 57 ||
+                bytes[0] != 0x89 || bytes[1] != 0x50 || bytes[2] != 0x4E || bytes[3] != 0x47 ||
+                bytes[4] != 0x0D || bytes[5] != 0x0A || bytes[6] != 0x1A || bytes[7] != 0x0A)
+            {
+                return false;
+            }
+            // Standard PNG terminates with 12-byte IEND chunk: 00 00 00 00 49 45 4E 44 AE 42 60 82
+            int end = bytes.Length;
+            while (end > 12 && bytes[end - 1] == 0)
+            {
+                end--;
+            }
+            if (end < 12) return false;
+            return bytes[end - 12] == 0x00 && bytes[end - 11] == 0x00 &&
+                   bytes[end - 10] == 0x00 && bytes[end - 9] == 0x00 &&
+                   bytes[end - 8] == 0x49 && bytes[end - 7] == 0x45 &&
+                   bytes[end - 6] == 0x4E && bytes[end - 5] == 0x44 &&
+                   bytes[end - 4] == 0xAE && bytes[end - 3] == 0x42 &&
+                   bytes[end - 2] == 0x60 && bytes[end - 1] == 0x82;
+        }
+        if (ext == ".jpg" || ext == ".jpeg")
+        {
+            if (bytes[0] != 0xFF || bytes[1] != 0xD8) return false;
+            int end = bytes.Length;
+            while (end > 2 && bytes[end - 1] == 0) end--;
+            return end >= 2 && bytes[end - 2] == 0xFF && bytes[end - 1] == 0xD9;
+        }
+        if (ext == ".webp")
+        {
+            if (bytes.Length < 12 ||
+                bytes[0] != (byte)'R' || bytes[1] != (byte)'I' || bytes[2] != (byte)'F' || bytes[3] != (byte)'F' ||
+                bytes[8] != (byte)'W' || bytes[9] != (byte)'E' || bytes[10] != (byte)'B' || bytes[11] != (byte)'P')
+            {
+                return false;
+            }
+            uint riffPayloadLen = BinaryPrimitives.ReadUInt32LittleEndian(bytes.AsSpan(4, 4));
+            return riffPayloadLen >= 12u && (long)bytes.Length >= (long)riffPayloadLen + 8L;
+        }
+        return true;
+    }
+
+    /// <summary>
+    /// Returns true when the leading bytes match the expected image format signature (or the file is empty
+    /// and just created), distinguishing active VRChat mid-write flushes from permanently corrupt non-image files.
+    /// </summary>
+    public static bool HasValidImageMagicPrefix(string path, byte[] bytes)
+    {
+        if (bytes == null || bytes.Length == 0)
+        {
+            return true;
+        }
+        string ext = Path.GetExtension(path).ToLowerInvariant();
+        if (ext == ".png")
+        {
+            ReadOnlySpan<byte> sig = new byte[] { 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A };
+            int check = Math.Min(bytes.Length, sig.Length);
+            for (int i = 0; i < check; i++)
+            {
+                if (bytes[i] != sig[i]) return false;
+            }
+            return true;
+        }
+        if (ext == ".jpg" || ext == ".jpeg")
+        {
+            if (bytes[0] != 0xFF) return false;
+            if (bytes.Length >= 2 && bytes[1] != 0xD8) return false;
+            return true;
+        }
+        if (ext == ".webp")
+        {
+            ReadOnlySpan<byte> riff = new byte[] { (byte)'R', (byte)'I', (byte)'F', (byte)'F' };
+            int check = Math.Min(bytes.Length, riff.Length);
+            for (int i = 0; i < check; i++)
+            {
+                if (bytes[i] != riff[i]) return false;
+            }
+            if (bytes.Length >= 12 &&
+                (bytes[8] != (byte)'W' || bytes[9] != (byte)'E' || bytes[10] != (byte)'B' || bytes[11] != (byte)'P'))
+            {
+                return false;
+            }
+            return true;
+        }
+        return true;
+    }
+
+    /// <summary>
     /// Uploads a queued screenshot and classifies failures as permanent (corrupt image / 4xx rejection)
-    /// vs transient (network / 5xx / 429 / temporary file lock) so callers can drop poison-pill entries.
+    /// vs transient (network / 5xx / 429 / temporary file lock / still flushing) so callers can drop true poison pills
+    /// without ever uploading truncated files or permanently blacklisting healthy fresh captures.
     /// </summary>
     public async Task<ScreenshotUploadOutcome> UploadQueuedTaskWithOutcomeAsync(PendingScreenshotTask task, CancellationToken ct)
     {
@@ -418,8 +591,40 @@ public sealed class ScreenshotPipeline
         var meta = BuildMetaPayload(task, cfg.CompressScreenshots);
         try
         {
+            // Uploading only needs read access (so read-only attribute files and explorer/OneDrive previews still upload).
+            bool ready = await WaitForFileReadyAsync(task.LocalPath, ct, requireWriteAccess: false).ConfigureAwait(false);
+            if (!ready)
+            {
+                Log.Debug("Screenshot {Path} is still locked by writer; deferring upload.", task.LocalPath);
+                return ScreenshotUploadOutcome.TransientFailure;
+            }
+
             // Hash the original source file bytes so screenshotId stays stable even if compression settings change.
             byte[] sourceBytes = await File.ReadAllBytesAsync(task.LocalPath, ct).ConfigureAwait(false);
+            if (!IsImageFileComplete(task.LocalPath, sourceBytes))
+            {
+                if (!HasValidImageMagicPrefix(task.LocalPath, sourceBytes))
+                {
+                    Log.Warn("Screenshot {Path} does not start with a valid image signature; skipping corrupt file.", task.LocalPath);
+                    return ScreenshotUploadOutcome.PermanentFailure;
+                }
+                bool recentlyModified = false;
+                try
+                {
+                    recentlyModified = (DateTime.UtcNow - File.GetLastWriteTimeUtc(task.LocalPath)).TotalSeconds < 30;
+                }
+                catch
+                {
+                    recentlyModified = true;
+                }
+                if (recentlyModified)
+                {
+                    Log.Debug("Screenshot {Path} is not structurally complete yet (still flushing); deferring upload.", task.LocalPath);
+                    return ScreenshotUploadOutcome.TransientFailure;
+                }
+                Log.Warn("Screenshot {Path} has an incomplete/truncated image footer after >30s; skipping corrupt file.", task.LocalPath);
+                return ScreenshotUploadOutcome.PermanentFailure;
+            }
             string screenshotId = HmacSigner.Sha256Hex(sourceBytes).Substring(0, 32);
 
             if (HasHashUploaded(screenshotId))
@@ -433,7 +638,8 @@ public sealed class ScreenshotPipeline
             string contentType;
             if (cfg.CompressScreenshots)
             {
-                payloadBytes = EncodeWebpThumbnail(task.LocalPath);
+                // Encode from the exact already-hashed sourceBytes buffer to avoid double I/O and TOCTOU mismatch.
+                payloadBytes = EncodeWebpThumbnail(sourceBytes);
                 contentType = "image/webp";
             }
             else
@@ -448,7 +654,11 @@ public sealed class ScreenshotPipeline
                 };
             }
 
-            string endpoint = $"{cfg.CloudUrl.TrimEnd('/')}/api/agent/media/screenshots/{screenshotId}";
+            if (!HttpSyncClient.TryNormalizeCloudUrl(cfg.CloudUrl, out string normalizedBaseUrl))
+            {
+                return ScreenshotUploadOutcome.TransientFailure;
+            }
+            string endpoint = $"{normalizedBaseUrl}/api/agent/media/screenshots/{screenshotId}";
 
             using var req = new HttpRequestMessage(HttpMethod.Put, endpoint)
             {
@@ -473,6 +683,26 @@ public sealed class ScreenshotPipeline
                 return isPermanentClientError
                     ? ScreenshotUploadOutcome.PermanentFailure
                     : ScreenshotUploadOutcome.TransientFailure;
+            }
+
+            string okBody = await res.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+            if (!string.IsNullOrWhiteSpace(okBody))
+            {
+                try
+                {
+                    JObject? parsedOk = JsonConvert.DeserializeObject<JObject>(okBody);
+                    JToken? r2StoredTok = parsedOk?["data"]?["r2Stored"];
+                    if (r2StoredTok != null && r2StoredTok.Type == JTokenType.Boolean && !r2StoredTok.Value<bool>())
+                    {
+                        // Cloud R2_MEDIA is not bound yet; do not mark permanently uploaded so enabling R2 later can backfill the image.
+                        Log.Warn("Cloud Worker accepted metadata for {Path} without R2 storage (r2Stored=false); leaving un-ledgered for later R2 backfill.", task.LocalPath);
+                        return ScreenshotUploadOutcome.TransientFailure;
+                    }
+                }
+                catch
+                {
+                    // Non-JSON 200 body (e.g. unit test stubs): treat as uploaded
+                }
             }
 
             MarkUploaded(task.LocalPath, screenshotId);
@@ -729,7 +959,10 @@ public sealed class ScreenshotPipeline
     /// Scans the local VRChat photos folder recursively for historical screenshots that have not yet been uploaded.
     /// Returns up to <paramref name="maxResults"/> tasks ordered newest-first so recent memories appear immediately.
     /// </summary>
-    public List<PendingScreenshotTask> ScanUnsyncedScreenshots(string photosDirectory, int maxResults = 50)
+    public List<PendingScreenshotTask> ScanUnsyncedScreenshots(
+        string photosDirectory,
+        int maxResults = 50,
+        IReadOnlySet<string>? skipNormalizedPaths = null)
     {
         var results = new List<PendingScreenshotTask>();
         if (maxResults <= 0 || string.IsNullOrWhiteSpace(photosDirectory) || !Directory.Exists(photosDirectory))
@@ -752,11 +985,24 @@ public sealed class ScreenshotPipeline
                 if (!SupportedPhotoExtensions.Contains(ext)) continue;
                 if (IsInsideExcludedSubfolder(photosDirectory, filePath)) continue;
                 if (HasAlreadyUploaded(filePath)) continue;
+                if (skipNormalizedPaths != null &&
+                    skipNormalizedPaths.Count > 0 &&
+                    skipNormalizedPaths.Contains(NormalizeScreenshotPath(filePath)))
+                {
+                    continue;
+                }
 
                 try
                 {
                     var fi = new FileInfo(filePath);
                     if (!fi.Exists || fi.Length < 64) continue;
+                    // For files modified within the last 2 seconds, verify structural completeness
+                    // before queueing so an active VRChat write finishes flushing first.
+                    if ((DateTime.UtcNow - fi.LastWriteTimeUtc).TotalSeconds < 2.0)
+                    {
+                        byte[] recentBytes = File.ReadAllBytes(filePath);
+                        if (!IsImageFileComplete(filePath, recentBytes)) continue;
+                    }
                 }
                 catch
                 {
@@ -779,18 +1025,27 @@ public sealed class ScreenshotPipeline
         return results;
     }
 
-    private static async Task<bool> WaitForFileReadyAsync(string path, CancellationToken ct)
+    private static async Task<bool> WaitForFileReadyAsync(string path, CancellationToken ct, bool requireWriteAccess = true)
     {
+        FileAccess access = requireWriteAccess ? FileAccess.ReadWrite : FileAccess.Read;
+        FileShare share = requireWriteAccess ? FileShare.None : FileShare.Read;
         for (int i = 0; i < 6; i++)
         {
             try
             {
-                using var fs = new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.None);
-                if (fs.Length > 8) return true;
+                using var fs = new FileStream(path, FileMode.Open, access, share);
+                if (fs.Length > 0) return true;
             }
             catch (IOException)
             {
                 // Still being written by VRChat
+            }
+            catch (UnauthorizedAccessException)
+            {
+                if (requireWriteAccess)
+                {
+                    return false;
+                }
             }
             await Task.Delay(250, ct).ConfigureAwait(false);
         }

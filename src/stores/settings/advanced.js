@@ -176,7 +176,7 @@ export const useAdvancedSettingsStore = defineStore('AdvancedSettings', () => {
             bioLanguage.value = bioLanguageConfig;
         }
 
-        enablePrimaryPassword.value = enablePrimaryPasswordConfig;
+        enablePrimaryPassword.value = typeof WEB !== 'undefined' && WEB ? false : enablePrimaryPasswordConfig;
         relaunchVRChatAfterCrash.value = relaunchVRChatAfterCrashConfig;
         vrcQuitFix.value = vrcQuitFixConfig;
         autoSweepVRChatCache.value = autoSweepVRChatCacheConfig;
@@ -382,7 +382,8 @@ export const useAdvancedSettingsStore = defineStore('AdvancedSettings', () => {
             const response = await webApiService.execute({
                 url: modelsURL,
                 method: 'GET',
-                headers
+                headers,
+                ...(typeof WEB !== 'undefined' && WEB ? { translationTestEndpoint: true } : {})
             });
 
             if (response.status !== 200) {
@@ -481,6 +482,8 @@ export const useAdvancedSettingsStore = defineStore('AdvancedSettings', () => {
      * @param {string} userId - Current user ID for per-user cleanup tracking.
      */
     async function runAvatarAutoCleanup(userId) {
+        // Cloud mode skips local SQLite avatar feed history purging.
+        if (typeof WEB !== 'undefined' && WEB) return;
         const cleanupSetting = await configRepository.getString('VRCX_avatarAutoCleanup', 'Off');
         if (cleanupSetting === 'Off') return;
 
@@ -755,6 +758,7 @@ export const useAdvancedSettingsStore = defineStore('AdvancedSettings', () => {
                 url: endpoint,
                 method: 'POST',
                 headers,
+                ...(typeof WEB !== 'undefined' && WEB && overrides?.endpoint ? { translationTestEndpoint: true } : {}),
                 body: JSON.stringify({
                     model,
                     messages: [

@@ -140,7 +140,7 @@ function findPackageLicenseFile(packageDir) {
             const fullPath = path.join(currentDir, dirEntry.name);
 
             if (dirEntry.isDirectory()) {
-                if (!fullPath.includes(`${path.sep}tools${path.sep}`)) {
+                if (dirEntry.name.toLowerCase() !== 'tools' && !fullPath.includes(`${path.sep}tools${path.sep}`)) {
                     stack.push(fullPath);
                 }
                 continue;
@@ -199,13 +199,20 @@ function parseFrontendLicenses(markdown) {
  * @returns {PackageReference[]}
  */
 function parseCsprojPackageReferences(csprojText) {
-    return [...csprojText.matchAll(/<PackageReference\s+Include="([^"]+)"\s+Version="([^"]+)"/g)].map(
-        ([, packageName, version]) => ({
-            name: packageName,
-            version,
+    const references = [];
+    for (const [, attrs] of csprojText.matchAll(/<PackageReference\b([^>]*)>/g)) {
+        const includeMatch = attrs.match(/\bInclude="([^"]+)"/);
+        const versionMatch = attrs.match(/\bVersion="([^"]+)"/);
+        if (!includeMatch || !versionMatch) {
+            continue;
+        }
+        references.push({
+            name: includeMatch[1],
+            version: versionMatch[1],
             sourceType: 'dotnet'
-        })
-    );
+        });
+    }
+    return references;
 }
 
 /**
@@ -279,7 +286,12 @@ function mergeDotnetEntries(csprojFiles) {
     for (const csprojFile of csprojFiles) {
         const projectName = path.basename(csprojFile, '.csproj');
         const csprojText = fs.readFileSync(csprojFile, 'utf8');
-        const assetEntries = parseAssetsLibraries(path.join(path.dirname(csprojFile), 'obj', 'project.assets.json'));
+        const assetsPath =
+            findFirstExistingFile([
+                path.join(path.dirname(csprojFile), 'obj', projectName, 'project.assets.json'),
+                path.join(path.dirname(csprojFile), 'obj', 'project.assets.json')
+            ]) || path.join(path.dirname(csprojFile), 'obj', 'project.assets.json');
+        const assetEntries = parseAssetsLibraries(assetsPath);
         const packageEntries = assetEntries.length > 0 ? assetEntries : parseCsprojPackageReferences(csprojText);
         const binaryEntries = parseCsprojBinaryReferences(csprojText);
 
@@ -304,7 +316,7 @@ function mergeDotnetEntries(csprojFiles) {
  * @param {string} version
  */
 function resolveNugetMetadata(packageName, version) {
-    const packageDir = path.join(nugetCacheDir, packageName.toLowerCase(), version);
+    const packageDir = path.join(nugetCacheDir, packageName.toLowerCase(), version.toLowerCase());
     const nuspecPath =
         findFirstExistingFile([
             path.join(packageDir, `${packageName.toLowerCase()}.nuspec`),

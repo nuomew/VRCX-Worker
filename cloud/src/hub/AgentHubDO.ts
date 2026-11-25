@@ -25,7 +25,7 @@ interface PendingRpc {
     timer: ReturnType<typeof setTimeout>;
 }
 
-const MAX_MESSAGE_BYTES = 524_288; // 512 KiB guardrail (supports VRChat JSON list responses)
+const MAX_MESSAGE_BYTES = 1_048_576; // 1 MiB guardrail (matches Cloudflare Workers WebSocket frame ceiling)
 const RPC_TIMEOUT_MS = 18_000;
 
 /**
@@ -37,6 +37,7 @@ const RPC_TIMEOUT_MS = 18_000;
  */
 export class AgentHubDO extends DurableObject<Env> {
     private readonly pendingRpcs = new Map<string, PendingRpc>();
+    private wsHintSyncChain: Promise<void> = Promise.resolve();
 
     constructor(ctx: DurableObjectState, env: Env) {
         super(ctx, env);
@@ -132,6 +133,9 @@ export class AgentHubDO extends DurableObject<Env> {
                 ts: Date.now(),
                 payload: { deviceId, revoked: true }
             });
+            // Server-initiated ws.close() does not trigger webSocketClose() under DO Hibernation;
+            // explicitly rewrite or delete ws_agent_hint excluding revoked sockets.
+            await this.syncWsAgentHint(new Set(sockets));
             return Response.json({ ok: true, data: { deviceId, closedSockets: sockets.length } });
         }
 
@@ -155,6 +159,28 @@ export class AgentHubDO extends DurableObject<Env> {
                 connectedAt: new Date().toISOString()
             };
 
+            if (role === 'agent') {
+                // Close any stale sockets for the same deviceId before accepting the replacement socket
+                // so duplicate reconnects never leave zombie sessions or stale pending RPCs.
+                const staleSockets = this.ctx.getWebSockets(`dev:${deviceId}`).filter((s) => {
+                    const a = s.deserializeAttachment() as SocketAttachment | null;
+                    return a?.role === 'agent';
+                });
+                for (const stale of staleSockets) {
+                    for (const [id, pending] of this.pendingRpcs.entries()) {
+                        if (pending.ws !== stale) continue;
+                        clearTimeout(pending.timer);
+                        pending.reject(new Error('Agent socket replaced by newer connection'));
+                        this.pendingRpcs.delete(id);
+                    }
+                    try {
+                        stale.close(4000, 'Replaced by newer connection');
+                    } catch {
+                        // Ignore already-closed sockets
+                    }
+                }
+            }
+
             // Mandatory hibernation acceptance; prefix tags to prevent role/deviceId namespace collisions.
             this.ctx.acceptWebSocket(server, [`role:${role}`, `dev:${deviceId}`]);
             server.serializeAttachment(attachment);
@@ -166,6 +192,8 @@ export class AgentHubDO extends DurableObject<Env> {
                     ts: Date.now(),
                     payload: { deviceId, connectedAt: attachment.connectedAt }
                 });
+                // Persist authoritative list of live WS agent IDs only AFTER genuine WebSocket upgrade succeeds.
+                await this.syncWsAgentHint();
             }
 
             return new Response(null, { status: 101, webSocket: client });
@@ -177,15 +205,28 @@ export class AgentHubDO extends DurableObject<Env> {
         );
     }
 
+    private isSocketOpen(ws: WebSocket): boolean {
+        return ws.readyState === WebSocket.OPEN;
+    }
+
     private pickAgentSocket(targetDeviceId?: string): WebSocket | null {
-        const candidates = targetDeviceId
-            ? this.ctx.getWebSockets(`dev:${targetDeviceId}`).filter((s) => {
-                  const a = s.deserializeAttachment() as SocketAttachment | null;
-                  return a?.role === 'agent';
-              })
-            : this.ctx.getWebSockets('role:agent');
-        // Prefer the newest accepted socket during reconnect overlap so stale closing sockets are avoided.
-        return candidates.length > 0 ? candidates[candidates.length - 1]! : null;
+        const candidates = (
+            targetDeviceId
+                ? this.ctx.getWebSockets(`dev:${targetDeviceId}`).filter((s) => {
+                      const a = s.deserializeAttachment() as SocketAttachment | null;
+                      return a?.role === 'agent';
+                  })
+                : this.ctx.getWebSockets('role:agent')
+        ).filter((s) => this.isSocketOpen(s));
+        if (candidates.length === 0) return null;
+        // Sort deterministically by connectedAt descending so the newest live socket is always chosen
+        // regardless of runtime getWebSockets() ordering after hibernation.
+        candidates.sort((a, b) => {
+            const atA = (a.deserializeAttachment() as SocketAttachment | null)?.connectedAt ?? '';
+            const atB = (b.deserializeAttachment() as SocketAttachment | null)?.connectedAt ?? '';
+            return atB.localeCompare(atA);
+        });
+        return candidates[0] ?? null;
     }
 
     private async handleVrcHttpRpc(request: Request): Promise<Response> {
@@ -217,7 +258,7 @@ export class AgentHubDO extends DurableObject<Env> {
                     id: reqId,
                     type: 'rpc.request',
                     ts: Date.now(),
-                    payload: { op: 'vrc_http', ...payload }
+                    payload: { ...payload, op: 'vrc_http' }
                 })
             );
         } catch (err) {
@@ -242,15 +283,17 @@ export class AgentHubDO extends DurableObject<Env> {
             const result = await rpcPromise;
             return Response.json({ ok: true, data: result });
         } catch (err) {
+            const msg = err instanceof Error ? err.message : 'Agent RPC timed out';
+            const isTimeout = msg.toLowerCase().includes('timeout');
             return Response.json(
                 {
                     ok: false,
                     error: {
-                        code: 'AGENT_RPC_TIMEOUT',
-                        message: err instanceof Error ? err.message : 'Agent RPC timed out'
+                        code: isTimeout ? 'AGENT_RPC_TIMEOUT' : 'AGENT_RPC_FAILED',
+                        message: msg
                     }
                 },
-                { status: 504 }
+                { status: isTimeout ? 504 : 502 }
             );
         }
     }
@@ -317,6 +360,19 @@ export class AgentHubDO extends DurableObject<Env> {
             return;
         }
         if (message.length > MAX_MESSAGE_BYTES) {
+            const attachment = ws.deserializeAttachment() as SocketAttachment | null;
+            if (attachment?.role === 'agent') {
+                // Fast-fail matching pending RPC instead of leaving caller hanging for 18s until timeout.
+                const head = message.slice(0, 512);
+                const idMatch = head.match(/"(?:id|reqId)"\s*:\s*"([^"]{4,128})"/);
+                const reqId = idMatch?.[1] ?? '';
+                const pending = reqId ? this.pendingRpcs.get(reqId) : undefined;
+                if (pending && pending.deviceId === attachment.deviceId) {
+                    clearTimeout(pending.timer);
+                    this.pendingRpcs.delete(reqId);
+                    pending.reject(new Error('Agent RPC response exceeded 1 MiB WebSocket frame limit'));
+                }
+            }
             ws.send(JSON.stringify({ v: 1, type: 'error', payload: { code: 'PAYLOAD_TOO_LARGE' } }));
             return;
         }
@@ -339,14 +395,19 @@ export class AgentHubDO extends DurableObject<Env> {
         }
 
         if (attachment.role === 'agent') {
-            if (envelope.type === 'agent.state' && envelope.payload) {
+            const safePayload =
+                envelope.payload && typeof envelope.payload === 'object' && !Array.isArray(envelope.payload)
+                    ? (envelope.payload as Record<string, unknown>)
+                    : null;
+
+            if (envelope.type === 'agent.state' && safePayload) {
                 const now = new Date().toISOString();
                 this.ctx.storage.sql.exec(
                     `INSERT INTO live_device_state (device_id, state_json, updated_at)
                      VALUES (?, ?, ?)
                      ON CONFLICT(device_id) DO UPDATE SET state_json = excluded.state_json, updated_at = excluded.updated_at`,
                     attachment.deviceId,
-                    JSON.stringify(envelope.payload),
+                    JSON.stringify(safePayload),
                     now
                 );
                 this.broadcastToRole('web', {
@@ -354,37 +415,29 @@ export class AgentHubDO extends DurableObject<Env> {
                     id: envelope.id,
                     type: 'agent.state',
                     ts: Date.now(),
-                    payload: { deviceId: attachment.deviceId, ...envelope.payload }
+                    payload: { ...safePayload, deviceId: attachment.deviceId }
                 });
                 return;
             }
 
             if (envelope.type === 'rpc.response') {
-                const reqId =
-                    envelope.id || (typeof envelope.payload?.reqId === 'string' ? envelope.payload.reqId : '');
+                const rpcPayload = safePayload ?? {};
+                const reqId = envelope.id || (typeof rpcPayload.reqId === 'string' ? rpcPayload.reqId : '');
                 const pending = reqId ? this.pendingRpcs.get(reqId) : undefined;
                 if (pending && pending.deviceId === attachment.deviceId) {
                     clearTimeout(pending.timer);
                     this.pendingRpcs.delete(reqId);
-                    pending.resolve(envelope.payload ?? {});
-                    return;
+                    pending.resolve(rpcPayload);
                 }
-                if (pending) {
-                    return;
-                }
-                this.broadcastToRole('web', {
-                    ...envelope,
-                    ts: Date.now(),
-                    payload: { deviceId: attachment.deviceId, ...(envelope.payload ?? {}) }
-                });
+                // Never broadcast late or unmatched rpc.response payloads to Web sockets.
                 return;
             }
 
             if (envelope.type === 'cmd.result') {
-                const cmdId =
-                    envelope.id || (typeof envelope.payload?.cmdId === 'string' ? envelope.payload.cmdId : '');
+                const cmdPayload = safePayload ?? {};
+                const cmdId = envelope.id || (typeof cmdPayload.cmdId === 'string' ? cmdPayload.cmdId : '');
                 if (cmdId) {
-                    const status = envelope.payload?.status === 'succeeded' ? 'succeeded' : 'failed';
+                    const status = cmdPayload.status === 'succeeded' ? 'succeeded' : 'failed';
                     const now = new Date().toISOString();
                     this.ctx.waitUntil(
                         this.env.DB_CORE.prepare(
@@ -394,7 +447,7 @@ export class AgentHubDO extends DurableObject<Env> {
                                AND (target_device_id = '' OR target_device_id = ?)
                                AND status IN ('pending', 'dispatching', 'dispatched')`
                         )
-                            .bind(status, JSON.stringify(envelope.payload ?? {}), now, cmdId, attachment.deviceId)
+                            .bind(status, JSON.stringify(cmdPayload), now, cmdId, attachment.deviceId)
                             .run()
                             .catch(() => {})
                     );
@@ -402,7 +455,7 @@ export class AgentHubDO extends DurableObject<Env> {
                 this.broadcastToRole('web', {
                     ...envelope,
                     ts: Date.now(),
-                    payload: { deviceId: attachment.deviceId, ...(envelope.payload ?? {}) }
+                    payload: { ...cmdPayload, deviceId: attachment.deviceId }
                 });
             }
             return;
@@ -426,6 +479,58 @@ export class AgentHubDO extends DurableObject<Env> {
         }
     }
 
+    /**
+     * Synchronizes the authoritative set of currently connected WS agent device IDs into D1
+     * `cloud_bg_sync_state('ws_agent_hint')` via a serialized queue so concurrent connect/disconnect/revoke
+     * transitions can never write stale D1 state out of order.
+     */
+    private syncWsAgentHint(excludedSockets?: Set<WebSocket>): Promise<void> {
+        const run = async (): Promise<void> => {
+            if (!this.env.DB_CORE) {
+                return;
+            }
+            const activeIds = Array.from(
+                new Set(
+                    this.ctx
+                        .getWebSockets('role:agent')
+                        .filter((s) => this.isSocketOpen(s) && !excludedSockets?.has(s))
+                        .map((s) => (s.deserializeAttachment() as SocketAttachment | null)?.deviceId)
+                        .filter((id): id is string => Boolean(id))
+                )
+            ).sort();
+            try {
+                if (activeIds.length === 0) {
+                    await this.env.DB_CORE.prepare(
+                        "DELETE FROM cloud_bg_sync_state WHERE state_key = 'ws_agent_hint'"
+                    ).run();
+                } else {
+                    const nowIso = new Date().toISOString();
+                    await this.env.DB_CORE.prepare(
+                        `INSERT INTO cloud_bg_sync_state (state_key, payload_json, updated_at)
+                         VALUES ('ws_agent_hint', ?, ?)
+                         ON CONFLICT(state_key) DO UPDATE SET
+                            payload_json = excluded.payload_json,
+                            updated_at = excluded.updated_at`
+                    )
+                        .bind(
+                            JSON.stringify({
+                                deviceIds: activeIds,
+                                deviceId: activeIds[0],
+                                updatedAt: nowIso
+                            }),
+                            nowIso
+                        )
+                        .run();
+                }
+            } catch {
+                // Non-fatal in minimal test setups where DB_CORE schema is not initialized
+            }
+        };
+        const next = this.wsHintSyncChain.then(run, run);
+        this.wsHintSyncChain = next.catch(() => {});
+        return next;
+    }
+
     private cleanupAgentSocket(ws: WebSocket, attachment: SocketAttachment | null): void {
         if (attachment?.role !== 'agent') {
             return;
@@ -438,7 +543,7 @@ export class AgentHubDO extends DurableObject<Env> {
             this.pendingRpcs.delete(id);
         }
         const stillOnline = this.ctx.getWebSockets(`dev:${attachment.deviceId}`).some((s) => {
-            if (s === ws) return false;
+            if (s === ws || !this.isSocketOpen(s)) return false;
             const a = s.deserializeAttachment() as SocketAttachment | null;
             return a?.role === 'agent';
         });
@@ -449,6 +554,7 @@ export class AgentHubDO extends DurableObject<Env> {
                 ts: Date.now(),
                 payload: { deviceId: attachment.deviceId }
             });
+            this.ctx.waitUntil(this.syncWsAgentHint(new Set([ws])));
         }
     }
 
@@ -477,7 +583,7 @@ export class AgentHubDO extends DurableObject<Env> {
         webClientsCount: number;
         deviceStates: Record<string, { state: unknown; updatedAt: string }>;
     } {
-        const agentSockets = this.ctx.getWebSockets('role:agent');
+        const agentSockets = this.ctx.getWebSockets('role:agent').filter((s) => this.isSocketOpen(s));
         const agentsOnline = Array.from(
             new Set(
                 agentSockets
@@ -485,14 +591,14 @@ export class AgentHubDO extends DurableObject<Env> {
                     .filter((id): id is string => Boolean(id))
             )
         );
-        const webClientsCount = this.ctx.getWebSockets('role:web').length;
+        const webClientsCount = this.ctx.getWebSockets('role:web').filter((s) => this.isSocketOpen(s)).length;
 
         const deviceStates: Record<string, { state: unknown; updatedAt: string }> = {};
         const cursor = this.ctx.storage.sql.exec<{
             device_id: string;
             state_json: string;
             updated_at: string;
-        }>(`SELECT device_id, state_json, updated_at FROM live_device_state LIMIT 20`);
+        }>(`SELECT device_id, state_json, updated_at FROM live_device_state ORDER BY updated_at DESC LIMIT 20`);
 
         for (const row of cursor) {
             try {
@@ -509,7 +615,7 @@ export class AgentHubDO extends DurableObject<Env> {
     }
 
     private broadcastToRole(role: ClientRole, envelope: HubEnvelope): void {
-        const sockets = this.ctx.getWebSockets(`role:${role}`);
+        const sockets = this.ctx.getWebSockets(`role:${role}`).filter((s) => this.isSocketOpen(s));
         if (sockets.length === 0) {
             return;
         }

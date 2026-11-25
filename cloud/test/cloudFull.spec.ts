@@ -1,11 +1,18 @@
 import { env as rawEnv, exports as rawExports } from 'cloudflare:workers';
 import { beforeAll, describe, expect, it, vi } from 'vitest';
-import { getMasterKey } from '../src/auth/auth';
+import { getMasterKey, isSameOriginRequest } from '../src/auth/auth';
 import { hmacSha256Hex, sha256Hex, verifyPasscode } from '../src/crypto/vault';
 import type { Env } from '../src/env';
 import worker from '../src/index';
 import { incrementCounter } from '../src/routes/coreData';
 import { mergeSetCookies } from '../src/routes/vrcProxy';
+import {
+    classifyVrcCacheUrl,
+    invalidateVrcCacheOnWrite,
+    normalizeVrcCacheKey,
+    putCachedVrcResponses,
+    serializeBoundedRssSnapshot
+} from '../src/cache/vrcCache';
 import { diffFriendSnapshot, runBackgroundFeedSync } from '../src/sync/backgroundFeedSync';
 
 const env = rawEnv as unknown as Env;
@@ -3291,5 +3298,2138 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
         expect(twJson.data.some((w) => w.world_id === 'wrld_tw_old')).toBe(false);
         expect(twJson.data.some((w) => w.world_id === 'wrld_tw_excl')).toBe(false);
         expect(twJson.data[0]?.world_id).toBe('wrld_tw_cnt');
+    });
+
+    it('covers Wave 4 backend fixes: pre-auth OOM guard, exact auth/user cookie resurrection guard, redirect cookie isolation, JPEG mime detection, SQL quit filter, Avatar-only feed filter, static sync-key deviceName, avatar-tags PATCH null, and composite friend-log delete', async () => {
+        // 1. P0-2: Unauthenticated agent endpoints reject with 401 BEFORE reading large bodies; oversized command result rejected with 413
+        const guardedEnv: Env = { ...env, AGENT_SYNC_KEY: 'wave4-secret-sync-key' };
+        const unauthShot = await worker.fetch(
+            new Request('http://example.com/api/agent/media/screenshots/wave4unauth01', {
+                method: 'PUT',
+                headers: { 'Content-Type': 'image/png', 'Content-Length': String(30 * 1024 * 1024) },
+                body: new Uint8Array([1, 2, 3, 4])
+            }),
+            guardedEnv
+        );
+        expect(unauthShot.status).toBe(401);
+
+        const unauthCmdRes = await worker.fetch(
+            new Request('http://example.com/api/agent/commands/cmd_unauth/result', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ status: 'succeeded', message: 'x'.repeat(100) })
+            }),
+            guardedEnv
+        );
+        expect(unauthCmdRes.status).toBe(401);
+
+        const oversizeCmdRes = await worker.fetch(
+            new Request('http://example.com/api/agent/commands/cmd_big/result', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    Authorization: 'Bearer wave4-secret-sync-key'
+                },
+                body: JSON.stringify({ status: 'succeeded', message: 'x'.repeat(70_000) })
+            }),
+            guardedEnv
+        );
+        expect(oversizeCmdRes.status).toBe(413);
+
+        // 2. P2-7: Static AGENT_SYNC_KEY respects body.deviceName when X-Device-Name header is omitted
+        const staticSyncRes = await worker.fetch(
+            new Request('http://example.com/api/agent/sync', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    Authorization: 'Bearer wave4-secret-sync-key',
+                    'X-Device-Id': 'win-wave4-custom'
+                },
+                body: JSON.stringify({ deviceName: 'MyCustomGamingRig', events: [] })
+            }),
+            guardedEnv
+        );
+        expect(staticSyncRes.status).toBe(200);
+        const staticSyncJson = (await staticSyncRes.json()) as { data: { deviceName: string } };
+        expect(staticSyncJson.data.deviceName).toBe('MyCustomGamingRig');
+
+        // 3. P0-3 & P1-3 & P1-12: /api/1/auth/user/friends does NOT resurrect deleted cookies; redirect to S3 does NOT pollute VRChat vault; JPEG image keeps data:image/jpeg
+        await exports.default.fetch('http://example.com/api/vrc/cookies', { method: 'DELETE' });
+        const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+            const u = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+            if (u.includes('/api/1/auth/user/friends')) {
+                return new Response('[]', {
+                    status: 200,
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Set-Cookie': '__cf_bm=should_not_resurrect; Path=/'
+                    }
+                });
+            }
+            if (u.includes('/api/1/file/file_w4_jpg/1/file')) {
+                return new Response(null, {
+                    status: 302,
+                    headers: {
+                        Location: 'https://d348imysud55la.cloudfront.net/file_w4_jpg.jpg'
+                    }
+                });
+            }
+            if (u.includes('d348imysud55la.cloudfront.net/file_w4_jpg.jpg')) {
+                return new Response(new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10]), {
+                    status: 200,
+                    headers: {
+                        'Content-Type': 'image/jpeg',
+                        'Set-Cookie': 'cdn_poison=evil; Path=/'
+                    }
+                });
+            }
+            return new Response('{}', { status: 200 });
+        });
+        try {
+            const friendsRes = await exports.default.fetch('http://example.com/api/vrc/execute', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    url: 'https://api.vrchat.cloud/api/1/auth/user/friends?offline=false&n=10',
+                    method: 'GET',
+                    preferCloudDirect: true
+                })
+            });
+            expect(friendsRes.status).toBe(200);
+            const vaultAfterFriends = await env.DB_CORE.prepare(
+                "SELECT account_key FROM cloud_cookie_vault WHERE account_key = 'default'"
+            ).first();
+            expect(vaultAfterFriends).toBeNull();
+
+            const jpgRes = await exports.default.fetch('http://example.com/api/vrc/execute', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    url: 'https://api.vrchat.cloud/api/1/file/file_w4_jpg/1/file',
+                    method: 'GET',
+                    preferCloudDirect: true
+                })
+            });
+            expect(jpgRes.status).toBe(200);
+            const jpgJson = (await jpgRes.json()) as { data: { data: string } };
+            expect(jpgJson.data.data.startsWith('data:image/jpeg;base64,')).toBe(true);
+            const vaultAfterCdn = await env.DB_CORE.prepare(
+                "SELECT account_key FROM cloud_cookie_vault WHERE account_key = 'default'"
+            ).first();
+            expect(vaultAfterCdn).toBeNull();
+        } finally {
+            fetchSpy.mockRestore();
+        }
+
+        // 4. P1-5: /api/activity/source self_slice filters 'VRChat closed' in SQL so >500 screenshot events never truncate quit rows
+        const shotEventStmts = Array.from({ length: 520 }, (_, i) =>
+            env.DB_GAMELOG.prepare('INSERT OR IGNORE INTO gamelog_event (created_at, data) VALUES (?, ?)').bind(
+                new Date(Date.parse('2026-09-01T00:00:00.000Z') + i * 1000).toISOString(),
+                `Screenshot saved: shot_${i}.png`
+            )
+        );
+        shotEventStmts.push(
+            env.DB_GAMELOG.prepare(
+                "INSERT OR IGNORE INTO gamelog_location (created_at, location, world_id, world_name, time) VALUES ('2026-09-02T10:00:00.000Z', 'wrld_w4_quit:1', 'wrld_w4_quit', 'QuitWorld', 0)"
+            ),
+            env.DB_GAMELOG.prepare(
+                "INSERT OR IGNORE INTO gamelog_event (created_at, data) VALUES ('2026-09-02T10:15:00.000Z', 'VRChat closed gracefully')"
+            ),
+            env.DB_GAMELOG.prepare(
+                "INSERT OR IGNORE INTO gamelog_location (created_at, location, world_id, world_name, time) VALUES ('2026-09-02T14:00:00.000Z', 'wrld_w4_next:1', 'wrld_w4_next', 'NextWorld', 0)"
+            )
+        );
+        for (let i = 0; i < shotEventStmts.length; i += 200) {
+            await env.DB_GAMELOG.batch(shotEventStmts.slice(i, i + 200));
+        }
+        const selfSliceRes = await exports.default.fetch(
+            'http://example.com/api/activity/source?kind=self_slice&fromDateIso=2026-09-01T00:00:00.000Z&toDateIso=2026-09-03T00:00:00.000Z'
+        );
+        expect(selfSliceRes.status).toBe(200);
+        const selfSliceJson = (await selfSliceRes.json()) as { data: Array<{ created_at: string; time: number }> };
+        const quitLoc = selfSliceJson.data.find((r) => r.created_at === '2026-09-02T10:00:00.000Z');
+        expect(quitLoc?.time).toBe(15 * 60_000);
+
+        // 5. P2-11: Feed query filtering strictly by ['Avatar'] returns [] instead of falling back to all feed types
+        const avatarOnlyFeed = await exports.default.fetch('http://example.com/api/feed/query', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ types: ['Avatar'], limit: 20 })
+        });
+        expect(avatarOnlyFeed.status).toBe(200);
+        const avatarOnlyJson = (await avatarOnlyFeed.json()) as { data: unknown[] };
+        expect(avatarOnlyJson.data).toEqual([]);
+
+        // 6. P2-6 & P2-12: PATCH /api/avatar-tags omitting color succeeds (null), missing fields -> 400; composite friend_log_history delete works without rowId
+        await exports.default.fetch('http://example.com/api/avatar-tags', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ avatarId: 'avtr_w4', tag: 'cute', color: '#fff' })
+        });
+        const patchTagNull = await exports.default.fetch('http://example.com/api/avatar-tags', {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ avatarId: 'avtr_w4', tag: 'cute' })
+        });
+        expect(patchTagNull.status).toBe(200);
+        const badPatchTag = await exports.default.fetch('http://example.com/api/avatar-tags', {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ tag: 'cute' })
+        });
+        expect(badPatchTag.status).toBe(400);
+
+        await exports.default.fetch('http://example.com/api/friend-log/history', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                entries: [{ created_at: '2026-11-25T05:00:00.000Z', type: 'Friend', user_id: 'usr_w4_del', display_name: 'DelUser' }]
+            })
+        });
+        const compDel = await exports.default.fetch(
+            'http://example.com/api/friend-log/history?createdAt=2026-11-25T05%3A00%3A00.000Z&type=Friend&userId=usr_w4_del',
+            { method: 'DELETE' }
+        );
+        expect(compDel.status).toBe(200);
+        const afterCompDel = await env.DB_CORE.prepare(
+            "SELECT id FROM friend_log_history WHERE user_id = 'usr_w4_del'"
+        ).first();
+        expect(afterCompDel).toBeNull();
+    });
+
+    it('covers Wave 6 convergence fixes: execute-batch Authorization block, JSON null 400s, Feed entity_worlds search, DELETE counter decrement, logout vault purge, and post-fetch session guard', async () => {
+        // 1. P1-4: /api/vrc/execute-batch rejects sub-requests carrying Authorization header without upstream fetch
+        let upstreamBatchCalls = 0;
+        const batchFetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => {
+            upstreamBatchCalls++;
+            return Response.json({ ok: true });
+        });
+        try {
+            const batchAuthRes = await exports.default.fetch('http://example.com/api/vrc/execute-batch', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    requests: [
+                        {
+                            url: 'https://api.vrchat.cloud/api/1/auth/user',
+                            method: 'GET',
+                            headers: { Authorization: 'Basic dGVzdDp0ZXN0' }
+                        }
+                    ]
+                })
+            });
+            expect(batchAuthRes.status).toBe(200);
+            const batchAuthJson = (await batchAuthRes.json()) as { data: { results: Array<{ status: number }> } };
+            expect(batchAuthJson.data.results[0]?.status).toBe(403);
+            expect(upstreamBatchCalls).toBe(0);
+        } finally {
+            batchFetchSpy.mockRestore();
+        }
+
+        // 2. P2-1: JSON null / non-object bodies return clean 400 instead of 500 and never burn pairing codes
+        const nullCookiesRes = await exports.default.fetch('http://example.com/api/vrc/cookies', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: 'null'
+        });
+        expect(nullCookiesRes.status).toBe(400);
+
+        const nullExecRes = await exports.default.fetch('http://example.com/api/vrc/execute', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: 'null'
+        });
+        expect(nullExecRes.status).toBe(400);
+
+        const nullActRes = await exports.default.fetch('http://example.com/api/activity/sessions', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: 'null'
+        });
+        expect(nullActRes.status).toBe(400);
+
+        const pairCodeRes = await exports.default.fetch('http://example.com/api/agent/pair-code', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ deviceLabel: 'Wave6-PC' })
+        });
+        const pairCodeJson = (await pairCodeRes.json()) as { data: { code: string } };
+        const badTypePair = await exports.default.fetch('http://example.com/api/agent/pair', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ code: pairCodeJson.data.code, deviceName: 12345 })
+        });
+        expect(badTypePair.status).toBe(400);
+        // Pairing code must remain unconsumed after type validation failure
+        const codeRow = await env.DB_CORE.prepare('SELECT used FROM cloud_pairing_codes WHERE code = ?')
+            .bind(pairCodeJson.data.code)
+            .first<{ used: number }>();
+        expect(codeRow?.used).toBe(0);
+
+        // 3. P1-5: ingestFeedItems indexes entity_worlds so /api/feed/search finds GPS rows by world name and wrld_id:inst
+        const w6WorldId = 'wrld_66666666-6666-6666-6666-666666666666';
+        await exports.default.fetch('http://example.com/api/feed', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                items: [
+                    {
+                        type: 'GPS',
+                        created_at: '2026-11-25T08:00:00.000Z',
+                        userId: 'usr_w6_world',
+                        displayName: 'ExplorerW6',
+                        location: `${w6WorldId}:9001~region(jp)`,
+                        worldName: 'Azure Observatory'
+                    }
+                ]
+            })
+        });
+        const worldEntity = await env.DB_CORE.prepare('SELECT world_name FROM entity_worlds WHERE world_id = ?')
+            .bind(w6WorldId)
+            .first<{ world_name: string }>();
+        expect(worldEntity?.world_name).toBe('Azure Observatory');
+
+        const searchByNameRes = await exports.default.fetch(
+            'http://example.com/api/feed/search?q=Observatory&types=GPS'
+        );
+        const searchByNameJson = (await searchByNameRes.json()) as { data: Array<{ worldName: string }> };
+        expect(searchByNameJson.data.some((r) => r.worldName === 'Azure Observatory')).toBe(true);
+
+        const searchByInstRes = await exports.default.fetch(
+            `http://example.com/api/feed/search?q=${encodeURIComponent(`${w6WorldId}:9001`)}&types=GPS`
+        );
+        const searchByInstJson = (await searchByInstRes.json()) as { data: Array<{ location: string }> };
+        expect(searchByInstJson.data.some((r) => r.location === `${w6WorldId}:9001~region(jp)`)).toBe(true);
+
+        // 4. P2-5: DELETE /api/notifications?v=1 and DELETE /api/gamelog decrement stats_counters
+        await exports.default.fetch('http://example.com/api/notifications', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                version: 1,
+                entry: { id: 'not_w6_del', created_at: '2026-11-25T08:10:00.000Z', type: 'invite', message: 'Hi' }
+            })
+        });
+        const notifBefore = await env.DB_CORE.prepare(
+            "SELECT row_count FROM stats_counters WHERE counter_key = 'notifications'"
+        ).first<{ row_count: number }>();
+        await exports.default.fetch('http://example.com/api/notifications?v=1&id=not_w6_del', { method: 'DELETE' });
+        const notifAfter = await env.DB_CORE.prepare(
+            "SELECT row_count FROM stats_counters WHERE counter_key = 'notifications'"
+        ).first<{ row_count: number }>();
+        expect((notifBefore?.row_count ?? 0) - (notifAfter?.row_count ?? 0)).toBe(1);
+
+        // 5. P1-3 & P2-4: Basic-Auth 2xx returning only __cf_bm never wipes valid auth; /api/1/logout 2xx deletes vault row
+        const validJarB64 = btoa(JSON.stringify({ auth: 'authcookie_w6_keep' }));
+        await exports.default.fetch('http://example.com/api/vrc/cookies', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ cookies: validJarB64 })
+        });
+        const proxySpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+            const u = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+            if (u.includes('/api/1/auth/user')) {
+                return new Response('{"requiresTwoFactorAuth":["totp"]}', {
+                    status: 200,
+                    headers: { 'Content-Type': 'application/json', 'Set-Cookie': '__cf_bm=only_cf; Path=/' }
+                });
+            }
+            if (u.includes('/api/1/logout')) {
+                return new Response('{"ok":true}', { status: 200, headers: { 'Content-Type': 'application/json' } });
+            }
+            return new Response('{}', { status: 200 });
+        });
+        try {
+            await exports.default.fetch('http://example.com/api/vrc/execute', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    url: 'https://api.vrchat.cloud/api/1/auth/user',
+                    method: 'GET',
+                    headers: { Authorization: 'Basic dGVzdDp0ZXN0' },
+                    preferCloudDirect: true
+                })
+            });
+            const cookiesAfterCfOnly = await exports.default.fetch('http://example.com/api/vrc/cookies');
+            const cookiesAfterJson = (await cookiesAfterCfOnly.json()) as { data: { cookies: string } };
+            expect(JSON.parse(atob(cookiesAfterJson.data.cookies)).auth).toBe('authcookie_w6_keep');
+
+            await exports.default.fetch('http://example.com/api/vrc/execute', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    url: 'https://api.vrchat.cloud/api/1/logout',
+                    method: 'PUT',
+                    preferCloudDirect: true
+                })
+            });
+            const vaultAfterLogout = await env.DB_CORE.prepare(
+                "SELECT account_key FROM cloud_cookie_vault WHERE account_key = 'default'"
+            ).first();
+            expect(vaultAfterLogout).toBeNull();
+        } finally {
+            proxySpy.mockRestore();
+        }
+
+        // 6. P1-2: runBackgroundFeedSync performs zero DB_CACHE / notifications writes if session logs out during notification fetch
+        await exports.default.fetch('http://example.com/api/vrc/cookies', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ cookies: btoa(JSON.stringify({ auth: 'authcookie_w6_race' })) })
+        });
+        const cacheDb = env.DB_CACHE ?? env.DB_CORE;
+        await cacheDb.batch([
+            cacheDb.prepare('DELETE FROM vrc_api_cache'),
+            cacheDb.prepare('DELETE FROM cloud_rss_snapshot')
+        ]);
+        const raceSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+            const u = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+            if (u.includes('/api/1/auth/user/friends')) {
+                return Response.json([]);
+            }
+            if (u.includes('/api/1/auth/user/notifications')) {
+                // Simulate concurrent logout while notifications fetch is in flight
+                await env.DB_CORE.prepare("DELETE FROM cloud_cookie_vault WHERE account_key = 'default'").run();
+                return Response.json([
+                    {
+                        id: 'not_w6_leaked_v1',
+                        created_at: '2026-11-25T09:00:00.000Z',
+                        type: 'invite',
+                        senderUserId: 'usr_leak',
+                        senderUsername: 'Leaker',
+                        message: 'Should not persist'
+                    }
+                ]);
+            }
+            if (u.includes('/api/1/notifications')) {
+                return Response.json([
+                    {
+                        id: 'not_w6_leaked_v2',
+                        createdAt: '2026-11-25T09:00:00.000Z',
+                        type: 'boop',
+                        message: 'Should not persist'
+                    }
+                ]);
+            }
+            return Response.json([]);
+        });
+        try {
+            const raceRes = await runBackgroundFeedSync(env, { force: true, trigger: 'manual' });
+            expect(raceRes.ran).toBe(false);
+            expect(raceRes.status).toBe('no_session');
+            const leakedV1 = await env.DB_CORE.prepare("SELECT id FROM notifications WHERE id = 'not_w6_leaked_v1'").first();
+            const leakedV2 = await env.DB_CORE.prepare("SELECT id FROM notifications_v2 WHERE id = 'not_w6_leaked_v2'").first();
+            const cacheCount = await cacheDb
+                .prepare('SELECT COUNT(*) AS c FROM vrc_api_cache')
+                .first<{ c: number }>();
+            expect(leakedV1).toBeNull();
+            expect(leakedV2).toBeNull();
+            expect(cacheCount?.c ?? 0).toBe(0);
+        } finally {
+            raceSpy.mockRestore();
+        }
+
+        // 7. Convergence P1-1/2/3: execute-batch rejects upload flags, PATCH /api/notifications requires id (400),
+        // and unauthenticated probe on empty vault never overwrites a concurrent login session via unconditional UPDATE
+        const badPatchNotif = await exports.default.fetch('http://example.com/api/notifications', {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ expired: true })
+        });
+        expect(badPatchNotif.status).toBe(400);
+
+        let uploadBatchCalls = 0;
+        const uploadBatchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => {
+            uploadBatchCalls++;
+            return Response.json({ ok: true });
+        });
+        try {
+            const uploadBatchRes = await exports.default.fetch('http://example.com/api/vrc/execute-batch', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    requests: [
+                        {
+                            url: 'https://api.vrchat.cloud/api/1/prints',
+                            method: 'GET',
+                            uploadImagePrint: true,
+                            imageData: 'AQID'
+                        }
+                    ]
+                })
+            });
+            const uploadBatchJson = (await uploadBatchRes.json()) as { data: { results: Array<{ status: number }> } };
+            expect(uploadBatchJson.data.results[0]?.status).toBe(403);
+            expect(uploadBatchCalls).toBe(0);
+        } finally {
+            uploadBatchSpy.mockRestore();
+        }
+
+        await exports.default.fetch('http://example.com/api/vrc/cookies', { method: 'DELETE' });
+        const emptyVaultRaceSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => {
+            // Concurrent login inserts a fresh valid auth cookie while the empty-vault probe is in flight
+            await exports.default.fetch('http://example.com/api/vrc/cookies', {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ cookies: btoa(JSON.stringify({ auth: 'authcookie_concurrent_login' })) })
+            });
+            return new Response('{"error":"Unauthorized"}', {
+                status: 401,
+                headers: { 'Content-Type': 'application/json', 'Set-Cookie': '__cf_bm=stale_probe; Path=/' }
+            });
+        });
+        try {
+            await exports.default.fetch('http://example.com/api/vrc/execute', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    url: 'https://api.vrchat.cloud/api/1/auth/user',
+                    method: 'GET',
+                    preferCloudDirect: true
+                })
+            });
+            const afterRaceCookies = await exports.default.fetch('http://example.com/api/vrc/cookies');
+            const afterRaceJson = (await afterRaceCookies.json()) as { data: { cookies: string } };
+            expect(JSON.parse(atob(afterRaceJson.data.cookies)).auth).toBe('authcookie_concurrent_login');
+        } finally {
+            emptyVaultRaceSpy.mockRestore();
+        }
+    });
+
+    it('enforces Wave 7 fixes: cache-poisoning session guard, SSRF trailing-dot & ::127.0.0.1, bundle replace sanitization, direct_id gamelog search, UTF-8 cookies, CAS 2FA retry, strict 400 validation, probeOnly sync, and clear_cache scope', async () => {
+        // 1. P1-2: SSRF blocks trailing dots and deprecated IPv4-compatible IPv6 addresses
+        for (const blockedUrl of [
+            'https://localhost./v1/models',
+            'https://internal.local./v1/models',
+            'https://[::127.0.0.1]/v1/models',
+            'https://[::7f00:1]/v1/models'
+        ]) {
+            const res = await exports.default.fetch('http://example.com/api/vrc/execute', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ url: blockedUrl, method: 'GET', translationTestEndpoint: true })
+            });
+            expect(res.status).toBe(403);
+        }
+
+        // 2. P1-3: PUT /api/config/bundle replace must validate object shape and sanitize nested savedCredentials objects
+        const badReplaceRes = await exports.default.fetch('http://example.com/api/config/bundle', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ bundleKey: 'vrcx_config', replace: 'not-an-object' })
+        });
+        expect(badReplaceRes.status).toBe(400);
+
+        const nestedReplaceRes = await exports.default.fetch('http://example.com/api/config/bundle', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                bundleKey: 'vrcx_config',
+                replace: {
+                    'config:savedCredentials': {
+                        usr_w7: {
+                            cookies: 'auth=secret_cookie',
+                            loginParams: { username: 'alice', password: 'plaintext_password' }
+                        }
+                    },
+                    'cloud:syncIntervalSeconds': '60'
+                }
+            })
+        });
+        expect(nestedReplaceRes.status).toBe(200);
+        const cfgRow = await env.DB_CORE.prepare(
+            "SELECT payload_json FROM config_bundles WHERE bundle_key = 'vrcx_config'"
+        ).first<{ payload_json: string }>();
+        const savedBundle = JSON.parse(cfgRow!.payload_json) as Record<string, string>;
+        const parsedCreds = JSON.parse(savedBundle['config:savedCredentials']!) as Record<
+            string,
+            { cookies?: string; loginParams?: { password?: string } }
+        >;
+        expect(parsedCreds.usr_w7?.cookies).toBeUndefined();
+        expect(parsedCreds.usr_w7?.loginParams?.password).toBe('');
+
+        // 3. P1-4 + P2-4 + P2-5 + Frontend P2-2: direct usr_ search, excludeUserId, non-wrld location excluded from top_worlds, reconstructed duration preserved
+        const w7Loc = 'wrld_77777777-7777-7777-7777-777777777777:7001';
+        const ingestRes = await exports.default.fetch('http://example.com/api/gamelog', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                items: [
+                    null,
+                    { type: 'Location', created_at: '2026-11-25T09:00:00.000Z', location: 'private', worldName: '' },
+                    { type: 'Location', created_at: '2026-11-25T09:01:00.000Z', location: w7Loc, worldName: 'Wave7 World' },
+                    {
+                        type: 'OnPlayerJoined',
+                        created_at: '2026-11-25T09:02:00.000Z',
+                        userId: 'usr_w7_direct_target',
+                        displayName: 'W7Target',
+                        location: w7Loc,
+                        time: 1000
+                    },
+                    {
+                        type: 'OnPlayerLeft',
+                        created_at: '2026-11-25T09:04:00.000Z',
+                        userId: 'usr_w7_direct_target',
+                        displayName: 'W7Target',
+                        location: w7Loc,
+                        time: 0
+                    },
+                    {
+                        type: 'OnPlayerJoined',
+                        created_at: '2026-11-25T09:02:05.000Z',
+                        userId: 'usr_w7_self',
+                        displayName: 'SelfUser',
+                        location: w7Loc,
+                        time: 0
+                    }
+                ]
+            })
+        });
+        expect(ingestRes.status).toBe(200);
+        const ingestJson = (await ingestRes.json()) as {
+            ok: boolean;
+            data: { inserted: number; skipped: number; rowIds: number[] };
+        };
+        expect(ingestJson.data.inserted).toBe(5);
+        expect(ingestJson.data.skipped).toBe(1);
+        expect(ingestJson.data.rowIds.length).toBe(6);
+        expect(ingestJson.data.rowIds[0]).toBe(0);
+        expect(ingestJson.data.rowIds[2]).toBeGreaterThan(0);
+
+        const directSearchRes = await exports.default.fetch(
+            'http://example.com/api/gamelog/search?q=usr_w7_direct_target&excludeUserId=usr_w7_self'
+        );
+        const directSearchJson = (await directSearchRes.json()) as {
+            data: { strategy: string; joinLeaveRows: Array<{ user_id: string }> };
+        };
+        expect(directSearchJson.data.strategy).toBe('direct_id');
+        expect(directSearchJson.data.joinLeaveRows.length).toBeGreaterThanOrEqual(2);
+        expect(directSearchJson.data.joinLeaveRows.every((r) => r.user_id === 'usr_w7_direct_target')).toBe(true);
+
+        const byLocExcludeRes = await exports.default.fetch(
+            `http://example.com/api/gamelog/by-location?location=${encodeURIComponent(w7Loc)}&excludeUserId=usr_w7_self`
+        );
+        const byLocExcludeJson = (await byLocExcludeRes.json()) as {
+            data: Array<{ type: string; userId?: string }>;
+        };
+        expect(
+            byLocExcludeJson.data.some((r) => (r.type === 'OnPlayerJoined' || r.type === 'OnPlayerLeft') && r.userId === 'usr_w7_self')
+        ).toBe(false);
+
+        const topWorldsRes = await exports.default.fetch('http://example.com/api/gamelog/stats?kind=top_worlds');
+        const topWorldsJson = (await topWorldsRes.json()) as { data: Array<{ world_id: string }> };
+        expect(topWorldsJson.data.some((w) => w.world_id === 'private')).toBe(false);
+
+        const userStatsRes = await exports.default.fetch(
+            'http://example.com/api/gamelog/stats?kind=user&userId=usr_w7_direct_target'
+        );
+        const userStatsJson = (await userStatsRes.json()) as { data: { timeSpent: number } };
+        expect(userStatsJson.data.timeSpent).toBeGreaterThanOrEqual(120_000);
+
+        // 4. P1-5: Malformed JSON / wrong field types return 400 cleanly across core/events/proxy routes
+        for (const [path, method, payload] of [
+            ['/api/memos', 'PUT', { kind: 'user', id: 123, memo: 'bad' }],
+            ['/api/favorites', 'POST', { kind: 'friend', targetId: '' }],
+            ['/api/avatar-tags', 'POST', { avatarId: 'avtr_1', tag: 'cute', color: { bad: 1 } }],
+            ['/api/friend-log/current', 'POST', { entries: 'not-array' }],
+            ['/api/gamelog', 'POST', { items: 'not-array' }],
+            ['/api/feed', 'POST', { items: 'not-array' }],
+            ['/api/vrc/execute', 'POST', { url: 'https://api.vrchat.cloud/api/1/config', method: 123 }]
+        ] as const) {
+            const badRes = await exports.default.fetch(`http://example.com${path}`, {
+                method,
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+            expect(badRes.status).toBe(400);
+        }
+
+        // 5. P2-2: UTF-8 safe base64 roundtrip on /api/vrc/cookies with non-Latin1 characters
+        const utf8CookiePayload = JSON.stringify({ auth: 'authcookie_utf8_test', note: '中文クッキー' });
+        const utf8Bytes = new TextEncoder().encode(utf8CookiePayload);
+        let utf8Bin = '';
+        for (const b of utf8Bytes) utf8Bin += String.fromCharCode(b);
+        const putUtf8Res = await exports.default.fetch('http://example.com/api/vrc/cookies', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ cookies: btoa(utf8Bin) })
+        });
+        expect(putUtf8Res.status).toBe(200);
+        const getUtf8Res = await exports.default.fetch('http://example.com/api/vrc/cookies');
+        expect(getUtf8Res.status).toBe(200);
+        const getUtf8Json = (await getUtf8Res.json()) as { ok: boolean; data: { cookies: string } };
+        const decodedBytes = Uint8Array.from(atob(getUtf8Json.data.cookies), (c) => c.charCodeAt(0));
+        expect(JSON.parse(new TextDecoder().decode(decodedBytes)).note).toBe('中文クッキー');
+
+        // 6. P1-1: Account switch mid-request must NOT poison DB_CACHE with previous account's private response
+        await exports.default.fetch('http://example.com/api/vrc/cookies', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ cookies: btoa(JSON.stringify({ auth: 'authcookie_account_A' })) })
+        });
+        const poisonUrl = 'https://api.vrchat.cloud/api/1/auth/user/friends?offline=false&n=100&offset=0';
+        let poisonFetchCount = 0;
+        const poisonSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => {
+            poisonFetchCount++;
+            if (poisonFetchCount === 1) {
+                // Account switches to B while Account A's friends request is still in flight
+                await exports.default.fetch('http://example.com/api/vrc/cookies', {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ cookies: btoa(JSON.stringify({ auth: 'authcookie_account_B' })) })
+                });
+                return Response.json([{ id: 'usr_account_a_friend' }]);
+            }
+            return Response.json([{ id: 'usr_account_b_friend' }]);
+        });
+        try {
+            const firstRes = await exports.default.fetch('http://example.com/api/vrc/execute', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ url: poisonUrl, method: 'GET', preferCloudDirect: true })
+            });
+            expect(firstRes.status).toBe(200);
+            // Subsequent request as Account B MUST miss DB_CACHE and fetch fresh Account B friends
+            const secondRes = await exports.default.fetch('http://example.com/api/vrc/execute', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ url: poisonUrl, method: 'GET', preferCloudDirect: true })
+            });
+            const secondJson = (await secondRes.json()) as { data: { data: string; route: string } };
+            expect(secondJson.data.route).toBe('cloud_direct');
+            expect(secondJson.data.data).toContain('usr_account_b_friend');
+        } finally {
+            poisonSpy.mockRestore();
+        }
+
+        // 7. P2-6: 2FA twoFactorAuth cookie survives concurrent __cf_bm CAS rotation for the same session
+        await exports.default.fetch('http://example.com/api/vrc/cookies', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ cookies: btoa(JSON.stringify({ auth: 'authcookie_2fa_same', __cf_bm: 'old_bm' })) })
+        });
+        const tfaRaceSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => {
+            // Simulate concurrent request rotating __cf_bm for the SAME auth cookie
+            await exports.default.fetch('http://example.com/api/vrc/cookies', {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ cookies: btoa(JSON.stringify({ auth: 'authcookie_2fa_same', __cf_bm: 'rotated_bm' })) })
+            });
+            return new Response('{"verified":true}', {
+                status: 200,
+                headers: { 'Content-Type': 'application/json', 'Set-Cookie': 'twoFactorAuth=tfa_token_kept; Path=/' }
+            });
+        });
+        try {
+            const tfaRes = await exports.default.fetch('http://example.com/api/vrc/execute', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    url: 'https://api.vrchat.cloud/api/1/auth/twofactorauth/totp/verify',
+                    method: 'POST',
+                    body: '{"code":"123456"}',
+                    preferCloudDirect: true
+                })
+            });
+            expect(tfaRes.status).toBe(200);
+            const afterTfaRes = await exports.default.fetch('http://example.com/api/vrc/cookies');
+            const afterTfaJson = (await afterTfaRes.json()) as { data: { cookies: string } };
+            const parsedAfterTfa = JSON.parse(atob(afterTfaJson.data.cookies)) as Record<string, string>;
+            expect(parsedAfterTfa.auth).toBe('authcookie_2fa_same');
+            expect(parsedAfterTfa.twoFactorAuth).toBe('tfa_token_kept');
+            expect(parsedAfterTfa.__cf_bm).toBe('rotated_bm');
+        } finally {
+            tfaRaceSpy.mockRestore();
+        }
+
+        // 8. Agent P1-2 + Cross-Layer P2-2 + Cross-Layer P2-3: probeOnly sync does not claim commands, regular sync returns skipped, clear_cache scope=single validates id
+        const badSingleCacheCmd = await exports.default.fetch('http://example.com/api/commands', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ action: 'clear_cache', params: { scope: 'single' } })
+        });
+        expect(badSingleCacheCmd.status).toBe(400);
+
+        const validSingleCacheCmd = await exports.default.fetch('http://example.com/api/commands', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ action: 'clear_cache', params: { scope: 'single', id: 'wrld_cache_item_1' } })
+        });
+        expect(validSingleCacheCmd.status).toBe(200);
+
+        const w7KeyRes = await exports.default.fetch('http://example.com/api/agent/sync-key', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ deviceName: 'Wave7-Probe-PC' })
+        });
+        const w7KeyJson = (await w7KeyRes.json()) as { data: { syncKey: string; deviceId: string } };
+
+        const probeSyncRes = await exports.default.fetch('http://example.com/api/agent/sync', {
+            method: 'POST',
+            headers: {
+                Authorization: `Bearer ${w7KeyJson.data.syncKey}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({ probeOnly: true, agentVersion: '1.10.8', events: [] })
+        });
+        expect(probeSyncRes.status).toBe(200);
+        const probeSyncJson = (await probeSyncRes.json()) as {
+            data: { pendingCommands: unknown[]; ingest: { inserted: number; skipped: number } };
+        };
+        expect(probeSyncJson.data.pendingCommands).toEqual([]);
+        expect(probeSyncJson.data.ingest).toEqual({ inserted: 0, skipped: 0 });
+
+        // Regular sync claims the previously queued clear_cache command and reports ingest.skipped accurately
+        const realSyncRes = await exports.default.fetch('http://example.com/api/agent/sync', {
+            method: 'POST',
+            headers: {
+                Authorization: `Bearer ${w7KeyJson.data.syncKey}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                agentVersion: '1.10.8',
+                events: [
+                    { type: 'Location', created_at: '2026-11-25T09:01:00.000Z', location: w7Loc, worldName: 'Wave7 World' }
+                ]
+            })
+        });
+        expect(realSyncRes.status).toBe(200);
+        const realSyncJson = (await realSyncRes.json()) as {
+            data: { pendingCommands: Array<{ action: string }>; ingest: { inserted: number; skipped: number } };
+        };
+        expect(realSyncJson.data.pendingCommands.some((c) => c.action === 'clear_cache')).toBe(true);
+        expect(realSyncJson.data.ingest.skipped).toBe(1);
+
+        // 9. Final audit hardening: IPv6 NAT64/site-local/multicast SSRF, clear_cache scope/dot/variant,
+        //    null-body POST queries, Infinity/non-string D1 binds, composite DELETE discriminator, third-party write isolation
+        for (const blockedV6 of [
+            'https://[64:ff9b::127.0.0.1]/v1/models',
+            'https://[fec0::1]/v1/models',
+            'https://[ff02::1]/v1/models'
+        ]) {
+            const r = await exports.default.fetch('http://example.com/api/vrc/execute', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ url: blockedV6, method: 'GET', translationTestEndpoint: true })
+            });
+            expect(r.status).toBe(403);
+        }
+
+        const badScopeNum = await exports.default.fetch('http://example.com/api/commands', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ action: 'clear_cache', params: { scope: 123 } })
+        });
+        expect(badScopeNum.status).toBe(400);
+
+        const badDotId = await exports.default.fetch('http://example.com/api/commands', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ action: 'clear_cache', params: { scope: 'single', id: '.' } })
+        });
+        expect(badDotId.status).toBe(400);
+
+        const goodVariantCmd = await exports.default.fetch('http://example.com/api/commands', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ action: 'clear_cache', params: { scope: 'single', id: 'file_abc', variant: 'security' } })
+        });
+        expect(goodVariantCmd.status).toBe(200);
+
+        for (const qPath of [
+            '/api/gamelog/query',
+            '/api/gamelog/stats/users',
+            '/api/gamelog/sessions/events',
+            '/api/feed/query'
+        ]) {
+            const nullBodyRes = await exports.default.fetch(`http://example.com${qPath}`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: 'null'
+            });
+            expect(nullBodyRes.status).toBe(200);
+        }
+
+        const infSegRes = await exports.default.fetch(
+            'http://example.com/api/gamelog/stats?kind=sessions_segments&beforeId=Infinity'
+        );
+        expect(infSegRes.status).toBe(200);
+
+        const infDelHist = await exports.default.fetch('http://example.com/api/friend-log/history?rowId=Infinity', {
+            method: 'DELETE'
+        });
+        expect(infDelHist.status).toBe(200);
+
+        const badRevActRes = await exports.default.fetch('http://example.com/api/activity/sessions', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                userId: 'usr_act_badrev',
+                replace: true,
+                sessions: [{ start: 1000, end: 2000, sourceRevision: { bad: true } }]
+            })
+        });
+        expect(badRevActRes.status).toBe(200);
+
+        // Composite DELETE must not wipe sibling same-second OnPlayerJoined rows
+        const sameSec = '2026-11-25T11:11:11.000Z';
+        await exports.default.fetch('http://example.com/api/gamelog', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                items: [
+                    { type: 'OnPlayerJoined', created_at: sameSec, displayName: 'SameSecAlice', userId: 'usr_ssa', location: w7Loc },
+                    { type: 'OnPlayerJoined', created_at: sameSec, displayName: 'SameSecBob', userId: 'usr_ssb', location: w7Loc }
+                ]
+            })
+        });
+        // Missing displayName deletes 0 rows
+        await exports.default.fetch(
+            `http://example.com/api/gamelog?kind=OnPlayerJoined&createdAt=${encodeURIComponent(sameSec)}`,
+            { method: 'DELETE' }
+        );
+        const stillBoth = await env.DB_GAMELOG.prepare(
+            'SELECT display_name FROM gamelog_join_leave WHERE created_at = ? ORDER BY display_name'
+        )
+            .bind(sameSec)
+            .all<{ display_name: string }>();
+        expect((stillBoth.results ?? []).map((r) => r.display_name)).toEqual(['SameSecAlice', 'SameSecBob']);
+        // Providing displayName deletes ONLY Alice
+        await exports.default.fetch(
+            `http://example.com/api/gamelog?kind=OnPlayerJoined&createdAt=${encodeURIComponent(sameSec)}&displayName=SameSecAlice`,
+            { method: 'DELETE' }
+        );
+        const onlyBob = await env.DB_GAMELOG.prepare(
+            'SELECT display_name FROM gamelog_join_leave WHERE created_at = ?'
+        )
+            .bind(sameSec)
+            .all<{ display_name: string }>();
+        expect((onlyBob.results ?? []).map((r) => r.display_name)).toEqual(['SameSecBob']);
+
+        // Third-party allowlisted POST to /api/1/logout must NOT delete VRChat cloud_cookie_vault
+        await exports.default.fetch('http://example.com/api/vrc/cookies', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ cookies: btoa(JSON.stringify({ auth: 'authcookie_keep_me' })) })
+        });
+        const thirdPartySpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => Response.json({ ok: true }));
+        try {
+            const tpRes = await exports.default.fetch('http://example.com/api/vrc/execute', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    url: 'https://api.github.com/api/1/logout',
+                    method: 'POST',
+                    body: '{}',
+                    preferCloudDirect: true
+                })
+            });
+            expect(tpRes.status).toBe(200);
+            const afterTpCookies = await exports.default.fetch('http://example.com/api/vrc/cookies');
+            const afterTpJson = (await afterTpCookies.json()) as { data: { cookies: string } };
+            expect(JSON.parse(atob(afterTpJson.data.cookies)).auth).toBe('authcookie_keep_me');
+        } finally {
+            thirdPartySpy.mockRestore();
+        }
+    });
+
+    it('covers Wave 8 secondary-dev fixes: 1 MiB RPC + immediate reject, bounded RSS snapshot, truncated friends guard, account-switch friend-log owner, bio rotation, screenshot orphan cleanup, cache invalidation, WS hint + current-instance, gamelog/feed search & stats', async () => {
+        // 1. AgentHubDO: supports >256 KiB (300 KiB) rpc.response and rejects >1 MiB rpc.response immediately with 502 (no 18s hang)
+        const rpcHub = env.AGENT_HUB.get(env.AGENT_HUB.idFromName('wave8-oversize-rpc-test'));
+        const agentWsRes = await rpcHub.fetch('https://agent-hub.internal/ws/agent?deviceId=dev-w8-rpc', {
+            headers: { Upgrade: 'websocket' }
+        });
+        expect(agentWsRes.status).toBe(101);
+        const rpcAgentWs = agentWsRes.webSocket!;
+        rpcAgentWs.accept();
+
+        const req300Promise = waitForMessage(rpcAgentWs, (m) => m.includes('"rpc.request"'));
+        const rpc300ResPromise = rpcHub.fetch('https://agent-hub.internal/rpc/vrc-http', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ url: 'https://api.vrchat.cloud/api/1/config', method: 'GET' })
+        });
+        const req300 = JSON.parse(await req300Promise) as { id: string };
+        rpcAgentWs.send(
+            JSON.stringify({
+                v: 1,
+                id: req300.id,
+                type: 'rpc.response',
+                payload: { status: 200, data: 'A'.repeat(300_000) }
+            })
+        );
+        const rpc300Res = await rpc300ResPromise;
+        expect(rpc300Res.status).toBe(200);
+        const rpc300Json = (await rpc300Res.json()) as { ok: boolean; data: { data: string } };
+        expect(rpc300Json.ok).toBe(true);
+        expect(rpc300Json.data.data.length).toBe(300_000);
+
+        const reqOverPromise = waitForMessage(rpcAgentWs, (m) => m.includes('"rpc.request"'));
+        const startMs = Date.now();
+        const rpcOverResPromise = rpcHub.fetch('https://agent-hub.internal/rpc/vrc-http', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ url: 'https://api.vrchat.cloud/api/1/config', method: 'GET' })
+        });
+        const reqOver = JSON.parse(await reqOverPromise) as { id: string };
+        rpcAgentWs.send(
+            JSON.stringify({
+                v: 1,
+                id: reqOver.id,
+                type: 'rpc.response',
+                payload: { status: 200, data: 'B'.repeat(1_100_000) }
+            })
+        );
+        const rpcOverRes = await rpcOverResPromise;
+        const elapsedMs = Date.now() - startMs;
+        expect(elapsedMs).toBeLessThan(5000);
+        expect(rpcOverRes.status).toBe(502);
+        const rpcOverJson = (await rpcOverRes.json()) as { error: { code: string } };
+        expect(rpcOverJson.error.code).toBe('AGENT_RPC_FAILED');
+        rpcAgentWs.close(1000, 'done');
+
+        // 2. serializeBoundedRssSnapshot strictly stays <= 1_400_000 UTF-8 bytes even with huge online friend payloads
+        const hugeFriends = Array.from({ length: 450 }, (_, i) => ({
+            id: `usr_huge_${i}`,
+            displayName: `Friend ${i}`,
+            location: `wrld_huge_${i}:12345`,
+            status: 'active',
+            statusDescription: 'status',
+            bio: 'X'.repeat(6000),
+            extraBloat: 'Y'.repeat(8000)
+        }));
+        const boundedJson = serializeBoundedRssSnapshot({
+            syncedAt: '2026-11-25T15:00:00.000Z',
+            onlineCount: hugeFriends.length,
+            feedInserted: 0,
+            notificationsInserted: 0,
+            bioChecked: 0,
+            onlineFriends: hugeFriends
+        });
+        expect(new TextEncoder().encode(boundedJson).byteLength).toBeLessThanOrEqual(1_400_000);
+        const parsedBounded = JSON.parse(boundedJson) as { onlineFriends: Array<{ id: string; extraBloat?: string }> };
+        expect(parsedBounded.onlineFriends.length).toBeGreaterThan(0);
+        expect(parsedBounded.onlineFriends[0]?.extraBloat).toBeUndefined();
+
+        // 3. diffFriendSnapshot({ truncated: true }) suppresses false Offline and evicts unseen overflow friends after >6 missed polls
+        let rollingSnap: Record<string, { n: string; l: string; w: string; g: string; s: string; d: string; la: number; o: boolean; m?: number }> = {
+            usr_seen: { n: 'Seen', l: 'wrld_1:1', w: 'W1', g: '', s: 'active', d: '', la: 1700000000000, o: true },
+            usr_overflow: { n: 'OverflowFriend', l: 'wrld_2:2', w: 'W2', g: '', s: 'active', d: '', la: 1700000000000, o: true }
+        };
+        const truncDiff = diffFriendSnapshot(
+            rollingSnap,
+            [{ id: 'usr_seen', displayName: 'Seen', location: 'wrld_1:1', status: 'active', statusDescription: '' }],
+            '2026-11-25T15:01:00.000Z',
+            new Map(),
+            { truncated: true }
+        );
+        expect(truncDiff.feedItems.some((e) => e.type === 'Offline')).toBe(false);
+        expect(truncDiff.nextSnapshot.usr_overflow?.m).toBe(1);
+        rollingSnap = truncDiff.nextSnapshot;
+        for (let tick = 2; tick <= 7; tick++) {
+            const step = diffFriendSnapshot(
+                rollingSnap,
+                [{ id: 'usr_seen', displayName: 'Seen', location: 'wrld_1:1', status: 'active', statusDescription: '' }],
+                `2026-11-25T15:0${tick}:00.000Z`,
+                new Map(),
+                { truncated: true }
+            );
+            expect(step.feedItems.some((e) => e.type === 'Offline')).toBe(false);
+            rollingSnap = step.nextSnapshot;
+        }
+        expect(rollingSnap.usr_overflow).toBeUndefined();
+
+        // 4. Account-switch friend_log_owner reset (no cross-account false Friend/Unfriend) + bio rotation never starves on 404/non-string bio + cookieRefreshed bypasses minIntervalMs
+        await env.DB_CORE.prepare(
+            "INSERT OR REPLACE INTO cloud_bg_sync_state (state_key, payload_json, updated_at) VALUES ('poller_meta', ?, ?)"
+        )
+            .bind(
+                JSON.stringify({
+                    lastRunAt: new Date(Date.now() - 1000).toISOString(),
+                    lastSuccessAt: '',
+                    nextAllowedAt: new Date(Date.now() + 600_000).toISOString(),
+                    webLastActiveAt: '',
+                    lastStatus: 'auth_expired',
+                    lastError: 'expired',
+                    lastOnlineCount: 0,
+                    lastFeedInserted: 0,
+                    lastNotificationsInserted: 0,
+                    lastBioChecked: 0
+                }),
+                new Date().toISOString()
+            )
+            .run();
+        await exports.default.fetch('http://example.com/api/vrc/cookies', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ cookies: btoa(JSON.stringify({ auth: 'authcookie_w8_acct_A' })) })
+        });
+        await env.DB_CORE.prepare('DELETE FROM friend_log_current').run();
+        await env.DB_CORE.prepare("DELETE FROM friend_log_history WHERE user_id LIKE 'usr_w8_fl_%'").run();
+        await env.DB_CORE.prepare(
+            "INSERT INTO friend_log_current (user_id, display_name, trust_level, friend_number) VALUES ('usr_w8_fl_old', 'OldAcctFriend', 'Known', 1)"
+        ).run();
+        await env.DB_CORE.prepare(
+            "INSERT OR REPLACE INTO cloud_bg_sync_state (state_key, payload_json, updated_at) VALUES ('friend_log_owner', ?, '2026-11-25T14:00:00.000Z')"
+        )
+            .bind(JSON.stringify({ userId: 'usr_owner_old' }))
+            .run();
+        await env.DB_CORE.prepare(
+            `INSERT OR REPLACE INTO user_profile (user_id, bio, bio_links, updated_at)
+             VALUES ('usr_w8_bio_bad', 'old bio', '[]', '2020-01-01T00:00:00.000Z')`
+        ).run();
+
+        const bgSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+            const u = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+            if (u.includes('/api/1/auth/user/friends')) {
+                return Response.json([
+                    { id: 'usr_w8_fl_new', displayName: 'NewAcctFriend', location: 'wrld_b:1', status: 'active', state: 'online', tags: ['system_trust_known'] },
+                    { id: 'usr_w8_bio_bad', displayName: 'BioBad', location: 'wrld_b:1', status: 'active', state: 'online', tags: ['system_trust_known'] }
+                ]);
+            }
+            if (u.includes('/api/1/auth/user/notifications')) {
+                return Response.json([]);
+            }
+            if (u.includes('/api/1/auth/user')) {
+                return Response.json({
+                    id: 'usr_owner_new',
+                    displayName: 'NewOwner',
+                    friends: ['usr_w8_fl_new', 'usr_w8_bio_bad']
+                });
+            }
+            if (u.includes('/api/1/users/usr_w8_bio_bad')) {
+                return new Response('Not Found', { status: 404 });
+            }
+            return Response.json({});
+        });
+        try {
+            // Even without force:true, fresh cookie upload clears backoff + lastRunAt so cron trigger runs immediately
+            const syncRes1 = await runBackgroundFeedSync(env, { trigger: 'cron' });
+            expect(syncRes1.ran).toBe(true);
+            // Cross-account switch must reset baseline without emitting fake Friend/Unfriend history rows
+            const fakeHist = await env.DB_CORE.prepare(
+                "SELECT type, user_id FROM friend_log_history WHERE user_id IN ('usr_w8_fl_old', 'usr_w8_fl_new')"
+            ).all<{ type: string; user_id: string }>();
+            expect(fakeHist.results ?? []).toHaveLength(0);
+            const curAfterSwitch = await env.DB_CORE.prepare(
+                "SELECT user_id FROM friend_log_current WHERE user_id IN ('usr_w8_fl_old', 'usr_w8_fl_new')"
+            ).all<{ user_id: string }>();
+            expect((curAfterSwitch.results ?? []).map((r) => r.user_id)).toEqual([]);
+            const ownerAfterSwitch = await env.DB_CORE.prepare(
+                "SELECT payload_json FROM cloud_bg_sync_state WHERE state_key = 'friend_log_owner'"
+            ).first<{ payload_json: string }>();
+            expect(JSON.parse(ownerAfterSwitch?.payload_json ?? '{}')).toEqual({ userId: 'usr_owner_new' });
+            // Bio rotation MUST advance updated_at for 404 friend so it moves to the back of the queue
+            const badBioRow = await env.DB_CORE.prepare(
+                "SELECT updated_at FROM user_profile WHERE user_id = 'usr_w8_bio_bad'"
+            ).first<{ updated_at: string }>();
+            expect(badBioRow?.updated_at && badBioRow.updated_at > '2025-01-01T00:00:00.000Z').toBe(true);
+        } finally {
+            bgSpy.mockRestore();
+        }
+
+        // 5. Screenshot UNIQUE local_filename dedupe cleans up orphan R2 object on duplicate upload
+        const w8KeyRes = await exports.default.fetch('http://example.com/api/agent/sync-key', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ deviceName: 'Wave8-Shot-PC' })
+        });
+        const w8Key = ((await w8KeyRes.json()) as { data: { syncKey: string; deviceId: string } }).data;
+        const shotMetaB64 = btoa(JSON.stringify({ localFilename: 'VRChat_wave8_unique_test.png', takenAt: '2026-11-25T15:02:00Z' }));
+        const pngStub = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 0]);
+        const firstShot = await exports.default.fetch('http://example.com/api/agent/media/screenshots/w8shot_first_1111', {
+            method: 'PUT',
+            headers: {
+                Authorization: `Bearer ${w8Key.syncKey}`,
+                'Content-Type': 'image/png',
+                'X-Screenshot-Meta': shotMetaB64
+            },
+            body: pngStub
+        });
+        expect(firstShot.status).toBe(200);
+        const dupShot = await exports.default.fetch('http://example.com/api/agent/media/screenshots/w8shot_second_2222', {
+            method: 'PUT',
+            headers: {
+                Authorization: `Bearer ${w8Key.syncKey}`,
+                'Content-Type': 'image/png',
+                'X-Screenshot-Meta': shotMetaB64
+            },
+            body: pngStub
+        });
+        expect(dupShot.status).toBe(200);
+        const dupShotJson = (await dupShot.json()) as { data: { duplicate: boolean } };
+        expect(dupShotJson.data.duplicate).toBe(true);
+        // Orphan R2 object for w8shot_second_2222 must have been deleted
+        const orphanObj = await env.R2_MEDIA!.get('screenshots/w8shot_second_2222.png');
+        expect(orphanObj).toBeNull();
+
+        // 6. Cache invalidation covers /api/1/file/{id}, /api/1/user/{id}, /api/1/auth/user/friends/{id}, and notification /accept
+        const cacheSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+            const u = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+            return Response.json({ url: u, ts: Math.random() });
+        });
+        try {
+            const execVrc = (url: string, method = 'GET') =>
+                exports.default.fetch('http://example.com/api/vrc/execute', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ url, method, preferCloudDirect: true })
+                });
+            // Warm caches for file + two users
+            await execVrc('https://api.vrchat.cloud/api/1/file/file_w8_01');
+            await execVrc('https://api.vrchat.cloud/api/1/users/usr_w8_u1');
+            await execVrc('https://api.vrchat.cloud/api/1/users/usr_w8_u2');
+            // Write mutations
+            await execVrc('https://api.vrchat.cloud/api/1/file/file_w8_01/1', 'DELETE');
+            await execVrc('https://api.vrchat.cloud/api/1/user/usr_w8_u1/friendRequest', 'POST');
+            await execVrc('https://api.vrchat.cloud/api/1/auth/user/friends/usr_w8_u2', 'DELETE');
+            // Subsequent GETs must miss DB_CACHE (route === 'cloud_direct')
+            for (const target of [
+                'https://api.vrchat.cloud/api/1/file/file_w8_01',
+                'https://api.vrchat.cloud/api/1/users/usr_w8_u1',
+                'https://api.vrchat.cloud/api/1/users/usr_w8_u2'
+            ]) {
+                const res = await execVrc(target, 'GET');
+                const json = (await res.json()) as { data: { route: string } };
+                expect(json.data.route).toBe('cloud_direct');
+            }
+            // Notification accept invalidates /api/1/users/%
+            await execVrc('https://api.vrchat.cloud/api/1/auth/user/notifications/not_w8_acc/accept', 'PUT');
+            const afterAcc = await execVrc('https://api.vrchat.cloud/api/1/users/usr_w8_u1', 'GET');
+            expect(((await afterAcc.json()) as { data: { route: string } }).data.route).toBe('cloud_direct');
+        } finally {
+            cacheSpy.mockRestore();
+        }
+
+        // 7. Pure WS Agent sets ws_agent_hint ONLY on genuine WS upgrade (never on 426 HTTP GET), preserves remaining device on multi-device revoke, and cleans up on last revoke
+        const wsOnlyKeyRes = await exports.default.fetch('http://example.com/api/agent/sync-key', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ deviceName: 'Wave8-WS-Only' })
+        });
+        const wsOnlyKey = ((await wsOnlyKeyRes.json()) as { data: { syncKey: string; deviceId: string } }).data;
+        const wsOnlyKey2Res = await exports.default.fetch('http://example.com/api/agent/sync-key', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ deviceName: 'Wave8-WS-Second' })
+        });
+        const wsOnlyKey2 = ((await wsOnlyKey2Res.json()) as { data: { syncKey: string; deviceId: string } }).data;
+
+        // Non-upgrade HTTP GET /ws/agent returns 426 and MUST NOT write ws_agent_hint
+        await env.DB_CORE.prepare("DELETE FROM cloud_bg_sync_state WHERE state_key = 'ws_agent_hint'").run();
+        const nonUpgradeRes = await exports.default.fetch('http://example.com/ws/agent', {
+            headers: { Authorization: `Bearer ${wsOnlyKey.syncKey}` }
+        });
+        expect(nonUpgradeRes.status).toBe(426);
+        const hintAfter426 = await env.DB_CORE.prepare(
+            "SELECT payload_json FROM cloud_bg_sync_state WHERE state_key = 'ws_agent_hint'"
+        ).first<{ payload_json?: string }>();
+        expect(hintAfter426).toBeNull();
+
+        const primaryAgentWsRes = await exports.default.fetch(
+            `http://example.com/ws/agent?deviceId=${encodeURIComponent(wsOnlyKey.deviceId)}`,
+            { headers: { Upgrade: 'websocket', Authorization: `Bearer ${wsOnlyKey.syncKey}` } }
+        );
+        expect(primaryAgentWsRes.status).toBe(101);
+        const primaryAgentWs = primaryAgentWsRes.webSocket!;
+        primaryAgentWs.accept();
+        const secondAgentWsRes = await exports.default.fetch(
+            `http://example.com/ws/agent?deviceId=${encodeURIComponent(wsOnlyKey2.deviceId)}`,
+            { headers: { Upgrade: 'websocket', Authorization: `Bearer ${wsOnlyKey2.syncKey}` } }
+        );
+        expect(secondAgentWsRes.status).toBe(101);
+        const secondAgentWs = secondAgentWsRes.webSocket!;
+        secondAgentWs.accept();
+        primaryAgentWs.send(
+            JSON.stringify({
+                v: 1,
+                type: 'agent.state',
+                payload: {
+                    vrcRunning: true,
+                    currentLocation: 'wrld_w8_ws_only:777~region(jp)',
+                    currentWorldName: 'Wave8 WS World',
+                    playerCount: 1,
+                    currentPlayers: [{ userId: 'usr_p1', displayName: 'PlayerOne' }]
+                }
+            })
+        );
+        await new Promise((r) => setTimeout(r, 30));
+        const uptimeRes = await exports.default.fetch('http://example.com/api/stats/uptime', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ addSeconds: 1 })
+        });
+        const uptimeJson = (await uptimeRes.json()) as { data: { wsAgentsOnlineHint?: string[] } };
+        expect(uptimeJson.data.wsAgentsOnlineHint).toEqual([wsOnlyKey.deviceId, wsOnlyKey2.deviceId].sort());
+
+        const curInstRes = await exports.default.fetch('http://example.com/api/gamelog/current-instance');
+        const curInstJson = (await curInstRes.json()) as {
+            data: Array<{ type: string; location?: string; worldName?: string; displayName?: string }>;
+        };
+        const locEntry = curInstJson.data.find((e) => e.type === 'Location');
+        const playerEntry = curInstJson.data.find((e) => e.type === 'OnPlayerJoined');
+        expect(locEntry?.location).toBe('wrld_w8_ws_only:777~region(jp)');
+        expect(locEntry?.worldName).toBe('Wave8 WS World');
+        expect(playerEntry?.displayName).toBe('PlayerOne');
+
+        // Revoking second device removes ONLY second device from ws_agent_hint; revoking first clears hint completely
+        await exports.default.fetch(
+            `http://example.com/api/agent/devices?deviceId=${encodeURIComponent(wsOnlyKey2.deviceId)}`,
+            { method: 'DELETE' }
+        );
+        const uptimeAfterFirstRevoke = (await (
+            await exports.default.fetch('http://example.com/api/stats/uptime', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ addSeconds: 1 })
+            })
+        ).json()) as { data: { wsAgentsOnlineHint?: string[] } };
+        expect(uptimeAfterFirstRevoke.data.wsAgentsOnlineHint).toEqual([wsOnlyKey.deviceId]);
+
+        await exports.default.fetch(
+            `http://example.com/api/agent/devices?deviceId=${encodeURIComponent(wsOnlyKey.deviceId)}`,
+            { method: 'DELETE' }
+        );
+        const uptimeAfterAllRevoked = (await (
+            await exports.default.fetch('http://example.com/api/stats/uptime', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ addSeconds: 1 })
+            })
+        ).json()) as { data: { wsAgentsOnlineHint?: string[] } };
+        expect(uptimeAfterAllRevoked.data.wsAgentsOnlineHint).toEqual([]);
+        primaryAgentWs.close(1000, 'done');
+        secondAgentWs.close(1000, 'done');
+
+        // 8. DELETE /api/gamelog?kind=instance preserves gamelog_join_leave; /api/gamelog/search returns VideoPlay/Event/PortalSpawn/External;
+        //    /api/gamelog/stats returns secondLastVisit/secondLastSeen/previousDisplayNames; /api/feed/search matches grp_...
+        const w8WorldId = 'wrld_w8_stats_1';
+        const w8Loc1 = `${w8WorldId}:101~group(grp_w8_club_01)`;
+        const w8Loc2 = `${w8WorldId}:102~group(grp_w8_club_01)`;
+        await exports.default.fetch('http://example.com/api/gamelog', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                items: [
+                    { type: 'Location', created_at: '2026-11-25T15:10:00.000Z', location: w8Loc1, worldId: w8WorldId, worldName: 'Wave8 Stats World', groupName: 'Wave8 Club', time: 60_000 },
+                    { type: 'Location', created_at: '2026-11-25T15:20:00.000Z', location: w8Loc2, worldId: w8WorldId, worldName: 'Wave8 Stats World', groupName: 'Wave8 Club', time: 30_000 },
+                    { type: 'OnPlayerJoined', created_at: '2026-11-25T15:11:00.000Z', location: w8Loc1, userId: 'usr_w8_renamed', displayName: 'OldNickW8' },
+                    { type: 'OnPlayerJoined', created_at: '2026-11-25T15:21:00.000Z', location: w8Loc2, userId: 'usr_w8_renamed', displayName: 'NewNickW8' },
+                    { type: 'VideoPlay', created_at: '2026-11-25T15:22:00.000Z', location: w8Loc2, videoUrl: 'https://youtu.be/w8unique', videoName: 'W8VideoNeedle' },
+                    { type: 'Event', created_at: '2026-11-25T15:23:00.000Z', data: 'W8EventNeedle happened' },
+                    { type: 'PortalSpawn', created_at: '2026-11-25T15:24:00.000Z', location: w8Loc2, displayName: 'PortalOpener', worldName: 'W8PortalNeedle' },
+                    { type: 'External', created_at: '2026-11-25T15:25:00.000Z', message: 'W8ExternalNeedle msg' }
+                ]
+            })
+        });
+        await exports.default.fetch('http://example.com/api/friend-log/history', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                entries: [
+                    {
+                        created_at: '2026-11-25T15:15:00.000Z',
+                        type: 'DisplayName',
+                        user_id: 'usr_w8_renamed',
+                        display_name: 'NewNickW8',
+                        previous_display_name: 'OlderNickFromHistory'
+                    }
+                ]
+            })
+        });
+
+        const wStatsRes = await exports.default.fetch(`http://example.com/api/gamelog/stats?kind=world&worldId=${w8WorldId}`);
+        const wStatsJson = (await wStatsRes.json()) as { data: { lastVisit: string; secondLastVisit: string } };
+        expect(wStatsJson.data.lastVisit).toBe('2026-11-25T15:20:00.000Z');
+        expect(wStatsJson.data.secondLastVisit).toBe('2026-11-25T15:10:00.000Z');
+
+        const uStatsRes = await exports.default.fetch('http://example.com/api/gamelog/stats?kind=user&userId=usr_w8_renamed');
+        const uStatsJson = (await uStatsRes.json()) as {
+            data: { lastSeen: string; secondLastSeen: string; previousDisplayNames: Array<[string, string]> };
+        };
+        expect(uStatsJson.data.lastSeen).toBe('2026-11-25T15:21:00.000Z');
+        expect(uStatsJson.data.secondLastSeen).toBe('2026-11-25T15:11:00.000Z');
+        const prevNames = uStatsJson.data.previousDisplayNames.map(([n]) => n);
+        expect(prevNames).toContain('OlderNickFromHistory');
+        expect(prevNames).toContain('OldNickW8');
+        expect(prevNames).not.toContain('NewNickW8');
+
+        // Single-instance user with Join+Leave in same room has secondLastSeen === '' and unseen new current name is NOT in previousDisplayNames
+        await exports.default.fetch('http://example.com/api/gamelog', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                items: [
+                    { type: 'OnPlayerJoined', created_at: '2026-11-25T15:26:00.000Z', location: w8Loc2, userId: 'usr_w8_single_meet', displayName: 'BeforeRename' },
+                    { type: 'OnPlayerLeft', created_at: '2026-11-25T15:27:00.000Z', location: w8Loc2, userId: 'usr_w8_single_meet', displayName: 'BeforeRename' }
+                ]
+            })
+        });
+        await exports.default.fetch('http://example.com/api/friend-log/history', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                entries: [
+                    {
+                        created_at: '2026-11-25T15:28:00.000Z',
+                        type: 'DisplayName',
+                        user_id: 'usr_w8_single_meet',
+                        display_name: 'BrandNewActiveName',
+                        previous_display_name: 'BeforeRename'
+                    }
+                ]
+            })
+        });
+        const singleStatsJson = (await (
+            await exports.default.fetch('http://example.com/api/gamelog/stats?kind=user&userId=usr_w8_single_meet')
+        ).json()) as { data: { secondLastSeen: string; previousDisplayNames: Array<[string, string]> } };
+        expect(singleStatsJson.data.secondLastSeen).toBe('');
+        const singlePrevNames = singleStatsJson.data.previousDisplayNames.map(([n]) => n);
+        expect(singlePrevNames).toContain('BeforeRename');
+        expect(singlePrevNames).not.toContain('BrandNewActiveName');
+
+        for (const [needle, field] of [
+            ['W8VideoNeedle', 'videoPlayRows'],
+            ['W8EventNeedle', 'eventRows'],
+            ['W8PortalNeedle', 'portalSpawnRows'],
+            ['W8ExternalNeedle', 'externalRows']
+        ] as const) {
+            const sRes = await exports.default.fetch(`http://example.com/api/gamelog/search?q=${needle}`);
+            const sJson = (await sRes.json()) as { data: Record<string, unknown[]> };
+            expect((sJson.data[field] ?? []).length).toBeGreaterThanOrEqual(1);
+        }
+
+        // DELETE kind=instance deletes only gamelog_location, preserving gamelog_join_leave
+        const delInstRes = await exports.default.fetch(
+            `http://example.com/api/gamelog?kind=instance&location=${encodeURIComponent(w8Loc1)}`,
+            { method: 'DELETE' }
+        );
+        expect(delInstRes.status).toBe(200);
+        const locStillThere = await env.DB_GAMELOG.prepare('SELECT COUNT(*) AS c FROM gamelog_location WHERE location = ?')
+            .bind(w8Loc1)
+            .first<{ c: number }>();
+        const jlStillThere = await env.DB_GAMELOG.prepare('SELECT COUNT(*) AS c FROM gamelog_join_leave WHERE location = ?')
+            .bind(w8Loc1)
+            .first<{ c: number }>();
+        expect(locStillThere?.c).toBe(0);
+        expect(jlStillThere?.c).toBeGreaterThanOrEqual(1);
+
+        // /api/feed/search matches grp_... AND group_name across feed_gps & feed_online_offline even when a friend's displayName contains the group name
+        await exports.default.fetch('http://example.com/api/feed', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                items: [
+                    {
+                        type: 'GPS',
+                        created_at: '2026-11-25T15:30:00.000Z',
+                        userId: 'usr_w8_grp_friend',
+                        displayName: 'GroupFriend',
+                        location: 'wrld_w8_g:99~group(grp_w8_search_target)',
+                        worldName: 'Group Hangout',
+                        groupName: 'Wave8 Guild'
+                    },
+                    {
+                        type: 'Online',
+                        created_at: '2026-11-25T15:31:00.000Z',
+                        userId: 'usr_w8_grp_online',
+                        displayName: 'OnlineMember',
+                        location: 'wrld_w8_g:99~group(grp_w8_search_target)',
+                        worldName: 'Group Hangout',
+                        groupName: 'Wave8 Guild'
+                    },
+                    {
+                        type: 'Status',
+                        created_at: '2026-11-25T15:32:00.000Z',
+                        userId: 'usr_w8_guild_named_user',
+                        displayName: 'Wave8 Guild Fan',
+                        status: 'active',
+                        statusDescription: 'hi'
+                    }
+                ]
+            })
+        });
+        const grpFeedRes = await exports.default.fetch('http://example.com/api/feed/search?q=grp_w8_search_target');
+        const grpFeedJson = (await grpFeedRes.json()) as { data: Array<{ userId: string; location: string }> };
+        expect(grpFeedJson.data.some((r) => r.userId === 'usr_w8_grp_friend')).toBe(true);
+        const grpNameRes = await exports.default.fetch(
+            `http://example.com/api/feed/search?q=${encodeURIComponent('Wave8 Guild')}`
+        );
+        const grpNameJson = (await grpNameRes.json()) as { data: Array<{ userId: string; type: string }> };
+        expect(grpNameJson.data.some((r) => r.userId === 'usr_w8_grp_friend' && r.type === 'GPS')).toBe(true);
+        expect(grpNameJson.data.some((r) => r.userId === 'usr_w8_grp_online' && r.type === 'Online')).toBe(true);
+    });
+
+    it('covers Wave 9 fixes: FTS5 NUL/LIKE safety, cache classification & WAF poison guard, logout revocation, R2 backfill, command online gate, and stats ordering', async () => {
+        // 1. FTS5 NUL byte sanitization & literal LIKE wildcard escaping
+        await exports.default.fetch('http://example.com/api/gamelog', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                items: [
+                    {
+                        type: 'OnPlayerJoined',
+                        created_at: '2026-11-25T16:00:00.000Z',
+                        location: 'wrld_w9_fts:1',
+                        userId: 'usr_w9_normal',
+                        displayName: 'AlphaNormalUser'
+                    },
+                    {
+                        type: 'OnPlayerJoined',
+                        created_at: '2026-11-25T16:00:01.000Z',
+                        location: 'wrld_w9_fts:1',
+                        userId: 'usr_w9_percent',
+                        displayName: '100%_Literal'
+                    }
+                ]
+            })
+        });
+        const nulSearchRes = await exports.default.fetch(
+            `http://example.com/api/gamelog/search?q=${encodeURIComponent('Alpha\u0000Normal')}`
+        );
+        expect(nulSearchRes.status).toBe(200);
+        const nulFeedRes = await exports.default.fetch(
+            `http://example.com/api/feed/search?q=${encodeURIComponent('Alpha\u0000Normal')}`
+        );
+        expect(nulFeedRes.status).toBe(200);
+
+        const percentSearchRes = await exports.default.fetch(
+            `http://example.com/api/gamelog/search?q=${encodeURIComponent('%_')}`
+        );
+        expect(percentSearchRes.status).toBe(200);
+        const percentSearchJson = (await percentSearchRes.json()) as { data: { matchedUserIds: string[] } };
+        expect(percentSearchJson.data.matchedUserIds).toContain('usr_w9_percent');
+        expect(percentSearchJson.data.matchedUserIds).not.toContain('usr_w9_normal');
+
+        // 2. Cache tier classification, hash-stripped canonical keys, and expanded write invalidation
+        expect(classifyVrcCacheUrl('https://api.vrchat.cloud/api/1/worlds/wrld_abc', 300)?.tier).toBe('world');
+        expect(classifyVrcCacheUrl('https://api.vrchat.cloud/api/1/worlds/wrld_abc/12345', 300)?.tier).toBe('dynamic');
+        expect(classifyVrcCacheUrl('https://api.vrchat.cloud/api/1/worlds/recent', 300)?.tier).toBe('dynamic');
+        expect(classifyVrcCacheUrl('https://api.vrchat.cloud/api/1/worlds/active', 300)?.tier).toBe('dynamic');
+        expect(classifyVrcCacheUrl('https://api.vrchat.cloud/api/1/groups/grp_abc/instances', 300)?.tier).toBe('dynamic');
+        expect(classifyVrcCacheUrl('https://api.vrchat.cloud/api/1/groups/grp_abc/requests', 300)?.tier).toBe('dynamic');
+        expect(normalizeVrcCacheKey('https://api.vrchat.cloud/api/1/worlds/wrld_1?b=2&a=1#frag')).toBe(
+            'https://api.vrchat.cloud/api/1/worlds/wrld_1?a=1&b=2'
+        );
+
+        await putCachedVrcResponses(env, [
+            {
+                url: 'https://api.vrchat.cloud/api/1/auth/user/playermoderations',
+                tier: 'dynamic',
+                status: 200,
+                bodyText: '[{"id":"pm_1"}]',
+                ttlMs: 300_000
+            },
+            {
+                url: 'https://api.vrchat.cloud/api/1/inventory?n=50',
+                tier: 'dynamic',
+                status: 200,
+                bodyText: '{"data":[]}',
+                ttlMs: 300_000
+            }
+        ]);
+        await invalidateVrcCacheOnWrite(env, 'https://api.vrchat.cloud/api/1/auth/user/unplayermoderate');
+        await invalidateVrcCacheOnWrite(env, 'https://api.vrchat.cloud/api/1/inventory/inv_1/consume');
+        const cacheDb = env.DB_CACHE ?? env.DB_CORE;
+        const cacheAfterInv = await cacheDb.prepare(
+            "SELECT COUNT(*) AS c FROM vrc_api_cache WHERE cache_key LIKE '%playermoderations%' OR cache_key LIKE '%/inventory%'"
+        ).first<{ c: number }>();
+        expect(cacheAfterInv?.c).toBe(0);
+
+        // 3. Same-origin check rejects Sec-Fetch-Site: same-site and normalizes default HTTPS :443 port
+        expect(
+            isSameOriginRequest(
+                new Request('https://vrcx.example.com/api/auth/logout', {
+                    method: 'POST',
+                    headers: { 'Sec-Fetch-Site': 'same-site' }
+                }),
+                new URL('https://vrcx.example.com/api/auth/logout')
+            )
+        ).toBe(false);
+        expect(
+            isSameOriginRequest(
+                new Request('https://vrcx.example.com/api/auth/logout', {
+                    method: 'POST',
+                    headers: { Origin: 'https://vrcx.example.com:443' }
+                }),
+                new URL('https://vrcx.example.com/api/auth/logout')
+            )
+        ).toBe(true);
+
+        // 4. Server-side session revocation on POST /api/auth/logout invalidates replayed cookie
+        const securedEnv: Env = { ...env, ADMIN_PASSCODE: 'wave9-revoke-pass-2026' };
+        const loginRes = await worker.fetch(
+            new Request('https://vrcx.example.com/api/auth/login', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    Origin: 'https://vrcx.example.com',
+                    'CF-Connecting-IP': '198.51.100.99'
+                },
+                body: JSON.stringify({ passcode: 'wave9-revoke-pass-2026' })
+            }),
+            securedEnv
+        );
+        expect(loginRes.status).toBe(200);
+        const sessionCookie = (loginRes.headers.get('Set-Cookie') ?? '').split(';')[0]!;
+        const beforeLogoutRes = await worker.fetch(
+            new Request('https://vrcx.example.com/api/stats/table-sizes', {
+                headers: { Cookie: sessionCookie }
+            }),
+            securedEnv
+        );
+        expect(beforeLogoutRes.status).toBe(200);
+
+        const logoutRes = await worker.fetch(
+            new Request('https://vrcx.example.com/api/auth/logout', {
+                method: 'POST',
+                headers: { Cookie: sessionCookie, Origin: 'https://vrcx.example.com' }
+            }),
+            securedEnv
+        );
+        expect(logoutRes.status).toBe(200);
+
+        const replayedAfterLogout = await worker.fetch(
+            new Request('https://vrcx.example.com/api/stats/table-sizes', {
+                headers: { Cookie: sessionCookie }
+            }),
+            securedEnv
+        );
+        expect(replayedAfterLogout.status).toBe(401);
+
+        // 5. vrcProxy: 200 HTML WAF page is NOT cached, HEAD returns empty string (not data:image/png), 401 logout still purges vault
+        const fetchSpy = vi.spyOn(globalThis, 'fetch');
+        try {
+            fetchSpy.mockImplementationOnce(
+                async () =>
+                    new Response('<html><body>Cloudflare Challenge</body></html>', {
+                        status: 200,
+                        headers: { 'content-type': 'text/html' }
+                    })
+            );
+            const htmlWorldUrl = 'https://api.vrchat.cloud/api/1/worlds/wrld_w9_waf_html';
+            const htmlRes = await worker.fetch(
+                new Request('http://example.com/api/vrc/execute', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ url: htmlWorldUrl, method: 'GET', preferCloudDirect: true })
+                }),
+                env
+            );
+            expect(htmlRes.status).toBe(200);
+            const cachedHtml = await cacheDb.prepare('SELECT cache_key FROM vrc_api_cache WHERE cache_key = ?')
+                .bind(htmlWorldUrl)
+                .first();
+            expect(cachedHtml).toBeNull();
+
+            fetchSpy.mockImplementationOnce(
+                async () => new Response(null, { status: 200, headers: { 'content-type': 'image/png' } })
+            );
+            const headRes = await worker.fetch(
+                new Request('http://example.com/api/vrc/execute', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        url: 'https://api.vrchat.cloud/api/1/file/file_w9/1/file',
+                        method: 'HEAD',
+                        preferCloudDirect: true
+                    })
+                }),
+                env
+            );
+            const headJson = (await headRes.json()) as { data: { data: string } };
+            expect(headJson.data.data).toBe('');
+
+            // Seed vault then trigger 401 on PUT /api/1/logout -> vault must be purged
+            await exports.default.fetch('http://example.com/api/vrc/cookies', {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ cookies: btoa(JSON.stringify({ auth: 'authcookie_w9_stale' })) })
+            });
+            fetchSpy.mockImplementationOnce(
+                async () =>
+                    new Response(JSON.stringify({ error: { message: 'Missing Credentials' } }), {
+                        status: 401,
+                        headers: { 'content-type': 'application/json' }
+                    })
+            );
+            const vrcLogoutRes = await worker.fetch(
+                new Request('http://example.com/api/vrc/execute', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        url: 'https://api.vrchat.cloud/api/1/logout',
+                        method: 'PUT',
+                        preferCloudDirect: true
+                    })
+                }),
+                env
+            );
+            expect(vrcLogoutRes.status).toBe(200);
+            const vaultAfter401Logout = await env.DB_CORE.prepare(
+                "SELECT account_key FROM cloud_cookie_vault WHERE account_key = 'default'"
+            ).first();
+            expect(vaultAfter401Logout).toBeNull();
+        } finally {
+            fetchSpy.mockRestore();
+        }
+
+        // 6. POST /api/commands: requireOnline=true returns 503 when target device is offline; launch_vrc rejects empty query segments
+        const offKeyRes = await exports.default.fetch('http://example.com/api/agent/sync-key', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ deviceName: 'Offline-W9-PC' })
+        });
+        const offKeyJson = (await offKeyRes.json()) as { data: { deviceId: string; syncKey: string } };
+        const reqOnlineOfflineRes = await exports.default.fetch('http://example.com/api/commands', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                action: 'launch_vrc',
+                targetDeviceId: offKeyJson.data.deviceId,
+                requireOnline: true,
+                params: { launchUrl: 'vrchat://launch?id=wrld_11111111-1111-1111-1111-111111111111:12345' }
+            })
+        });
+        expect(reqOnlineOfflineRes.status).toBe(503);
+
+        const emptySegLaunchRes = await exports.default.fetch('http://example.com/api/commands', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                action: 'launch_vrc',
+                params: { launchUrl: 'vrchat://launch?id=wrld_11111111-1111-1111-1111-111111111111:12345&&ref=vrcx.app' }
+            })
+        });
+        expect(emptySegLaunchRes.status).toBe(400);
+
+        // 7. Screenshot R2 backfill when R2_MEDIA is bound after initial metadata-only upload
+        const shotId = 'w9backfill00112233445566778899aa';
+        const shotMeta = btoa(
+            JSON.stringify({
+                takenAt: '2026-11-25T16:30:00+08:00',
+                localFilename: 'VRChat_2026-11-25_w9_backfill.png',
+                worldId: 'wrld_w9_shot',
+                worldName: 'Backfill World'
+            })
+        );
+        const metaOnlyPut = await worker.fetch(
+            new Request(`http://example.com/api/agent/media/screenshots/${shotId}`, {
+                method: 'PUT',
+                headers: {
+                    Authorization: `Bearer ${offKeyJson.data.syncKey}`,
+                    'Content-Type': 'image/png',
+                    'X-Screenshot-Meta': shotMeta
+                },
+                body: new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10])
+            }),
+            { ...env, R2_MEDIA: undefined }
+        );
+        expect(metaOnlyPut.status).toBe(200);
+        const metaOnlyJson = (await metaOnlyPut.json()) as { data: { r2Stored: boolean } };
+        expect(metaOnlyJson.data.r2Stored).toBe(false);
+
+        const putCalls: string[] = [];
+        const mockR2 = {
+            put: async (key: string) => {
+                putCalls.push(key);
+                return null;
+            },
+            delete: async () => {}
+        } as unknown as R2Bucket;
+        const backfillPut = await worker.fetch(
+            new Request(`http://example.com/api/agent/media/screenshots/${shotId}`, {
+                method: 'PUT',
+                headers: {
+                    Authorization: `Bearer ${offKeyJson.data.syncKey}`,
+                    'Content-Type': 'image/png',
+                    'X-Screenshot-Meta': shotMeta
+                },
+                body: new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10])
+            }),
+            { ...env, R2_MEDIA: mockR2 }
+        );
+        expect(backfillPut.status).toBe(200);
+        const backfillJson = (await backfillPut.json()) as { data: { duplicate: boolean; r2Stored: boolean } };
+        expect(backfillJson.data.duplicate).toBe(false);
+        expect(backfillJson.data.r2Stored).toBe(true);
+        expect(putCalls).toHaveLength(1);
+
+        // 8. Fractional limit=0.5 falls back safely; sessions_segments combines sinceDate + beforeId; hot-worlds days=1 computes rising accurately; notifications empty id generates UUID
+        const fracRes = await exports.default.fetch('http://example.com/api/screenshots?limit=0.5');
+        expect(fracRes.status).toBe(200);
+        const fracJson = (await fracRes.json()) as { data: unknown[] };
+        expect(fracJson.data.length).toBeGreaterThanOrEqual(1);
+
+        const nowMs = Date.now();
+        const recentIso = new Date(nowMs - 2 * 3600_000).toISOString();
+        await exports.default.fetch('http://example.com/api/feed', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                items: [
+                    {
+                        type: 'GPS',
+                        created_at: recentIso,
+                        userId: 'usr_w9_hot_1',
+                        displayName: 'HotVisitor',
+                        location: 'wrld_w9_hot_1day:1',
+                        worldName: 'One Day Rising World'
+                    }
+                ]
+            })
+        });
+        const hot1Res = await exports.default.fetch('http://example.com/api/feed/hot-worlds?days=1&limit=20');
+        const hot1Json = (await hot1Res.json()) as { data: Array<{ worldId: string; trend: string }> };
+        expect(hot1Json.data.find((w) => w.worldId === 'wrld_w9_hot_1day')?.trend).toBe('rising');
+
+        const emptyIdNotyRes = await exports.default.fetch('http://example.com/api/notifications', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                version: 1,
+                entries: [
+                    { id: '', type: 'invite', senderUserId: 'usr_w9_n1', message: 'first' },
+                    { id: '   ', type: 'invite', senderUserId: 'usr_w9_n2', message: 'second' }
+                ]
+            })
+        });
+        expect(emptyIdNotyRes.status).toBe(200);
+        const emptyIdCount = await env.DB_CORE.prepare(
+            "SELECT COUNT(*) AS c FROM notifications WHERE sender_user_id IN ('usr_w9_n1', 'usr_w9_n2') AND id != ''"
+        ).first<{ c: number }>();
+        expect(emptyIdCount?.c).toBe(2);
+
+        // 9. serializeBoundedRssSnapshot marks onlineFriendsTruncated when Tier-3 slicing triggers
+        const hugeFriends = Array.from({ length: 6500 }, (_, i) => ({
+            id: `usr_w9_huge_${i}`,
+            displayName: `LongDisplayName_${i}_${'X'.repeat(60)}`,
+            location: `wrld_11111111-1111-1111-1111-111111111111:${i}`,
+            status: 'active',
+            statusDescription: 'D'.repeat(120),
+            platform: 'standalonewindows'
+        }));
+        const boundedJson = JSON.parse(
+            serializeBoundedRssSnapshot({
+                syncedAt: '2026-11-25T16:40:00.000Z',
+                onlineCount: hugeFriends.length,
+                feedInserted: 0,
+                notificationsInserted: 0,
+                bioChecked: 0,
+                onlineFriends: hugeFriends
+            })
+        ) as { onlineFriendsTruncated?: boolean; onlineFriends: unknown[] };
+        expect(boundedJson.onlineFriends.length).toBeLessThan(hugeFriends.length);
+        expect(boundedJson.onlineFriendsTruncated).toBe(true);
+    });
+
+    it('covers final secondary-dev contract fixes: hot-worlds/detail range bounds, sessions_segments >100 limit, gamelog/search self VideoPlay/PortalSpawn/External, and Cron boop normalization', async () => {
+        // 1. GET /api/feed/hot-worlds/detail handles >=49-byte worldId without D1 50B LIKE error and never treats '_' as wildcard
+        const longWorldId = 'wrld_12345678-1234-1234-1234-1234567890ab_extra99';
+        const wildcardProbeId = 'wrld_____________________________________________';
+        const recentIso = new Date(Date.now() - 3600_000).toISOString();
+        await exports.default.fetch('http://example.com/api/feed', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                items: [
+                    {
+                        type: 'GPS',
+                        created_at: recentIso,
+                        userId: 'usr_w10_hot',
+                        displayName: 'LongWorldVisitor',
+                        location: `${longWorldId}:12345`,
+                        worldName: 'Long World'
+                    },
+                    {
+                        type: 'GPS',
+                        created_at: recentIso,
+                        userId: 'usr_w10_hot',
+                        displayName: 'LongWorldVisitor',
+                        location: 'wrld:12345',
+                        worldName: 'Bogus Missing Underscore'
+                    }
+                ]
+            })
+        });
+        const hotListRes = await exports.default.fetch('http://example.com/api/feed/hot-worlds?days=7&limit=50');
+        expect(hotListRes.status).toBe(200);
+        const hotListJson = (await hotListRes.json()) as { data: Array<{ worldId: string }> };
+        expect(hotListJson.data.some((w) => w.worldId === 'wrld')).toBe(false);
+        expect(hotListJson.data.some((w) => w.worldId === longWorldId)).toBe(true);
+        const longDetailRes = await exports.default.fetch(
+            `http://example.com/api/feed/hot-worlds/detail?worldId=${encodeURIComponent(longWorldId)}&days=7`
+        );
+        expect(longDetailRes.status).toBe(200);
+        const longDetailJson = (await longDetailRes.json()) as { data: Array<{ userId: string; visitCount: number }> };
+        expect(longDetailJson.data).toEqual([
+            expect.objectContaining({ userId: 'usr_w10_hot', visitCount: 1 })
+        ]);
+        const wildRes = await exports.default.fetch(
+            `http://example.com/api/feed/hot-worlds/detail?worldId=${encodeURIComponent(wildcardProbeId)}&days=7`
+        );
+        expect(wildRes.status).toBe(200);
+        const wildJson = (await wildRes.json()) as { data: unknown[] };
+        expect(wildJson.data).toEqual([]);
+
+        // 2. GET /api/gamelog/stats?kind=sessions_segments supports limit > 100 (up to 405 for maxTableSize=10000)
+        const baseMs = Date.parse('2026-11-20T00:00:00.000Z');
+        const segStmts = Array.from({ length: 105 }, (_, i) =>
+            env.DB_GAMELOG.prepare(
+                `INSERT OR IGNORE INTO gamelog_location (created_at, location, world_id, world_name, time, group_name)
+                 VALUES (?, ?, ?, ?, 60000, '')`
+            ).bind(new Date(baseMs + i * 1000).toISOString(), `wrld_w10_seg:${i}`, 'wrld_w10_seg', `Seg ${i}`)
+        );
+        await env.DB_GAMELOG.batch(segStmts.slice(0, 60));
+        await env.DB_GAMELOG.batch(segStmts.slice(60));
+        const segsRes = await exports.default.fetch(
+            'http://example.com/api/gamelog/stats?kind=sessions_segments&limit=105'
+        );
+        expect(segsRes.status).toBe(200);
+        const segsJson = (await segsRes.json()) as { data: unknown[] };
+        expect(segsJson.data.length).toBe(105);
+
+        // 3. GET /api/gamelog/search with excludeUserId hides self join/leave but keeps self VideoPlay/PortalSpawn/External
+        const selfUid = 'usr_w10_self_owner';
+        await exports.default.fetch('http://example.com/api/gamelog', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                items: [
+                    {
+                        type: 'OnPlayerJoined',
+                        created_at: '2026-11-25T12:00:01.000Z',
+                        displayName: 'SelfW10Owner',
+                        userId: selfUid,
+                        location: 'wrld_w10_media:1'
+                    },
+                    {
+                        type: 'VideoPlay',
+                        created_at: '2026-11-25T12:00:02.000Z',
+                        displayName: 'SelfW10Owner',
+                        userId: selfUid,
+                        location: 'wrld_w10_media:1',
+                        videoName: 'UniqueW10VideoTrack',
+                        videoUrl: 'https://youtu.be/w10track'
+                    },
+                    {
+                        type: 'PortalSpawn',
+                        created_at: '2026-11-25T12:00:03.000Z',
+                        displayName: 'SelfW10Owner',
+                        userId: selfUid,
+                        location: 'wrld_w10_media:1',
+                        instanceId: 'wrld_w10_portal:9',
+                        worldName: 'UniqueW10PortalWorld'
+                    },
+                    {
+                        type: 'External',
+                        created_at: '2026-11-25T12:00:04.000Z',
+                        displayName: 'SelfW10Owner',
+                        userId: selfUid,
+                        message: 'UniqueW10ExternalNote'
+                    }
+                ]
+            })
+        });
+        const searchSelfRes = await exports.default.fetch(
+            `http://example.com/api/gamelog/search?q=SelfW10Owner&excludeUserId=${encodeURIComponent(selfUid)}`
+        );
+        expect(searchSelfRes.status).toBe(200);
+        const searchSelfJson = (await searchSelfRes.json()) as {
+            data: {
+                joinLeaveRows: Array<{ user_id: string }>;
+                videoPlayRows: Array<{ user_id: string; video_name: string }>;
+                portalSpawnRows: Array<{ user_id: string; world_name: string }>;
+                externalRows: Array<{ user_id: string; message: string }>;
+            };
+        };
+        expect(searchSelfJson.data.joinLeaveRows.some((r) => r.user_id === selfUid)).toBe(false);
+        expect(searchSelfJson.data.videoPlayRows.some((r) => r.video_name === 'UniqueW10VideoTrack')).toBe(true);
+        expect(searchSelfJson.data.portalSpawnRows.some((r) => r.world_name === 'UniqueW10PortalWorld')).toBe(true);
+        expect(searchSelfJson.data.externalRows.some((r) => r.message === 'UniqueW10ExternalNote')).toBe(true);
+
+        // 4. POST /api/rss/sync normalizes V2 boop notifications (custom file emoji & default_* emoji) in DB_CORE
+        await exports.default.fetch('http://example.com/api/vrc/cookies', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ cookies: btoa(JSON.stringify({ auth: 'authcookie_w10_boop_test' })) })
+        });
+        const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+            const urlStr = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+            if (urlStr.includes('/api/1/notifications?n=100')) {
+                return new Response(
+                    JSON.stringify([
+                        {
+                            id: 'not_w10_boop_custom',
+                            type: 'boop',
+                            title: 'Alice booped you!',
+                            message: '',
+                            imageUrl: '',
+                            createdAt: '2026-11-25T12:10:00.000Z',
+                            details: { emojiId: 'file_boop_img_1', emojiVersion: 2 },
+                            responses: []
+                        },
+                        {
+                            id: 'not_w10_boop_default',
+                            type: 'boop',
+                            title: 'Bob booped you!',
+                            message: '',
+                            imageUrl: '',
+                            createdAt: '2026-11-25T12:11:00.000Z',
+                            details: { emojiId: 'default_heart', emojiVersion: 1 },
+                            responses: []
+                        }
+                    ]),
+                    { status: 200, headers: { 'Content-Type': 'application/json' } }
+                );
+            }
+            return new Response('[]', { status: 200, headers: { 'Content-Type': 'application/json' } });
+        });
+        try {
+            const syncRes = await worker.fetch(
+                new Request('http://example.com/api/rss/sync', { method: 'POST' }),
+                env
+            );
+            expect(syncRes.status).toBe(200);
+        } finally {
+            fetchSpy.mockRestore();
+        }
+        const boopRows = await env.DB_CORE.prepare(
+            "SELECT id, title, message, image_url FROM notifications_v2 WHERE id IN ('not_w10_boop_custom', 'not_w10_boop_default') ORDER BY id ASC"
+        ).all<{ id: string; title: string; message: string; image_url: string }>();
+        const byId = new Map((boopRows.results ?? []).map((r) => [r.id, r]));
+        expect(byId.get('not_w10_boop_custom')).toEqual({
+            id: 'not_w10_boop_custom',
+            title: '',
+            message: 'Alice booped you!',
+            image_url: 'https://api.vrchat.cloud/api/1/file/file_boop_img_1/2'
+        });
+        expect(byId.get('not_w10_boop_default')).toEqual({
+            id: 'not_w10_boop_default',
+            title: '',
+            message: 'Bob booped you! heart',
+            image_url: 'default_heart'
+        });
+
+        // 5. Security & boundary hardening: DELETE /api/gamelog ignores Object.prototype keys,
+        // boundary dates do not throw RangeError 500, and /api/media/screenshots/:id clamps unsafe Content-Type + adds nosniff/CSP sandbox
+        const protoDelRes = await exports.default.fetch('http://example.com/api/gamelog?kind=toString&rowId=1', {
+            method: 'DELETE'
+        });
+        expect(protoDelRes.status).toBe(200);
+
+        const extremeActRes = await exports.default.fetch(
+            'http://example.com/api/gamelog/instance-activity?startDate=%2B275760-09-13T00:00:00.000Z&endDate=%2B275760-09-13T00:00:00.000Z'
+        );
+        expect(extremeActRes.status).toBe(200);
+
+        const extremeSelfRes = await exports.default.fetch(
+            'http://example.com/api/activity/source?kind=self_slice&fromDateIso=2026-01-01T00:00:00.000Z&toDateIso=%2B275760-09-13T00:00:00.000Z'
+        );
+        expect(extremeSelfRes.status).toBe(200);
+
+        await env.DB_CORE.prepare(
+            `INSERT OR REPLACE INTO cloud_screenshots (id, device_id, taken_at, world_id, world_name, r2_thumb_key, local_filename, created_at)
+             VALUES ('w12xss001', 'dev-xss-test', '2026-11-25T12:00:00.000Z', '', '', 'screenshots/w12xss001.bin', 'w12xss001.png', '2026-11-25T12:00:00.000Z')`
+        ).run();
+        const mockHtmlR2 = {
+            get: async () => ({
+                body: '<script>alert(1)</script>',
+                writeHttpMetadata: (h: Headers) => {
+                    h.set('Content-Type', 'text/html; charset=utf-8');
+                }
+            })
+        } as unknown as R2Bucket;
+        const mediaRes = await worker.fetch(
+            new Request('http://example.com/api/media/screenshots/w12xss001'),
+            { ...env, R2_MEDIA: mockHtmlR2 }
+        );
+        expect(mediaRes.status).toBe(200);
+        expect(mediaRes.headers.get('Content-Type')).toBe('application/octet-stream');
+        expect(mediaRes.headers.get('Content-Disposition')).toBe('attachment');
+        expect(mediaRes.headers.get('X-Content-Type-Options')).toBe('nosniff');
+        expect(mediaRes.headers.get('Content-Security-Policy')).toContain('sandbox');
+
+        // 6. Monotonic cloud_rss_snapshot synced_at guard & atomic PUT /api/vrc/cookies account switch purge
+        const cacheDb = env.DB_CACHE ?? env.DB_CORE;
+        const newerSync = '2026-11-25T20:00:00.000Z';
+        const olderSync = '2026-11-25T19:00:00.000Z';
+        await cacheDb
+            .prepare(
+                `INSERT INTO cloud_rss_snapshot (snapshot_key, payload_json, synced_at)
+                 VALUES ('primary', '{"syncedAt":"2026-11-25T20:00:00.000Z","onlineCount":2,"onlineFriends":[]}', ?)
+                 ON CONFLICT(snapshot_key) DO UPDATE SET payload_json = excluded.payload_json, synced_at = excluded.synced_at`
+            )
+            .bind(newerSync)
+            .run();
+        await cacheDb
+            .prepare(
+                `INSERT INTO cloud_rss_snapshot (snapshot_key, payload_json, synced_at)
+                 VALUES ('primary', '{"syncedAt":"2026-11-25T19:00:00.000Z","onlineCount":99,"onlineFriends":[]}', ?)
+                 ON CONFLICT(snapshot_key) DO UPDATE SET
+                    payload_json = excluded.payload_json,
+                    synced_at = excluded.synced_at
+                 WHERE excluded.synced_at >= cloud_rss_snapshot.synced_at`
+            )
+            .bind(olderSync)
+            .run();
+        const snapRow = await cacheDb
+            .prepare("SELECT synced_at FROM cloud_rss_snapshot WHERE snapshot_key = 'primary'")
+            .first<{ synced_at: string }>();
+        expect(snapRow?.synced_at).toBe(newerSync);
+
+        // Seed Account A baseline then switch via PUT /api/vrc/cookies -> Account A baseline & cache must be purged atomically
+        await env.DB_CORE.batch([
+            env.DB_CORE.prepare(
+                `INSERT OR REPLACE INTO cloud_bg_sync_state (state_key, payload_json, updated_at)
+                 VALUES ('friends_snapshot', '{"usr_old":{"n":"OldFriend"}}', '2026-11-25T20:00:00.000Z')`
+            ),
+            env.DB_CORE.prepare(
+                `INSERT OR REPLACE INTO friend_log_current (user_id, display_name, trust_level, friend_number)
+                 VALUES ('usr_old', 'OldFriend', 'User', 1)`
+            )
+        ]);
+        const switchRes = await exports.default.fetch('http://example.com/api/vrc/cookies', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ cookies: btoa(JSON.stringify({ auth: 'authcookie_w13_account_b' })) })
+        });
+        expect(switchRes.status).toBe(200);
+        const oldSnapAfterSwitch = await env.DB_CORE.prepare(
+            "SELECT state_key FROM cloud_bg_sync_state WHERE state_key = 'friends_snapshot'"
+        ).first();
+        const oldFriendLogAfterSwitch = await env.DB_CORE.prepare(
+            "SELECT user_id FROM friend_log_current WHERE user_id = 'usr_old'"
+        ).first();
+        expect(oldSnapAfterSwitch).toBeNull();
+        expect(oldFriendLogAfterSwitch).toBeNull();
+
+        // 7. Revoked registered per-device agent cannot be resurrected or claim commands via POST /api/agent/sync
+        const revKeyRes = await exports.default.fetch('http://example.com/api/agent/sync-key', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ deviceName: 'RevokeRacePC' })
+        });
+        const revKeyJson = (await revKeyRes.json()) as { data: { deviceId: string; syncKey: string } };
+        const delDevRes = await exports.default.fetch(
+            `http://example.com/api/agent/devices?deviceId=${encodeURIComponent(revKeyJson.data.deviceId)}`,
+            { method: 'DELETE' }
+        );
+        expect(delDevRes.status).toBe(200);
+        const revokedSyncRes = await exports.default.fetch('http://example.com/api/agent/sync', {
+            method: 'POST',
+            headers: {
+                Authorization: `Bearer ${revKeyJson.data.syncKey}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({ agentVersion: '1.10.6', events: [] })
+        });
+        expect(revokedSyncRes.status).toBe(401);
+        const devRowAfterRevoke = await env.DB_CORE.prepare(
+            'SELECT device_id FROM cloud_devices WHERE device_id = ?'
+        )
+            .bind(revKeyJson.data.deviceId)
+            .first();
+        expect(devRowAfterRevoke).toBeNull();
     });
 });

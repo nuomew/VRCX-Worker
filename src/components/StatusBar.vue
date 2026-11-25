@@ -414,6 +414,7 @@
                     {{ t('status_bar.steamvr') }}
                 </ContextMenuCheckboxItem>
                 <ContextMenuCheckboxItem
+                    v-if="!isWeb"
                     :model-value="visibility.proxy"
                     @select.prevent
                     @update:model-value="toggleVisibility('proxy')">
@@ -439,7 +440,7 @@
                     {{ t('status_bar.app_uptime_short') }}
                 </ContextMenuCheckboxItem>
                 <ContextMenuCheckboxItem
-                    v-if="!isMacOS"
+                    v-if="!isMacOS && !isWeb"
                     :model-value="visibility.zoom"
                     @select.prevent
                     @update:model-value="toggleVisibility('zoom')">
@@ -851,6 +852,9 @@
             if (n >= 0 && n <= 3) clockCount.value = n;
         }
 
+        if (isUnmounted) {
+            return;
+        }
         drawSparkline();
 
         if (isWeb.value) {
@@ -868,6 +872,7 @@
     const zoomLevel = ref(100);
     const zoomEditing = ref(false);
     const zoomInputRef = ref(null);
+    let isUnmounted = false;
     let cleanupWheel = null;
     let cleanupCloudUptime = null;
 
@@ -876,15 +881,17 @@
         let inFlight = false;
 
         async function pulseUptimeAndPresence() {
-            if (inFlight || !cloudState.authenticated) return;
+            if (isUnmounted || inFlight || !cloudState.authenticated) return;
             if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
             inFlight = true;
             try {
                 const data = await cloudFetch('/api/stats/uptime', { method: 'POST' });
+                if (isUnmounted) return;
                 lastPulseAt = Date.now();
                 applyCloudPresenceUpdate({
                     deviceLastSeen: data?.deviceLastSeen,
                     httpAgentsOnline: data?.httpAgentsOnline,
+                    wsAgentsOnlineHint: data?.wsAgentsOnlineHint,
                     deviceStates: data?.deviceStates,
                     totalUptimeSeconds: data?.totalUptimeSeconds,
                     syncIntervalSeconds: data?.syncIntervalSeconds,
@@ -935,6 +942,7 @@
     }
 
     onBeforeUnmount(() => {
+        isUnmounted = true;
         clearTimeout(serversHoverTimer);
         if (cleanupWheel) {
             cleanupWheel();

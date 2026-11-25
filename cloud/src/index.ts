@@ -107,7 +107,8 @@ export default {
             }
 
             // 2. Auth endpoints (/api/auth/me, /api/auth/login, /api/auth/logout)
-            if (url.pathname === '/api/auth/login' && request.method === 'POST') {
+            // Ensure schema exists before auth endpoints access rate-limit / revoked-session state in DB_CORE.
+            if (url.pathname.startsWith('/api/auth/')) {
                 await ensureSchemaReady(env);
             }
             const authResp = await handleAuthRoutes(request, env, url);
@@ -185,7 +186,10 @@ export default {
             }
 
             if (url.pathname === '/api/bg-sync/config' && request.method === 'PUT') {
-                const body = (await request.json().catch(() => ({}))) as { enabled?: unknown };
+                const rawBody = await request.json().catch(() => ({}));
+                const body = (
+                    rawBody && typeof rawBody === 'object' && !Array.isArray(rawBody) ? rawBody : {}
+                ) as { enabled?: unknown };
                 const enabled = await setBackgroundFeedSyncEnabled(env, body.enabled !== false);
                 return Response.json({ ok: true, data: { enabled } });
             }
@@ -219,12 +223,13 @@ export default {
                 { status: 404 }
             );
         } catch (err) {
+            console.error('[VRCX Cloud] Unhandled Worker error:', err);
             return Response.json(
                 {
                     ok: false,
                     error: {
                         code: 'INTERNAL_ERROR',
-                        message: err instanceof Error ? err.message : 'Unexpected server error'
+                        message: 'Unexpected server error'
                     }
                 },
                 { status: 500 }

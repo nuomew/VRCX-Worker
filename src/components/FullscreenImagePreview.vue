@@ -343,10 +343,13 @@
                 blob = await convertBlobToPng(await fetchCloudMediaBlob(url));
             } else {
                 const response = await webApiService.execute({ url, method: 'GET' });
-                if (response.status !== 200 || !String(response.data).startsWith('data:image/png')) {
+                if (response.status !== 200 || !String(response.data).startsWith('data:image/')) {
                     throw new Error(`Error: ${response.data}`);
                 }
                 blob = await (await fetch(response.data)).blob();
+                if (blob.type !== 'image/png') {
+                    blob = await convertBlobToPng(blob);
+                }
             }
             await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })]);
             toast.success(t('message.image.copied_to_clipboard'));
@@ -369,14 +372,21 @@
                 const blob = await fetchCloudMediaBlob(url);
                 if (blob.type === 'image/webp') inferredExt = 'webp';
                 else if (blob.type === 'image/jpeg') inferredExt = 'jpg';
+                else if (blob.type === 'image/gif') inferredExt = 'gif';
                 objectUrl = URL.createObjectURL(blob);
                 href = objectUrl;
             } else {
                 const response = await webApiService.execute({ url, method: 'GET' });
-                if (response.status !== 200 || !String(response.data).startsWith('data:image/png')) {
+                const dataStr = String(response.data || '');
+                if (response.status !== 200 || !dataStr.startsWith('data:image/')) {
                     throw new Error(`Error: ${response.data}`);
                 }
-                href = response.data;
+                const mimeMatch = dataStr.match(/^data:image\/([a-z0-9.+-]+);base64,/i);
+                const sub = (mimeMatch?.[1] || 'png').toLowerCase();
+                if (sub === 'jpeg' || sub === 'jpg') inferredExt = 'jpg';
+                else if (sub === 'webp') inferredExt = 'webp';
+                else if (sub === 'gif') inferredExt = 'gif';
+                href = dataStr;
             }
 
             const link = document.createElement('a');

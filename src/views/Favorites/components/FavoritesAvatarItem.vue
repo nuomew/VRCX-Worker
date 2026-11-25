@@ -23,7 +23,7 @@
                     </ItemMedia>
                     <ItemContent class="min-w-0">
                         <ItemTitle class="truncate max-w-full">
-                            {{ localFavFakeRef.name }}
+                            {{ localFavFakeRef.name || localFavFakeRef.id }}
                             <AlertTriangle
                                 v-if="showUnavailable"
                                 :title="t('view.favorite.unavailable_tooltip')"

@@ -1,3 +1,27 @@
-# Optional bearer token to protect /poc/*, /api/*, and /ws/* endpoints in Phase 0.
-# Leave empty for local testing; set a random secret via `wrangler secret put POC_ADMIN_TOKEN` or Dashboard Secrets for production.
+# Local development environment variables for `wrangler dev` (`cloud/`).
+# Leave all auth variables empty for local `open_setup` testing.
+# For production deployments, configure secrets via `wrangler secret put <NAME>` or Cloudflare Dashboard Secrets.
+
+# --- Recommended Production Auth (Option A: Passcode + Optional TOTP) ---
+# Plain secret or `pbkdf2$<iterations>$<saltHex>$<hashHex>` (<= 100000 iterations)
+ADMIN_PASSCODE=
+# Optional Base32 RFC-6238 TOTP secret paired with ADMIN_PASSCODE
+ADMIN_TOTP_SECRET=
+
+# --- Recommended Production Auth (Option B: Cloudflare Access Zero Trust) ---
+# Set both team domain (e.g. myteam.cloudflareaccess.com) and application AUD tag
+CF_ACCESS_TEAM_DOMAIN=
+CF_ACCESS_AUD=
+
+# --- Encryption Master Key (Required whenever production auth is enabled) ---
+# Generate with: openssl rand -hex 32
+COOKIE_MASTER_KEY=
+
+# --- Windows VRCX.Agent Sync & Proxy Behavior ---
+# Optional shared secret for VRCX.Agent HTTP uploads (per-device Sync Keys from Cloud Hub are preferred)
+AGENT_SYNC_KEY=
+# Keep "true" (default) for HTTP-only VRCX.Agent & Cloud RSS/Cron sync; set "false" only if exclusively using WS Agent RPC
+VRC_ALLOW_CLOUD_FALLBACK=true
+
+# --- Local Dev / CLI Debug ONLY (DO NOT set as sole production auth — locks out Web UI passcode login) ---
 POC_ADMIN_TOKEN=

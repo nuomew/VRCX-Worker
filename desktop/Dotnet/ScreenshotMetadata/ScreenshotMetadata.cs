@@ -82,19 +82,22 @@ namespace VRCX
 
         public bool ContainsPlayerID(string id)
         {
-            return Players.Any(p => p.Id == id);
+            return Players != null && Players.Any(p => p?.Id == id);
         }
 
         public bool ContainsPlayerName(string playerName, bool partial, bool ignoreCase)
         {
+            if (Players == null || string.IsNullOrEmpty(playerName))
+                return false;
+
             var comparisonType = ignoreCase ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
 
             if (partial)
             {
-                return Players.Any(p => p.DisplayName.IndexOf(playerName, comparisonType) != -1);
+                return Players.Any(p => p?.DisplayName != null && p.DisplayName.IndexOf(playerName, comparisonType) != -1);
             }
 
-            return Players.Any(p => p.DisplayName.Equals(playerName, comparisonType));
+            return Players.Any(p => p?.DisplayName != null && p.DisplayName.Equals(playerName, comparisonType));
         }
 
         public class AuthorDetail

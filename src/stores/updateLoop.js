@@ -78,6 +78,10 @@ export const useUpdateLoopStore = defineStore('UpdateLoop', () => {
         try {
             if (watchState.isLoggedIn) {
                 const isWebMode = typeof WEB !== 'undefined' && WEB;
+                if (isWebMode && !cloudState.authenticated) {
+                    workerTimers.setTimeout(() => updateLoop(), 1000);
+                    return;
+                }
                 const isTabHidden =
                     isWebMode && typeof document !== 'undefined' && document.visibilityState === 'hidden';
                 const webRssIntervalSec = isWebMode ? Math.max(60, cloudState.webSyncIntervalSeconds || 300) : 300;

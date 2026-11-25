@@ -5,7 +5,7 @@ let initPromise: Promise<void> | null = null;
 
 // Static DDL mirrored from cloud/migrations/*/0001_init.sql.
 // Uses a schema_meta version sentinel so upgrades from Phase 0 auto-add Phase 1 tables idempotently.
-const SCHEMA_VERSION = 'v6-indexes-and-ratelimit';
+const SCHEMA_VERSION = 'v7-unique-screenshot-filename';
 
 const CORE_STATEMENTS: readonly string[] = [
     `CREATE TABLE IF NOT EXISTS schema_meta (
@@ -249,7 +249,9 @@ const CORE_STATEMENTS: readonly string[] = [
     )`,
     `CREATE INDEX IF NOT EXISTS idx_screenshots_taken ON cloud_screenshots (taken_at DESC)`,
     `CREATE INDEX IF NOT EXISTS idx_screenshots_world ON cloud_screenshots (world_id, taken_at DESC)`,
-    `CREATE INDEX IF NOT EXISTS idx_screenshots_filename ON cloud_screenshots (local_filename COLLATE NOCASE)`,
+    `DELETE FROM cloud_screenshots WHERE rowid NOT IN (SELECT MIN(rowid) FROM cloud_screenshots GROUP BY LOWER(local_filename))`,
+    `DROP INDEX IF EXISTS idx_screenshots_filename`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_screenshots_filename ON cloud_screenshots (local_filename COLLATE NOCASE)`,
     `CREATE TABLE IF NOT EXISTS cloud_commands (
         cmd_id TEXT PRIMARY KEY,
         target_device_id TEXT NOT NULL,
@@ -318,6 +320,7 @@ const GAMELOG_STATEMENTS: readonly string[] = [
         UNIQUE (created_at, display_name)
     )`,
     `CREATE INDEX IF NOT EXISTS idx_gamelog_portal_location ON gamelog_portal_spawn (location, id DESC)`,
+    `CREATE INDEX IF NOT EXISTS idx_gamelog_portal_user_id ON gamelog_portal_spawn (user_id, id DESC)`,
     `CREATE TABLE IF NOT EXISTS gamelog_video_play (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         created_at TEXT NOT NULL,
@@ -330,6 +333,7 @@ const GAMELOG_STATEMENTS: readonly string[] = [
         UNIQUE (created_at, video_url)
     )`,
     `CREATE INDEX IF NOT EXISTS idx_gamelog_video_location ON gamelog_video_play (location, created_at)`,
+    `CREATE INDEX IF NOT EXISTS idx_gamelog_video_user_id ON gamelog_video_play (user_id, id DESC)`,
     `CREATE TABLE IF NOT EXISTS gamelog_event (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         created_at TEXT NOT NULL,
@@ -344,7 +348,8 @@ const GAMELOG_STATEMENTS: readonly string[] = [
         user_id TEXT NOT NULL DEFAULT '',
         location TEXT NOT NULL DEFAULT '',
         UNIQUE (created_at, message)
-    )`
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_gamelog_ext_user_id ON gamelog_external (user_id, id DESC)`
 ];
 
 const FEED_STATEMENTS: readonly string[] = [
@@ -445,9 +450,20 @@ async function initCoreIfNeeded(db: D1Database): Promise<void> {
         // schema_meta does not exist yet
     }
 
-    // Chunk under 25 statements per batch to stay well inside Free-tier D1 limits.
-    for (let i = 0; i < CORE_STATEMENTS.length; i += 20) {
-        await db.batch(CORE_STATEMENTS.slice(i, i + 20).map((sql) => db.prepare(sql)));
+    // Group statements under 20 per D1 batch while keeping cloud_screenshots dedup + DROP INDEX + CREATE UNIQUE INDEX
+    // inside a single atomic D1 batch transaction so concurrent inserts cannot slip between dedup and index creation.
+    const dedupStartIdx = CORE_STATEMENTS.findIndex((sql) => sql.startsWith('DELETE FROM cloud_screenshots '));
+    const dedupEndIdx = dedupStartIdx >= 0 ? dedupStartIdx + 3 : -1;
+    let cursor = 0;
+    while (cursor < CORE_STATEMENTS.length) {
+        let nextEnd = Math.min(cursor + 20, CORE_STATEMENTS.length);
+        if (dedupStartIdx >= 0 && cursor < dedupStartIdx && nextEnd > dedupStartIdx && nextEnd < dedupEndIdx) {
+            nextEnd = dedupStartIdx;
+        } else if (dedupStartIdx >= 0 && cursor === dedupStartIdx && nextEnd < dedupEndIdx) {
+            nextEnd = dedupEndIdx;
+        }
+        await db.batch(CORE_STATEMENTS.slice(cursor, nextEnd).map((sql) => db.prepare(sql)));
+        cursor = nextEnd;
     }
     await db
         .prepare("INSERT OR REPLACE INTO schema_meta (meta_key, meta_value) VALUES ('version', ?)")
@@ -484,7 +500,7 @@ export async function ensureSchemaReady(env: Env): Promise<void> {
     if (!initPromise) {
         initPromise = Promise.all([
             initCoreIfNeeded(env.DB_CORE),
-            initShardIfNeeded(env.DB_GAMELOG, 'idx_gamelog_portal_location', GAMELOG_STATEMENTS, 'index'),
+            initShardIfNeeded(env.DB_GAMELOG, 'idx_gamelog_ext_user_id', GAMELOG_STATEMENTS, 'index'),
             initShardIfNeeded(env.DB_FEED, 'activity_sessions_v2', FEED_STATEMENTS, 'table'),
             initShardIfNeeded(getCacheDb(env), 'cloud_rss_snapshot', CACHE_STATEMENTS, 'table')
         ])

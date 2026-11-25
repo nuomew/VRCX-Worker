@@ -188,12 +188,13 @@ export const useAuthStore = defineStore('Auth', () => {
             );
             return;
         }
+        const isWeb = typeof WEB !== 'undefined' && WEB;
         if (
-            !advancedSettingsStore.enablePrimaryPassword &&
+            (isWeb || !advancedSettingsStore.enablePrimaryPassword) &&
             (await configRepository.getString('lastUserLoggedIn')) !== null
         ) {
             const user = await getSavedCredentials(loginForm.value.lastUserLoggedIn);
-            if (user?.loginParams?.endpoint) {
+            if (!isWeb && user?.loginParams?.endpoint) {
                 AppDebug.endpointDomain = user.loginParams.endpoint;
                 AppDebug.websocketDomain = user.loginParams.websocket;
             }
@@ -215,33 +216,51 @@ export const useAuthStore = defineStore('Auth', () => {
     }
 
     async function clearCookiesTryLogin() {
-        await webApiService.clearCookies();
+        const isWebMode = typeof WEB !== 'undefined' && WEB;
         if (loginForm.value.lastUserLoggedIn) {
             const user = await getSavedCredentials(loginForm.value.lastUserLoggedIn);
+            if (isWebMode && !user?.loginParams?.password) {
+                // In Web mode passwords are never stored in cloud configs; avoid clearing the active
+                // pre-2FA cookie and deleting the saved account card on a failed 2FA attempt.
+                toast.error(t('message.auth.saved_credentials_invalid'));
+                return;
+            }
+            await webApiService.clearCookies();
             if (user) {
                 delete user.cookies;
                 await relogin(user, {
                     shouldTrackLoginNetworkIssueHint: false
                 });
             }
+            return;
         }
+        await webApiService.clearCookies();
     }
 
     async function resendEmail2fa() {
         if (loginForm.value.lastUserLoggedIn) {
             const user = await getSavedCredentials(loginForm.value.lastUserLoggedIn);
-            if (user) {
+            if (user?.loginParams?.password) {
                 await webApiService.clearCookies();
                 delete user.cookies;
                 relogin(user, {
                     shouldTrackLoginNetworkIssueHint: false
-                }).then(() => {
-                    toast.success(t('message.auth.email_2fa_resent'));
-                });
+                })
+                    .then(() => {
+                        toast.success(t('message.auth.email_2fa_resent'));
+                    })
+                    .catch((err) => {
+                        console.error('[auth] Failed to resend email 2FA:', err);
+                    });
                 return;
             }
         }
         toast.error(t('message.auth.email_2fa_no_credentials'));
+        if (typeof WEB !== 'undefined' && WEB) {
+            // Re-open the Email OTP prompt so the user can still enter an already-received code
+            // instead of being stranded with a dismissed 2FA modal.
+            promptEmailOTP();
+        }
     }
 
     function resetLoginNetworkIssueHintState() {
@@ -496,7 +515,9 @@ export const useAuthStore = defineStore('Auth', () => {
                 if (existingStyle) {
                     existingStyle.parentNode.removeChild(existingStyle);
                 }
-                handleLogoutEvent();
+                handleLogoutEvent().catch((err) => {
+                    console.error('[auth] Logout flow failed:', err);
+                });
             })
             .catch(() => {});
     }
@@ -510,7 +531,8 @@ export const useAuthStore = defineStore('Auth', () => {
             await webApiService.setCookies(user.cookies);
         }
         loginForm.value.lastUserLoggedIn = user.user.id; // for resend email 2fa
-        if (loginParams.endpoint) {
+        const isWebMode = typeof WEB !== 'undefined' && WEB;
+        if (!isWebMode && loginParams.endpoint) {
             AppDebug.endpointDomain = loginParams.endpoint;
             AppDebug.websocketDomain = loginParams.websocket;
         } else {
@@ -539,6 +561,7 @@ export const useAuthStore = defineStore('Auth', () => {
             }
 
             await authRequest.getConfig();
+            const isWebMode = typeof WEB !== 'undefined' && WEB;
             try {
                 if (password) {
                     await authLogin({
@@ -548,6 +571,49 @@ export const useAuthStore = defineStore('Auth', () => {
                         websocket: loginParams.websocket
                     });
                 } else {
+                    if (isWebMode) {
+                        // Web mode strips plaintext passwords & per-account cookies from savedCredentials.
+                        // Probe /auth/user via WebApi directly (bypassing request.js's 401 handleAutoLogin side-effects)
+                        // so we verify the active cloud cookie vault belongs to the selected account before reusing it.
+                        let activeUserId = '';
+                        let probeStatus = 0;
+                        try {
+                            const endpointBase = String(
+                                AppDebug.endpointDomain || AppDebug.endpointDomainVrchat || 'https://api.vrchat.cloud/api/1'
+                            ).replace(/\/+$/, '');
+                            const rawProbe = await window.WebApi?.ExecuteJson?.(
+                                JSON.stringify({
+                                    url: `${endpointBase}/auth/user`,
+                                    method: 'GET',
+                                    bypassCache: true
+                                })
+                            );
+                            const parsedProbe = typeof rawProbe === 'string' ? JSON.parse(rawProbe) : rawProbe;
+                            probeStatus = Number(parsedProbe?.status || 0);
+                            if (probeStatus >= 200 && probeStatus < 300 && parsedProbe?.message) {
+                                const userJson = JSON.parse(parsedProbe.message);
+                                activeUserId = typeof userJson?.id === 'string' ? userJson.id : '';
+                            }
+                        } catch {
+                            probeStatus = 0;
+                        }
+                        if (
+                            probeStatus === 401 ||
+                            (probeStatus >= 200 && probeStatus < 300 && (!activeUserId || activeUserId !== user.user.id))
+                        ) {
+                            const mismatchErr = Object.assign(
+                                new Error('Saved account requires password re-entry in Web mode'),
+                                { status: 401, isWebAccountMismatch: true }
+                            );
+                            throw mismatchErr;
+                        }
+                        if (probeStatus < 200 || probeStatus >= 300) {
+                            throw Object.assign(
+                                new Error(`Unable to verify Web session (HTTP ${probeStatus || 'network error'})`),
+                                { status: probeStatus || 0 }
+                            );
+                        }
+                    }
                     // stops the 401 from starting a second auto login
                     attemptingAutoLogin.value = true;
                     try {
@@ -557,6 +623,12 @@ export const useAuthStore = defineStore('Auth', () => {
                     }
                 }
             } catch (err) {
+                if (err?.isWebAccountMismatch) {
+                    if (watchState.isLoggedIn) {
+                        await handleLogoutEvent();
+                    }
+                    throw err;
+                }
                 if (shouldTrackLoginNetworkIssueHint && shouldCountLoginFailureForNetworkHint(err)) {
                     maybeShowLoginNetworkIssueHint();
                 }
@@ -567,8 +639,14 @@ export const useAuthStore = defineStore('Auth', () => {
                 throw err;
             }
         } catch (err) {
+            const isWebMode = typeof WEB !== 'undefined' && WEB;
             const sessionExpired = !loginParams.password && err.status === 401;
-            if (sessionExpired || err.message.includes('Invalid Username/Email or Password')) {
+            if (sessionExpired && isWebMode) {
+                // Web mode strips plaintext passwords & cookies from cloud savedCredentials; prefill username
+                // and ask the user to re-enter their password instead of permanently deleting the saved account.
+                loginForm.value.username = loginParams.username || user.user?.username || '';
+                toast.error(t('message.auth.saved_credentials_invalid'));
+            } else if (sessionExpired || err.message?.includes('Invalid Username/Email or Password')) {
                 toast.error(t('message.auth.saved_credentials_invalid'));
                 await deleteSavedLogin(user.user.id);
             }
@@ -604,7 +682,8 @@ export const useAuthStore = defineStore('Auth', () => {
                 endpoint: loginForm.value.endpoint,
                 websocket: loginForm.value.websocket
             });
-            if (loginForm.value.endpoint) {
+            const isWeb = typeof WEB !== 'undefined' && WEB;
+            if (!isWeb && loginForm.value.endpoint) {
                 AppDebug.endpointDomain = loginForm.value.endpoint;
                 AppDebug.websocketDomain = loginForm.value.websocket;
             } else {
@@ -613,7 +692,7 @@ export const useAuthStore = defineStore('Auth', () => {
             }
             try {
                 await authRequest.getConfig();
-                if (loginForm.value.saveCredentials && advancedSettingsStore.enablePrimaryPassword) {
+                if (!isWeb && loginForm.value.saveCredentials && advancedSettingsStore.enablePrimaryPassword) {
                     try {
                         const { ok, value } = await modalStore.prompt({
                             title: t('prompt.primary_password.header'),
@@ -622,9 +701,12 @@ export const useAuthStore = defineStore('Auth', () => {
                             pattern: /[\s\S]{1,32}/
                         });
                         if (ok) {
-                            const savedCredentials = JSON.parse(await configRepository.getString('savedCredentials'));
+                            const rawSaved = await configRepository.getString('savedCredentials');
+                            const parsedSaved = rawSaved ? JSON.parse(rawSaved) : {};
+                            const savedCredentials =
+                                parsedSaved && typeof parsedSaved === 'object' ? parsedSaved : {};
                             const saveCredential = Object.values(savedCredentials).find(
-                                (credential) => credential.loginParams.password
+                                (credential) => credential?.loginParams?.password
                             );
                             if (saveCredential) {
                                 await security.decrypt(saveCredential.loginParams.password, value);
@@ -701,12 +783,16 @@ export const useAuthStore = defineStore('Auth', () => {
                     .verifyTOTP({
                         code: value.trim()
                     })
-                    .catch((err) => {
-                        console.error(err);
-                        clearCookiesTryLogin();
-                    })
                     .then(() => {
                         getCurrentUser();
+                    })
+                    .catch((err) => {
+                        console.error(err);
+                        if (typeof WEB !== 'undefined' && WEB) {
+                            promptTOTP();
+                        } else {
+                            clearCookiesTryLogin();
+                        }
                     });
             })
             .catch(() => {
@@ -740,12 +826,16 @@ export const useAuthStore = defineStore('Auth', () => {
                     .verifyOTP({
                         code: `${value.slice(0, 4)}-${value.slice(4)}`
                     })
-                    .catch((err) => {
-                        console.error(err);
-                        clearCookiesTryLogin();
-                    })
                     .then(() => {
                         getCurrentUser();
+                    })
+                    .catch((err) => {
+                        console.error(err);
+                        if (typeof WEB !== 'undefined' && WEB) {
+                            promptOTP();
+                        } else {
+                            clearCookiesTryLogin();
+                        }
                     });
             })
             .catch(() => {
@@ -780,12 +870,12 @@ export const useAuthStore = defineStore('Auth', () => {
                     .verifyEmailOTP({
                         code: value.trim()
                     })
+                    .then(() => {
+                        getCurrentUser();
+                    })
                     .catch((err) => {
                         console.error(err);
                         promptEmailOTP();
-                    })
-                    .then(() => {
-                        getCurrentUser();
                     });
             })
             .catch(() => {
@@ -895,7 +985,10 @@ export const useAuthStore = defineStore('Auth', () => {
         watchState.isLoggedIn = true;
         AppApi.CheckGameRunning(); // restore state from hot-reload
 
-        activityStore.startFullCacheBuild(userStore.currentUser.id);
+        // Avoid full 10-year activity history D1 rebuild on every Web page reload; Activity page builds on demand.
+        if (typeof WEB === 'undefined' || !WEB) {
+            activityStore.startFullCacheBuild(userStore.currentUser.id);
+        }
     }
 
     /**

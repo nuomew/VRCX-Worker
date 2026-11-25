@@ -1,6 +1,7 @@
 import { getGroupName, getWorldName, parseLocation } from '../shared/utils';
 import { AppDebug } from '../services/appConfig';
 import { database } from '../services/database';
+import { isCloudFeedWriteSuppressed } from '../services/database/cloud/index.js';
 import { getAvatarName } from './avatarCoordinator';
 import { useFeedStore } from '../stores/feed';
 import { useFriendStore } from '../stores/friend';
@@ -40,6 +41,8 @@ export async function runHandleUserUpdateFlow(ref, props, { now = Date.now, nowI
     if (typeof friend === 'undefined') {
         return;
     }
+    // Capture cloud RSS write suppression synchronously before any await.
+    const suppressCloudFeed = typeof WEB !== 'undefined' && WEB && isCloudFeedWriteSuppressed();
     if (props.location) {
         // update instancePlayerCount
         previousLocation = props.location[1];
@@ -115,24 +118,26 @@ export async function runHandleUserUpdateFlow(ref, props, { now = Date.now, nowI
             // location traveled to is the same
             ref.$location_at = now() - time;
         } else {
-            const worldName = await getWorldName(newLocation);
-            const groupName = await getGroupName(newLocation);
-            feed = {
-                created_at: nowIso(),
-                type: 'GPS',
-                userId: ref.id,
-                displayName: ref.displayName,
-                location: newLocation,
-                worldName,
-                groupName,
-                previousLocation,
-                time
-            };
-            notificationStore.queueFeedNoty(feed);
-            sharedFeedStore.addEntry(feed);
-            const persistedFeed = await database.addGPSToDatabase(feed);
-            if (persistedFeed) {
-                feedStore.addFeedEntry(persistedFeed);
+            if (!suppressCloudFeed) {
+                const worldName = await getWorldName(newLocation);
+                const groupName = await getGroupName(newLocation);
+                feed = {
+                    created_at: nowIso(),
+                    type: 'GPS',
+                    userId: ref.id,
+                    displayName: ref.displayName,
+                    location: newLocation,
+                    worldName,
+                    groupName,
+                    previousLocation,
+                    time
+                };
+                notificationStore.queueFeedNoty(feed);
+                sharedFeedStore.addEntry(feed);
+                const persistedFeed = await database.addGPSToDatabase(feed);
+                if (persistedFeed) {
+                    feedStore.addFeedEntry(persistedFeed);
+                }
             }
             // clear previousLocation after GPS
             ref.$previousLocation = '';
@@ -144,7 +149,7 @@ export async function runHandleUserUpdateFlow(ref, props, { now = Date.now, nowI
         ref.$previousLocation = props.location[1];
         ref.$travelingToTime = now();
     }
-    if (ref.bannerType === 'avatarBanner' && props.bannerUrl && props.bannerUrl[0]) {
+    if (!suppressCloudFeed && ref.bannerType === 'avatarBanner' && props.bannerUrl && props.bannerUrl[0]) {
         const currentBannerUrl = props.bannerUrl[0];
         const previousBannerUrl = props.bannerUrl[1];
         let avatarInfo = {
@@ -187,7 +192,7 @@ export async function runHandleUserUpdateFlow(ref, props, { now = Date.now, nowI
                 feedStore.addFeedEntry(persistedFeed);
             }
         }
-    } else if (props.iconUrl && props.iconUrl[0]) {
+    } else if (!suppressCloudFeed && props.iconUrl && props.iconUrl[0]) {
         const currentIconUrl = props.iconUrl[0];
         const previousIconUrl = props.iconUrl[1];
         let avatarInfo = {
@@ -262,21 +267,23 @@ export async function runHandleUserUpdateFlow(ref, props, { now = Date.now, nowI
             statusDescription = ref.statusDescription;
             previousStatusDescription = ref.statusDescription;
         }
-        feed = {
-            created_at: nowIso(),
-            type: 'Status',
-            userId: ref.id,
-            displayName: ref.displayName,
-            status,
-            statusDescription,
-            previousStatus,
-            previousStatusDescription
-        };
-        notificationStore.queueFeedNoty(feed);
-        sharedFeedStore.addEntry(feed);
-        const persistedFeed = await database.addStatusToDatabase(feed);
-        if (persistedFeed) {
-            feedStore.addFeedEntry(persistedFeed);
+        if (!suppressCloudFeed) {
+            feed = {
+                created_at: nowIso(),
+                type: 'Status',
+                userId: ref.id,
+                displayName: ref.displayName,
+                status,
+                statusDescription,
+                previousStatus,
+                previousStatusDescription
+            };
+            notificationStore.queueFeedNoty(feed);
+            sharedFeedStore.addEntry(feed);
+            const persistedFeed = await database.addStatusToDatabase(feed);
+            if (persistedFeed) {
+                feedStore.addFeedEntry(persistedFeed);
+            }
         }
     }
     if (props.note && props.note[0] !== null && props.note[0] !== props.note[1]) {

@@ -1,6 +1,7 @@
 {
     "$schema": "node_modules/wrangler/config-schema.json",
-    "name": "vrcx-cloud",
+    // Local dev/test Worker config only (Vitest / Miniflare). Production deploys MUST use repository root `wrangler.jsonc`.
+    "name": "vrcx-cloud-local-test",
     "main": "src/index.ts",
     "compatibility_date": "2026-11-01",
     // Static frontend assets served directly from Cloudflare edge at zero Worker request cost.
@@ -49,12 +50,11 @@
     ],
     "triggers": {
         "crons": ["* * * * *"]
-    }
-    // Optional R2 binding (uncomment after enabling R2 in Cloudflare dashboard):
-    // "r2_buckets": [
-    //     {
-    //         "binding": "R2_MEDIA",
-    //         "bucket_name": "vrcx-media"
-    //     }
-    // ]
+    },
+    "r2_buckets": [
+        {
+            "binding": "R2_MEDIA",
+            "bucket_name": "vrcx-media-local-test"
+        }
+    ]
 }

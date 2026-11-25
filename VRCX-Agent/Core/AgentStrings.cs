@@ -125,6 +125,18 @@ public static class AgentStrings
         ? "请输入有效的 https:// 或 http:// 云端连接地址。"
         : "Please enter a valid https:// or http:// Cloud URL.";
 
+    public static string InvalidSyncSecretMessage => IsChinese
+        ? "同步密钥只能包含英文数字或可见 ASCII 符号，不能包含中文、空格或换行。"
+        : "Sync Secret must contain only printable ASCII characters without spaces or line breaks.";
+
+    public static string BalloonAutoStartFailed => IsChinese
+        ? "无法更新 Windows 开机自启注册表项，请检查系统权限。"
+        : "Failed to update the Windows startup registry entry. Check permissions.";
+
+    public static string ConnectionTestTimeoutMessage => IsChinese
+        ? "连接测试超时（15 秒），请检查云端地址、网络或代理配置。"
+        : "Connection test timed out (15s). Check your Cloud URL, network, or proxy settings.";
+
     public static string TestingViaProxyMessage => IsChinese
         ? "正在通过代理测试连接并获取网页端同步间隔…"
         : "Testing connection via proxy && fetching Web sync schedule ...";
@@ -300,13 +312,21 @@ public static class AgentStrings
         ? $"发现新版本 {latestTag}，当前 v{currentVersion}，正在后台自动下载更新…"
         : $"New version {latestTag} found, current v{currentVersion}. Downloading update automatically...";
 
+    public static string FormatBalloonUpdateAvailableManual(string latestTag, string currentVersion) => IsChinese
+        ? $"发现新版本 {latestTag}（当前 v{currentVersion}），点击此通知或在托盘菜单中手动更新。"
+        : $"New version {latestTag} available (current v{currentVersion}). Click here or use the tray menu to update.";
+
+    public static string FormatPortableUpdateNotice(string latestTag, string currentVersion) => IsChinese
+        ? $"发现新版本 {latestTag}（当前便携版 v{currentVersion}）。便携版不支持覆盖安装程序，即将打开 GitHub Releases 页面供您下载最新便携包。"
+        : $"New version {latestTag} is available (current portable v{currentVersion}). Opening GitHub Releases so you can download the latest portable archive.";
+
     public static string FormatBalloonAutoInstallingUpdate(string latestTag) => IsChinese
         ? $"已下载新版本 {latestTag} 并通过 SHA-256 校验，正在自动安装并重启…"
-        : $"Downloaded && verified {latestTag}. Installing update && restarting automatically...";
+        : $"Downloaded & verified {latestTag}. Installing update & restarting automatically...";
 
     public static string FormatDialogAutoDownloadingUpdate(string latestTag) => IsChinese
         ? $"正在后台自动下载新版本 {latestTag}，下载校验完成后将自动安装并重启，请稍候。"
-        : $"Downloading update {latestTag} in the background. It will install && restart automatically once verified.";
+        : $"Downloading update {latestTag} in the background. It will install & restart automatically once verified.";
 
     public static string FormatBalloonAlreadyLatest(string currentVersion) => IsChinese
         ? $"当前已是最新版本 v{currentVersion}。"

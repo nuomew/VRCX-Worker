@@ -54,7 +54,7 @@ public sealed class RemoteCommandExecutor
             {
                 "launch_vrc" => LaunchVrChat(cmdId, parameters),
                 "quit_vrc" => QuitVrChat(cmdId),
-                "clear_cache" => ClearVrChatCache(cmdId),
+                "clear_cache" => ClearVrChatCache(cmdId, parameters),
                 "send_vr_notify" => await SendVrNotificationAsync(cmdId, parameters, ct).ConfigureAwait(false),
                 "discord_update" => UpdateDiscordPresence(cmdId, parameters),
                 "sync_now" => await TriggerSyncNowAsync(cmdId, ct).ConfigureAwait(false),
@@ -165,39 +165,19 @@ public sealed class RemoteCommandExecutor
         };
     }
 
-    private static CommandExecutionResult ClearVrChatCache(string cmdId)
+    private CommandExecutionResult ClearVrChatCache(string cmdId, Dictionary<string, object?> parameters)
     {
-        string cacheDir = ResolveVrChatCacheDirectory();
-        if (string.IsNullOrEmpty(cacheDir) || !Directory.Exists(cacheDir))
-        {
-            return new CommandExecutionResult
-            {
-                CmdId = cmdId,
-                Status = "succeeded",
-                Message = "VRChat cache directory does not exist"
-            };
-        }
-
-        int deletedDirs = 0;
-        foreach (string subDir in Directory.EnumerateDirectories(cacheDir))
-        {
-            try
-            {
-                Directory.Delete(subDir, recursive: true);
-                deletedDirs++;
-            }
-            catch (Exception ex)
-            {
-                Log.Debug(ex, "Skipped locked cache subfolder {Dir}", subDir);
-            }
-        }
-
-        return new CommandExecutionResult
-        {
-            CmdId = cmdId,
-            Status = "succeeded",
-            Message = $"Cleared {deletedDirs} VRChat cache folder(s)"
-        };
+        string scope = GetString(parameters, "scope", "all");
+        string itemId = GetString(parameters, "id");
+        string variant = GetString(parameters, "variant");
+        string cacheDir = ResolveVrChatCacheDirectory(_configProvider().VrChatLogDirectory);
+        return CommandValidator.ClearVrChatCacheInDirectory(
+            cmdId,
+            cacheDir,
+            scope,
+            itemId,
+            variant,
+            (ex, dir) => Log.Debug(ex, "Skipped locked cache subfolder {Dir}", dir));
     }
 
     private static async Task<CommandExecutionResult> SendVrNotificationAsync(
@@ -218,7 +198,22 @@ public sealed class RemoteCommandExecutor
         bool sent;
         if (target == "ovrtoolkit")
         {
-            sent = await VrNotificationSender.SendOvrToolkitAsync(title, body, ct).ConfigureAwait(false);
+            bool hudNotification = GetBool(parameters, "hudNotification", true);
+            bool wristNotification = GetBool(parameters, "wristNotification", false);
+            string iconBase64 = GetString(parameters, "image");
+            if (string.IsNullOrWhiteSpace(iconBase64))
+            {
+                iconBase64 = GetString(parameters, "icon");
+            }
+            sent = await VrNotificationSender
+                .SendOvrToolkitAsync(
+                    title,
+                    body,
+                    ct,
+                    hudNotification: hudNotification,
+                    wristNotification: wristNotification,
+                    iconBase64: iconBase64)
+                .ConfigureAwait(false);
         }
         else
         {
@@ -236,7 +231,6 @@ public sealed class RemoteCommandExecutor
     private static CommandExecutionResult UpdateDiscordPresence(string cmdId, Dictionary<string, object?> parameters)
     {
         bool active = GetBool(parameters, "active", false);
-        VRCX.Discord.Instance.SetActive(active);
         if (active)
         {
             string details = GetString(parameters, "details");
@@ -254,9 +248,14 @@ public sealed class RemoteCommandExecutor
             string buttonText = GetString(parameters, "buttonText");
             string buttonUrl = GetString(parameters, "buttonUrl");
             string appId = GetString(parameters, "appId", "883308884863901717");
+            if (string.IsNullOrWhiteSpace(appId))
+            {
+                appId = "883308884863901717";
+            }
             int activityType = GetInt(parameters, "activityType", 0);
             int statusDisplayType = GetInt(parameters, "statusDisplayType", 0);
 
+            // Populate presence & appId before activating Discord RPC so the background timer never observes null appId.
             VRCX.Discord.Instance.SetAssets(
                 details, state, detailsUrl,
                 largeImage, largeText,
@@ -265,6 +264,11 @@ public sealed class RemoteCommandExecutor
                 partyId, partySize, partyMax,
                 buttonText, buttonUrl, appId,
                 activityType, statusDisplayType);
+            VRCX.Discord.Instance.SetActive(true);
+        }
+        else
+        {
+            VRCX.Discord.Instance.SetActive(false);
         }
 
         return new CommandExecutionResult
@@ -286,12 +290,9 @@ public sealed class RemoteCommandExecutor
         };
     }
 
-    public static string ResolveVrChatCacheDirectory()
+    public static string ResolveVrChatCacheDirectory(string? vrChatLogDirectory = null)
     {
-        string localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
-        string? appDataRoot = string.IsNullOrEmpty(localAppData) ? null : Directory.GetParent(localAppData)?.FullName;
-        if (string.IsNullOrEmpty(appDataRoot)) return string.Empty;
-        return Path.Combine(appDataRoot, "LocalLow", "VRChat", "VRChat", "Cache-WindowsPlayer");
+        return CommandValidator.ResolveVrChatCacheDirectory(vrChatLogDirectory);
     }
 
     public static string? ResolveVrChatExecutablePath(string? overridePath)
@@ -387,18 +388,30 @@ public sealed class RemoteCommandExecutor
     private static int GetInt(Dictionary<string, object?> dict, string key, int fallback)
     {
         if (!dict.TryGetValue(key, out var val) || val == null) return fallback;
-        return int.TryParse(Convert.ToString(val), out int parsed) ? parsed : fallback;
+        return int.TryParse(
+            Convert.ToString(val, System.Globalization.CultureInfo.InvariantCulture),
+            System.Globalization.NumberStyles.Integer,
+            System.Globalization.CultureInfo.InvariantCulture,
+            out int parsed) ? parsed : fallback;
     }
 
     private static float GetFloat(Dictionary<string, object?> dict, string key, float fallback)
     {
         if (!dict.TryGetValue(key, out var val) || val == null) return fallback;
-        return float.TryParse(Convert.ToString(val), out float parsed) ? parsed : fallback;
+        return float.TryParse(
+            Convert.ToString(val, System.Globalization.CultureInfo.InvariantCulture),
+            System.Globalization.NumberStyles.Float,
+            System.Globalization.CultureInfo.InvariantCulture,
+            out float parsed) ? parsed : fallback;
     }
 
     private static double GetDouble(Dictionary<string, object?> dict, string key, double fallback)
     {
         if (!dict.TryGetValue(key, out var val) || val == null) return fallback;
-        return double.TryParse(Convert.ToString(val), out double parsed) ? parsed : fallback;
+        return double.TryParse(
+            Convert.ToString(val, System.Globalization.CultureInfo.InvariantCulture),
+            System.Globalization.NumberStyles.Float,
+            System.Globalization.CultureInfo.InvariantCulture,
+            out double parsed) ? parsed : fallback;
     }
 }

@@ -166,7 +166,7 @@
         </SettingsGroup>
 
         <!-- Remote Database -->
-        <SettingsGroup :title="t('view.settings.advanced.advanced.remote_database.header')">
+        <SettingsGroup v-if="!isWeb" :title="t('view.settings.advanced.advanced.remote_database.header')">
             <SettingsItem
                 :label="t('view.settings.advanced.advanced.remote_database.enable')"
                 :description="t('view.settings.advanced.advanced.remote_database.enable_description')"
@@ -186,7 +186,7 @@
 
         <TranslationApiDialog v-model:isTranslationApiDialogVisible="isTranslationApiDialogVisible" />
         <YouTubeApiDialog v-model:isYouTubeApiDialogVisible="isYouTubeApiDialogVisible" />
-        <AvatarProviderDialog v-model:isAvatarProviderDialogVisible="isAvatarProviderDialogVisible" />
+        <AvatarProviderDialog v-if="!isWeb" v-model:isAvatarProviderDialogVisible="isAvatarProviderDialogVisible" />
     </div>
 </template>
 

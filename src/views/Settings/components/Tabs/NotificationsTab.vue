@@ -73,19 +73,19 @@
                         <SelectItem value="Never">{{
                             t('view.settings.notifications.notifications.conditions.never')
                         }}</SelectItem>
-                        <SelectItem v-if="!isWeb" value="Desktop Mode">{{
+                        <SelectItem v-if="!isWeb || desktopToast === 'Desktop Mode'" value="Desktop Mode">{{
                             t('view.settings.notifications.notifications.conditions.desktop')
                         }}</SelectItem>
-                        <SelectItem v-if="!isWeb" value="Inside VR">{{
+                        <SelectItem v-if="!isWeb || desktopToast === 'Inside VR'" value="Inside VR">{{
                             t('view.settings.notifications.notifications.conditions.inside_vr')
                         }}</SelectItem>
-                        <SelectItem v-if="!isWeb" value="Outside VR">{{
+                        <SelectItem v-if="!isWeb || desktopToast === 'Outside VR'" value="Outside VR">{{
                             t('view.settings.notifications.notifications.conditions.outside_vr')
                         }}</SelectItem>
-                        <SelectItem v-if="!isWeb" value="Game Running">{{
+                        <SelectItem v-if="!isWeb || desktopToast === 'Game Running'" value="Game Running">{{
                             t('view.settings.notifications.notifications.conditions.inside_vrchat')
                         }}</SelectItem>
-                        <SelectItem v-if="!isWeb" value="Game Closed">{{
+                        <SelectItem v-if="!isWeb || desktopToast === 'Game Closed'" value="Game Closed">{{
                             t('view.settings.notifications.notifications.conditions.outside_vrchat')
                         }}</SelectItem>
                         <SelectItem value="Always">{{
@@ -134,13 +134,13 @@
                         <SelectItem value="Never">{{
                             t('view.settings.notifications.notifications.conditions.never')
                         }}</SelectItem>
-                        <SelectItem v-if="!isWeb" value="Inside VR">{{
+                        <SelectItem v-if="!isWeb || notificationTTS === 'Inside VR'" value="Inside VR">{{
                             t('view.settings.notifications.notifications.conditions.inside_vr')
                         }}</SelectItem>
-                        <SelectItem v-if="!isWeb" value="Game Running">{{
+                        <SelectItem v-if="!isWeb || notificationTTS === 'Game Running'" value="Game Running">{{
                             t('view.settings.notifications.notifications.conditions.inside_vrchat')
                         }}</SelectItem>
-                        <SelectItem v-if="!isWeb" value="Game Closed">{{
+                        <SelectItem v-if="!isWeb || notificationTTS === 'Game Closed'" value="Game Closed">{{
                             t('view.settings.notifications.notifications.conditions.outside_vrchat')
                         }}</SelectItem>
                         <SelectItem value="Always">{{

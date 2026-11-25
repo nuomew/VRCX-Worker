@@ -285,6 +285,9 @@ function isWebBlockedAvatarProvider(providerUrl) {
 }
 
 export async function lookupAvatars(type, search) {
+    if (typeof WEB !== 'undefined' && WEB) {
+        return new Map();
+    }
     const avatarProviderStore = useAvatarProviderStore();
     const vrcxUpdaterStore = useVRCXUpdaterStore();
 
@@ -357,6 +360,9 @@ export async function lookupAvatars(type, search) {
  * @param fileId
  */
 export async function lookupAvatarByImageFileId(authorId, fileId) {
+    if (typeof WEB !== 'undefined' && WEB) {
+        return null;
+    }
     const avatarProviderStore = useAvatarProviderStore();
 
     for (const providerUrl of avatarProviderStore.avatarRemoteDatabaseProviderList) {
@@ -542,6 +548,9 @@ export function checkAvatarCache(fileId) {
  * @param ownerUserId
  */
 export async function checkAvatarCacheRemote(fileId, ownerUserId) {
+    if (typeof WEB !== 'undefined' && WEB) {
+        return null;
+    }
     const advancedSettingsStore = useAdvancedSettingsStore();
     const avatarStore = useAvatarStore();
     const t = i18n.global.t;

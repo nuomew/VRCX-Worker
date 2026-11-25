@@ -15,7 +15,25 @@ public class PNGChunk
     public PNGChunkTypeFilter ChunkTypeEnum;
     public byte[] Data;
 
-    private static uint[] crcTable;
+    private static readonly uint[] crcTable = BuildCrcTable();
+
+    private static uint[] BuildCrcTable()
+    {
+        var table = new uint[256];
+        for (uint n = 0; n <= 255; n++)
+        {
+            uint c = n;
+            for (var k = 0; k <= 7; k++)
+            {
+                if ((c & 1) == 1)
+                    c = 0xEDB88320 ^ ((c >> 1) & 0x7FFFFFFF);
+                else
+                    c = (c >> 1) & 0x7FFFFFFF;
+            }
+            table[n] = c;
+        }
+        return table;
+    }
 
     /// <summary>
     /// Checks if the chunk data is empty
@@ -59,8 +77,10 @@ public class PNGChunk
 
         // Parse keyword as null-terminated string
         var keywordEncoding = Encoding.UTF8;
+        if (chunkData == null) return null;
+        int safeLength = Math.Min(chunkLength, chunkData.Length);
         int keywordLength = 0;
-        for (int i = 0; i < chunkLength; i++)
+        for (int i = 0; i < safeLength; i++)
         {
             if (chunkData[i] == 0x0)
             {
@@ -69,12 +89,13 @@ public class PNGChunk
             }
         }
 
-        if (keywordLength == 0 || keywordLength > 79 || chunkLength < keywordLength) return null;
+        if (keywordLength == 0 || keywordLength > 79) return null;
         string keyword = keywordEncoding.GetString(chunkData, 0, keywordLength);
 
-        // lazy skip over the rest of the chunk
+        // lazy skip over the rest of the chunk (null + compFlag + compMethod + null + null)
         int textOffset = keywordLength + 5;
-        int textLength = chunkLength - textOffset;
+        if (textOffset > safeLength) return null;
+        int textLength = safeLength - textOffset;
 
         return new Tuple<string, string>(keyword, Encoding.UTF8.GetString(chunkData, textOffset, textLength));
     }
@@ -103,17 +124,12 @@ public class PNGChunk
             Interlace method:   1 byte
         */
 
-        int chunkLength = this.Length;
         byte[] chunkData = this.Data;
+        if (chunkData == null || chunkData.Length < 8)
+            throw new Exception("Invalid IHDR chunk data");
 
-        if (BitConverter.IsLittleEndian)
-        {
-            Array.Reverse(chunkData, 0, 4);
-            Array.Reverse(chunkData, 4, 4);
-        }
-
-        int width = BitConverter.ToInt32(chunkData, 0);
-        int height = BitConverter.ToInt32(chunkData, 4);
+        int width = BinaryPrimitives.ReadInt32BigEndian(chunkData.AsSpan(0, 4));
+        int height = BinaryPrimitives.ReadInt32BigEndian(chunkData.AsSpan(4, 4));
 
         return new Tuple<int, int>(width, height);
     }
@@ -196,26 +212,7 @@ public class PNGChunk
     // https://web.archive.org/web/20150825201508/http://upokecenter.dreamhosters.com/articles/png-image-encoder-in-c/
     private static uint Crc32(byte[] stream, int offset, int length, uint crc)
     {
-        uint c;
-        if (crcTable == null)
-        {
-            crcTable = new uint[256];
-            for (uint n = 0; n <= 255; n++)
-            {
-                c = n;
-                for (var k = 0; k <= 7; k++)
-                {
-                    if ((c & 1) == 1)
-                        c = 0xEDB88320 ^ ((c >> 1) & 0x7FFFFFFF);
-                    else
-                        c = (c >> 1) & 0x7FFFFFFF;
-                }
-
-                crcTable[n] = c;
-            }
-        }
-
-        c = crc ^ 0xffffffff;
+        uint c = crc ^ 0xffffffff;
         var endOffset = offset + length;
         for (var i = offset; i < endOffset; i++)
         {

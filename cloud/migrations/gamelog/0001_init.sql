@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS gamelog_portal_spawn (
     UNIQUE (created_at, display_name)
 );
 CREATE INDEX IF NOT EXISTS idx_gamelog_portal_location ON gamelog_portal_spawn (location, id DESC);
+CREATE INDEX IF NOT EXISTS idx_gamelog_portal_user_id ON gamelog_portal_spawn (user_id, id DESC);
 
 CREATE TABLE IF NOT EXISTS gamelog_video_play (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -51,6 +52,7 @@ CREATE TABLE IF NOT EXISTS gamelog_video_play (
     UNIQUE (created_at, video_url)
 );
 CREATE INDEX IF NOT EXISTS idx_gamelog_video_location ON gamelog_video_play (location, created_at);
+CREATE INDEX IF NOT EXISTS idx_gamelog_video_user_id ON gamelog_video_play (user_id, id DESC);
 
 CREATE TABLE IF NOT EXISTS gamelog_event (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -68,3 +70,4 @@ CREATE TABLE IF NOT EXISTS gamelog_external (
     location TEXT NOT NULL DEFAULT '',
     UNIQUE (created_at, message)
 );
+CREATE INDEX IF NOT EXISTS idx_gamelog_ext_user_id ON gamelog_external (user_id, id DESC);

@@ -34,15 +34,17 @@
                             <SelectValue />
                         </SelectTrigger>
                         <SelectContent>
-                            <SelectItem
-                                v-for="(item, key) in userDialogGroupSortingOptions"
-                                :key="String(key)"
-                                :value="String(key)"
-                                :disabled="
-                                    item === userDialogGroupSortingOptions.inGame && userDialog.id !== currentUser.id
-                                ">
-                                {{ t(item.name) }}
-                            </SelectItem>
+                            <template v-for="(item, key) in userDialogGroupSortingOptions" :key="String(key)">
+                                <SelectItem
+                                    v-if="!(isWeb && item === userDialogGroupSortingOptions.inGame)"
+                                    :value="String(key)"
+                                    :disabled="
+                                        item === userDialogGroupSortingOptions.inGame &&
+                                        userDialog.id !== currentUser.id
+                                    ">
+                                    {{ t(item.name) }}
+                                </SelectItem>
+                            </template>
                         </SelectContent>
                     </Select>
                 </template>
@@ -122,7 +124,7 @@
                                     @update:modelValue="() => toggleGroupSelection(group.id)" />
                             </div>
 
-                            <div style="margin-right: 3px; margin-left: 6px" @click.stop>
+                            <div v-if="!isWeb" style="margin-right: 3px; margin-left: 6px" @click.stop>
                                 <Button
                                     size="icon-sm"
                                     variant="outline"
@@ -153,7 +155,7 @@
                                     <DownloadIcon class="size-3.5 shrink-0" />
                                 </Button>
                             </div>
-                            <div style="margin-right: 8px" @click.stop>
+                            <div v-if="!isWeb" style="margin-right: 8px" @click.stop>
                                 <Button
                                     size="icon-sm"
                                     variant="outline"
@@ -418,6 +420,8 @@
     } from '../../../coordinators/groupCoordinator';
     import { compareByMemberCount, compareByName } from '../../../shared/utils';
     import { groupRequest } from '../../../api';
+
+    const isWeb = typeof WEB !== 'undefined' && WEB;
     import { useOptionKeySelect } from '../../../composables/useOptionKeySelect';
     import { userDialogGroupSortingOptions } from '../../../shared/constants';
     import { moveGroupInOrder, normalizeGroupOrder } from '../../../shared/utils/groupOrder';
@@ -542,7 +546,7 @@
                 userDialog.value.userGroups.remainingGroups.unshift(group);
             }
         }
-        if (userId === currentUser.value.id) {
+        if (!isWeb && userId === currentUser.value.id) {
             userDialog.value.groupSorting = userDialogGroupSortingOptions.inGame;
         } else if (userDialog.value.groupSorting.value === userDialogGroupSortingOptions.inGame.value) {
             userDialog.value.groupSorting = userDialogGroupSortingOptions.alphabetical;

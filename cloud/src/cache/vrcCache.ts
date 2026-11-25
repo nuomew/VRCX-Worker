@@ -26,11 +26,129 @@ export interface RssSnapshotPayload {
     notificationsInserted: number;
     bioChecked: number;
     friendLogInserted?: number;
+    onlineFriendsTruncated?: boolean;
     onlineFriends: Array<Record<string, unknown>>;
 }
 
 const RSS_SNAPSHOT_PRIMARY_KEY = 'primary';
 const MAX_CACHE_BODY_BYTES = 512 * 1024; // Avoid stuffing oversized payloads into D1 rows
+const MAX_RSS_SNAPSHOT_JSON_BYTES = 1_400_000; // Keep well below D1's 2 MB single-row limit
+
+const RSS_FRIEND_CORE_KEYS = [
+    'id',
+    'displayName',
+    'location',
+    'worldId',
+    'instanceId',
+    'travelingToLocation',
+    'travelingToWorld',
+    'travelingToInstance',
+    'status',
+    'statusDescription',
+    'state',
+    'platform',
+    'last_platform',
+    'currentAvatarThumbnailImageUrl',
+    'currentAvatarImageUrl',
+    'userIcon',
+    'profilePicOverride',
+    'profilePicOverrideThumbnail',
+    'developerType',
+    'isFriend',
+    'friendKey',
+    'note',
+    'last_login',
+    'last_activity',
+    'date_joined'
+] as const;
+
+const RSS_FRIEND_MINIMAL_KEYS = [
+    'id',
+    'displayName',
+    'location',
+    'status',
+    'statusDescription',
+    'state',
+    'platform',
+    'currentAvatarThumbnailImageUrl',
+    'userIcon',
+    'profilePicOverride'
+] as const;
+
+export function compactRssOnlineFriendRecord(raw: Record<string, unknown>, includeSecondary = true): Record<string, unknown> {
+    const out: Record<string, unknown> = {};
+    for (const key of RSS_FRIEND_CORE_KEYS) {
+        if (raw[key] !== undefined) {
+            out[key] = raw[key];
+        }
+    }
+    if (includeSecondary) {
+        if (typeof raw.bio === 'string' && raw.bio) {
+            out.bio = raw.bio.length > 512 ? raw.bio.slice(0, 512) : raw.bio;
+        }
+        if (Array.isArray(raw.bioLinks) && raw.bioLinks.length > 0) {
+            out.bioLinks = raw.bioLinks
+                .filter((x): x is string => typeof x === 'string')
+                .slice(0, 5)
+                .map((s) => s.slice(0, 256));
+        }
+        if (Array.isArray(raw.tags) && raw.tags.length > 0) {
+            out.tags = raw.tags.filter((x): x is string => typeof x === 'string').slice(0, 32);
+        }
+    }
+    return out;
+}
+
+export function serializeBoundedRssSnapshot(snapshot: RssSnapshotPayload): string {
+    const encoder = new TextEncoder();
+    const rawFriends = Array.isArray(snapshot.onlineFriends) ? snapshot.onlineFriends : [];
+
+    // Tier 1: Compacted fields (drops unused VRChat bloat while preserving applyUser fidelity)
+    const compactPayload: RssSnapshotPayload = {
+        ...snapshot,
+        onlineFriends: rawFriends.map((f) => compactRssOnlineFriendRecord(f, true))
+    };
+    let serialized = JSON.stringify(compactPayload);
+    if (encoder.encode(serialized).byteLength <= MAX_RSS_SNAPSHOT_JSON_BYTES) {
+        return serialized;
+    }
+
+    // Tier 2: Drop bio/bioLinks/tags to fit very large online friend lists cleanly inside D1 row limit
+    const leanPayload: RssSnapshotPayload = {
+        ...snapshot,
+        onlineFriends: rawFriends.map((f) => compactRssOnlineFriendRecord(f, false))
+    };
+    serialized = JSON.stringify(leanPayload);
+    if (encoder.encode(serialized).byteLength <= MAX_RSS_SNAPSHOT_JSON_BYTES) {
+        return serialized;
+    }
+
+    // Tier 3: Minimal presence fields + progressive slice guardrail
+    let minimalFriends = rawFriends.map((f) => {
+        const out: Record<string, unknown> = {};
+        for (const key of RSS_FRIEND_MINIMAL_KEYS) {
+            if (f[key] !== undefined) out[key] = f[key];
+        }
+        return out;
+    });
+    while (minimalFriends.length > 0) {
+        const truncatedBySize = minimalFriends.length < rawFriends.length;
+        serialized = JSON.stringify({
+            ...snapshot,
+            onlineFriendsTruncated: Boolean(snapshot.onlineFriendsTruncated || truncatedBySize),
+            onlineFriends: minimalFriends
+        });
+        if (encoder.encode(serialized).byteLength <= MAX_RSS_SNAPSHOT_JSON_BYTES) {
+            return serialized;
+        }
+        minimalFriends = minimalFriends.slice(0, Math.floor(minimalFriends.length * 0.75));
+    }
+    return JSON.stringify({
+        ...snapshot,
+        onlineFriendsTruncated: Boolean(snapshot.onlineFriendsTruncated || rawFriends.length > 0),
+        onlineFriends: []
+    });
+}
 
 /**
  * Classifies read-only VRChat / status GET URLs into server-side DB_CACHE tiers & TTLs.
@@ -82,6 +200,14 @@ export function classifyVrcCacheUrl(
     ) {
         return { tier: 'favorites', ttlMs: Math.max(900, baseSyncSec) * 1000 };
     }
+    if (
+        p === '/api/1/worlds/recent' ||
+        p === '/api/1/worlds/active' ||
+        /^\/api\/1\/worlds\/[^/]+\/.+/.test(p) ||
+        /^\/api\/1\/groups\/[^/]+\/(instances|requests|invites|bans|members|auditLogs|posts|galleries)\b/.test(p)
+    ) {
+        return { tier: 'dynamic', ttlMs: Math.max(300, baseSyncSec) * 1000 };
+    }
     if (p.startsWith('/api/1/worlds/')) {
         return { tier: 'world', ttlMs: 6 * 3600 * 1000 };
     }
@@ -107,12 +233,13 @@ export function classifyVrcCacheUrl(
 }
 
 /**
- * Canonicalizes a URL by sorting query parameters alphabetically so Cron prewarm
- * and browser requests with differently ordered query strings share the same DB_CACHE key.
+ * Canonicalizes a URL by stripping hash fragments and sorting query parameters alphabetically
+ * so Cron prewarm and browser requests share the same DB_CACHE key.
  */
 export function normalizeVrcCacheKey(rawUrl: string): string {
     try {
         const parsed = new URL(rawUrl);
+        parsed.hash = '';
         parsed.searchParams.sort();
         return parsed.toString();
     } catch {
@@ -142,17 +269,29 @@ export async function getCachedVrcResponses(
 
     const byNorm = new Map<string, CachedVrcEntry>();
     const db = getCacheDb(env);
-    for (let i = 0; i < unique.length; i += 20) {
-        const chunk = unique.slice(i, i + 20);
+    // Batch all chunked IN queries (<=80 keys/stmt, under D1 100-param limit) into a single D1 subrequest.
+    const stmts: D1PreparedStatement[] = [];
+    for (let i = 0; i < unique.length; i += 80) {
+        const chunk = unique.slice(i, i + 80);
         const ph = chunk.map(() => '?').join(', ');
-        const res = await db
-            .prepare(
-                `SELECT cache_key, tier, status, body_text, expires_at
-                 FROM vrc_api_cache
-                 WHERE cache_key IN (${ph}) AND expires_at > ?`
-            )
-            .bind(...chunk, nowMs)
-            .all<{ cache_key: string; tier: VrcCacheTier; status: number; body_text: string; expires_at: number }>();
+        stmts.push(
+            db
+                .prepare(
+                    `SELECT cache_key, tier, status, body_text, expires_at
+                     FROM vrc_api_cache
+                     WHERE cache_key IN (${ph}) AND expires_at > ?`
+                )
+                .bind(...chunk, nowMs)
+        );
+    }
+    const batchResults = (await db.batch(stmts)) as D1Result<{
+        cache_key: string;
+        tier: VrcCacheTier;
+        status: number;
+        body_text: string;
+        expires_at: number;
+    }>[];
+    for (const res of batchResults) {
         for (const row of res.results ?? []) {
             byNorm.set(row.cache_key, {
                 cacheKey: row.cache_key,
@@ -172,22 +311,24 @@ export async function getCachedVrcResponses(
     return out;
 }
 
-/**
- * Upserts one or more successful VRChat API GET responses into dedicated DB_CACHE.
- */
-export async function putCachedVrcResponses(
+export function buildPutCachedVrcStatements(
     env: Env,
     entries: Array<{ url: string; tier: VrcCacheTier; status: number; bodyText: string; ttlMs: number }>,
     nowMs = Date.now()
-): Promise<void> {
+): D1PreparedStatement[] {
+    const encoder = new TextEncoder();
     const valid = entries.filter(
-        (e) => e.url && e.status >= 200 && e.status < 300 && e.bodyText.length <= MAX_CACHE_BODY_BYTES
+        (e) =>
+            e.url &&
+            e.status >= 200 &&
+            e.status < 300 &&
+            encoder.encode(e.bodyText).byteLength <= MAX_CACHE_BODY_BYTES
     );
-    if (valid.length === 0) return;
+    if (valid.length === 0) return [];
 
     const db = getCacheDb(env);
     const nowIso = new Date(nowMs).toISOString();
-    const stmts = valid.map((e) =>
+    return valid.map((e) =>
         db
             .prepare(
                 `INSERT INTO vrc_api_cache (cache_key, tier, status, body_text, updated_at, expires_at)
@@ -201,9 +342,29 @@ export async function putCachedVrcResponses(
             )
             .bind(normalizeVrcCacheKey(e.url), e.tier, e.status, e.bodyText, nowIso, nowMs + e.ttlMs)
     );
-    for (let i = 0; i < stmts.length; i += 20) {
-        await db.batch(stmts.slice(i, i + 20));
+}
+
+/**
+ * Upserts one or more successful VRChat API GET responses into dedicated DB_CACHE.
+ */
+export async function putCachedVrcResponses(
+    env: Env,
+    entries: Array<{ url: string; tier: VrcCacheTier; status: number; bodyText: string; ttlMs: number }>,
+    nowMs = Date.now()
+): Promise<void> {
+    const stmts = buildPutCachedVrcStatements(env, entries, nowMs);
+    if (stmts.length > 0) {
+        const db = getCacheDb(env);
+        await db.batch(stmts);
     }
+}
+
+function buildDeleteCacheByPrefix(db: D1Database, prefix: string): D1PreparedStatement {
+    // Prefix range scan on PRIMARY KEY (cache_key) avoids Cloudflare D1's 50-byte LIKE pattern length cap
+    // while using the B-tree index directly.
+    return db
+        .prepare('DELETE FROM vrc_api_cache WHERE cache_key >= ? AND cache_key < ?')
+        .bind(prefix, `${prefix}\uffff`);
 }
 
 /**
@@ -213,33 +374,107 @@ export async function putCachedVrcResponses(
 export async function invalidateVrcCacheOnWrite(env: Env, writeUrl: string): Promise<void> {
     let path = '';
     try {
-        path = new URL(writeUrl).pathname;
+        const u = new URL(writeUrl);
+        const host = u.hostname.toLowerCase();
+        // Only VRChat API writes may invalidate VRChat server-side cache entries.
+        if (host !== 'api.vrchat.cloud' && host !== 'vrchat.com' && !host.endsWith('.vrchat.com')) {
+            return;
+        }
+        path = u.pathname;
     } catch {
         return;
     }
     const db = getCacheDb(env);
     const stmts: D1PreparedStatement[] = [];
 
+    if (path === '/api/1/logout' || path === '/api/1/auth/user') {
+        await clearAllVrcCache(env);
+        return;
+    }
     if (path.startsWith('/api/1/favorites') || path.startsWith('/api/1/favorite/')) {
         stmts.push(db.prepare("DELETE FROM vrc_api_cache WHERE tier = 'favorites'"));
-    } else if (path.includes('/notifications')) {
+    }
+    if (path.includes('/notifications')) {
         stmts.push(db.prepare("DELETE FROM vrc_api_cache WHERE tier = 'notifications'"));
-    } else if (path.includes('/friend')) {
+    }
+    const isFriendWrite =
+        path.includes('/friend') ||
+        (path.startsWith('/api/1/auth/user/notifications/') && path.endsWith('/accept'));
+    if (isFriendWrite) {
         stmts.push(db.prepare("DELETE FROM vrc_api_cache WHERE tier IN ('friends_online', 'friends_offline')"));
-    } else {
+    }
+    if (path.startsWith('/api/1/prints')) {
+        stmts.push(buildDeleteCacheByPrefix(db, 'https://api.vrchat.cloud/api/1/prints'));
+    }
+    const singularUserMatch = path.match(/^\/api\/1\/user\/([^/]+)/);
+    const friendTargetMatch = path.match(/^\/api\/1\/auth\/user\/friends\/([^/]+)/);
+    const targetedUserId = singularUserMatch?.[1] ?? friendTargetMatch?.[1] ?? '';
+    if (targetedUserId) {
+        stmts.push(buildDeleteCacheByPrefix(db, `https://api.vrchat.cloud/api/1/users/${targetedUserId}`));
+        if (singularUserMatch) {
+            stmts.push(buildDeleteCacheByPrefix(db, `https://api.vrchat.cloud/api/1/user/${targetedUserId}`));
+        }
+    } else if (isFriendWrite) {
+        // Accepting a friend request notification lacks target userId in the URL; invalidate cached user profiles.
+        stmts.push(buildDeleteCacheByPrefix(db, 'https://api.vrchat.cloud/api/1/users/'));
+    }
+    const entityMatch = path.match(/^(\/api\/1\/(groups|worlds|avatars|users|file)\/[^/]+)/);
+    if (entityMatch) {
+        const entityPrefix = entityMatch[1]!;
+        const entityKind = entityMatch[2]!;
+        stmts.push(buildDeleteCacheByPrefix(db, `https://api.vrchat.cloud${entityPrefix}`));
+        if (entityKind === 'groups') {
+            stmts.push(
+                db
+                    .prepare(
+                        "DELETE FROM vrc_api_cache WHERE cache_key >= ? AND cache_key < ? AND INSTR(cache_key, '/groups') > 0"
+                    )
+                    .bind('https://api.vrchat.cloud/api/1/users/', 'https://api.vrchat.cloud/api/1/users/\uffff')
+            );
+        } else if (entityKind === 'avatars' && /\/select(?:Fallback)?\/?$/i.test(path)) {
+            stmts.push(buildDeleteCacheByPrefix(db, 'https://api.vrchat.cloud/api/1/users/'));
+        }
+    }
+    if (path.includes('playermoderat')) {
+        stmts.push(
+            buildDeleteCacheByPrefix(db, 'https://api.vrchat.cloud/api/1/auth/user/playermoderations'),
+            buildDeleteCacheByPrefix(db, 'https://api.vrchat.cloud/api/1/users/')
+        );
+    }
+    if (path.includes('avatarmoderat')) {
+        stmts.push(buildDeleteCacheByPrefix(db, 'https://api.vrchat.cloud/api/1/auth/user/avatarmoderations'));
+    }
+    if (path.startsWith('/api/1/inventory') || path.includes('/reward/redeem')) {
+        stmts.push(buildDeleteCacheByPrefix(db, 'https://api.vrchat.cloud/api/1/inventory'));
+    }
+    const instanceMatch = path.match(/^\/api\/1\/instances\/([^/]+)/);
+    if (instanceMatch) {
+        const locPart = instanceMatch[1]!;
+        const worldPart = locPart.split(':')[0] ?? '';
+        stmts.push(buildDeleteCacheByPrefix(db, `https://api.vrchat.cloud/api/1/instances/${locPart}`));
+        if (worldPart.startsWith('wrld_')) {
+            stmts.push(buildDeleteCacheByPrefix(db, `https://api.vrchat.cloud/api/1/worlds/${worldPart}`));
+        }
+    }
+    if (path.startsWith('/api/1/userNotes')) {
+        stmts.push(buildDeleteCacheByPrefix(db, 'https://api.vrchat.cloud/api/1/users/'));
+    }
+    if (stmts.length === 0) {
         stmts.push(db.prepare('DELETE FROM vrc_api_cache WHERE cache_key = ?').bind(normalizeVrcCacheKey(writeUrl)));
     }
-    if (stmts.length > 0) {
-        await db.batch(stmts);
-    }
+    await db.batch(stmts);
+}
+
+export function buildPruneExpiredVrcCacheStatement(env: Env, nowMs = Date.now()): D1PreparedStatement {
+    const db = getCacheDb(env);
+    return db.prepare('DELETE FROM vrc_api_cache WHERE expires_at <= ?').bind(nowMs);
 }
 
 /**
  * Deletes expired rows from DB_CACHE (indexed on expires_at) to keep storage lean within Free-tier 500 MB cap.
  */
 export async function pruneExpiredVrcCache(env: Env, nowMs = Date.now()): Promise<void> {
-    const db = getCacheDb(env);
-    await db.prepare('DELETE FROM vrc_api_cache WHERE expires_at <= ?').bind(nowMs).run();
+    await buildPruneExpiredVrcCacheStatement(env, nowMs).run();
 }
 
 /**
@@ -267,6 +502,7 @@ export async function readRssSnapshot(env: Env): Promise<RssSnapshotPayload | nu
             notificationsInserted: Number(parsed.notificationsInserted ?? 0),
             bioChecked: Number(parsed.bioChecked ?? 0),
             friendLogInserted: Number(parsed.friendLogInserted ?? 0),
+            onlineFriendsTruncated: Boolean(parsed.onlineFriendsTruncated),
             onlineFriends: Array.isArray(parsed.onlineFriends) ? parsed.onlineFriends : []
         };
     } catch {
@@ -274,16 +510,20 @@ export async function readRssSnapshot(env: Env): Promise<RssSnapshotPayload | nu
     }
 }
 
-export async function writeRssSnapshot(env: Env, snapshot: RssSnapshotPayload): Promise<void> {
+export function buildWriteRssSnapshotStatement(env: Env, snapshot: RssSnapshotPayload): D1PreparedStatement {
     const db = getCacheDb(env);
-    await db
+    return db
         .prepare(
             `INSERT INTO cloud_rss_snapshot (snapshot_key, payload_json, synced_at)
              VALUES (?, ?, ?)
              ON CONFLICT(snapshot_key) DO UPDATE SET
                 payload_json = excluded.payload_json,
-                synced_at = excluded.synced_at`
+                synced_at = excluded.synced_at
+             WHERE excluded.synced_at >= cloud_rss_snapshot.synced_at`
         )
-        .bind(RSS_SNAPSHOT_PRIMARY_KEY, JSON.stringify(snapshot), snapshot.syncedAt)
-        .run();
+        .bind(RSS_SNAPSHOT_PRIMARY_KEY, serializeBoundedRssSnapshot(snapshot), snapshot.syncedAt);
+}
+
+export async function writeRssSnapshot(env: Env, snapshot: RssSnapshotPayload): Promise<void> {
+    await buildWriteRssSnapshotStatement(env, snapshot).run();
 }

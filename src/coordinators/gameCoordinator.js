@@ -2,6 +2,7 @@ import { toast } from 'vue-sonner';
 
 import { deleteVRChatCache as _deleteVRChatCache, isRealInstance } from '../shared/utils';
 import { database } from '../services/database';
+import { setSuppressCloudGameLogWrites } from '../services/database/cloud/index.js';
 import { useAdvancedSettingsStore } from '../stores/settings/advanced';
 import { useAvatarStore } from '../stores/avatar';
 import { addAvatarWearTime } from './avatarCoordinator';
@@ -62,7 +63,17 @@ export async function runGameRunningChangedFlow(isGameRunning) {
         addAvatarWearTime(userStore.currentUser.currentAvatar);
     }
 
-    await runLastLocationResetFlow();
+    if (typeof WEB !== 'undefined' && WEB) {
+        // In Web mode, VRCX.Agent persists authoritative leave events and room durations directly to D1.
+        setSuppressCloudGameLogWrites(true);
+        try {
+            await runLastLocationResetFlow();
+        } finally {
+            setSuppressCloudGameLogWrites(false);
+        }
+    } else {
+        await runLastLocationResetFlow();
+    }
     gameLogStore.clearNowPlaying();
     gameLogStore.resetNowPlayingProducers();
     vrStore.updateVRLastLocation();

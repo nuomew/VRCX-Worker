@@ -34,7 +34,7 @@ jobs:
         shell: pwsh
         run: |
           $tag = if ("${{ github.event_name }}" -eq "workflow_dispatch") { "${{ inputs.tag }}" } else { "${{ github.ref_name }}" }
-          $ver = $tag.TrimStart('v')
+          $ver = $tag.TrimStart('v', 'V')
           if ($ver -notmatch '^\d+\.\d+\.\d+') { $ver = '1.10.6' }
           echo "tag=$tag" >> $env:GITHUB_OUTPUT
           echo "ver=$ver" >> $env:GITHUB_OUTPUT
@@ -118,6 +118,14 @@ jobs:
           $issPath = (Resolve-Path "VRCX-Agent\Installer\VRCX-Agent.iss").Path
           $iconPath = (Resolve-Path "images\VRCX.ico").Path
 
+          # Ensure UTF-8 BOM on .iss so Inno Setup parses Chinese [CustomMessages] cleanly on English runners
+          $issBytes = [System.IO.File]::ReadAllBytes($issPath)
+          if ($issBytes.Length -lt 3 -or $issBytes[0] -ne 0xEF -or $issBytes[1] -ne 0xBB -or $issBytes[2] -ne 0xBF) {
+            $issText = [System.Text.Encoding]::UTF8.GetString($issBytes)
+            $utf8Bom = New-Object System.Text.UTF8Encoding($true)
+            [System.IO.File]::WriteAllText($issPath, $issText, $utf8Bom)
+          }
+
           & $iscc `
             "/DAppVersion=$ver" `
             "/DSourceDir=$stage\standalone" `
@@ -185,6 +193,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          $ErrorActionPreference = "Stop"
           $tag = "${{ steps.meta.outputs.tag }}"
           $stage = "${{ steps.publish.outputs.stage }}"
           $setupExe = "${{ steps.publish.outputs.setup_exe }}"
@@ -195,10 +204,13 @@ jobs:
           gh release view $tag *> $null
           if ($LASTEXITCODE -eq 0) {
             gh release upload $tag $setupExe $standaloneZip $portableZip --clobber
+            if ($LASTEXITCODE -ne 0) { throw "gh release upload failed with exit code $LASTEXITCODE" }
             gh release edit $tag --title "VRCX.Agent $tag (Windows x64)" --notes-file $notes
+            if ($LASTEXITCODE -ne 0) { throw "gh release edit failed with exit code $LASTEXITCODE" }
           } else {
             gh release create $tag $setupExe $standaloneZip $portableZip `
               --title "VRCX.Agent $tag (Windows x64)" `
               --notes-file $notes `
               --target "${{ github.sha }}"
+            if ($LASTEXITCODE -ne 0) { throw "gh release create failed with exit code $LASTEXITCODE" }
           }

@@ -247,7 +247,8 @@
                                             class="cursor-pointer"
                                             @click="
                                                 showFullscreenImageDialog(
-                                                    `/api/media/screenshots/${encodeURIComponent(shot.id)}`
+                                                    `/api/media/screenshots/${encodeURIComponent(shot.id)}`,
+                                                    shot.local_filename || `${shot.id}.webp`
                                                 )
                                             ">
                                             <img
@@ -852,6 +853,7 @@
     const cloudScreenshotsLoading = ref(false);
     const cloudScreenshotsHasMore = ref(false);
     const copiedR2Var = ref(false);
+    let cloudGalleryReqSeq = 0;
 
     const groupedCloudScreenshots = computed(() =>
         groupCloudScreenshotsByDate(cloudScreenshots.value, locale.value, t('cloud_hub.gallery.unknown_date'))
@@ -861,14 +863,18 @@
         if (!isWeb) {
             return;
         }
+        const reqSeq = ++cloudGalleryReqSeq;
         cloudScreenshotsLoading.value = true;
         try {
             const { cloudFetch } = await import('../../ipc-web/apiClient');
             const rows = await cloudFetch(`/api/screenshots?limit=${CLOUD_GALLERY_PAGE_SIZE}`).catch(() => []);
+            if (reqSeq !== cloudGalleryReqSeq) return;
             cloudScreenshots.value = Array.isArray(rows) ? rows : [];
             cloudScreenshotsHasMore.value = cloudScreenshots.value.length >= CLOUD_GALLERY_PAGE_SIZE;
         } finally {
-            cloudScreenshotsLoading.value = false;
+            if (reqSeq === cloudGalleryReqSeq) {
+                cloudScreenshotsLoading.value = false;
+            }
         }
     }
 
@@ -881,6 +887,7 @@
             cloudScreenshotsHasMore.value = false;
             return;
         }
+        const reqSeq = ++cloudGalleryReqSeq;
         cloudScreenshotsLoading.value = true;
         try {
             const { cloudFetch } = await import('../../ipc-web/apiClient');
@@ -890,6 +897,7 @@
                 beforeId: String(last.id || '')
             });
             const rows = await cloudFetch(`/api/screenshots?${query.toString()}`).catch(() => []);
+            if (reqSeq !== cloudGalleryReqSeq) return;
             const nextList = Array.isArray(rows) ? rows : [];
             const seen = new Set(cloudScreenshots.value.map((s) => s.id));
             for (const item of nextList) {
@@ -900,7 +908,9 @@
             }
             cloudScreenshotsHasMore.value = nextList.length >= CLOUD_GALLERY_PAGE_SIZE;
         } finally {
-            cloudScreenshotsLoading.value = false;
+            if (reqSeq === cloudGalleryReqSeq) {
+                cloudScreenshotsLoading.value = false;
+            }
         }
     }
 
@@ -932,7 +942,7 @@
     });
 
     watch(activeTab, (tab) => {
-        if (isWeb && tab === 'cloud-gallery') {
+        if (isWeb && tab === 'cloud-gallery' && cloudScreenshots.value.length === 0 && !cloudScreenshotsLoading.value) {
             loadCloudScreenshots();
         }
     });
@@ -989,7 +999,7 @@
     onMounted(() => {
         galleryDialogVisible.value = true;
         loadGalleryData();
-        if (isWeb) {
+        if (isWeb && activeTab.value === 'cloud-gallery' && cloudScreenshots.value.length === 0) {
             loadCloudScreenshots();
         }
     });

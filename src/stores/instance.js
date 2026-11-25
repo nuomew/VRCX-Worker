@@ -1339,7 +1339,9 @@ export const useInstanceStore = defineStore('Instance', () => {
                     if (typeof ref !== 'undefined') {
                         pushUser(ref, profileRef);
                     } else {
-                        let { joinTime } = locationStore.lastLocation.playerList.get(player.userId);
+                        let joinTime =
+                            player.joinTime ??
+                            locationStore.lastLocation.playerList.get(player.userId || player.displayName)?.joinTime;
                         if (!joinTime) {
                             joinTime = Date.now();
                         }

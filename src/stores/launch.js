@@ -136,8 +136,18 @@ export const useLaunchStore = defineStore('Launch', () => {
         if (desktopMode) {
             args.push('--no-vr');
         }
+        const isWeb = typeof WEB !== 'undefined' && WEB;
         try {
-            if (vrcLaunchPathOverride && !LINUX) {
+            if (isWeb) {
+                const result = await AppApi.StartGame(args.join(' '));
+                if (!result) {
+                    toast.error(
+                        'No online Windows Companion Agent found. Connect VRCX.Agent in Cloud Hub or use Self Invite.'
+                    );
+                } else {
+                    toast.success('VRChat launched');
+                }
+            } else if (vrcLaunchPathOverride && !LINUX) {
                 const result = await AppApi.StartGameFromPath(vrcLaunchPathOverride, args.join(' '));
                 if (!result) {
                     toast.error('Failed to launch VRChat, invalid custom path set');

@@ -22,7 +22,7 @@ public sealed class LocalProcessMonitor
     private DateTimeOffset? _vrcStartedAtUtc;
     private DateTimeOffset? _steamVrStartedAtUtc;
     private long _cachedCacheBytes;
-    private DateTimeOffset _lastCacheScanAt = DateTimeOffset.MinValue;
+    private long _lastCacheScanAtMonoMs = long.MinValue;
 
     public sealed record ProcessStateSnapshot(
         bool IsVrcRunning,
@@ -58,6 +58,28 @@ public sealed class LocalProcessMonitor
         bool shouldAutoLaunch = false;
         string? autoLaunchDir = null;
         bool changed;
+        DateTimeOffset nowUtc = DateTimeOffset.UtcNow;
+
+        long nowMonoMs = Environment.TickCount64;
+        DateTimeOffset? prevVrcStartSnapshot;
+        DateTimeOffset? prevSteamStartSnapshot;
+        bool shouldScanCache;
+        lock (_lock)
+        {
+            prevVrcStartSnapshot = _vrcStartedAtUtc;
+            prevSteamStartSnapshot = _steamVrStartedAtUtc;
+            shouldScanCache = _lastCacheScanAtMonoMs == long.MinValue || (nowMonoMs - _lastCacheScanAtMonoMs) > 120_000L;
+            if (shouldScanCache)
+            {
+                // Reserve scan slot immediately so concurrent refreshes do not duplicate directory walks.
+                _lastCacheScanAtMonoMs = nowMonoMs;
+            }
+        }
+
+        // Probe OS process table and walk VRChat cache directory OUTSIDE _lock so tray UI reads never stall.
+        var (nextVrc, nextVrcStart) = ProbeProcessGroup(prevVrcStartSnapshot, nowUtc, "VRChat");
+        var (nextSteamVr, nextSteamStart) = ProbeProcessGroup(prevSteamStartSnapshot, nowUtc, "vrserver", "vrmonitor");
+        long? nextCacheBytes = shouldScanCache ? ComputeCacheSizeBytes(config.VrChatLogDirectory) : null;
 
         lock (_lock)
         {
@@ -65,15 +87,14 @@ public sealed class LocalProcessMonitor
             bool prevSteamVr = _steamVrRunning;
             DateTimeOffset? prevVrcStart = _vrcStartedAtUtc;
             DateTimeOffset? prevSteamStart = _steamVrStartedAtUtc;
-            DateTimeOffset nowUtc = DateTimeOffset.UtcNow;
 
-            (_vrcRunning, _vrcStartedAtUtc) = ProbeProcessGroup(_vrcStartedAtUtc, nowUtc, "VRChat");
-            (_steamVrRunning, _steamVrStartedAtUtc) = ProbeProcessGroup(_steamVrStartedAtUtc, nowUtc, "vrserver", "vrmonitor");
-
-            if ((nowUtc - _lastCacheScanAt) > TimeSpan.FromMinutes(2))
+            _vrcRunning = nextVrc;
+            _vrcStartedAtUtc = nextVrcStart;
+            _steamVrRunning = nextSteamVr;
+            _steamVrStartedAtUtc = nextSteamStart;
+            if (nextCacheBytes.HasValue)
             {
-                _lastCacheScanAt = nowUtc;
-                _cachedCacheBytes = ComputeCacheSizeBytes();
+                _cachedCacheBytes = nextCacheBytes.Value;
             }
 
             if (!prevVrc && _vrcRunning && config.AutoLaunchAppsEnabled)
@@ -159,17 +180,22 @@ public sealed class LocalProcessMonitor
         return running;
     }
 
-    private static long ComputeCacheSizeBytes()
+    private static long ComputeCacheSizeBytes(string? vrChatLogDirectory = null)
     {
         try
         {
-            string cacheDir = RemoteCommandExecutor.ResolveVrChatCacheDirectory();
+            string cacheDir = RemoteCommandExecutor.ResolveVrChatCacheDirectory(vrChatLogDirectory);
             if (string.IsNullOrEmpty(cacheDir) || !Directory.Exists(cacheDir))
             {
                 return 0;
             }
             long total = 0;
-            foreach (string file in Directory.EnumerateFiles(cacheDir, "*", SearchOption.AllDirectories))
+            var enumOpts = new EnumerationOptions
+            {
+                RecurseSubdirectories = true,
+                IgnoreInaccessible = true
+            };
+            foreach (string file in Directory.EnumerateFiles(cacheDir, "*", enumOpts))
             {
                 try
                 {
@@ -199,24 +225,29 @@ public sealed class LocalProcessMonitor
             return;
         }
 
-        foreach (string exePath in Directory.EnumerateFiles(dir, "*.exe", SearchOption.TopDirectoryOnly))
+        foreach (string launchPath in Directory.EnumerateFiles(dir, "*", SearchOption.TopDirectoryOnly))
         {
+            string ext = Path.GetExtension(launchPath);
+            bool isExe = string.Equals(ext, ".exe", StringComparison.OrdinalIgnoreCase);
+            bool isShortcut = string.Equals(ext, ".lnk", StringComparison.OrdinalIgnoreCase);
+            if (!isExe && !isShortcut) continue;
+
             try
             {
-                string procName = Path.GetFileNameWithoutExtension(exePath);
+                string procName = Path.GetFileNameWithoutExtension(launchPath);
                 if (IsProcessRunning(procName)) continue;
 
                 using Process? started = Process.Start(new ProcessStartInfo
                 {
-                    FileName = exePath,
-                    UseShellExecute = false,
-                    WorkingDirectory = Path.GetDirectoryName(exePath) ?? dir
+                    FileName = launchPath,
+                    UseShellExecute = isShortcut,
+                    WorkingDirectory = Path.GetDirectoryName(launchPath) ?? dir
                 });
                 Log.Info("Auto-launched companion app {App}", procName);
             }
             catch (Exception ex)
             {
-                Log.Warn(ex, "Failed to auto-launch {Path}", exePath);
+                Log.Warn(ex, "Failed to auto-launch {Path}", launchPath);
             }
         }
     }

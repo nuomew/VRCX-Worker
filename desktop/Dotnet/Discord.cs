@@ -14,7 +14,8 @@ namespace VRCX
         private readonly RichPresence _presence;
         private DiscordRpcClient _client;
         private readonly Timer _timer;
-        private bool _active;
+        private volatile bool _active;
+        private volatile bool _exited;
         private string _discordAppId;
         private const string VrcxUrl = "https://vrcx.app";
 
@@ -32,15 +33,22 @@ namespace VRCX
 
         public void Init()
         {
-            _timer.Change(0, 3000);
+            lock (this)
+            {
+                _exited = false;
+                _timer.Change(0, 3000);
+            }
         }
 
         public void Exit()
         {
             lock (this)
             {
+                _exited = true;
+                _active = false;
                 _timer.Change(-1, -1);
                 _client?.Dispose();
+                _client = null;
             }
         }
 
@@ -61,7 +69,10 @@ namespace VRCX
 
         private void Update()
         {
-            if (_client == null && _active)
+            if (_exited)
+                return;
+
+            if (_client == null && _active && !string.IsNullOrWhiteSpace(_discordAppId))
             {
                 _client = new DiscordRpcClient(_discordAppId);
                 _client.OnReady += (sender, e) =>
@@ -114,20 +125,27 @@ namespace VRCX
             return _active;
         }
 
-        // https://stackoverflow.com/questions/1225052/best-way-to-shorten-utf8-string-based-on-byte-length
-        private static string LimitByteLength(string str, int maxBytesLength)
+        internal static string LimitByteLength(string str, int maxBytesLength)
         {
-            if (str == null)
+            if (string.IsNullOrEmpty(str) || maxBytesLength <= 0)
                 return string.Empty;
-            var bytesArr = Encoding.UTF8.GetBytes(str);
-            var bytesToRemove = 0;
-            var lastIndexInString = str.Length - 1;
-            while (bytesArr.Length - bytesToRemove > maxBytesLength)
+            if (Encoding.UTF8.GetByteCount(str) <= maxBytesLength)
+                return str;
+
+            var sb = new StringBuilder(str.Length);
+            int usedBytes = 0;
+            int i = 0;
+            while (i < str.Length)
             {
-                bytesToRemove += Encoding.UTF8.GetByteCount(new char[] { str[lastIndexInString] });
-                --lastIndexInString;
+                int charLen = char.IsSurrogatePair(str, i) ? 2 : 1;
+                int chunkBytes = Encoding.UTF8.GetByteCount(str, i, charLen);
+                if (usedBytes + chunkBytes > maxBytesLength)
+                    break;
+                sb.Append(str, i, charLen);
+                usedBytes += chunkBytes;
+                i += charLen;
             }
-            return Encoding.UTF8.GetString(bytesArr, 0, bytesArr.Length - bytesToRemove);
+            return sb.ToString();
         }
 
         public void SetAssets(
@@ -154,72 +172,78 @@ namespace VRCX
             int statusDisplayType)
         {
             bool appIdChanged = false;
+            string effectiveAppId = string.IsNullOrEmpty(appId) ? (_discordAppId ?? "883308884863901717") : appId;
             _lock.EnterWriteLock();
             try
             {
+                appIdChanged = _discordAppId != effectiveAppId;
+                _presence.Details = LimitByteLength(details, 127);
+                _presence.DetailsUrl = !string.IsNullOrEmpty(detailsUrl) ? detailsUrl : null;
+                // _presence.StateUrl
+                _presence.State = LimitByteLength(state, 127);
+
                 if (string.IsNullOrEmpty(largeKey) &&
                     string.IsNullOrEmpty(smallKey))
                 {
                     _presence.Assets = null;
                     _presence.Party = null;
                     _presence.Timestamps = null;
-                    return;
-                }
-
-                _presence.Details = LimitByteLength(details, 127);
-                _presence.DetailsUrl = !string.IsNullOrEmpty(detailsUrl) ? detailsUrl : null;
-                // _presence.StateUrl
-                _presence.State = LimitByteLength(state, 127);
-                _presence.Assets ??= new Assets();
-
-                _presence.Assets.LargeImageKey = largeKey;
-                _presence.Assets.LargeImageText = largeText;
-                _presence.Assets.LargeImageUrl = VrcxUrl;
-
-                _presence.Assets.SmallImageKey = smallKey;
-                _presence.Assets.SmallImageText = smallText;
-                // m_Presence.Assets.SmallImageUrl
-
-                if (startUnixMilliseconds == 0)
-                {
-                    _presence.Timestamps = null;
                 }
                 else
                 {
-                    _presence.Timestamps ??= new Timestamps();
-                    _presence.Timestamps.StartUnixMilliseconds = (ulong)startUnixMilliseconds;
-                    if (endUnixMilliseconds == 0)
-                        _presence.Timestamps.End = null;
+                    _presence.Assets ??= new Assets();
+
+                    _presence.Assets.LargeImageKey = largeKey;
+                    _presence.Assets.LargeImageText = LimitByteLength(largeText, 127);
+                    _presence.Assets.LargeImageUrl = VrcxUrl;
+
+                    _presence.Assets.SmallImageKey = smallKey;
+                    _presence.Assets.SmallImageText = LimitByteLength(smallText, 127);
+                    // m_Presence.Assets.SmallImageUrl
+
+                    if (startUnixMilliseconds == 0)
+                    {
+                        _presence.Timestamps = null;
+                    }
                     else
-                        _presence.Timestamps.EndUnixMilliseconds = (ulong)endUnixMilliseconds;
-                }
+                    {
+                        _presence.Timestamps ??= new Timestamps();
+                        _presence.Timestamps.StartUnixMilliseconds = (ulong)startUnixMilliseconds;
+                        if (endUnixMilliseconds == 0)
+                            _presence.Timestamps.End = null;
+                        else
+                            _presence.Timestamps.EndUnixMilliseconds = (ulong)endUnixMilliseconds;
+                    }
 
-                if (partyMax == 0)
-                {
-                    _presence.Party = null;
-                }
-                else
-                {
-                    _presence.Party ??= new Party();
-                    _presence.Party.ID = partyId;
-                    _presence.Party.Size = partySize;
-                    _presence.Party.Max = partyMax;
+                    if (partyMax == 0)
+                    {
+                        _presence.Party = null;
+                    }
+                    else
+                    {
+                        _presence.Party ??= new Party();
+                        _presence.Party.ID = partyId;
+                        _presence.Party.Size = partySize;
+                        _presence.Party.Max = partyMax;
+                    }
                 }
 
                 _presence.Type = (ActivityType)activityType;
                 _presence.StatusDisplay = (StatusDisplayType)statusDisplayType;
 
                 Button[] buttons = [];
-                if (!string.IsNullOrEmpty(buttonUrl))
+                if (!string.IsNullOrEmpty(buttonUrl) && !string.IsNullOrWhiteSpace(buttonText))
                 {
-                    buttons =
-                    [
-                        new Button { Label = buttonText, Url = buttonUrl }
-                    ];
+                    string safeLabel = LimitByteLength(buttonText, 32);
+                    if (!string.IsNullOrWhiteSpace(safeLabel))
+                    {
+                        buttons =
+                        [
+                            new Button { Label = safeLabel, Url = buttonUrl }
+                        ];
+                    }
                 }
                 _presence.Buttons = buttons;
-
-                appIdChanged = _discordAppId != appId;
             }
             catch (Exception ex)
             {
@@ -236,9 +260,9 @@ namespace VRCX
                 // so _client disposal/recreation never races with the 3-second presence timer.
                 lock (this)
                 {
-                    if (_discordAppId != appId)
+                    if (_discordAppId != effectiveAppId)
                     {
-                        _discordAppId = appId;
+                        _discordAppId = effectiveAppId;
                         if (_client != null)
                         {
                             _client.Dispose();

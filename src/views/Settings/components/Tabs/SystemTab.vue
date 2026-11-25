@@ -204,7 +204,7 @@
                 <p class="m-0">{{ t('view.settings.general.legal_notice.disclaimer2') }}</p>
             </div>
 
-            <SettingsItem :label="t('view.settings.general.legal_notice.open_source_software_notice')">
+            <SettingsItem v-if="!isWeb" :label="t('view.settings.general.legal_notice.open_source_software_notice')">
                 <Button size="sm" variant="outline" @click="openOSSDialog">{{
                     t('view.settings.general.legal_notice.open_source_software_notice')
                 }}</Button>

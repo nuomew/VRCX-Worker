@@ -1,7 +1,9 @@
-import { cloudFetch } from './apiClient.js';
+import { cloudFetch, onCloudUnauthorized } from './apiClient.js';
+import { normalizeUploadImageInBrowser } from './appApiWeb.js';
 import { clampWebSyncIntervalSeconds, cloudState } from './cloudState.js';
 
 const MAX_CACHE_ENTRIES = 800;
+const MAX_CACHE_ENTRY_CHARS = 256 * 1024; // Avoid retaining multi-MB image Data URLs or oversized payloads in browser RAM
 const MAX_BATCH_SIZE = 12;
 
 /**
@@ -60,6 +62,14 @@ function classifyThrottleableReadGet(options) {
         p.startsWith('/api/1/avatars/favorites')
     ) {
         return 'entity';
+    }
+    if (
+        p === '/api/1/worlds/recent' ||
+        p === '/api/1/worlds/active' ||
+        /^\/api\/1\/worlds\/[^/]+\/.+/.test(p) ||
+        /^\/api\/1\/groups\/[^/]+\/(instances|requests|invites|bans|members|auditLogs|posts|galleries)\b/.test(p)
+    ) {
+        return 'dynamic';
     }
     if (
         p.startsWith('/api/1/worlds/') ||
@@ -133,11 +143,109 @@ export function createWebApiBridge() {
     function clearReadCache() {
         writeGeneration++;
         getCache.clear();
+        inflightGets.clear();
+    }
+
+    onCloudUnauthorized(clearReadCache);
+
+    function extractEntityPrefix(pathname) {
+        const match = String(pathname || '').match(/^(\/api\/1\/(?:groups|worlds|avatars|users|file)\/[^/]+)/);
+        return match ? match[1] : '';
+    }
+
+    function extractTargetedUserId(pathname) {
+        const p = String(pathname || '');
+        const singular = p.match(/^\/api\/1\/user\/([^/]+)/);
+        if (singular) return singular[1];
+        const friendTarget = p.match(/^\/api\/1\/auth\/user\/friends\/([^/]+)/);
+        if (friendTarget) return friendTarget[1];
+        return '';
+    }
+
+    function shouldInvalidateUrlKey(key, tier, writePath, flags) {
+        if (tier === 'volatile') return true;
+        let keyPath = '';
+        try {
+            keyPath = new URL(key).pathname;
+        } catch {
+            keyPath = key;
+        }
+        if (
+            flags.isFavoriteWrite &&
+            (keyPath.startsWith('/api/1/favorites') ||
+                keyPath.startsWith('/api/1/favorite/') ||
+                keyPath.startsWith('/api/1/worlds/favorites') ||
+                keyPath.startsWith('/api/1/avatars/favorites'))
+        ) {
+            return true;
+        }
+        if (flags.isFriendWrite && keyPath.startsWith('/api/1/auth/user/friends')) {
+            return true;
+        }
+        if (
+            flags.targetedUserId &&
+            (keyPath === `/api/1/users/${flags.targetedUserId}` ||
+                keyPath.startsWith(`/api/1/users/${flags.targetedUserId}/`) ||
+                keyPath === `/api/1/user/${flags.targetedUserId}` ||
+                keyPath.startsWith(`/api/1/user/${flags.targetedUserId}/`))
+        ) {
+            return true;
+        }
+        if (flags.isFriendWrite && !flags.targetedUserId && keyPath.startsWith('/api/1/users/')) {
+            return true;
+        }
+        if (
+            flags.isNotificationWrite &&
+            (keyPath.startsWith('/api/1/notifications') || keyPath.startsWith('/api/1/auth/user/notifications'))
+        ) {
+            return true;
+        }
+        if (flags.isPrintWrite && keyPath.startsWith('/api/1/prints')) {
+            return true;
+        }
+        if (
+            flags.entityPrefix &&
+            (keyPath === flags.entityPrefix || keyPath.startsWith(`${flags.entityPrefix}/`))
+        ) {
+            return true;
+        }
+        if (flags.isGroupWrite && /^\/api\/1\/users\/[^/]+\/groups(?:\/|$)/.test(keyPath)) {
+            return true;
+        }
+        if (flags.isAvatarSelectWrite && keyPath.startsWith('/api/1/users/')) {
+            return true;
+        }
+        if (
+            flags.isPlayerModerationWrite &&
+            (keyPath.startsWith('/api/1/auth/user/playermoderations') || keyPath.startsWith('/api/1/users/'))
+        ) {
+            return true;
+        }
+        if (flags.isAvatarModerationWrite && keyPath.startsWith('/api/1/auth/user/avatarmoderations')) {
+            return true;
+        }
+        if (flags.isInventoryWrite && keyPath.startsWith('/api/1/inventory')) {
+            return true;
+        }
+        if (flags.instanceWorldPrefix && keyPath.startsWith(flags.instanceWorldPrefix)) {
+            return true;
+        }
+        if (flags.isUserNoteWrite && keyPath.startsWith('/api/1/users/')) {
+            return true;
+        }
+        if (tier === 'dynamic' && (key.includes(writePath) || writePath.startsWith('/api/1/instances/'))) {
+            return true;
+        }
+        if (tier === 'entity' && key.includes(writePath)) {
+            return true;
+        }
+        return false;
     }
 
     /**
      * Invalidates volatile lists and mutated domain collections (favorites, friends including offline=true,
-     * notifications, prints) while preserving unrelated static/entity caches.
+     * notifications, prints, and entity sub-resources) while preserving unrelated static/entity caches.
+     * Also clears matching in-flight GET dedupe entries so subsequent reads never reuse stale pre-write requests.
      *
      * @param {string} writeUrl
      */
@@ -150,58 +258,47 @@ export function createWebApiBridge() {
             clearReadCache();
             return;
         }
-        const isFavoriteWrite = writePath.startsWith('/api/1/favorites') || writePath.startsWith('/api/1/favorite/');
-        const isFriendWrite = writePath.includes('/friend');
-        const isNotificationWrite = writePath.includes('/notifications');
-        const isPrintWrite = writePath.startsWith('/api/1/prints');
+        const instanceMatch = writePath.match(/^\/api\/1\/instances\/([^/]+)/);
+        const instanceWorldId = instanceMatch?.[1]?.split(':')[0] || '';
+        const flags = {
+            isFavoriteWrite: writePath.startsWith('/api/1/favorites') || writePath.startsWith('/api/1/favorite/'),
+            isFriendWrite:
+                writePath.includes('/friend') ||
+                (writePath.startsWith('/api/1/auth/user/notifications/') && writePath.endsWith('/accept')),
+            isNotificationWrite: writePath.includes('/notifications'),
+            isPrintWrite: writePath.startsWith('/api/1/prints'),
+            entityPrefix: extractEntityPrefix(writePath),
+            targetedUserId: extractTargetedUserId(writePath),
+            isGroupWrite: writePath.startsWith('/api/1/groups/'),
+            isAvatarSelectWrite: /^\/api\/1\/avatars\/[^/]+\/select(?:Fallback)?\/?$/i.test(writePath),
+            isPlayerModerationWrite: writePath.includes('playermoderat'),
+            isAvatarModerationWrite: writePath.includes('avatarmoderat'),
+            isInventoryWrite: writePath.startsWith('/api/1/inventory') || writePath.includes('/reward/redeem'),
+            instanceWorldPrefix: instanceWorldId.startsWith('wrld_') ? `/api/1/worlds/${instanceWorldId}` : '',
+            isUserNoteWrite: writePath.startsWith('/api/1/userNotes')
+        };
 
         for (const [key, entry] of getCache.entries()) {
-            if (entry.tier === 'volatile') {
+            if (shouldInvalidateUrlKey(key, entry.tier, writePath, flags)) {
                 getCache.delete(key);
-                continue;
             }
-            let keyPath = '';
-            try {
-                keyPath = new URL(key).pathname;
-            } catch {
-                keyPath = key;
-            }
-            if (
-                isFavoriteWrite &&
-                (keyPath.startsWith('/api/1/favorites') ||
-                    keyPath.startsWith('/api/1/favorite/') ||
-                    keyPath.startsWith('/api/1/worlds/favorites') ||
-                    keyPath.startsWith('/api/1/avatars/favorites'))
-            ) {
-                getCache.delete(key);
-                continue;
-            }
-            if (isFriendWrite && keyPath.startsWith('/api/1/auth/user/friends')) {
-                getCache.delete(key);
-                continue;
-            }
-            if (
-                isNotificationWrite &&
-                (keyPath.startsWith('/api/1/notifications') || keyPath.startsWith('/api/1/auth/user/notifications'))
-            ) {
-                getCache.delete(key);
-                continue;
-            }
-            if (isPrintWrite && keyPath.startsWith('/api/1/prints')) {
-                getCache.delete(key);
-                continue;
-            }
-            if (entry.tier === 'dynamic' && (key.includes(writePath) || writePath.startsWith('/api/1/instances/'))) {
-                getCache.delete(key);
-                continue;
-            }
-            if (entry.tier === 'entity' && key.includes(writePath)) {
-                getCache.delete(key);
+        }
+        for (const key of inflightGets.keys()) {
+            const tier = classifyThrottleableReadGet({ url: key, method: 'GET' });
+            if (shouldInvalidateUrlKey(key, tier, writePath, flags)) {
+                inflightGets.delete(key);
             }
         }
     }
 
-    function setCachedResponse(url, responseJson, tier) {
+    function setCachedResponse(url, responseJson, tier, rawMessage = '') {
+        if (
+            !responseJson ||
+            responseJson.length > MAX_CACHE_ENTRY_CHARS ||
+            (typeof rawMessage === 'string' && rawMessage.startsWith('data:'))
+        ) {
+            return;
+        }
         if (getCache.size >= MAX_CACHE_ENTRIES) {
             const firstKey = getCache.keys().next().value;
             if (firstKey !== undefined) {
@@ -241,7 +338,7 @@ export function createWebApiBridge() {
                 message: data?.data ?? ''
             });
             if (cacheTier && status >= 200 && status < 300 && startGen === writeGeneration) {
-                setCachedResponse(cacheKey, serialized, cacheTier);
+                setCachedResponse(cacheKey, serialized, cacheTier, data?.data ?? '');
             }
             return serialized;
         } catch (err) {
@@ -283,7 +380,8 @@ export function createWebApiBridge() {
                     requests: chunk.map((c) => ({
                         url: c.options.url,
                         method: 'GET',
-                        headers: c.options.headers
+                        headers: c.options.headers,
+                        ...(c.options.bypassCache ? { bypassCache: true } : {})
                     }))
                 }
             })
@@ -304,7 +402,7 @@ export function createWebApiBridge() {
                             message: r.error ? String(r.error) : (r.data ?? '')
                         });
                         if (status >= 200 && status < 300 && item.startGen === writeGeneration) {
-                            setCachedResponse(item.cacheKey, serialized, item.tier);
+                            setCachedResponse(item.cacheKey, serialized, item.tier, r.data ?? '');
                         }
                         item.resolve(serialized);
                     });
@@ -359,13 +457,35 @@ export function createWebApiBridge() {
                 options?.uploadImagePrint ||
                 options?.uploadPrintImage
             );
-            if (method !== 'GET' || isUpload) {
-                invalidateCacheForWrite(String(options?.url || ''));
+            const isWriteOp = method !== 'GET' || isUpload;
+            const writeUrl = isWriteOp ? String(options?.url || '') : '';
+            if (isWriteOp) {
+                invalidateCacheForWrite(writeUrl);
             }
 
+            // Normalize browser multipart image uploads (Gallery/Icon/Emoji/Sticker/Print/Invite) to VRChat-compliant PNG.
+            if (
+                (options?.uploadImage ||
+                    options?.uploadImageLegacy ||
+                    options?.uploadImagePrint ||
+                    options?.uploadPrintImage) &&
+                typeof options?.imageData === 'string' &&
+                options.imageData
+            ) {
+                options = {
+                    ...options,
+                    imageData: await normalizeUploadImageInBrowser(options.imageData, {
+                        matchingDimensions: Boolean(options.matchingDimensions),
+                        isPrint: Boolean(options.uploadImagePrint || options.uploadPrintImage),
+                        cropWhiteBorder: Boolean(options.cropWhiteBorder)
+                    })
+                };
+            }
+
+            const bypassCache = Boolean(options?.bypassCache);
             const cacheTier = classifyThrottleableReadGet(options);
             const cacheKey = cacheTier ? String(options.url) : '';
-            if (cacheTier) {
+            if (cacheTier && !bypassCache) {
                 const cached = getCache.get(cacheKey);
                 if (cached && cached.expiresAt > Date.now()) {
                     return cached.responseJson;
@@ -390,12 +510,19 @@ export function createWebApiBridge() {
                 execPromise = executeSingleRequest(options, cacheTier, cacheKey, startGen);
             }
 
-            if (cacheTier) {
+            if (cacheTier && !bypassCache) {
                 const tracked = execPromise.finally(() => {
-                    inflightGets.delete(cacheKey);
+                    if (inflightGets.get(cacheKey) === tracked) {
+                        inflightGets.delete(cacheKey);
+                    }
                 });
                 inflightGets.set(cacheKey, tracked);
                 return tracked;
+            }
+            if (isWriteOp) {
+                return execPromise.finally(() => {
+                    invalidateCacheForWrite(writeUrl);
+                });
             }
             return execPromise;
         },

@@ -14,6 +14,7 @@ import { applyCurrentUser } from './userCoordinator';
 import { watchState } from '../services/watchState';
 
 import configRepository from '../services/config';
+import { resetCloudRssSyncState } from '../ipc-web/cloudRssSync.js';
 import { resetCloudDatabaseState } from '../services/database/cloud/index.js';
 import webApiService from '../services/webapi';
 
@@ -40,15 +41,28 @@ export async function runLogoutFlow() {
     watchState.isFriendsLoaded = false;
     watchState.isFavoritesLoaded = false;
     notificationStore.setNotificationInitStatus(false);
-    await authStore.updateStoredUser(userStore.currentUser);
-    webApiService.clearCookies();
+    try {
+        await authStore.updateStoredUser(userStore.currentUser);
+    } catch (err) {
+        console.warn('[auth] Failed to update stored user during logout:', err);
+    }
+    try {
+        await webApiService.clearCookies();
+    } catch (err) {
+        console.warn('[auth] Failed to clear cookies during logout:', err);
+    }
     authStore.loginForm.lastUserLoggedIn = '';
-    await configRepository.remove('lastUserLoggedIn');
+    try {
+        await configRepository.remove('lastUserLoggedIn');
+    } catch (err) {
+        console.warn('[auth] Failed to clear lastUserLoggedIn during logout:', err);
+    }
     authStore.setAttemptingAutoLogin(false);
     authStore.autoLoginAttempts.clear();
     closeWebSocket();
     queryClient.clear();
     if (typeof WEB !== 'undefined' && WEB) {
+        resetCloudRssSyncState();
         resetCloudDatabaseState();
     }
 }

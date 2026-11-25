@@ -878,7 +878,8 @@ export const useNotificationStore = defineStore('Notification', () => {
         const playNotificationTTS = notiConditions[notificationsSettingsStore.notificationTTS]?.();
         const playDesktopToast = notiConditions[notificationsSettingsStore.desktopToast]?.() || notiConditions['AFK']();
 
-        const playOverlayToast = notiConditions[notificationsSettingsStore.overlayToast]?.();
+        const isWebMode = typeof WEB !== 'undefined' && WEB;
+        const playOverlayToast = !isWebMode && notiConditions[notificationsSettingsStore.overlayToast]?.();
         const playOverlayNotification = notificationsSettingsStore.overlayNotifications && playOverlayToast;
         const playXSNotification = notificationsSettingsStore.xsNotifications && playOverlayToast;
         const playOvrtHudNotifications = notificationsSettingsStore.ovrtHudNotifications && playOverlayToast;

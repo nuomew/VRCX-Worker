@@ -61,7 +61,7 @@ public sealed class HttpSyncClient
         return (selected, selected.Count);
     }
 
-    private static GameLogEventItem TruncateOversizedEvent(GameLogEventItem source)
+    public static GameLogEventItem TruncateOversizedEvent(GameLogEventItem source, int maxDataChars = 4096)
     {
         static string? Clamp(string? value, int maxChars)
         {
@@ -69,6 +69,7 @@ public sealed class HttpSyncClient
             return value.Substring(0, maxChars);
         }
 
+        int safeDataMax = Math.Clamp(maxDataChars, 128, 4096);
         return new GameLogEventItem
         {
             Type = source.Type,
@@ -80,10 +81,10 @@ public sealed class HttpSyncClient
             DisplayName = Clamp(source.DisplayName, 256),
             UserId = Clamp(source.UserId, 128),
             Time = source.Time,
-            VideoUrl = Clamp(source.VideoUrl, 2048),
+            VideoUrl = Clamp(source.VideoUrl, Math.Min(2048, safeDataMax)),
             VideoName = Clamp(source.VideoName, 512),
             VideoId = Clamp(source.VideoId, 128),
-            Data = Clamp(source.Data, 4096)
+            Data = Clamp(source.Data, safeDataMax)
         };
     }
 
@@ -103,6 +104,44 @@ public sealed class HttpSyncClient
     /// Validates Cloud URL + Sync Secret + selected proxy mode by sending a lightweight empty sync request
     /// and returns the authoritative Web sync schedule from the server.
     /// </summary>
+    /// <summary>
+    /// Validates and normalizes a Cloud Worker base URL, stripping any hash-router `#fragment`
+    /// (e.g. `/#/settings` copied from the Web UI address bar) or `?query` before endpoint concatenation.
+    /// </summary>
+    public static bool TryNormalizeCloudUrl(string? rawUrl, out string normalizedUrl)
+    {
+        normalizedUrl = string.Empty;
+        string trimmed = (rawUrl ?? string.Empty).Trim();
+        if (!Uri.TryCreate(trimmed, UriKind.Absolute, out Uri? uri) ||
+            (uri.Scheme != Uri.UriSchemeHttps && uri.Scheme != Uri.UriSchemeHttp) ||
+            string.IsNullOrWhiteSpace(uri.Host) ||
+            !string.IsNullOrEmpty(uri.UserInfo))
+        {
+            return false;
+        }
+
+        try
+        {
+            var builder = new UriBuilder(uri)
+            {
+                Query = string.Empty,
+                Fragment = string.Empty
+            };
+            if ((builder.Scheme.Equals(Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase) && builder.Port == 443) ||
+                (builder.Scheme.Equals(Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase) && builder.Port == 80))
+            {
+                builder.Port = -1;
+            }
+            normalizedUrl = builder.Uri.AbsoluteUri.TrimEnd('/');
+            return !string.IsNullOrEmpty(normalizedUrl);
+        }
+        catch (UriFormatException)
+        {
+            normalizedUrl = string.Empty;
+            return false;
+        }
+    }
+
     public async Task<(bool Ok, string Message, AgentSyncResponse? Response)> TestConnectionAsync(
         string cloudUrl,
         string syncSecret,
@@ -112,11 +151,15 @@ public sealed class HttpSyncClient
         string proxyAddress,
         CancellationToken ct)
     {
-        string normalizedUrl = (cloudUrl ?? string.Empty).Trim().TrimEnd('/');
-        if (!Uri.TryCreate(normalizedUrl, UriKind.Absolute, out Uri? uri) ||
-            (uri.Scheme != Uri.UriSchemeHttps && uri.Scheme != Uri.UriSchemeHttp))
+        if (!TryNormalizeCloudUrl(cloudUrl, out string normalizedUrl))
         {
             return (false, AgentStrings.InvalidCloudUrlMessage, null);
+        }
+
+        string trimmedSecret = (syncSecret ?? string.Empty).Trim();
+        if (!HmacSigner.IsValidSyncSecret(trimmedSecret))
+        {
+            return (false, AgentStrings.InvalidSyncSecretMessage, null);
         }
 
         if (proxyEnabled)
@@ -131,7 +174,7 @@ public sealed class HttpSyncClient
         var probeCfg = new AgentConfig
         {
             CloudUrl = normalizedUrl,
-            SyncSecret = (syncSecret ?? string.Empty).Trim(),
+            SyncSecret = trimmedSecret,
             DeviceId = deviceId,
             DeviceName = (deviceName ?? string.Empty).Trim(),
             ProxyEnabled = proxyEnabled,
@@ -143,16 +186,31 @@ public sealed class HttpSyncClient
             AgentSyncResponse res;
             if (_usesInjectedClient)
             {
-                res = await SyncOnceAsync(probeCfg, Array.Empty<GameLogEventItem>(), null, null, ct).ConfigureAwait(false);
+                res = await SyncOnceAsync(probeCfg, Array.Empty<GameLogEventItem>(), null, null, ct, probeOnly: true).ConfigureAwait(false);
             }
             else
             {
-                using HttpClient probeHttp = ProxyHttpClientFactory.CreateHttpClient(probeCfg, TimeSpan.FromSeconds(15));
+                using HttpClient probeHttp = ProxyHttpClientFactory.CreateHttpClient(
+                    probeCfg,
+                    timeout: TimeSpan.FromSeconds(20),
+                    connectTimeout: TimeSpan.FromSeconds(20));
                 var probeClient = new HttpSyncClient(probeHttp);
-                res = await probeClient.SyncOnceAsync(probeCfg, Array.Empty<GameLogEventItem>(), null, null, ct).ConfigureAwait(false);
+                res = await probeClient.SyncOnceAsync(probeCfg, Array.Empty<GameLogEventItem>(), null, null, ct, probeOnly: true).ConfigureAwait(false);
             }
             int webInterval = SyncScheduleGate.ClampInterval(res.SyncIntervalSeconds);
             return (true, AgentStrings.FormatTestConnected(res.DeviceName, webInterval), res);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (OperationCanceledException)
+        {
+            return (false, AgentStrings.ConnectionTestTimeoutMessage, null);
+        }
+        catch (TimeoutException)
+        {
+            return (false, AgentStrings.ConnectionTestTimeoutMessage, null);
         }
         catch (HttpRequestException ex)
         {
@@ -173,19 +231,24 @@ public sealed class HttpSyncClient
         IReadOnlyList<GameLogEventItem> events,
         LogCursorState? cursor,
         LiveAgentState? state,
-        CancellationToken ct)
+        CancellationToken ct,
+        bool probeOnly = false)
     {
-        if (!config.IsConfigured)
+        if (!config.IsConfigured || !TryNormalizeCloudUrl(config.CloudUrl, out string normalizedBaseUrl))
         {
             throw new InvalidOperationException("Cloud URL is not configured.");
         }
 
-        string endpoint = config.CloudUrl.Trim().TrimEnd('/') + "/api/agent/sync";
+        string endpoint = normalizedBaseUrl + "/api/agent/sync";
         var payload = new Dictionary<string, object?>
         {
             ["agentVersion"] = AgentVersion,
             ["events"] = events
         };
+        if (probeOnly)
+        {
+            payload["probeOnly"] = true;
+        }
         if (!string.IsNullOrWhiteSpace(config.DeviceName))
         {
             payload["deviceName"] = config.DeviceName.Trim();
@@ -237,12 +300,13 @@ public sealed class HttpSyncClient
         CommandExecutionResult result,
         CancellationToken ct)
     {
-        if (!config.IsConfigured || string.IsNullOrWhiteSpace(result.CmdId))
+        if (!config.IsConfigured || string.IsNullOrWhiteSpace(result.CmdId) ||
+            !TryNormalizeCloudUrl(config.CloudUrl, out string normalizedBaseUrl))
         {
             return false;
         }
 
-        string endpoint = $"{config.CloudUrl.Trim().TrimEnd('/')}/api/agent/commands/{Uri.EscapeDataString(result.CmdId)}/result";
+        string endpoint = $"{normalizedBaseUrl}/api/agent/commands/{Uri.EscapeDataString(result.CmdId)}/result";
         string jsonBody = JsonConvert.SerializeObject(new
         {
             status = result.Status,

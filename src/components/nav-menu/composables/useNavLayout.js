@@ -16,12 +16,37 @@ import {
 } from '../navConfigUtils';
 import { normalizeHiddenKeys, sanitizeLayout } from '../navMenuUtils';
 
+const WEB_EXCLUDED_TOOL_BASE_KEYS = new Set([
+    'screenshot-metadata',
+    'vrc-photos',
+    'steam-screenshots',
+    'vrcx-data',
+    'vrchat-data',
+    'crash-dumps',
+    'vrchat-config',
+    'launch-options',
+    'registry-backup'
+]);
+
+function isDesktopOnlyNavDefinition(def) {
+    if (!def || typeof def.key !== 'string') return false;
+    const baseKey = def.key.startsWith('tool-') ? def.key.slice('tool-'.length) : def.key;
+    return WEB_EXCLUDED_TOOL_BASE_KEYS.has(def.key) || WEB_EXCLUDED_TOOL_BASE_KEYS.has(baseKey);
+}
+
 export function useNavLayout({ t, locale, router, dashboardStore, dashboards, directAccessPaste, triggerTool }) {
+    const isWebMode = typeof WEB !== 'undefined' && WEB;
+    const activeNavDefinitions = isWebMode
+        ? navDefinitions.filter((def) => !isDesktopOnlyNavDefinition(def))
+        : navDefinitions;
     const navLayout = ref([]);
     const navLayoutReady = ref(false);
     const navHiddenKeys = ref([]);
 
-    const allNavDefinitions = computed(() => [...navDefinitions, ...dashboardStore.getDashboardNavDefinitions()]);
+    const allNavDefinitions = computed(() => [
+        ...activeNavDefinitions,
+        ...dashboardStore.getDashboardNavDefinitions()
+    ]);
 
     const navDefinitionMap = computed(() => {
         const map = createNavDefinitionMap(allNavDefinitions.value);
@@ -82,7 +107,7 @@ export function useNavLayout({ t, locale, router, dashboardStore, dashboards, di
 
     const getAppendDefinitions = (layout, hiddenKeys = []) => {
         return buildNavDefinitionsForLayout(
-            navDefinitions,
+            activeNavDefinitions,
             dashboardStore.getDashboardNavDefinitions(),
             layout,
             hiddenKeys

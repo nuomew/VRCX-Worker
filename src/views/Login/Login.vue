@@ -1,7 +1,7 @@
 <template>
     <div class="absolute inset-0 flex flex-col items-center overflow-y-auto px-4 pt-12">
         <div class="absolute top-0 left-0 m-1.5">
-            <LoginSettingsDialog />
+            <LoginSettingsDialog v-if="!isWeb" />
             <TooltipWrapper v-if="!noUpdater" side="top" :content="t('view.login.updater')">
                 <Button class="rounded-full mr-2 text-xs" size="icon-sm" variant="ghost" @click="showVRCXUpdateDialog">
                     <span class="relative inline-flex items-center justify-center">
@@ -224,6 +224,7 @@
     import { openExternalLink } from '../../shared/utils';
 
     import configRepository from '../../services/config';
+    import { cloudState } from '../../ipc-web/cloudState';
     import { useUserDisplay } from '../../composables/useUserDisplay';
     import { watchState } from '../../services/watchState';
 
@@ -247,6 +248,7 @@
     const vrcStatusStore = useVrcStatusStore();
 
     const { t } = useI18n();
+    const isWeb = typeof WEB !== 'undefined' && WEB;
 
     /** @type {import('vue').Ref<Record<string, any>>} */
     const savedCredentials = ref({});
@@ -261,13 +263,22 @@
         })
     );
 
-    const { handleSubmit, resetForm, values } = useForm({
+    const { handleSubmit, resetForm, setFieldValue, values } = useForm({
         validationSchema: formSchema,
         initialValues: {
             username: loginForm.value.username,
             password: loginForm.value.password
         }
     });
+
+    watch(
+        () => loginForm.value.username,
+        (nextUsername) => {
+            if (nextUsername && nextUsername !== values.username) {
+                setFieldValue('username', nextUsername);
+            }
+        }
+    );
 
     watch(qrActive, (active) => {
         if (active) {
@@ -339,6 +350,9 @@
 
     async function detectAndPromptLanguage() {
         try {
+            if (typeof WEB !== 'undefined' && WEB && !cloudState.authenticated) {
+                return;
+            }
             const savedLanguage = await configRepository.getString('VRCX_appLanguage');
             if (savedLanguage || !isActive) return;
 

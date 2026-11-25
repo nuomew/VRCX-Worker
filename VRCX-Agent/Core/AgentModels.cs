@@ -90,13 +90,35 @@ public sealed class AgentConfig
     /// </summary>
     public string EnsureDeviceId()
     {
-        if (!string.IsNullOrWhiteSpace(DeviceId))
+        if (!string.IsNullOrWhiteSpace(DeviceId) && HmacSigner.IsValidSyncSecret(DeviceId))
         {
             return DeviceId.Trim();
         }
         string seed = $"{Environment.MachineName}:{Environment.UserName}";
         DeviceId = "win-" + HmacSigner.Sha256Hex(seed).Substring(0, 12);
         return DeviceId;
+    }
+
+    public AgentConfig Clone()
+    {
+        return new AgentConfig
+        {
+            CloudUrl = CloudUrl,
+            SyncSecret = SyncSecret,
+            DeviceId = DeviceId,
+            DeviceName = DeviceName,
+            SyncIntervalSeconds = SyncIntervalSeconds,
+            ProxyEnabled = ProxyEnabled,
+            ProxyAddress = ProxyAddress,
+            AutoUploadScreenshots = AutoUploadScreenshots,
+            CompressScreenshots = CompressScreenshots,
+            AutoCheckUpdates = AutoCheckUpdates,
+            WritePngMetadata = WritePngMetadata,
+            AutoLaunchAppsEnabled = AutoLaunchAppsEnabled,
+            VrChatLogDirectory = VrChatLogDirectory,
+            AutoLaunchDirectory = AutoLaunchDirectory,
+            VrChatExecutableOverride = VrChatExecutableOverride
+        };
     }
 }
 
@@ -170,6 +192,10 @@ public sealed class GameLogEventItem
     /// <summary>Local-only path for ScreenshotPipeline; excluded from cloud GameLog payload.</summary>
     [JsonIgnore]
     public string? LocalScreenshotPath { get; set; }
+
+    /// <summary>Point-in-time room snapshot captured at the exact log line when a screenshot was taken.</summary>
+    [JsonIgnore]
+    public LogTailCollector.LiveRoomSnapshot? CapturedRoomSnapshot { get; set; }
 }
 
 public sealed class AgentPlayerSnapshot

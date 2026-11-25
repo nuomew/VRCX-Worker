@@ -45,7 +45,7 @@ namespace VRCX
                 if (legacyTextChunk != null)
                 {
                     var data = legacyTextChunk.ReadITXtChunk();
-                    if (data.Item1 == keyword)
+                    if (data != null && data.Item1 == keyword)
                         return data.Item2;
                 }
 
@@ -59,7 +59,7 @@ namespace VRCX
             for (int i = 0; i < iTXtChunk.Count; i++)
             {
                 var data = iTXtChunk[i].ReadITXtChunk();
-                if (data.Item1 == keyword)
+                if (data != null && data.Item1 == keyword)
                     return data.Item2;
             }
 
@@ -68,18 +68,20 @@ namespace VRCX
 
         public static bool DeleteTextChunk(string keyword, PNGFile pngFile)
         {
-            var iTXtChunk = pngFile.GetChunksOfType(PNGChunkTypeFilter.iTXt);
-            if (iTXtChunk.Count == 0)
+            var iTXtChunks = pngFile.GetChunksOfType(PNGChunkTypeFilter.iTXt);
+            if (iTXtChunks.Count == 0)
                 return false;
 
-            for (int i = 0; i < iTXtChunk.Count; i++)
+            bool deletedAny = false;
+            // Delete from back to front so removing a chunk never skips subsequent duplicates.
+            for (int i = iTXtChunks.Count - 1; i >= 0; i--)
             {
-                var data = iTXtChunk[i].ReadITXtChunk();
-                if (data.Item1 == keyword)
-                    return pngFile.DeleteChunk(iTXtChunk[i]);
+                var data = iTXtChunks[i].ReadITXtChunk();
+                if (data != null && data.Item1 == keyword && pngFile.DeleteChunk(iTXtChunks[i]))
+                    deletedAny = true;
             }
 
-            return false;
+            return deletedAny;
         }
 
         /// <summary>

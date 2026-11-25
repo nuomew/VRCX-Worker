@@ -408,6 +408,7 @@
         favoriteWorlds,
         favoriteWorldGroups,
         localWorldFavorites,
+        localWorldFavoritesList,
         selectedFavoriteWorlds,
         worldImportDialogInput,
         isFavoriteLoading,
@@ -417,8 +418,7 @@
         showWorldImportDialog,
         localWorldFavGroupLength,
         deleteLocalWorldFavoriteGroup,
-        handleFavoriteGroup,
-        localWorldFavoritesList
+        handleFavoriteGroup
     } = favoriteStore;
 
     const {
@@ -1080,7 +1080,7 @@
         };
         refreshCancelToken.value = token;
         try {
-            for (const worldId of localWorldFavoritesList) {
+            for (const worldId of localWorldFavoritesList.value) {
                 if (token.cancelled) {
                     break;
                 }

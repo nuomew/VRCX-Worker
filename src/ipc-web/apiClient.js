@@ -1,4 +1,4 @@
-import { cloudState, syncGameRunningBridge } from './cloudState.js';
+import { cloudState, setWsAutoConnectHandler, syncGameRunningBridge } from './cloudState.js';
 
 /** @type {WebSocket | null} */
 let hubSocket = null;
@@ -7,11 +7,22 @@ let pingTimer = null;
 /** @type {ReturnType<typeof setTimeout> | null} */
 let reconnectTimer = null;
 let reconnectDelayMs = 2000;
+let consecutiveWsFailures = 0;
 
 /** @type {Array<(event: any) => void>} */
 const gameLogListeners = [];
 /** @type {Array<(msg: any) => void>} */
 const commandResultListeners = [];
+/** @type {Array<() => void>} */
+const unauthorizedListeners = [];
+
+export function onCloudUnauthorized(listener) {
+    unauthorizedListeners.push(listener);
+    return () => {
+        const idx = unauthorizedListeners.indexOf(listener);
+        if (idx >= 0) unauthorizedListeners.splice(idx, 1);
+    };
+}
 
 export function onCloudGameLogEvent(listener) {
     gameLogListeners.push(listener);
@@ -27,6 +38,26 @@ export function onCloudCommandResult(listener) {
         const idx = commandResultListeners.indexOf(listener);
         if (idx >= 0) commandResultListeners.splice(idx, 1);
     };
+}
+
+function handleCloudUnauthorized() {
+    cloudState.authenticated = false;
+    cloudState.authCheckFailed = false;
+    cloudState.authCheckError = '';
+    cloudState.hubDialogOpen = false;
+    cloudState.agentsOnline = [];
+    cloudState.wsAgentsOnline = [];
+    cloudState.deviceLastSeen = {};
+    cloudState.deviceStates = {};
+    disconnectCloudHubWs();
+    syncGameRunningBridge();
+    for (const fn of unauthorizedListeners) {
+        try {
+            fn();
+        } catch {
+            // Ignore listener cleanup errors
+        }
+    }
 }
 
 /**
@@ -49,11 +80,25 @@ export async function cloudFetch(path, options = {}) {
         ...options,
         headers,
         body,
-        credentials: 'include'
+        credentials: 'include',
+        redirect: 'manual'
     });
 
+    // Worker API routes never emit 3xx redirects; any redirect or opaqueredirect (including on /api/auth/me)
+    // indicates an outer Cloudflare Access login gate intercepting the request.
+    if (res.type === 'opaqueredirect' || (res.status >= 300 && res.status < 400)) {
+        cloudState.authMode = 'cloudflare_access';
+        handleCloudUnauthorized();
+        const err = new Error('Cloudflare Access authentication required');
+        // @ts-ignore attach error code for callers
+        err.code = 'CLOUDFLARE_ACCESS_REQUIRED';
+        // @ts-ignore
+        err.status = res.status || 302;
+        throw err;
+    }
+
     if (res.status === 401 && !path.startsWith('/api/auth/')) {
-        cloudState.authenticated = false;
+        handleCloudUnauthorized();
         throw new Error('Cloud authentication required');
     }
 
@@ -96,8 +141,11 @@ export function connectCloudHubWs() {
     try {
         const ws = new WebSocket(wsUrl);
         hubSocket = ws;
+        let wasOpened = false;
 
         ws.onopen = () => {
+            wasOpened = true;
+            consecutiveWsFailures = 0;
             cloudState.wsConnected = true;
             reconnectDelayMs = 2000;
             if (pingTimer) clearInterval(pingTimer);
@@ -137,6 +185,7 @@ export function connectCloudHubWs() {
                 const deviceId = msg.payload.deviceId;
                 cloudState.wsAgentsOnline = cloudState.wsAgentsOnline.filter((id) => id !== deviceId);
                 delete cloudState.deviceLastSeen[deviceId];
+                delete cloudState.deviceStates[deviceId];
                 cloudState.agentsOnline = cloudState.agentsOnline.filter((id) => id !== deviceId);
                 dispatchLiveGameState();
             } else if (msg.type === 'agent.state' && msg.payload?.deviceId) {
@@ -175,7 +224,7 @@ export function connectCloudHubWs() {
             }
         };
 
-        ws.onclose = () => {
+        ws.onclose = async () => {
             cloudState.wsConnected = false;
             if (pingTimer) {
                 clearInterval(pingTimer);
@@ -184,12 +233,56 @@ export function connectCloudHubWs() {
             if (hubSocket === ws) {
                 hubSocket = null;
             }
-            if (cloudState.authenticated) {
+            if (!cloudState.authenticated) {
+                return;
+            }
+            if (!wasOpened) {
+                consecutiveWsFailures += 1;
+                // Browser WebSocket hides HTTP 401/302 upgrade status; probe /api/auth/me with redirect:'manual'
+                // so expired passcode sessions (401 / authenticated:false) AND expired Cloudflare Access sessions
+                // (302 opaqueredirect to Access login) transition cleanly to the unlock screen.
+                try {
+                    const authRes = await fetch('/api/auth/me', {
+                        credentials: 'include',
+                        cache: 'no-store',
+                        redirect: 'manual'
+                    });
+                    if (
+                        authRes.type === 'opaqueredirect' ||
+                        (authRes.status >= 300 && authRes.status < 400)
+                    ) {
+                        cloudState.authMode = 'cloudflare_access';
+                        handleCloudUnauthorized();
+                        return;
+                    }
+                    if (authRes.status === 401) {
+                        handleCloudUnauthorized();
+                        return;
+                    }
+                    const authJson = await authRes.json().catch(() => null);
+                    const authData = authJson?.data;
+                    if (authData && authData.authenticated === false) {
+                        if (authData.authMode) cloudState.authMode = authData.authMode;
+                        cloudState.requiresTotp = Boolean(authData.requiresTotp);
+                        handleCloudUnauthorized();
+                        return;
+                    }
+                } catch {
+                    // Transient network failure; fall through to bounded backoff reconnect below
+                }
+                // Stop endless reconnect loops after 6 consecutive unopened handshake failures;
+                // future presence heartbeats or manual actions can call connectCloudHubWs() again.
+                if (consecutiveWsFailures >= 6) {
+                    return;
+                }
+            }
+            if (cloudState.authenticated && !hubSocket) {
                 if (reconnectTimer) clearTimeout(reconnectTimer);
+                const delay = reconnectDelayMs;
                 reconnectTimer = setTimeout(() => {
                     reconnectDelayMs = Math.min(reconnectDelayMs * 2, 30_000);
                     connectCloudHubWs();
-                }, reconnectDelayMs);
+                }, delay);
             }
         };
 
@@ -215,12 +308,20 @@ export function disconnectCloudHubWs() {
         pingTimer = null;
     }
     if (hubSocket) {
+        const sock = hubSocket;
+        hubSocket = null;
+        sock.onopen = null;
+        sock.onmessage = null;
+        sock.onclose = null;
+        sock.onerror = null;
         try {
-            hubSocket.close(1000, 'logout');
+            sock.close(1000, 'logout');
         } catch {
             // Ignore
         }
-        hubSocket = null;
     }
     cloudState.wsConnected = false;
+    consecutiveWsFailures = 0;
 }
+
+setWsAutoConnectHandler(connectCloudHubWs);

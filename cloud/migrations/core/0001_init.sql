@@ -279,7 +279,7 @@ CREATE TABLE IF NOT EXISTS cloud_screenshots (
 );
 CREATE INDEX IF NOT EXISTS idx_screenshots_taken ON cloud_screenshots (taken_at DESC);
 CREATE INDEX IF NOT EXISTS idx_screenshots_world ON cloud_screenshots (world_id, taken_at DESC);
-CREATE INDEX IF NOT EXISTS idx_screenshots_filename ON cloud_screenshots (local_filename COLLATE NOCASE);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_screenshots_filename ON cloud_screenshots (local_filename COLLATE NOCASE);
 
 CREATE TABLE IF NOT EXISTS cloud_commands (
     cmd_id TEXT PRIMARY KEY,

@@ -1,7 +1,18 @@
 import { cloudFetch, onCloudGameLogEvent } from './apiClient.js';
 import { bootstrapCache, flushStorageNow, scheduleStoragePatch } from './bootstrapCache.js';
-import { cloudState, getAggregatedGameState, getPrimaryAgentState, syncGameRunningBridge } from './cloudState.js';
-import { setSuppressCloudGameLogWrites } from '../services/database/cloud/index.js';
+import {
+    cloudState,
+    getAggregatedGameState,
+    getPrimaryAgentState,
+    isAnyAgentOnline,
+    syncGameRunningBridge
+} from './cloudState.js';
+import {
+    clearActiveCloudGameLogRowMeta,
+    clearCloudActivitySyncStateCache,
+    setActiveCloudGameLogRowMeta,
+    setSuppressCloudGameLogWrites
+} from '../services/database/cloud/index.js';
 
 /**
  * Lightweight RFC 1321 MD5 returning Base64 (used by imageUploadCoordinator for VRChat file uploads).
@@ -274,45 +285,198 @@ function hashUserIdToHue(userId) {
     return hash % 65536;
 }
 
+const VRCHAT_MAX_UPLOAD_DIM = 2000;
+const VRCHAT_MAX_PRINT_WIDTH = 1920;
+const VRCHAT_MAX_PRINT_HEIGHT = 1080;
+const VRCHAT_MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
+
+function isPngBytes(bytes) {
+    return (
+        bytes.byteLength >= 8 &&
+        bytes[0] === 0x89 &&
+        bytes[1] === 0x50 &&
+        bytes[2] === 0x4e &&
+        bytes[3] === 0x47 &&
+        bytes[4] === 0x0d &&
+        bytes[5] === 0x0a &&
+        bytes[6] === 0x1a &&
+        bytes[7] === 0x0a
+    );
+}
+
+function sniffImageMimeFromBytes(bytes) {
+    if (isPngBytes(bytes)) return 'image/png';
+    if (bytes.byteLength >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return 'image/jpeg';
+    if (
+        bytes.byteLength >= 12 &&
+        bytes[0] === 0x52 &&
+        bytes[1] === 0x49 &&
+        bytes[2] === 0x46 &&
+        bytes[3] === 0x46 &&
+        bytes[8] === 0x57 &&
+        bytes[9] === 0x45 &&
+        bytes[10] === 0x42 &&
+        bytes[11] === 0x50
+    ) {
+        return 'image/webp';
+    }
+    if (bytes.byteLength >= 6 && bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46) return 'image/gif';
+    return 'image/png';
+}
+
+function detectWhiteBorderCropRect(ctx, width, height) {
+    const imgData = ctx.getImageData(0, 0, width, height).data;
+    const isNearWhite = (x, y) => {
+        const idx = (y * width + x) * 4;
+        return imgData[idx + 3] < 16 || (imgData[idx] >= 245 && imgData[idx + 1] >= 245 && imgData[idx + 2] >= 245);
+    };
+    let top = 0;
+    let bottom = height - 1;
+    let left = 0;
+    let right = width - 1;
+    const rowWhite = (y) => {
+        for (let x = 0; x < width; x++) if (!isNearWhite(x, y)) return false;
+        return true;
+    };
+    const colWhite = (x) => {
+        for (let y = top; y <= bottom; y++) if (!isNearWhite(x, y)) return false;
+        return true;
+    };
+    while (top < bottom && rowWhite(top)) top++;
+    while (bottom > top && rowWhite(bottom)) bottom--;
+    while (left < right && colWhite(left)) left++;
+    while (right > left && colWhite(right)) right--;
+    const cropW = right - left + 1;
+    const cropH = bottom - top + 1;
+    if (cropW < 32 || cropH < 32 || (cropW === width && cropH === height)) {
+        return null;
+    }
+    return { x: left, y: top, w: cropW, h: cropH };
+}
+
 /**
- * Client-side Canvas image resize (replaces .NET ImageSharp in Web mode so Workers stay under 10ms CPU).
+ * Client-side Canvas image normalization (replaces .NET ImageSharp in Web mode so Workers stay under 10ms CPU).
+ * Converts JPEG/WebP/GIF uploads to PNG, enforces VRChat's 2000px / 10 MiB limits, supports square padding
+ * (`matchingDimensions`) for VRC+ icons/emojis/stickers, and Print white-border crop + 1920x1080 limits.
  *
  * @param {string} base64Data
+ * @param {{ matchingDimensions?: boolean; isPrint?: boolean; cropWhiteBorder?: boolean }} [opts]
  * @returns {Promise<string>}
  */
-async function resizeImageInBrowser(base64Data) {
+export async function normalizeUploadImageInBrowser(base64Data, opts = {}) {
+    if (typeof base64Data !== 'string' || !base64Data) return base64Data;
+    const rawBase64 = base64Data.includes(',') ? base64Data.slice(base64Data.indexOf(',') + 1) : base64Data;
+    if (typeof document === 'undefined' || typeof createImageBitmap !== 'function') {
+        return rawBase64;
+    }
+    const matchingDimensions = Boolean(opts.matchingDimensions);
+    const isPrint = Boolean(opts.isPrint);
+    const cropWhiteBorder = Boolean(opts.cropWhiteBorder);
+
     try {
-        const clean = base64Data.includes(',') ? base64Data : `data:image/png;base64,${base64Data}`;
-        const res = await fetch(clean);
-        const blob = await res.blob();
+        const bytes = base64ToBytes(rawBase64);
+        const alreadyPng = isPngBytes(bytes);
+        const mime = sniffImageMimeFromBytes(bytes);
+        const blob = new Blob([bytes], { type: mime });
         const bitmap = await createImageBitmap(blob);
-        const maxDim = 2048;
-        let width = bitmap.width;
-        let height = bitmap.height;
-        if (width > maxDim || height > maxDim) {
-            const scale = Math.min(maxDim / width, maxDim / height);
-            width = Math.max(1, Math.round(width * scale));
-            height = Math.max(1, Math.round(height * scale));
+        try {
+            let srcX = 0;
+            let srcY = 0;
+            let srcW = bitmap.width;
+            let srcH = bitmap.height;
+
+            // Fast path: preserve already-compliant PNG uploads verbatim without pointless re-encoding.
+            if (
+                alreadyPng &&
+                !isPrint &&
+                !cropWhiteBorder &&
+                srcW <= VRCHAT_MAX_UPLOAD_DIM &&
+                srcH <= VRCHAT_MAX_UPLOAD_DIM &&
+                (!matchingDimensions || srcW === srcH) &&
+                bytes.byteLength <= VRCHAT_MAX_UPLOAD_BYTES
+            ) {
+                return rawBase64;
+            }
+
+            if (isPrint && cropWhiteBorder) {
+                const probeCanvas = document.createElement('canvas');
+                probeCanvas.width = srcW;
+                probeCanvas.height = srcH;
+                const probeCtx = probeCanvas.getContext('2d', { willReadFrequently: true });
+                if (probeCtx) {
+                    probeCtx.drawImage(bitmap, 0, 0);
+                    const rect = detectWhiteBorderCropRect(probeCtx, srcW, srcH);
+                    if (rect) {
+                        srcX = rect.x;
+                        srcY = rect.y;
+                        srcW = rect.w;
+                        srcH = rect.h;
+                    }
+                }
+            }
+
+            const maxW = isPrint ? VRCHAT_MAX_PRINT_WIDTH : VRCHAT_MAX_UPLOAD_DIM;
+            const maxH = isPrint ? VRCHAT_MAX_PRINT_HEIGHT : VRCHAT_MAX_UPLOAD_DIM;
+            let targetW = matchingDimensions ? Math.max(srcW, srcH) : srcW;
+            let targetH = matchingDimensions ? Math.max(srcW, srcH) : srcH;
+
+            if (targetW > maxW || targetH > maxH) {
+                const scale = Math.min(maxW / targetW, maxH / targetH);
+                targetW = Math.max(1, Math.round(targetW * scale));
+                targetH = Math.max(1, Math.round(targetH * scale));
+            }
+
+            const encodeCanvas = (w, h) => {
+                const canvas = document.createElement('canvas');
+                canvas.width = w;
+                canvas.height = h;
+                const ctx = canvas.getContext('2d');
+                if (!ctx) return null;
+                if (matchingDimensions && srcW !== srcH) {
+                    const scale = Math.min(w / srcW, h / srcH);
+                    const drawW = Math.max(1, Math.round(srcW * scale));
+                    const drawH = Math.max(1, Math.round(srcH * scale));
+                    const offsetX = Math.floor((w - drawW) / 2);
+                    const offsetY = Math.floor((h - drawH) / 2);
+                    ctx.drawImage(bitmap, srcX, srcY, srcW, srcH, offsetX, offsetY, drawW, drawH);
+                } else {
+                    ctx.drawImage(bitmap, srcX, srcY, srcW, srcH, 0, 0, w, h);
+                }
+                const dataUrl = canvas.toDataURL('image/png');
+                return dataUrl.slice(dataUrl.indexOf(',') + 1);
+            };
+
+            let outBase64 = encodeCanvas(targetW, targetH);
+            if (!outBase64) return rawBase64;
+            // Shrink progressively if PNG output exceeds VRChat's 10 MiB upload ceiling.
+            for (let attempt = 0; attempt < 4 && Math.floor((outBase64.length * 3) / 4) > VRCHAT_MAX_UPLOAD_BYTES; attempt++) {
+                targetW = Math.max(64, Math.round(targetW * 0.85));
+                targetH = Math.max(64, Math.round(targetH * 0.85));
+                const shrunk = encodeCanvas(targetW, targetH);
+                if (!shrunk) break;
+                outBase64 = shrunk;
+            }
+            return outBase64;
+        } finally {
+            bitmap.close();
         }
-        const canvas = document.createElement('canvas');
-        canvas.width = width;
-        canvas.height = height;
-        const ctx = canvas.getContext('2d');
-        if (!ctx) return base64Data;
-        ctx.drawImage(bitmap, 0, 0, width, height);
-        bitmap.close();
-        const dataUrl = canvas.toDataURL('image/png');
-        return dataUrl.slice(dataUrl.indexOf(',') + 1);
     } catch {
-        return base64Data;
+        return rawBase64;
     }
 }
 
-async function dispatchRemoteCommand(action, params = {}) {
+async function resizeImageInBrowser(base64Data, matchingDimensions = false) {
+    return normalizeUploadImageInBrowser(base64Data, { matchingDimensions });
+}
+
+async function dispatchRemoteCommand(action, params = {}, options = {}) {
+    if (options.requireOnline && !isAnyAgentOnline()) {
+        return false;
+    }
     try {
         await cloudFetch('/api/commands', {
             method: 'POST',
-            json: { action, params }
+            json: options.requireOnline ? { action, params, requireOnline: true } : { action, params }
         });
         return true;
     } catch (err) {
@@ -336,6 +500,7 @@ export function createVrcxStorageBridge() {
             scheduleStoragePatch(key, null);
         },
         async Clear() {
+            clearCloudActivitySyncStateCache();
             for (const k of Object.keys(bootstrapCache.storage)) {
                 scheduleStoragePatch(k, null);
             }
@@ -347,31 +512,62 @@ export function createVrcxStorageBridge() {
     };
 }
 
+/** @type {(() => void) | null} */
+let activeLogWatcherUnsub = null;
+
 export function createLogWatcherBridge() {
-    /** @type {string[][]} */
+    activeLogWatcherUnsub?.();
+    activeLogWatcherUnsub = null;
+
+    /** @type {Array<{ row: string[]; rowId: number; type: string; createdAt: string }>} */
     const queue = [];
     const MAX_QUEUED_ROWS = 500;
+    let inFlightAsyncDispatch = false;
 
     /**
-     * Forwards a real-time WS GameLog row into window.$bridge.addGameLogEvent while
-     * suppressing duplicate D1 write-back (the Windows Agent already persisted it).
-     * @param {string[]} row
+     * Strictly serializes real-time WS GameLog delivery into window.$bridge.addGameLogEvent
+     * in FIFO order (waiting for each async Promise to settle before starting the next item)
+     * so server-assigned D1 rowIds can never be scrambled across multi-event batches.
      */
-    function dispatchRowToBridge(row) {
+    function pumpQueue() {
+        if (inFlightAsyncDispatch) return;
         const bridge = typeof window !== 'undefined' ? /** @type {any} */ (window).$bridge : null;
         if (!bridge || typeof bridge.addGameLogEvent !== 'function') {
-            return false;
+            return;
         }
-        setSuppressCloudGameLogWrites(true);
-        Promise.resolve()
-            .then(() => bridge.addGameLogEvent(JSON.stringify(row)))
-            .catch(() => {})
-            .finally(() => setSuppressCloudGameLogWrites(false));
-        return true;
+        while (queue.length > 0) {
+            const item = queue.shift();
+            if (!item) break;
+            setSuppressCloudGameLogWrites(true);
+            setActiveCloudGameLogRowMeta(
+                item.rowId > 0 ? { rowId: item.rowId, type: item.type, createdAt: item.createdAt } : null
+            );
+            try {
+                const ret = bridge.addGameLogEvent(JSON.stringify(item.row));
+                if (ret && typeof ret.then === 'function') {
+                    inFlightAsyncDispatch = true;
+                    Promise.resolve(ret)
+                        .catch(() => {})
+                        .finally(() => {
+                            clearActiveCloudGameLogRowMeta();
+                            setSuppressCloudGameLogWrites(false);
+                            inFlightAsyncDispatch = false;
+                            pumpQueue();
+                        });
+                    return;
+                }
+                clearActiveCloudGameLogRowMeta();
+                setSuppressCloudGameLogWrites(false);
+            } catch {
+                clearActiveCloudGameLogRowMeta();
+                setSuppressCloudGameLogWrites(false);
+            }
+        }
     }
 
-    onCloudGameLogEvent((ev) => {
+    activeLogWatcherUnsub = onCloudGameLogEvent((ev) => {
         const dt = ev.created_at || new Date().toISOString();
+        const serverRowId = Number(ev.rowId) > 0 ? Math.floor(Number(ev.rowId)) : 0;
         /** @type {string[] | null} */
         let row = null;
         if (ev.type === 'Location') {
@@ -389,16 +585,11 @@ export function createLogWatcherBridge() {
         }
         if (!row) return;
 
-        // Drain any early startup-queued rows first once $bridge.addGameLogEvent is ready.
-        while (queue.length > 0 && dispatchRowToBridge(queue[0])) {
+        if (queue.length >= MAX_QUEUED_ROWS) {
             queue.shift();
         }
-        if (!dispatchRowToBridge(row)) {
-            if (queue.length >= MAX_QUEUED_ROWS) {
-                queue.shift();
-            }
-            queue.push(row);
-        }
+        queue.push({ row, rowId: serverRowId, type: String(ev.type || ''), createdAt: dt });
+        pumpQueue();
     });
 
     return {
@@ -408,7 +599,7 @@ export function createLogWatcherBridge() {
         async SetDateTill() {},
         async Get() {
             if (queue.length === 0) return [];
-            return queue.splice(0, 50);
+            return queue.splice(0, 50).map((item) => item.row);
         },
         async GetLogLines() {
             return [];
@@ -508,8 +699,14 @@ export function createAssetBundleManagerBridge() {
         async CheckVRChatCache() {
             return { Item1: -1, Item2: false, Item3: '' };
         },
-        async DeleteCache() {
-            await dispatchRemoteCommand('clear_cache', { scope: 'single' });
+        async DeleteCache(id, _version, variant) {
+            const itemId = String(id || '').trim();
+            if (!itemId) return;
+            const cleanVariant = typeof variant === 'string' ? variant.trim() : '';
+            await dispatchRemoteCommand(
+                'clear_cache',
+                cleanVariant ? { scope: 'single', id: itemId, variant: cleanVariant } : { scope: 'single', id: itemId }
+            );
         },
         async DeleteAllCache() {
             await dispatchRemoteCommand('clear_cache', { scope: 'all' });
@@ -529,12 +726,19 @@ export function createAppApiBridge() {
         async GetZoom() {
             return zoomLevel;
         },
-        async DesktopNotification(boldText, text) {
+        async DesktopNotification(boldText, text, image) {
             if (typeof Notification === 'undefined') return;
+            const opts = { body: text || '', icon: image || undefined };
             if (Notification.permission === 'granted') {
-                new Notification(boldText || 'VRCX', { body: text || '' });
+                new Notification(boldText || 'VRCX', opts);
             } else if (Notification.permission === 'default') {
-                Notification.requestPermission().catch(() => {});
+                Notification.requestPermission()
+                    .then((permission) => {
+                        if (permission === 'granted') {
+                            new Notification(boldText || 'VRCX', opts);
+                        }
+                    })
+                    .catch(() => {});
             }
         },
         async RestartApplication() {
@@ -567,8 +771,13 @@ export function createAppApiBridge() {
             const a = document.createElement('a');
             a.href = url;
             a.download = 'vrchat-event.ics';
+            a.style.display = 'none';
+            document.body?.appendChild(a);
             a.click();
-            URL.revokeObjectURL(url);
+            a.remove();
+            setTimeout(() => {
+                URL.revokeObjectURL(url);
+            }, 1000);
         },
         async GetColourFromUserID(userId) {
             return hashUserIdToHue(userId);
@@ -627,7 +836,7 @@ export function createAppApiBridge() {
             const raw = String(launchUrl || '').trim();
             if (!raw.startsWith('vrchat://launch?')) return false;
             const urlWithAttach = raw.includes('attach=') ? raw : `${raw}&attach=1`;
-            return dispatchRemoteCommand('launch_vrc', { launchUrl: urlWithAttach });
+            return dispatchRemoteCommand('launch_vrc', { launchUrl: urlWithAttach }, { requireOnline: true });
         },
         async StartGame(args) {
             const rawArgs = String(args || '');
@@ -636,7 +845,8 @@ export function createAppApiBridge() {
             const desktopMode = /(?:^|\s)--no-vr(?:\s|$)/.test(rawArgs);
             return dispatchRemoteCommand(
                 'launch_vrc',
-                desktopMode ? { launchUrl: match[0], desktopMode: true } : { launchUrl: match[0] }
+                desktopMode ? { launchUrl: match[0], desktopMode: true } : { launchUrl: match[0] },
+                { requireOnline: true }
             );
         },
         async StartGameFromPath(_path, args) {
@@ -664,8 +874,8 @@ export function createAppApiBridge() {
         async FileLength(base64) {
             return String(base64ToBytes(base64).byteLength);
         },
-        async ResizeImageToFitLimits(base64data) {
-            return resizeImageInBrowser(base64data);
+        async ResizeImageToFitLimits(base64data, matchingDimensions = false) {
+            return resizeImageInBrowser(base64data, Boolean(matchingDimensions));
         },
         async PopulateImageHosts() {},
         async GetImage(url) {
@@ -728,8 +938,8 @@ export function createAppApiBridge() {
         },
         async WriteConfigFile() {},
         async FindScreenshotsBySearch() {
-            const rows = await cloudFetch('/api/screenshots?limit=50').catch(() => []);
-            return JSON.stringify(rows);
+            // Desktop contract returns local file path strings (string[]); cloud gallery uses /api/screenshots directly.
+            return '[]';
         },
         async GetScreenshotMetadata() {
             return '{}';
@@ -773,9 +983,19 @@ export function createElectronShim() {
         onSystemThemeChanged: noopUnsub,
         openFileDialog: async () => '',
         openDirectoryDialog: async () => '',
-        desktopNotification: async (title, body) => {
-            if (typeof Notification !== 'undefined' && Notification.permission === 'granted') {
-                new Notification(title || 'VRCX', { body: body || '' });
+        desktopNotification: async (title, body, image) => {
+            if (typeof Notification === 'undefined') return;
+            const opts = { body: body || '', icon: image || undefined };
+            if (Notification.permission === 'granted') {
+                new Notification(title || 'VRCX', opts);
+            } else if (Notification.permission === 'default') {
+                Notification.requestPermission()
+                    .then((permission) => {
+                        if (permission === 'granted') {
+                            new Notification(title || 'VRCX', opts);
+                        }
+                    })
+                    .catch(() => {});
             }
         },
         restartApp: async () => window.location.reload(),

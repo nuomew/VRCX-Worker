@@ -6,7 +6,7 @@ const links = {
     upstreamGithub: 'https://github.com/vrcx-team/VRCX',
     agentDownload: 'https://github.com/nuomew/VRCX-Worker/releases',
     agentGuide:
-        'https://github.com/nuomew/VRCX-Worker/blob/master/docs/cloud-architecture/DEPLOY.md#3-building--configuring-the-windows-companion-tray-agent-dotnetvrcx-agent',
+        'https://github.com/nuomew/VRCX-Worker/blob/master/docs/cloud-architecture/DEPLOY.md#5-windows-companion-tray-agent-vrcxagent',
     discord: 'https://vrcx.app/discord'
 };
 

@@ -82,12 +82,15 @@ public static class ProxyHttpClientFactory
     /// Creates a SocketsHttpHandler configured for Direct (Overseas), standard HTTP/SOCKS proxy,
     /// Windows system proxy, or native VMess AEAD tunnel (`vmess://`).
     /// </summary>
-    public static SocketsHttpHandler CreateHandler(bool proxyEnabled, string? proxyAddress)
+    public static SocketsHttpHandler CreateHandler(
+        bool proxyEnabled,
+        string? proxyAddress,
+        TimeSpan? connectTimeout = null)
     {
         var handler = new SocketsHttpHandler
         {
             PooledConnectionLifetime = TimeSpan.FromMinutes(5),
-            ConnectTimeout = TimeSpan.FromSeconds(15)
+            ConnectTimeout = connectTimeout ?? TimeSpan.FromSeconds(15)
         };
 
         if (!proxyEnabled)
@@ -135,6 +138,11 @@ public static class ProxyHttpClientFactory
         handler.UseProxy = true;
 
         var builder = new UriBuilder(proxyUri) { UserName = string.Empty, Password = string.Empty };
+        // .NET SocketsHttpHandler supports `socks5://` (with remote DNS resolution) and rejects `socks5h://` at send time.
+        if (string.Equals(builder.Scheme, "socks5h", StringComparison.OrdinalIgnoreCase))
+        {
+            builder.Scheme = "socks5";
+        }
         var webProxy = new WebProxy(builder.Uri)
         {
             BypassProxyOnLocal = false
@@ -152,9 +160,12 @@ public static class ProxyHttpClientFactory
         return handler;
     }
 
-    public static HttpClient CreateHttpClient(AgentConfig config, TimeSpan? timeout = null)
+    public static HttpClient CreateHttpClient(
+        AgentConfig config,
+        TimeSpan? timeout = null,
+        TimeSpan? connectTimeout = null)
     {
-        var handler = CreateHandler(config.ProxyEnabled, config.ProxyAddress);
+        var handler = CreateHandler(config.ProxyEnabled, config.ProxyAddress, connectTimeout);
         return new HttpClient(handler, disposeHandler: true)
         {
             Timeout = timeout ?? TimeSpan.FromSeconds(20)

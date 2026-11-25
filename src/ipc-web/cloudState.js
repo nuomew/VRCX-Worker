@@ -41,6 +41,8 @@ export function clampWebSyncIntervalSeconds(raw) {
 export const cloudState = reactive({
     initialized: false,
     authenticated: false,
+    authCheckFailed: false,
+    authCheckError: '',
     authMode: 'open_setup',
     requiresTotp: false,
     subject: '',
@@ -214,12 +216,25 @@ export function syncGameRunningBridge(nowMs = Date.now()) {
     }
 }
 
+/** @type {(() => void) | null} */
+let wsAutoConnectHandler = null;
+
 /**
- * Applies server-reported HTTP agent presence, device states, and optional cumulative uptime snapshot to `cloudState`.
+ * Registers the AgentHub WebSocket connector without creating a circular import between cloudState and apiClient.
+ * @param {() => void} handler
+ */
+export function setWsAutoConnectHandler(handler) {
+    wsAutoConnectHandler = typeof handler === 'function' ? handler : null;
+}
+
+/**
+ * Applies server-reported HTTP/WS agent presence, device states, and optional cumulative uptime snapshot to `cloudState`.
  *
  * @param {{
  *     deviceLastSeen?: Record<string, number>;
  *     httpAgentsOnline?: string[];
+ *     wsAgentsOnline?: string[];
+ *     wsAgentsOnlineHint?: boolean | string[];
  *     deviceStates?: Record<string, { state: Record<string, any>; updatedAt: string }>;
  *     totalUptimeSeconds?: number;
  *     syncIntervalSeconds?: number;
@@ -235,6 +250,11 @@ export function applyCloudPresenceUpdate(payload) {
     }
     if (payload.webSyncIntervalSeconds !== undefined) {
         cloudState.webSyncIntervalSeconds = clampWebSyncIntervalSeconds(payload.webSyncIntervalSeconds);
+    }
+    if (Array.isArray(payload.wsAgentsOnline)) {
+        cloudState.wsAgentsOnline = Array.from(
+            new Set(payload.wsAgentsOnline.map((id) => String(id || '').trim()).filter(Boolean))
+        );
     }
     if (payload.deviceLastSeen && typeof payload.deviceLastSeen === 'object') {
         if (payload.replaceDeviceMap) {
@@ -257,9 +277,18 @@ export function applyCloudPresenceUpdate(payload) {
     if (payload.deviceStates && typeof payload.deviceStates === 'object') {
         for (const [deviceId, entry] of Object.entries(payload.deviceStates)) {
             if (!deviceId || !entry || typeof entry !== 'object') continue;
+            const incomingUpdatedAt = entry.updatedAt || new Date(nowMs).toISOString();
+            const existing = cloudState.deviceStates[deviceId];
+            if (existing?.updatedAt) {
+                const existingMs = Date.parse(existing.updatedAt);
+                const incomingMs = Date.parse(incomingUpdatedAt);
+                if (Number.isFinite(existingMs) && Number.isFinite(incomingMs) && incomingMs < existingMs) {
+                    continue;
+                }
+            }
             cloudState.deviceStates[deviceId] = {
                 state: entry.state && typeof entry.state === 'object' ? entry.state : {},
-                updatedAt: entry.updatedAt || new Date(nowMs).toISOString()
+                updatedAt: incomingUpdatedAt
             };
         }
     }
@@ -270,6 +299,14 @@ export function applyCloudPresenceUpdate(payload) {
         cloudState.totalUptimeSyncedAt = nowMs;
     }
     syncGameRunningBridge(nowMs);
+
+    const hasWsPresenceInPayload =
+        (Array.isArray(payload.wsAgentsOnline) && payload.wsAgentsOnline.some((id) => Boolean(id))) ||
+        payload.wsAgentsOnlineHint === true ||
+        (Array.isArray(payload.wsAgentsOnlineHint) && payload.wsAgentsOnlineHint.some((id) => Boolean(id)));
+    if (hasWsPresenceInPayload && cloudState.authenticated && !cloudState.wsConnected && wsAutoConnectHandler) {
+        wsAutoConnectHandler();
+    }
 }
 
 export function isAnyAgentOnline(nowMs = Date.now()) {
@@ -277,7 +314,7 @@ export function isAnyAgentOnline(nowMs = Date.now()) {
 }
 
 export function getPrimaryAgentState() {
-    const firstId = getOnlineAgentIds()[0] || Object.keys(cloudState.deviceStates)[0];
+    const firstId = getOnlineAgentIds()[0];
     if (!firstId) return null;
     return cloudState.deviceStates[firstId]?.state ?? null;
 }

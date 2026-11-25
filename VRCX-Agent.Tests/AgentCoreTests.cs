@@ -1596,6 +1596,951 @@ public sealed class AgentCoreTests
         }
     }
 
+    [Fact]
+    public async Task Wave4RegressionFixes_VmessWsTlsCustomSni_DisposeNoDeadlock_VrcLogParser_AndPngMetadata()
+    {
+        // 1. P1-15: VMess WS+TLS sends exact custom SNI (different from connect IP and HTTP Host header)
+        string uuid = "de305d54-75b4-431b-adb2-eb6b9e546014";
+        using var ecdsa = System.Security.Cryptography.ECDsa.Create(System.Security.Cryptography.ECCurve.NamedCurves.nistP256);
+        var certReq = new System.Security.Cryptography.X509Certificates.CertificateRequest(
+            "CN=custom-sni.example", ecdsa, System.Security.Cryptography.HashAlgorithmName.SHA256);
+        using var selfSigned = certReq.CreateSelfSigned(DateTimeOffset.UtcNow.AddDays(-1), DateTimeOffset.UtcNow.AddDays(1));
+
+        using var wsListener = new System.Net.Sockets.TcpListener(IPAddress.Loopback, 0);
+        wsListener.Start();
+        int wsPort = ((IPEndPoint)wsListener.LocalEndpoint).Port;
+
+        string? capturedSni = null;
+        string? capturedUpgradeReq = null;
+        Task wsServerTask = Task.Run(async () =>
+        {
+            using var tcp = await wsListener.AcceptTcpClientAsync();
+            using var ssl = new System.Net.Security.SslStream(tcp.GetStream(), leaveInnerStreamOpen: false);
+            await ssl.AuthenticateAsServerAsync(new System.Net.Security.SslServerAuthenticationOptions
+            {
+                ServerCertificateSelectionCallback = (_, hostName) =>
+                {
+                    capturedSni = hostName;
+                    return selfSigned;
+                },
+                ClientCertificateRequired = false,
+                EnabledSslProtocols = System.Security.Authentication.SslProtocols.Tls12 | System.Security.Authentication.SslProtocols.Tls13
+            });
+            byte[] buf = new byte[4096];
+            int total = 0;
+            while (total < buf.Length)
+            {
+                int n = await ssl.ReadAsync(buf.AsMemory(total, buf.Length - total));
+                if (n == 0) break;
+                total += n;
+                if (Encoding.ASCII.GetString(buf, 0, total).Contains("\r\n\r\n", StringComparison.Ordinal)) break;
+            }
+            capturedUpgradeReq = Encoding.ASCII.GetString(buf, 0, total);
+            string wsKey = string.Empty;
+            foreach (string line in capturedUpgradeReq.Split("\r\n", StringSplitOptions.RemoveEmptyEntries))
+            {
+                if (line.StartsWith("Sec-WebSocket-Key:", StringComparison.OrdinalIgnoreCase))
+                {
+                    wsKey = line.Substring("Sec-WebSocket-Key:".Length).Trim();
+                }
+            }
+            string accept = Convert.ToBase64String(
+                System.Security.Cryptography.SHA1.HashData(
+                    Encoding.ASCII.GetBytes(wsKey + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")));
+            string resp = $"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n";
+            await ssl.WriteAsync(Encoding.ASCII.GetBytes(resp));
+            await ssl.FlushAsync();
+            // Keep connection open briefly until client disposes
+            try
+            {
+                await Task.Delay(500);
+            }
+            catch { }
+        });
+
+        string wsTlsJson = $"{{\"v\":\"2\",\"ps\":\"WsTlsCustomSni\",\"add\":\"127.0.0.1\",\"port\":{wsPort},\"id\":\"{uuid}\",\"aid\":0,\"scy\":\"aes-128-gcm\",\"net\":\"ws\",\"type\":\"none\",\"host\":\"cdn-host.example\",\"path\":\"/vws\",\"tls\":\"tls\",\"sni\":\"custom-sni.example\",\"allowInsecure\":true}}";
+        string wsTlsLink = "vmess://" + Convert.ToBase64String(Encoding.UTF8.GetBytes(wsTlsJson));
+        Assert.True(VmessConfig.TryParse(wsTlsLink, out VmessConfig? wsCfg, out _));
+        Assert.Equal("custom-sni.example", wsCfg!.EffectiveSni);
+        Assert.Equal("cdn-host.example", wsCfg.PrimaryHost);
+
+        using (Stream vmessWsStream = await VmessAeadClient.ConnectAsync(wsCfg, "api.vrchat.cloud", 443, CancellationToken.None))
+        {
+            Assert.NotNull(vmessWsStream);
+        }
+        await wsServerTask;
+        Assert.Equal("custom-sni.example", capturedSni);
+        Assert.NotNull(capturedUpgradeReq);
+        Assert.Contains("GET /vws HTTP/1.1", capturedUpgradeReq!);
+        Assert.Contains("Host: cdn-host.example", capturedUpgradeReq!);
+
+        // 2. P1-16: Concurrent Dispose() during an active WriteAsync completes immediately without deadlocking or throwing ODE on _writeLock
+        using var stallListener = new System.Net.Sockets.TcpListener(IPAddress.Loopback, 0);
+        stallListener.Start();
+        int stallPort = ((IPEndPoint)stallListener.LocalEndpoint).Port;
+        string stallLink = "vmess://" + Convert.ToBase64String(Encoding.UTF8.GetBytes(
+            $"{{\"v\":\"2\",\"add\":\"127.0.0.1\",\"port\":{stallPort},\"id\":\"{uuid}\",\"aid\":0,\"scy\":\"aes-128-gcm\",\"net\":\"tcp\",\"tls\":\"\"}}"));
+        Assert.True(VmessConfig.TryParse(stallLink, out VmessConfig? stallCfg, out _));
+        Task<System.Net.Sockets.TcpClient> acceptTask = stallListener.AcceptTcpClientAsync();
+        Stream stallStream = await VmessAeadClient.ConnectAsync(stallCfg!, "example.com", 80, CancellationToken.None);
+        using System.Net.Sockets.TcpClient acceptedPeer = await acceptTask;
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        stallStream.Dispose();
+        await stallStream.DisposeAsync();
+        sw.Stop();
+        Assert.True(sw.Elapsed < TimeSpan.FromSeconds(2));
+
+        // 3. P2-23: VrcLogParser clears stale world name on missing Entering Room & flushes superseded Joining event
+        var parser = new VrcLogParser();
+        Assert.Null(parser.ParseLine("2026.11.25 10:00:00 Log        -  [Behaviour] Entering Room: Old World"));
+        var ev1 = parser.ParseLine("2026.11.25 10:00:01 Log        -  [Behaviour] Joining wrld_11111111-1111-1111-1111-111111111111:100");
+        Assert.NotNull(ev1);
+        Assert.Equal("Old World", ev1!.WorldName);
+        Assert.Equal("Old World", parser.CurrentWorldName);
+
+        // Next Joining arrives without Entering Room -> CurrentWorldName cleared (no stale "Old World")
+        Assert.Null(parser.ParseLine("2026.11.25 10:05:00 Log        -  [Behaviour] Joining wrld_22222222-2222-2222-2222-222222222222:200"));
+        Assert.Equal(string.Empty, parser.CurrentWorldName);
+
+        // Consecutive Joining without Entering Room -> returns superseded wrld_2222... Location instead of dropping it
+        var flushedPrev = parser.ParseLine("2026.11.25 10:05:10 Log        -  [Behaviour] Joining wrld_33333333-3333-3333-3333-333333333333:300");
+        Assert.NotNull(flushedPrev);
+        Assert.Equal("wrld_22222222-2222-2222-2222-222222222222:200", flushedPrev!.Location);
+        var flushedLast = parser.FlushPendingLocation();
+        Assert.NotNull(flushedLast);
+        Assert.Equal("wrld_33333333-3333-3333-3333-333333333333:300", flushedLast!.Location);
+
+        // 4. P1-20 & P2-24: PNGChunkTypeFilter bitmask, thread-safe CRC32, non-mutating IHDR, malformed iTXt, IsValid seek(0)
+        Assert.False((VRCX.PNGChunkTypeFilter.IHDR | VRCX.PNGChunkTypeFilter.sRGB).HasFlag(VRCX.PNGChunkTypeFilter.iTXt));
+        Assert.True((VRCX.PNGChunkTypeFilter.IHDR | VRCX.PNGChunkTypeFilter.iTXt).HasFlag(VRCX.PNGChunkTypeFilter.iTXt));
+
+        var ihdrData = new byte[] { 0x00, 0x00, 0x07, 0x80, 0x00, 0x00, 0x04, 0x38, 8, 2, 0, 0, 0 }; // 1920x1080
+        var ihdrChunk = new VRCX.PNGChunk
+        {
+            ChunkType = "IHDR",
+            ChunkTypeEnum = VRCX.PNGChunkTypeFilter.IHDR,
+            Length = ihdrData.Length,
+            Data = ihdrData
+        };
+        var res1 = ihdrChunk.ReadIHDRChunkResolution();
+        var res2 = ihdrChunk.ReadIHDRChunkResolution();
+        Assert.Equal((1920, 1080), (res1.Item1, res1.Item2));
+        Assert.Equal((1920, 1080), (res2.Item1, res2.Item2));
+
+        var malformedItxt = new VRCX.PNGChunk
+        {
+            ChunkType = "iTXt",
+            ChunkTypeEnum = VRCX.PNGChunkTypeFilter.iTXt,
+            Length = 5,
+            Data = new byte[] { (byte)'D', (byte)'e', 0, 0, 0 } // textOffset=7 > length=5
+        };
+        Assert.Null(malformedItxt.ReadITXtChunk());
+
+        uint expectedCrc = ihdrChunk.CalculateCRC();
+        var parallelCrcs = new System.Collections.Concurrent.ConcurrentBag<uint>();
+        Parallel.For(0, 32, _ => parallelCrcs.Add(ihdrChunk.CalculateCRC()));
+        Assert.All(parallelCrcs, c => Assert.Equal(expectedCrc, c));
+
+        // 5. P2-21 & P1-18: Manual update balloon does not falsely claim automatic background download
+        Assert.DoesNotContain("自动下载", AgentStrings.FormatBalloonUpdateAvailableManual("v1.10.7", "1.10.6"));
+        Assert.False(string.IsNullOrWhiteSpace(AgentStrings.ConnectionTestTimeoutMessage));
+        Assert.False(string.IsNullOrWhiteSpace(AgentStrings.FormatPortableUpdateNotice("v1.10.7", "1.10.6")));
+
+        // 6. Wave 5 P1-1: HttpSyncClient.TestConnectionAsync propagates OperationCanceledException on caller cancellation/timeout
+        using var slowHandler = new StubHttpHandler(async _ =>
+        {
+            await Task.Delay(TimeSpan.FromSeconds(10));
+            return new HttpResponseMessage(HttpStatusCode.OK);
+        });
+        using var slowHttp = new HttpClient(slowHandler);
+        var syncClient = new HttpSyncClient(slowHttp);
+        using var callerCts = new CancellationTokenSource(TimeSpan.FromMilliseconds(50));
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => syncClient.TestConnectionAsync(
+            "https://vrcx-cloud.example.workers.dev",
+            "secret",
+            "dev-1",
+            "",
+            proxyEnabled: false,
+            proxyAddress: "",
+            callerCts.Token));
+
+        // 7. Wave 5 P2-3: Duplicate Entering Room for current world does not poison next nameless Joining
+        var parser2 = new VrcLogParser();
+        Assert.Null(parser2.ParseLine("2026.11.25 11:00:00 Log        -  [Behaviour] Entering Room: Alpha"));
+        var aEv = parser2.ParseLine("2026.11.25 11:00:01 Log        -  [Behaviour] Joining wrld_aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa:1");
+        Assert.Equal("Alpha", aEv!.WorldName);
+        Assert.Null(parser2.ParseLine("2026.11.25 11:00:02 Log        -  [Behaviour] Entering Room: Alpha"));
+        Assert.Null(parser2.ParseLine("2026.11.25 11:00:05 Log        -  [Behaviour] Joining wrld_bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb:2"));
+        Assert.Equal(string.Empty, parser2.CurrentWorldName);
+        var bEv = parser2.FlushPendingLocation();
+        Assert.Equal(string.Empty, bEv!.WorldName);
+    }
+
+    [Fact]
+    public async Task Wave6_ConvergenceFixes_SkipFailedShots_LeftRoomSever_Ipv6Host_Strings_PngAndLfs_Timeout()
+    {
+        // 1. P1-1: ScanUnsyncedScreenshots skips permanently failed normalized paths so older photos are never starved
+        string tempRoot = Path.Combine(Path.GetTempPath(), "vrcx-w6-skip-" + Guid.NewGuid().ToString("N"));
+        string photosDir = Path.Combine(tempRoot, "photos");
+        string stateDir = Path.Combine(tempRoot, "state");
+        Directory.CreateDirectory(photosDir);
+        Directory.CreateDirectory(stateDir);
+        try
+        {
+            string badNew = Path.Combine(photosDir, "VRChat_2026-11-25_12-00-00.000_1920x1080.png");
+            string okOld = Path.Combine(photosDir, "VRChat_2026-11-20_12-00-00.000_1920x1080.png");
+            using (var img = new Image<Rgba32>(16, 16, new Rgba32(10, 20, 30, 255)))
+            {
+                img.SaveAsPng(badNew);
+                img.SaveAsPng(okOld);
+            }
+            var cfg = new AgentConfig { AutoUploadScreenshots = true };
+            using var http = new HttpClient(new StubHttpHandler(_ => Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK))));
+            var pipeline = new ScreenshotPipeline(() => cfg, http, stateDir);
+            var skip = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            {
+                ScreenshotPipeline.NormalizeScreenshotPath(badNew)
+            };
+            List<PendingScreenshotTask> scanned = pipeline.ScanUnsyncedScreenshots(photosDir, maxResults: 1, skipNormalizedPaths: skip);
+            Assert.Single(scanned);
+            Assert.Equal(okOld, scanned[0].LocalPath);
+
+            // 5. P2-7: PNGHelper.DeleteTextChunk removes ALL duplicate Description chunks
+            using (var png = new VRCX.PNGFile(okOld, writeAccess: true))
+            {
+                Assert.True(png.WriteChunk(VRCX.PNGHelper.GenerateTextChunk("Description", "{\"v\":1}")));
+                Assert.True(png.WriteChunk(VRCX.PNGHelper.GenerateTextChunk("Description", "{\"v\":2}")));
+            }
+            using (var png = new VRCX.PNGFile(okOld, writeAccess: true))
+            {
+                Assert.True(VRCX.PNGHelper.DeleteTextChunk("Description", png));
+                Assert.Null(VRCX.PNGHelper.ReadTextChunk("Description", png));
+            }
+        }
+        finally
+        {
+            if (Directory.Exists(tempRoot)) Directory.Delete(tempRoot, recursive: true);
+        }
+
+        // 2. P2-5: OnLeftRoom severs pending nameless Joining so a later Entering Room cannot bind to the old room
+        var parser = new VrcLogParser();
+        Assert.Null(parser.ParseLine("2026.11.25 12:00:00 Log        -  [Behaviour] Joining wrld_11111111-1111-1111-1111-111111111111:100"));
+        var leftFlushed = parser.ParseLine("2026.11.25 12:00:02 Log        -  [Behaviour] OnLeftRoom");
+        Assert.NotNull(leftFlushed);
+        Assert.Equal("wrld_11111111-1111-1111-1111-111111111111:100", leftFlushed!.Location);
+        Assert.Null(parser.ParseLine("2026.11.25 12:00:03 Log        -  [Behaviour] Entering Room: New Next World"));
+        var nextEv = parser.ParseLine("2026.11.25 12:00:04 Log        -  [Behaviour] Joining wrld_22222222-2222-2222-2222-222222222222:200");
+        Assert.NotNull(nextEv);
+        Assert.Equal("New Next World", nextEv!.WorldName);
+        Assert.Equal("wrld_22222222-2222-2222-2222-222222222222:200", nextEv.Location);
+
+        // Quick rejoin to the same world within 10s after OnLeftRoom preserves WorldName
+        Assert.Null(parser.ParseLine("2026.11.25 12:00:05 Log        -  [Behaviour] OnLeftRoom"));
+        Assert.Equal(string.Empty, parser.CurrentWorldName);
+        Assert.Null(parser.ParseLine("2026.11.25 12:00:06 Log        -  [Behaviour] Entering Room: New Next World"));
+        var rejoinEv = parser.ParseLine("2026.11.25 12:00:07 Log        -  [Behaviour] Joining wrld_22222222-2222-2222-2222-222222222222:300");
+        Assert.NotNull(rejoinEv);
+        Assert.Equal("New Next World", rejoinEv!.WorldName);
+
+        // 3. P2-6: VmessConfig strips IPv6 brackets in Server, brackets bare IPv6 literals for HTTP/WS Host headers,
+        // and leaves valid hostname:port / ipv4:port values untouched
+        string uuid = "de305d54-75b4-431b-adb2-eb6b9e546014";
+        string ipv6Json = $"{{\"v\":\"2\",\"add\":\"[2001:db8::1]\",\"port\":443,\"id\":\"{uuid}\",\"aid\":0,\"scy\":\"auto\",\"net\":\"ws\",\"tls\":\"tls\"}}";
+        string ipv6Link = "vmess://" + Convert.ToBase64String(Encoding.UTF8.GetBytes(ipv6Json));
+        Assert.True(VmessConfig.TryParse(ipv6Link, out VmessConfig? ipv6Cfg, out _));
+        Assert.Equal("2001:db8::1", ipv6Cfg!.Server);
+        Assert.Equal("[2001:db8::1]", ipv6Cfg.EffectiveHttpHeaderHost);
+        Assert.Equal("[2001:db8::2]", VmessConfig.FormatHostForHttpHeader("2001:db8::2"));
+        Assert.Equal("cdn.example.com:8443", VmessConfig.FormatHostForHttpHeader("cdn.example.com:8443"));
+        Assert.Equal("1.2.3.4:8080", VmessConfig.FormatHostForHttpHeader("1.2.3.4:8080"));
+
+        // 4. P2-1: English non-WinForms balloon/dialog auto-update strings use single '&' instead of doubled '&&'
+        string? prevLang = AgentStrings.LanguageOverride;
+        try
+        {
+            AgentStrings.LanguageOverride = "en-US";
+            Assert.DoesNotContain("&&", AgentStrings.FormatBalloonAutoInstallingUpdate("v1.10.7"));
+            Assert.DoesNotContain("&&", AgentStrings.FormatDialogAutoDownloadingUpdate("v1.10.7"));
+        }
+        finally
+        {
+            AgentStrings.LanguageOverride = prevLang;
+        }
+
+        // 6. P2-4: HttpSyncClient.TestConnectionAsync returns localized timeout message on internal HttpClient/connect timeout
+        using var timeoutHandler = new StubHttpHandler(_ => Task.FromException<HttpResponseMessage>(new TaskCanceledException("Simulated SocketsHttpHandler timeout")));
+        using var timeoutHttp = new HttpClient(timeoutHandler);
+        var syncClient = new HttpSyncClient(timeoutHttp);
+        var (ok, message, _) = await syncClient.TestConnectionAsync(
+            "https://vrcx-cloud.example.workers.dev",
+            "secret",
+            "dev-1",
+            "",
+            proxyEnabled: false,
+            proxyAddress: "",
+            CancellationToken.None);
+        Assert.False(ok);
+        Assert.Equal(AgentStrings.ConnectionTestTimeoutMessage, message);
+    }
+
+    [Fact]
+    public async Task Wave7Fixes_CoverSocks5hNormalizationProbeOnlyQuitResetPendingJoiningRecoveryAndSingleCacheScope()
+    {
+        // 1. Agent P1-1: socks5h:// normalizes to socks5:// inside SocketsHttpHandler WebProxy
+        using (var handler = ProxyHttpClientFactory.CreateHandler(proxyEnabled: true, proxyAddress: "socks5h://127.0.0.1:7891"))
+        {
+            var webProxy = Assert.IsType<WebProxy>(handler.Proxy);
+            Assert.NotNull(webProxy.Address);
+            Assert.Equal("socks5", webProxy.Address!.Scheme);
+            Assert.Equal("127.0.0.1", webProxy.Address.Host);
+            Assert.Equal(7891, webProxy.Address.Port);
+        }
+
+        // 2. Agent P1-2: TestConnectionAsync sends probeOnly=true so server does not claim pending commands
+        string? capturedProbeBody = null;
+        using (var probeHandler = new StubHttpHandler(async req =>
+        {
+            capturedProbeBody = req.Content != null ? await req.Content.ReadAsStringAsync() : null;
+            return new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(
+                    "{\"ok\":true,\"data\":{\"deviceId\":\"dev-w7\",\"deviceName\":\"W7PC\",\"syncIntervalSeconds\":60,\"pendingCommands\":[]}}",
+                    Encoding.UTF8,
+                    "application/json")
+            };
+        }))
+        using (var probeHttp = new HttpClient(probeHandler))
+        {
+            var syncClient = new HttpSyncClient(probeHttp);
+            var (ok, _, _) = await syncClient.TestConnectionAsync(
+                "https://vrcx-cloud.example.workers.dev",
+                "vrcx_sync_w7",
+                "dev-w7",
+                "W7PC",
+                proxyEnabled: false,
+                proxyAddress: "",
+                CancellationToken.None);
+            Assert.True(ok);
+            Assert.NotNull(capturedProbeBody);
+            Assert.Contains("\"probeOnly\":true", capturedProbeBody);
+        }
+
+        // 3. Agent P2-1: VrcLogParser recognizes HandleApplicationQuit and clears room/player state
+        var parser = new VrcLogParser();
+        Assert.Null(parser.ParseLine("2026.11.25 13:00:00 Log        -  [Behaviour] Entering Room: Quit Test World"));
+        var joinLoc = parser.ParseLine("2026.11.25 13:00:01 Log        -  [Behaviour] Joining wrld_33333333-3333-3333-3333-333333333333:300");
+        Assert.NotNull(joinLoc);
+        Assert.NotNull(parser.ParseLine("2026.11.25 13:00:02 Log        -  [Behaviour] OnPlayerJoined Alice (usr_11111111-1111-1111-1111-111111111111)"));
+        Assert.Equal(1, parser.CurrentPlayerCount);
+        var quitEv = parser.ParseLine("2026.11.25 13:00:05 Log        -  VRCApplication: HandleApplicationQuit");
+        Assert.NotNull(quitEv);
+        Assert.Equal("VRChat closed gracefully", quitEv!.Data);
+        Assert.Equal(0, parser.CurrentPlayerCount);
+        Assert.Equal(string.Empty, parser.CurrentLocation);
+        Assert.Equal(string.Empty, parser.CurrentWorldId);
+        Assert.Equal(string.Empty, parser.CurrentWorldName);
+
+        // 4. Agent P2-2: Trailing standalone Joining line does not advance persisted cursor past itself; restart recovers it
+        string tempRoot = Path.Combine(Path.GetTempPath(), "vrcx-w7-pending-join-" + Guid.NewGuid().ToString("N"));
+        string logDir = Path.Combine(tempRoot, "logs");
+        string stateDir = Path.Combine(tempRoot, "state");
+        Directory.CreateDirectory(logDir);
+        Directory.CreateDirectory(stateDir);
+        try
+        {
+            string logFile = Path.Combine(logDir, "output_log_2026-11-25_13-10-00.txt");
+            await File.WriteAllTextAsync(
+                logFile,
+                "2026.11.25 13:10:01 Log        -  [Behaviour] Joining wrld_44444444-4444-4444-4444-444444444444:400\n",
+                Encoding.UTF8);
+
+            long fileLen = new FileInfo(logFile).Length;
+            var collector1 = new LogTailCollector(stateDir);
+            Assert.Equal(0, collector1.PollLogDirectory(logDir));
+            Assert.Equal(0, collector1.OfflineQueueCount);
+            // Persisted cursor MUST stay strictly before the pending Joining line (after any 3-byte UTF-8 BOM, never at EOF)
+            Assert.True(collector1.SnapshotCursor().ByteOffset < fileLen);
+
+            // Simulate agent restart and subsequent timeout flush -> Location event is recovered cleanly
+            var collector2 = new LogTailCollector(stateDir)
+            {
+                PendingLocationFlushDelay = TimeSpan.Zero
+            };
+            Assert.Equal(1, collector2.PollLogDirectory(logDir));
+            var recovered = collector2.PeekBatch(10);
+            Assert.Single(recovered);
+            Assert.Equal("Location", recovered[0].Type);
+            Assert.Equal("wrld_44444444-4444-4444-4444-444444444444:400", recovered[0].Location);
+            Assert.Equal(fileLen, collector2.SnapshotCursor().ByteOffset);
+        }
+        finally
+        {
+            if (Directory.Exists(tempRoot)) Directory.Delete(tempRoot, recursive: true);
+        }
+
+        // 5. Cross-Layer P2-3 + Agent P1-1 + Agent P2-3: clear_cache validates scope/dot/variant, deletes security-variant SHA-256 folder, and respects config.json cache_directory
+        Assert.False(CommandValidator.ValidateRemoteCommand("clear_cache", new Dictionary<string, object?> { ["scope"] = "single" }).Ok);
+        Assert.False(CommandValidator.ValidateRemoteCommand("clear_cache", new Dictionary<string, object?> { ["scope"] = 123 }).Ok);
+        Assert.False(CommandValidator.ValidateRemoteCommand("clear_cache", new Dictionary<string, object?> { ["scope"] = "single", ["id"] = "." }).Ok);
+        Assert.False(CommandValidator.ValidateRemoteCommand("clear_cache", new Dictionary<string, object?> { ["scope"] = "single", ["id"] = "../escape" }).Ok);
+        Assert.True(CommandValidator.ValidateRemoteCommand("clear_cache", new Dictionary<string, object?> { ["scope"] = "single", ["id"] = "file_single_target", ["variant"] = "security" }).Ok);
+
+        string cacheRoot = Path.Combine(Path.GetTempPath(), "vrcx-w7-cache-" + Guid.NewGuid().ToString("N"));
+        string keepDir = Path.Combine(cacheRoot, "KEEP_ME_DIR");
+        string securityHashedDirName = CommandValidator.ComputeVrChatCacheFolderHash("file_single_target", "security");
+        string targetDir = Path.Combine(cacheRoot, securityHashedDirName);
+        Directory.CreateDirectory(keepDir);
+        Directory.CreateDirectory(targetDir);
+        try
+        {
+            var singleRes = CommandValidator.ClearVrChatCacheInDirectory("cmd_single_1", cacheRoot, "single", "file_single_target", "security");
+            Assert.Equal("succeeded", singleRes.Status);
+            Assert.False(Directory.Exists(targetDir));
+            Assert.True(Directory.Exists(keepDir));
+
+            // config.json custom cache_directory resolution
+            string fakeAppData = Path.Combine(cacheRoot, "VrcAppData");
+            string customBase = Path.Combine(cacheRoot, "CustomCacheBase");
+            Directory.CreateDirectory(fakeAppData);
+            Directory.CreateDirectory(customBase);
+            await File.WriteAllTextAsync(
+                Path.Combine(fakeAppData, "config.json"),
+                Newtonsoft.Json.JsonConvert.SerializeObject(new { cache_directory = customBase }),
+                Encoding.UTF8);
+            Assert.Equal(Path.Combine(customBase, "Cache-WindowsPlayer"), CommandValidator.ResolveVrChatCacheDirectory(fakeAppData));
+        }
+        finally
+        {
+            if (Directory.Exists(cacheRoot)) Directory.Delete(cacheRoot, recursive: true);
+        }
+
+        // 6. Agent P1-2, P1-3, P2-1, P2-2: pending Joining flushes on timeout even during log noise, does NOT duplicate on file rotation,
+        //    preserves pending Location before HandleApplicationQuit, and recovers cleanly on in-place file truncation
+        string rotRoot = Path.Combine(Path.GetTempPath(), "vrcx-w7-rot-" + Guid.NewGuid().ToString("N"));
+        string rotLogDir = Path.Combine(rotRoot, "logs");
+        string rotStateDir = Path.Combine(rotRoot, "state");
+        Directory.CreateDirectory(rotLogDir);
+        Directory.CreateDirectory(rotStateDir);
+        try
+        {
+            // (a) Noise lines arriving after timeout still flush pending Joining
+            string noiseFile = Path.Combine(rotLogDir, "output_log_2026-11-25_14-00-00.txt");
+            await File.WriteAllTextAsync(
+                noiseFile,
+                "2026.11.25 14:00:01 Log        -  [Behaviour] Joining wrld_55555555-5555-5555-5555-555555555555:500\n",
+                new UTF8Encoding(false));
+            var noiseCollector = new LogTailCollector(rotStateDir)
+            {
+                PendingLocationFlushDelay = TimeSpan.FromMilliseconds(20)
+            };
+            Assert.Equal(0, noiseCollector.PollLogDirectory(rotLogDir));
+            await Task.Delay(40);
+            await File.AppendAllTextAsync(
+                noiseFile,
+                "2026.11.25 14:00:15 Log        -  Some noisy unity debug line\n",
+                new UTF8Encoding(false));
+            Assert.Equal(1, noiseCollector.PollLogDirectory(rotLogDir));
+            Assert.Equal(new FileInfo(noiseFile).Length, noiseCollector.SnapshotCursor().ByteOffset);
+
+            // (b) Rotation while Joining is pending + trailing Entering Room emits strictly ONE named Location (no duplicates!)
+            await File.AppendAllTextAsync(
+                noiseFile,
+                "2026.11.25 14:01:01 Log        -  [Behaviour] Joining wrld_66666666-6666-6666-6666-666666666666:600\n",
+                new UTF8Encoding(false));
+            noiseCollector.PendingLocationFlushDelay = TimeSpan.FromSeconds(30);
+            Assert.Equal(0, noiseCollector.PollLogDirectory(rotLogDir));
+            await File.AppendAllTextAsync(
+                noiseFile,
+                "2026.11.25 14:01:02 Log        -  [Behaviour] Entering Room: Rotated World\n",
+                new UTF8Encoding(false));
+            string nextFile = Path.Combine(rotLogDir, "output_log_2026-11-25_14-02-00.txt");
+            await File.WriteAllTextAsync(
+                nextFile,
+                "2026.11.25 14:02:01 Log        -  [Behaviour] Joining wrld_77777777-7777-7777-7777-777777777777:700\n" +
+                "2026.11.25 14:02:02 Log        -  VRCApplication: HandleApplicationQuit\n",
+                new UTF8Encoding(false));
+            noiseCollector.PollLogDirectory(rotLogDir);
+            var allEvents = noiseCollector.PeekBatch(20);
+            var rotatedMatches = allEvents.FindAll(e => e.Location == "wrld_66666666-6666-6666-6666-666666666666:600");
+            Assert.Single(rotatedMatches);
+            Assert.Equal("Rotated World", rotatedMatches[0].WorldName);
+            // Pending Joining followed immediately by HandleApplicationQuit preserves BOTH the Location and the quit Event
+            Assert.Contains(allEvents, e => e.Type == "Location" && e.Location == "wrld_77777777-7777-7777-7777-777777777777:700");
+            Assert.Contains(allEvents, e => e.Type == "Event" && e.Data == "VRChat closed gracefully");
+        }
+        finally
+        {
+            if (Directory.Exists(rotRoot)) Directory.Delete(rotRoot, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task Wave8_AgentFixes_SnapshotCapture_IncompletePngGuard_OvrEndpoint_ParserCompat_MonotonicGate_LogOrderAndChunkBackfill_VmessObfsAndHost_Truncate()
+    {
+        string tempRoot = Path.Combine(Path.GetTempPath(), "vrcx-w8-agent-" + Guid.NewGuid().ToString("N"));
+        string logDir = Path.Combine(tempRoot, "logs");
+        string stateDir = Path.Combine(tempRoot, "state");
+        string photoDir = Path.Combine(tempRoot, "photos");
+        Directory.CreateDirectory(logDir);
+        Directory.CreateDirectory(stateDir);
+        Directory.CreateDirectory(photoDir);
+
+        try
+        {
+            // 1. CapturedRoomSnapshot preserves room & players at screenshot moment even if OnLeftRoom follows in same poll
+            string snapLog = Path.Combine(logDir, "output_log_2026-11-25_15-00-00.txt");
+            await File.WriteAllTextAsync(
+                snapLog,
+                "2026.11.25 15:00:01 Log        -  [Behaviour] Entering Room: Photo Shrine\n" +
+                "2026.11.25 15:00:01 Log        -  [Behaviour] Joining wrld_88888888-8888-8888-8888-888888888888:808\n" +
+                "2026.11.25 15:00:02 Log        -  [Behaviour] OnPlayerJoined Sakura (usr_1234567890)\n" +
+                "2026.11.25 15:00:03 Log        -  [VRC Camera] Took screenshot to: C:\\Pictures\\VRChat\\shot_snap.png\n" +
+                "2026.11.25 15:00:04 Log        -  [Behaviour] OnLeftRoom\n",
+                new UTF8Encoding(false));
+
+            var snapCollector = new LogTailCollector(stateDir);
+            GameLogEventItem? capturedShotEv = null;
+            snapCollector.ScreenshotCaptured += ev => capturedShotEv = ev;
+            snapCollector.PollLogDirectory(logDir);
+            Assert.NotNull(capturedShotEv);
+            Assert.NotNull(capturedShotEv!.CapturedRoomSnapshot);
+            Assert.Equal("Photo Shrine", capturedShotEv.CapturedRoomSnapshot!.CurrentWorldName);
+            Assert.Equal("wrld_88888888-8888-8888-8888-888888888888", capturedShotEv.CapturedRoomSnapshot.CurrentWorldId);
+            Assert.Single(capturedShotEv.CapturedRoomSnapshot.PlayersForMetadata);
+            Assert.Equal("usr_1234567890", capturedShotEv.CapturedRoomSnapshot.PlayersForMetadata[0]["id"]);
+            // Live state after poll reflects OnLeftRoom, proving screenshot snapshot was frozen before leaving
+            Assert.Equal(string.Empty, snapCollector.SnapshotLiveRoomState().CurrentLocation);
+
+            // 2. Partial PNG (valid PNG magic header, missing IEND footer) returns TransientFailure while recent (<30s) and is skipped by ScanUnsyncedScreenshots
+            string partialPng = Path.Combine(photoDir, "VRChat_2026-11-25_15-05-00.000_1920x1080.png");
+            byte[] partialBytes = new byte[128];
+            new byte[] { 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A }.CopyTo(partialBytes, 0);
+            await File.WriteAllBytesAsync(partialPng, partialBytes);
+            Assert.True(ScreenshotPipeline.HasValidImageMagicPrefix(partialPng, partialBytes));
+            Assert.False(ScreenshotPipeline.IsImageFileComplete(partialPng, partialBytes));
+
+            var uploadCfg = new AgentConfig
+            {
+                CloudUrl = "https://vrcx.example.workers.dev",
+                SyncSecret = "secret",
+                AutoUploadScreenshots = true,
+                CompressScreenshots = false
+            };
+            int uploadHits = 0;
+            using (var http = new HttpClient(new StubHttpHandler(_ =>
+            {
+                Interlocked.Increment(ref uploadHits);
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK));
+            })))
+            {
+                var pipeline = new ScreenshotPipeline(() => uploadCfg, http);
+                Assert.Empty(pipeline.ScanUnsyncedScreenshots(photoDir, maxResults: 10));
+                ScreenshotUploadOutcome partialOutcome = await pipeline.UploadQueuedTaskWithOutcomeAsync(
+                    new PendingScreenshotTask { LocalPath = partialPng, TakenAtIso = "2026-11-25T15:05:00Z" },
+                    CancellationToken.None);
+                Assert.Equal(ScreenshotUploadOutcome.TransientFailure, partialOutcome);
+                Assert.Equal(0, uploadHits);
+            }
+
+            // 3. VrNotificationSender default OVRToolkit endpoint includes /api, strips HTTPS URL icons, and sends body-only wrist payload
+            Assert.Equal("ws://127.0.0.1:11450/api", VrNotificationSender.DefaultOvrToolkitEndpoint);
+            Assert.Null(VrNotificationSender.NormalizeValidBase64Icon("https://api.vrchat.cloud/api/1/file/file_123/1/file"));
+            Assert.Equal("iVBORw==", VrNotificationSender.NormalizeValidBase64Icon("data:image/png;base64,iVBORw=="));
+            List<string> packets = VrNotificationSender.BuildOvrToolkitPackets("Title", "Body", hudNotification: true, wristNotification: true, iconBase64: "iVBORw==");
+            Assert.Equal(2, packets.Count);
+            Assert.Contains("SendNotification", packets[0]);
+            Assert.Contains("iVBORw==", packets[0]);
+            Assert.Contains("SendWristNotification", packets[1]);
+            Assert.Contains("Title - Body", packets[1]);
+            Assert.DoesNotContain("iVBORw==", packets[1]);
+            List<string> urlIconPackets = VrNotificationSender.BuildOvrToolkitPackets("Title", "Body", hudNotification: true, wristNotification: false, iconBase64: "https://api.vrchat.cloud/api/1/file/file_123/1/file");
+            Assert.DoesNotContain("https://api.vrchat.cloud", urlIconPackets[0]);
+
+            // 3b. Read-only attribute PNG uploads cleanly via read-only WaitForFileReadyAsync
+            string roPng = Path.Combine(photoDir, "VRChat_2026-11-25_15-06-00.000_1920x1080.png");
+            using (var img = new Image<Rgba32>(8, 8, new Rgba32(100, 120, 140, 255)))
+            {
+                img.SaveAsPng(roPng);
+            }
+            File.SetAttributes(roPng, File.GetAttributes(roPng) | FileAttributes.ReadOnly);
+            try
+            {
+                int roUploads = 0;
+                using var roHttp = new HttpClient(new StubHttpHandler(_ =>
+                {
+                    Interlocked.Increment(ref roUploads);
+                    return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK));
+                }));
+                var roPipeline = new ScreenshotPipeline(() => uploadCfg, roHttp);
+                var roOutcome = await roPipeline.UploadQueuedTaskWithOutcomeAsync(
+                    new PendingScreenshotTask { LocalPath = roPng, TakenAtIso = "2026-11-25T15:06:00Z" },
+                    CancellationToken.None);
+                Assert.Equal(ScreenshotUploadOutcome.Uploaded, roOutcome);
+                Assert.Equal(1, roUploads);
+            }
+            finally
+            {
+                File.SetAttributes(roPng, File.GetAttributes(roPng) & ~FileAttributes.ReadOnly);
+            }
+
+            // 4. VrcLogParser supports legacy wld_ world prefix, 10-char usr_ IDs, AVPro Resolving URL, and real VRChat Portal format
+            var parser = new VrcLogParser();
+            var legacyJoin = parser.ParseLine("2026.11.25 15:10:00 Log        -  [Behaviour] Joining wld_11111111-1111-1111-1111-111111111111:123");
+            Assert.Null(legacyJoin); // waits for Entering Room
+            var legacyEnter = parser.ParseLine("2026.11.25 15:10:01 Log        -  [Behaviour] Entering Room: Legacy World");
+            Assert.NotNull(legacyEnter);
+            Assert.Equal("wld_11111111-1111-1111-1111-111111111111", legacyEnter!.WorldId);
+
+            var legacyPlayer = parser.ParseLine("2026.11.25 15:10:02 Log        -  [Behaviour] OnPlayerJoined LegacyUser (usr_1a2b3c4d5e)");
+            Assert.NotNull(legacyPlayer);
+            Assert.Equal("usr_1a2b3c4d5e", legacyPlayer!.UserId);
+
+            var avproEv = parser.ParseLine("2026.11.25 15:10:03 Log        -  [Video Playback] Resolving URL 'rtmp://stream.example.com/live/vr'");
+            Assert.NotNull(avproEv);
+            Assert.Equal("VideoPlay", avproEv!.Type);
+            Assert.Equal("rtmp://stream.example.com/live/vr", avproEv.VideoUrl);
+
+            var portalEv = parser.ParseLine("2026.11.25 15:10:04 Log        -  [Behaviour] Instantiated a (Clone [42] Portals/PortalInternalDynamic)");
+            Assert.NotNull(portalEv);
+            Assert.Equal("PortalSpawn", portalEv!.Type);
+
+            // 5. SyncScheduleGate monotonic clock resists system wall-clock rollbacks
+            var gate = new SyncScheduleGate(60);
+            DateTimeOffset t0 = new(2026, 11, 25, 15, 0, 0, TimeSpan.Zero);
+            gate.ApplyServerSchedule(new AgentSyncResponse { SyncIntervalSeconds = 120 }, t0, nowMonoMs: 1_000_000);
+            Assert.False(gate.IsDueMonotonic(1_060_000));
+            Assert.True(gate.IsDueMonotonic(1_120_000));
+
+            // 6. LogTailCollector sorts by filename timestamp (ignoring stale mtime on older file) and chunks large historical logs (>1000 events)
+            string chunkDir = Path.Combine(tempRoot, "chunk-logs");
+            string chunkState = Path.Combine(tempRoot, "chunk-state");
+            Directory.CreateDirectory(chunkDir);
+            Directory.CreateDirectory(chunkState);
+            string olderLog = Path.Combine(chunkDir, "output_log_2026-11-25_10-00-00.txt");
+            string newerLog = Path.Combine(chunkDir, "output_log_2026-11-25_16-00-00.txt");
+            var sb = new StringBuilder();
+            for (int i = 0; i < 1250; i++)
+            {
+                sb.Append("2026.11.25 10:00:01 Log        -  [Video Playback] Attempting to resolve URL 'https://example.com/v/")
+                  .Append(i)
+                  .AppendLine("'");
+            }
+            await File.WriteAllTextAsync(olderLog, sb.ToString(), new UTF8Encoding(false));
+            await File.WriteAllTextAsync(
+                newerLog,
+                "2026.11.25 16:00:01 Log        -  [Behaviour] Entering Room: Newer Active World\n" +
+                "2026.11.25 16:00:01 Log        -  [Behaviour] Joining wrld_99999999-9999-9999-9999-999999999999:909\n",
+                new UTF8Encoding(false));
+            // Give the OLDER filename a NEWER mtime and mix a non-timestamped fallback file to verify strict total order (no List.Sort cycle)
+            string fallbackLog = Path.Combine(chunkDir, "output_log_manual_backup.txt");
+            await File.WriteAllTextAsync(fallbackLog, "", new UTF8Encoding(false));
+            File.SetLastWriteTimeUtc(olderLog, DateTime.UtcNow.AddMinutes(10));
+            File.SetLastWriteTimeUtc(fallbackLog, DateTime.UtcNow.AddMinutes(5));
+            Assert.True(LogTailCollector.CompareLogFilesChronologically(fallbackLog, olderLog) < 0);
+            Assert.True(LogTailCollector.CompareLogFilesChronologically(fallbackLog, newerLog) < 0);
+            Assert.True(LogTailCollector.CompareLogFilesChronologically(olderLog, newerLog) < 0);
+            File.Delete(fallbackLog);
+
+            var chunkCollector = new LogTailCollector(chunkState);
+            int pass1 = chunkCollector.PollLogDirectory(chunkDir);
+            // Active file MUST stay newerLog; pass 1 caps historical backfill at 1000 (+ 1 live Location = 1001)
+            Assert.Equal(Path.GetFileName(newerLog), chunkCollector.SnapshotCursor().FileName);
+            Assert.Equal(1001, pass1);
+            int pass2 = chunkCollector.PollLogDirectory(chunkDir);
+            Assert.Equal(250, pass2);
+            Assert.Equal(1251, chunkCollector.OfflineQueueCount);
+
+            // 7. VmessConfig parses Shadowrocket JSON obfsParam, computes EffectiveWsHostHeader (SNI for preferred-IP TLS), and rejects whitespace Path
+            string srCore = Convert.ToBase64String(Encoding.UTF8.GetBytes("auto:11111111-1111-1111-1111-111111111111@104.16.1.1:443"));
+            string obfsJson = Uri.EscapeDataString("{\"Host\":\"cdn.example.com\",\"Path\":\"/vmess-ws\"}");
+            Assert.True(VmessConfig.TryParse($"vmess://{srCore}?obfs=websocket&obfsParam={obfsJson}&tls=1", out VmessConfig? srCfg, out string srErr), srErr);
+            Assert.Equal("cdn.example.com", srCfg!.Host);
+            Assert.Equal("/vmess-ws", srCfg.Path);
+            Assert.Equal("cdn.example.com", srCfg.EffectiveWsHostHeader);
+
+            // Preferred-IP WS+TLS node without explicit Host falls back to SNI for Host header
+            string sniOnlyJson = Convert.ToBase64String(Encoding.UTF8.GetBytes(
+                "{\"add\":\"104.16.1.2\",\"port\":\"443\",\"id\":\"11111111-1111-1111-1111-111111111111\",\"net\":\"ws\",\"tls\":\"tls\",\"sni\":\"edge.example.com\",\"path\":\"/ws\"}"));
+            Assert.True(VmessConfig.TryParse($"vmess://{sniOnlyJson}", out VmessConfig? sniCfg, out _));
+            Assert.Equal("edge.example.com", sniCfg!.EffectiveWsHostHeader);
+
+            // Path with whitespace/control chars rejected
+            string badPathJson = Convert.ToBase64String(Encoding.UTF8.GetBytes(
+                "{\"add\":\"example.com\",\"port\":\"443\",\"id\":\"11111111-1111-1111-1111-111111111111\",\"net\":\"ws\",\"path\":\"/bad path\"}"));
+            Assert.False(VmessConfig.TryParse($"vmess://{badPathJson}", out _, out _));
+
+            // 8. HttpSyncClient.TruncateOversizedEvent honors custom 512-char clamp for 413 retry
+            var bigEv = new GameLogEventItem { Type = "Event", CreatedAt = "2026-11-25T15:00:00Z", Data = new string('Z', 3000) };
+            GameLogEventItem clamped = HttpSyncClient.TruncateOversizedEvent(bigEv, maxDataChars: 512);
+            Assert.Equal(512, clamped.Data!.Length);
+        }
+        finally
+        {
+            if (Directory.Exists(tempRoot)) Directory.Delete(tempRoot, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task Wave9_Fixes_OversizedLineNoLivelock_QueueHeadSeq_IssBom_MetadataGuard_VmessCrlf_AndUpdaterHtml()
+    {
+        string tempRoot = Path.Combine(Path.GetTempPath(), "vrcx-w9-" + Guid.NewGuid().ToString("N"));
+        string logDir = Path.Combine(tempRoot, "logs");
+        string stateDir = Path.Combine(tempRoot, "state");
+        Directory.CreateDirectory(logDir);
+        Directory.CreateDirectory(stateDir);
+        try
+        {
+            // 1. Live log single line exceeding 8 MiB chunk cap advances past line without livelocking and parses subsequent events
+            string liveLog = Path.Combine(logDir, "output_log_2026-11-25_18-00-00.txt");
+            using (var fs = new FileStream(liveLog, FileMode.Create, FileAccess.Write, FileShare.Read))
+            {
+                byte[] filler = new byte[1024 * 1024];
+                Array.Fill(filler, (byte)'A');
+                for (int i = 0; i < 9; i++)
+                {
+                    await fs.WriteAsync(filler);
+                }
+                byte[] tailLine = Encoding.UTF8.GetBytes(
+                    "\n2026.11.25 18:01:00 Log        -  [Behaviour] Joining wrld_11111111-1111-1111-1111-111111111111:9090\n" +
+                    "2026.11.25 18:01:01 Log        -  [Behaviour] Entering Room: Post-Oversize World\n");
+                await fs.WriteAsync(tailLine);
+            }
+            var collector = new LogTailCollector(stateDir);
+            int parsed = collector.PollLogDirectory(logDir);
+            Assert.Equal(1, parsed);
+            Assert.Equal("Post-Oversize World", collector.Parser.CurrentWorldName);
+            Assert.True(collector.SnapshotCursor().ByteOffset > 9 * 1024 * 1024);
+
+            // 2. Sequence-guarded AcknowledgeBatch refuses to drop newer events after 20k queue head trim
+            var seqState = Path.Combine(tempRoot, "seq-state");
+            var seqLogs = Path.Combine(tempRoot, "seq-logs");
+            Directory.CreateDirectory(seqState);
+            Directory.CreateDirectory(seqLogs);
+            var seqCollector = new LogTailCollector(seqState);
+            string bulkLog = Path.Combine(seqLogs, "output_log_2026-11-25_18-05-00.txt");
+            var bulkSb = new StringBuilder();
+            for (int i = 0; i < 20_050; i++)
+            {
+                bulkSb.Append("2026.11.25 18:05:00 Log        -  [Video Playback] Attempting to resolve URL 'https://example.com/q/")
+                      .Append(i)
+                      .AppendLine("'");
+            }
+            await File.WriteAllTextAsync(bulkLog, bulkSb.ToString(), new UTF8Encoding(false));
+            // Seed initial small batch and capture headSeq before overflow trim
+            string seedLog = Path.Combine(seqLogs, "output_log_2026-11-25_18-04-00.txt");
+            await File.WriteAllTextAsync(
+                seedLog,
+                "2026.11.25 18:04:00 Log        -  [Video Playback] Attempting to resolve URL 'https://example.com/seed/0'\n",
+                new UTF8Encoding(false));
+            var seqCollector2 = new LogTailCollector(Path.Combine(tempRoot, "seq-state-2"));
+            File.Delete(bulkLog);
+            seqCollector2.PollLogDirectory(seqLogs);
+            var (initialBatch, staleSeq) = seqCollector2.PeekBatchWithSeq(1);
+            Assert.Single(initialBatch);
+
+            // Trigger >20k queue overflow which trims old head and advances _queueHeadSeq
+            await File.WriteAllTextAsync(bulkLog, bulkSb.ToString(), new UTF8Encoding(false));
+            seqCollector2.PollLogDirectory(seqLogs);
+            int countBeforeStaleAck = seqCollector2.OfflineQueueCount;
+            Assert.Equal(20_000, countBeforeStaleAck);
+            seqCollector2.AcknowledgeBatch(1, staleSeq);
+            // Stale headSeq must NOT remove any surviving newer item
+            Assert.Equal(countBeforeStaleAck, seqCollector2.OfflineQueueCount);
+
+            // 3. Installer .iss carries UTF-8 BOM so Inno Setup compiles Chinese/Japanese text without mojibake
+            string? dir = AppContext.BaseDirectory;
+            string? issPath = null;
+            for (int i = 0; i < 8 && dir != null; i++)
+            {
+                string candidate = Path.Combine(dir, "VRCX-Agent", "Installer", "VRCX-Agent.iss");
+                if (File.Exists(candidate))
+                {
+                    issPath = candidate;
+                    break;
+                }
+                dir = Directory.GetParent(dir)?.FullName;
+            }
+            Assert.NotNull(issPath);
+            byte[] issHead = File.ReadAllBytes(issPath!)[..3];
+            Assert.Equal(new byte[] { 0xEF, 0xBB, 0xBF }, issHead);
+
+            // 4. ScreenshotPipeline: rejects non-PNG metadata write, rejects riffPayloadLen<12 WebP, and does NOT persist ledger when r2Stored=false
+            string fakeJpg = Path.Combine(tempRoot, "not_a_png.jpg");
+            await File.WriteAllBytesAsync(fakeJpg, new byte[] { 0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0xFF, 0xD9 });
+            Assert.False(ScreenshotPipeline.WriteVrcxPngMetadata(fakeJpg, new ScreenshotMetaPayload { WorldName = "Nope" }));
+
+            string badWebp = Path.Combine(tempRoot, "malformed.webp");
+            byte[] badWebpBytes = new byte[12];
+            Encoding.ASCII.GetBytes("RIFF").CopyTo(badWebpBytes, 0);
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(badWebpBytes.AsSpan(4, 4), 4u);
+            Encoding.ASCII.GetBytes("WEBP").CopyTo(badWebpBytes, 8);
+            await File.WriteAllBytesAsync(badWebp, badWebpBytes);
+            Assert.False(ScreenshotPipeline.IsImageFileComplete(badWebp, badWebpBytes));
+
+            string validPng = Path.Combine(tempRoot, "VRChat_2026-11-25_18-10-00.000_64x64.png");
+            using (var img = new Image<Rgba32>(16, 16, new Rgba32(10, 120, 200, 255)))
+            {
+                img.SaveAsPng(validPng);
+            }
+            var r2Cfg = new AgentConfig
+            {
+                CloudUrl = "https://vrcx.example.workers.dev",
+                SyncSecret = "vrcx_sync_w9_secret",
+                AutoUploadScreenshots = true,
+                CompressScreenshots = false
+            };
+            using var r2FalseHttp = new HttpClient(new StubHttpHandler(_ => Task.FromResult(
+                new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent("{\"ok\":true,\"data\":{\"duplicate\":false,\"r2Stored\":false}}", Encoding.UTF8, "application/json")
+                })));
+            var r2Pipeline = new ScreenshotPipeline(() => r2Cfg, r2FalseHttp, Path.Combine(tempRoot, "r2-state"));
+            bool r2Uploaded = await r2Pipeline.UploadQueuedTaskAsync(
+                new PendingScreenshotTask { LocalPath = validPng, TakenAtIso = "2026-11-25T18:10:00.000Z" },
+                CancellationToken.None);
+            Assert.False(r2Uploaded);
+            Assert.False(r2Pipeline.HasAlreadyUploaded(validPng));
+
+            // 5. VmessConfig: rejects CRLF/whitespace in Host/SNI/ALPN, falls back from blank peer= to sni=, accepts comma+space paths
+            string crlfHostJson = Convert.ToBase64String(Encoding.UTF8.GetBytes(
+                "{\"add\":\"example.com\",\"port\":\"443\",\"id\":\"11111111-1111-1111-1111-111111111111\",\"net\":\"ws\",\"host\":\"evil.com\\r\\nX-Inject: 1\",\"path\":\"/ws\"}"));
+            Assert.False(VmessConfig.TryParse($"vmess://{crlfHostJson}", out _, out _));
+
+            string srCore2 = Convert.ToBase64String(Encoding.UTF8.GetBytes("auto:11111111-1111-1111-1111-111111111111@104.16.1.1:443"));
+            Assert.True(VmessConfig.TryParse($"vmess://{srCore2}?tls=1&peer=&sni=fallback-sni.example.com&obfs=websocket&path=/a,%20/b", out VmessConfig? srCfg2, out string srErr2), srErr2);
+            Assert.Equal("fallback-sni.example.com", srCfg2!.Sni);
+            Assert.Equal("/a", srCfg2.EffectiveWsPath);
+
+            // 6. AgentUpdater HTML fallback extracts tag terminated by closing quote in href attribute
+            using var updaterHttp = new HttpClient(new StubHttpHandler(req =>
+            {
+                if (req.RequestUri!.AbsoluteUri.Contains("api.github.com"))
+                {
+                    return Task.FromResult(new HttpResponseMessage(HttpStatusCode.Forbidden));
+                }
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent(
+                        "<html><body><a href=\"https://github.com/nuomew/VRCX-Worker/releases/tag/v1.10.9\">v1.10.9</a></body></html>",
+                        Encoding.UTF8,
+                        "text/html")
+                });
+            }));
+            var updater = new AgentUpdater(updaterHttp);
+            AgentReleaseInfo rel = await updater.CheckForUpdateAsync("1.10.6", CancellationToken.None);
+            Assert.True(rel.UsedFallbackRedirect);
+            Assert.Equal("v1.10.9", rel.TagName);
+            Assert.True(rel.IsUpdateAvailable);
+
+            // 7. AgentConfig.Clone() isolates config snapshot from subsequent mutation; EmbedLocalMetadataOnlyAsync tolerates read-only PNG without throwing
+            var origCfg = new AgentConfig { CloudUrl = "https://a.example", SyncSecret = "s1" };
+            AgentConfig clonedCfg = origCfg.Clone();
+            origCfg.CloudUrl = "https://b.example";
+            Assert.Equal("https://a.example", clonedCfg.CloudUrl);
+
+            string roPng2 = Path.Combine(tempRoot, "readonly_embed_guard.png");
+            using (var roImg = new Image<Rgba32>(8, 8, new Rgba32(50, 60, 70, 255)))
+            {
+                roImg.SaveAsPng(roPng2);
+            }
+            File.SetAttributes(roPng2, File.GetAttributes(roPng2) | FileAttributes.ReadOnly);
+            try
+            {
+                await r2Pipeline.EmbedLocalMetadataOnlyAsync(
+                    new PendingScreenshotTask { LocalPath = roPng2, WorldName = "ReadOnlyWorld" },
+                    CancellationToken.None);
+            }
+            finally
+            {
+                File.SetAttributes(roPng2, File.GetAttributes(roPng2) & ~FileAttributes.ReadOnly);
+            }
+        }
+        finally
+        {
+            if (Directory.Exists(tempRoot)) Directory.Delete(tempRoot, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task CloudUrlNormalizationAndSyncSecretValidation_StripHashRouterAndRejectInvalidHeaders()
+    {
+        // 1. TryNormalizeCloudUrl strips Vue hash-router #/settings and ?query while preserving base path
+        Assert.True(HttpSyncClient.TryNormalizeCloudUrl("https://vrcx.example.workers.dev/#/settings", out string norm1));
+        Assert.Equal("https://vrcx.example.workers.dev", norm1);
+
+        Assert.True(HttpSyncClient.TryNormalizeCloudUrl("https://example.com:443/vrcx/?tab=cloud#/settings", out string norm2));
+        Assert.Equal("https://example.com/vrcx", norm2);
+
+        Assert.False(HttpSyncClient.TryNormalizeCloudUrl("ftp://example.com", out _));
+        Assert.False(HttpSyncClient.TryNormalizeCloudUrl("not-a-url", out _));
+        // Reject embedded credentials including empty-user ':pass@' which would otherwise throw UriFormatException in UriBuilder
+        Assert.False(HttpSyncClient.TryNormalizeCloudUrl("https://:pass@vrcx.example.workers.dev", out _));
+        Assert.False(HttpSyncClient.TryNormalizeCloudUrl("https://user:pass@vrcx.example.workers.dev", out _));
+
+        // Deterministic ASCII-safe DeviceId fallback without mutating caller's AgentConfig in ApplySyncAuthHeaders
+        var legacyCfg = new AgentConfig { DeviceId = "设备-中文 1" };
+        using var req1 = new HttpRequestMessage(HttpMethod.Post, "https://vrcx.example.workers.dev/api/agent/sync");
+        using var req2 = new HttpRequestMessage(HttpMethod.Post, "https://vrcx.example.workers.dev/api/agent/sync");
+        HmacSigner.ApplySyncAuthHeaders(req1, legacyCfg);
+        HmacSigner.ApplySyncAuthHeaders(req2, legacyCfg);
+        string h1 = Assert.Single(req1.Headers.GetValues("X-Device-Id"));
+        string h2 = Assert.Single(req2.Headers.GetValues("X-Device-Id"));
+        Assert.Equal(h1, h2);
+        Assert.True(HmacSigner.IsValidSyncSecret(h1));
+        Assert.Equal("设备-中文 1", legacyCfg.DeviceId);
+        Assert.Equal(h1, legacyCfg.EnsureDeviceId());
+
+        // 2. IsValidSyncSecret allows empty or printable ASCII without whitespace; rejects CJK, zero-width space, internal spaces, CRLF
+        Assert.True(HmacSigner.IsValidSyncSecret(""));
+        Assert.True(HmacSigner.IsValidSyncSecret("  vrcx_sync-Key.123!  "));
+        Assert.False(HmacSigner.IsValidSyncSecret("密钥_abc"));
+        Assert.False(HmacSigner.IsValidSyncSecret("abc\u200Bdef"));
+        Assert.False(HmacSigner.IsValidSyncSecret("abc def"));
+        Assert.False(HmacSigner.IsValidSyncSecret("abc\r\ndef"));
+
+        // 3. TestConnectionAsync rejects non-ASCII SyncSecret BEFORE issuing HTTP calls, and sends normalized URL without #/settings
+        int httpCalls = 0;
+        Uri? sentUri = null;
+        using var stubHttp = new HttpClient(new StubHttpHandler(req =>
+        {
+            httpCalls++;
+            sentUri = req.RequestUri;
+            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(
+                    "{\"ok\":true,\"data\":{\"deviceId\":\"win-1\",\"deviceName\":\"TestPC\",\"syncIntervalSeconds\":60}}",
+                    Encoding.UTF8,
+                    "application/json")
+            });
+        }));
+        var client = new HttpSyncClient(stubHttp);
+
+        var (badOk, badMsg, _) = await client.TestConnectionAsync(
+            "https://vrcx.example.workers.dev/#/settings",
+            "bad\u200Bsecret",
+            "win-1",
+            "TestPC",
+            false,
+            "",
+            CancellationToken.None);
+        Assert.False(badOk);
+        Assert.Equal(AgentStrings.InvalidSyncSecretMessage, badMsg);
+        Assert.Equal(0, httpCalls);
+
+        var (goodOk, _, goodRes) = await client.TestConnectionAsync(
+            "https://vrcx.example.workers.dev/#/settings",
+            "valid_key_123",
+            "win-1",
+            "TestPC",
+            false,
+            "",
+            CancellationToken.None);
+        Assert.True(goodOk);
+        Assert.NotNull(goodRes);
+        Assert.Equal(1, httpCalls);
+        Assert.Equal("https://vrcx.example.workers.dev/api/agent/sync", sentUri?.AbsoluteUri);
+    }
+
     private sealed class StubHttpHandler : HttpMessageHandler
     {
         private readonly Func<HttpRequestMessage, Task<HttpResponseMessage>> _responder;

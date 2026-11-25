@@ -236,6 +236,16 @@ export const useNotificationsSettingsStore = defineStore('NotificationsSettings'
     function setDesktopToast(value) {
         desktopToast.value = value;
         configRepository.setString('VRCX_desktopToast', value);
+        if (
+            typeof WEB !== 'undefined' &&
+            WEB &&
+            value &&
+            value !== 'Never' &&
+            typeof Notification !== 'undefined' &&
+            Notification.permission === 'default'
+        ) {
+            Notification.requestPermission().catch(() => {});
+        }
     }
     function setAfkDesktopToast() {
         afkDesktopToast.value = !afkDesktopToast.value;

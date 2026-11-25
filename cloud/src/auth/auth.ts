@@ -14,6 +14,8 @@ import type { Env } from '../env';
 const SESSION_COOKIE_NAME = 'vrcx_cloud_session';
 const SESSION_TTL_SECONDS = 60 * 60 * 24 * 14; // 14 days
 const AGENT_REPLAY_WINDOW_SEC = 60;
+const STATE_KEY_REVOKED_SESSIONS = 'revoked_sessions';
+const MAX_REVOKED_SESSIONS = 50;
 
 export type AuthMode = 'cloudflare_access' | 'passcode_session' | 'bearer_token' | 'open_setup';
 
@@ -28,6 +30,10 @@ export interface AgentAuthResult {
     authenticated: boolean;
     deviceId?: string;
     deviceName?: string;
+    requiresHmac?: boolean;
+    hmacSecretEnc?: string;
+    /** True when credentials matched a per-device row in `cloud_devices` (must never be resurrected if revoked mid-flight). */
+    fromDeviceTable?: boolean;
     reason?: string;
 }
 
@@ -46,16 +52,29 @@ export function getMasterKey(env: Env): string {
 
 /**
  * Blocks cross-origin browser WebSocket handshakes (CSWSH) and cross-site state-changing requests (CSRF)
- * while permitting same-origin browsers and non-browser clients that omit Origin.
+ * while permitting same-origin browsers and non-browser clients that omit browser fetch metadata.
  */
 export function isSameOriginRequest(request: Request, url: URL): boolean {
+    const targetOrigin = url.origin.toLowerCase();
     const origin = request.headers.get('Origin')?.trim();
     if (origin) {
-        return origin.toLowerCase() === url.origin.toLowerCase();
+        try {
+            return new URL(origin).origin.toLowerCase() === targetOrigin;
+        } catch {
+            return false;
+        }
     }
     const fetchSite = request.headers.get('Sec-Fetch-Site')?.trim().toLowerCase();
-    if (fetchSite === 'cross-site') {
+    if (fetchSite && fetchSite !== 'same-origin' && fetchSite !== 'none') {
         return false;
+    }
+    const referer = request.headers.get('Referer')?.trim();
+    if (referer) {
+        try {
+            return new URL(referer).origin.toLowerCase() === targetOrigin;
+        } catch {
+            return false;
+        }
     }
     return true;
 }
@@ -103,16 +122,35 @@ function base64UrlDecode(str: string): Uint8Array {
 }
 
 let cachedAccessJwks: { domain: string; fetchedAt: number; keys: JsonWebKey[] } | null = null;
-let lastJwksForcedRefreshAt = 0;
+const jwksRefreshCooldownByDomain = new Map<string, { rotatedAt: number; unchangedAt: number; failedAt: number }>();
+let inFlightJwksFetch: { domain: string; promise: Promise<JsonWebKey[] | null> } | null = null;
 
 async function fetchCloudflareAccessJwks(normalizedDomain: string, now: number): Promise<JsonWebKey[] | null> {
-    const certsUrl = `https://${normalizedDomain}/cdn-cgi/access/certs`;
-    const res = await fetch(certsUrl);
-    if (!res.ok) return null;
-    const json = (await res.json()) as { keys?: JsonWebKey[] };
-    const keys = Array.isArray(json.keys) ? json.keys : [];
-    cachedAccessJwks = { domain: normalizedDomain, fetchedAt: now, keys };
-    return keys;
+    if (inFlightJwksFetch && inFlightJwksFetch.domain === normalizedDomain) {
+        return inFlightJwksFetch.promise;
+    }
+    const promise = (async (): Promise<JsonWebKey[] | null> => {
+        try {
+            const certsUrl = `https://${normalizedDomain}/cdn-cgi/access/certs`;
+            const res = await fetch(certsUrl);
+            if (!res.ok) return null;
+            const json = (await res.json()) as { keys?: JsonWebKey[] };
+            const keys = Array.isArray(json.keys) ? json.keys : [];
+            if (keys.length === 0) return null;
+            cachedAccessJwks = { domain: normalizedDomain, fetchedAt: now, keys };
+            return keys;
+        } catch {
+            return null;
+        }
+    })();
+    inFlightJwksFetch = { domain: normalizedDomain, promise };
+    try {
+        return await promise;
+    } finally {
+        if (inFlightJwksFetch?.promise === promise) {
+            inFlightJwksFetch = null;
+        }
+    }
 }
 
 async function verifyCloudflareAccessJwt(jwt: string, teamDomain: string, expectedAud: string): Promise<string | null> {
@@ -125,9 +163,9 @@ async function verifyCloudflareAccessJwt(jwt: string, teamDomain: string, expect
         };
         const payload = JSON.parse(new TextDecoder().decode(base64UrlDecode(parts[1]!))) as {
             aud?: string | string[];
-            exp?: number;
-            nbf?: number;
-            iss?: string;
+            exp?: unknown;
+            nbf?: unknown;
+            iss?: unknown;
             email?: string;
             sub?: string;
         };
@@ -138,17 +176,24 @@ async function verifyCloudflareAccessJwt(jwt: string, teamDomain: string, expect
         const normalizedDomain = teamDomain.replace(/^https?:\/\//i, '').replace(/\/+$/, '');
         if (!normalizedDomain) return null;
 
-        const audList = Array.isArray(payload.aud) ? payload.aud : payload.aud ? [payload.aud] : [];
+        const audList = Array.isArray(payload.aud) ? payload.aud : typeof payload.aud === 'string' ? [payload.aud] : [];
         if (!audList.includes(expectedAud)) return null;
 
         const nowSec = Math.floor(Date.now() / 1000);
-        if (!payload.exp || payload.exp < nowSec) return null;
-        if (typeof payload.nbf === 'number' && payload.nbf > nowSec + 60) return null;
-        if (payload.iss) {
-            const normalizedIss = payload.iss.replace(/\/+$/, '').toLowerCase();
-            if (normalizedIss !== `https://${normalizedDomain.toLowerCase()}`) {
+        if (typeof payload.exp !== 'number' || !Number.isFinite(payload.exp) || payload.exp <= nowSec) {
+            return null;
+        }
+        if (payload.nbf !== undefined) {
+            if (typeof payload.nbf !== 'number' || !Number.isFinite(payload.nbf) || payload.nbf > nowSec + 60) {
                 return null;
             }
+        }
+        if (typeof payload.iss !== 'string' || !payload.iss.trim()) {
+            return null;
+        }
+        const normalizedIss = payload.iss.trim().replace(/\/+$/, '').toLowerCase();
+        if (normalizedIss !== `https://${normalizedDomain.toLowerCase()}`) {
+            return null;
         }
 
         const now = Date.now();
@@ -162,13 +207,42 @@ async function verifyCloudflareAccessJwt(jwt: string, teamDomain: string, expect
         }
 
         let jwk = cachedAccessJwks?.keys.find((k) => (k as { kid?: string }).kid === header.kid);
-        // Handle Cloudflare Access key rotation promptly by refreshing JWKS once per 60s cooldown on unknown kid.
-        if (!jwk && now - lastJwksForcedRefreshAt > 60_000) {
-            lastJwksForcedRefreshAt = now;
+        // Handle Cloudflare Access key rotation promptly with per-domain cooldowns:
+        // - 60s cooldown only when JWKS actually rotated or matched the requested kid;
+        // - 15s cooldown when an unknown/forged kid fetched an unchanged JWKS set (prevents forged-kid DoS during rotation);
+        // - 5s backoff after transient fetch failure.
+        const domainCooldown = jwksRefreshCooldownByDomain.get(normalizedDomain) ?? {
+            rotatedAt: 0,
+            unchangedAt: 0,
+            failedAt: 0
+        };
+        if (
+            !jwk &&
+            now - domainCooldown.rotatedAt > 60_000 &&
+            now - domainCooldown.unchangedAt > 15_000 &&
+            now - domainCooldown.failedAt > 5_000
+        ) {
+            const prevKids = new Set(
+                (cachedAccessJwks?.domain === normalizedDomain ? cachedAccessJwks.keys : [])
+                    .map((k) => (k as { kid?: string }).kid)
+                    .filter((k): k is string => Boolean(k))
+            );
             const refreshed = await fetchCloudflareAccessJwks(normalizedDomain, now);
             if (refreshed) {
                 jwk = refreshed.find((k) => (k as { kid?: string }).kid === header.kid);
+                const hasNewKey = refreshed.some((k) => {
+                    const kid = (k as { kid?: string }).kid;
+                    return Boolean(kid && !prevKids.has(kid));
+                });
+                if (jwk || hasNewKey) {
+                    domainCooldown.rotatedAt = now;
+                } else {
+                    domainCooldown.unchangedAt = now;
+                }
+            } else {
+                domainCooldown.failedAt = now;
             }
+            jwksRefreshCooldownByDomain.set(normalizedDomain, domainCooldown);
         }
         if (!jwk) return null;
 
@@ -190,6 +264,67 @@ async function verifyCloudflareAccessJwt(jwt: string, teamDomain: string, expect
         return valid ? payload.email || payload.sub || 'access-user' : null;
     } catch {
         return null;
+    }
+}
+
+async function isSessionRevoked(env: Env, sessionId: string): Promise<boolean> {
+    if (!sessionId || !env.DB_CORE) return false;
+    try {
+        const row = await env.DB_CORE.prepare(
+            'SELECT payload_json FROM cloud_bg_sync_state WHERE state_key = ? LIMIT 1'
+        )
+            .bind(STATE_KEY_REVOKED_SESSIONS)
+            .first<{ payload_json?: string }>();
+        if (!row?.payload_json) return false;
+        const parsed = JSON.parse(row.payload_json) as Record<string, unknown>;
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return false;
+        const expSec = Number(parsed[sessionId] ?? 0);
+        return Number.isFinite(expSec) && expSec >= Math.floor(Date.now() / 1000);
+    } catch {
+        return false;
+    }
+}
+
+async function revokeSessionId(env: Env, sessionId: string): Promise<void> {
+    if (!sessionId || !env.DB_CORE) return;
+    const nowSec = Math.floor(Date.now() / 1000);
+    const nowIso = new Date().toISOString();
+    try {
+        const row = await env.DB_CORE.prepare(
+            'SELECT payload_json FROM cloud_bg_sync_state WHERE state_key = ? LIMIT 1'
+        )
+            .bind(STATE_KEY_REVOKED_SESSIONS)
+            .first<{ payload_json?: string }>();
+        const active: Array<[string, number]> = [];
+        if (row?.payload_json) {
+            try {
+                const parsed = JSON.parse(row.payload_json) as Record<string, unknown>;
+                if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+                    for (const [sid, exp] of Object.entries(parsed)) {
+                        const expNum = Number(exp);
+                        if (sid && sid !== sessionId && Number.isFinite(expNum) && expNum >= nowSec) {
+                            active.push([sid, expNum]);
+                        }
+                    }
+                }
+            } catch {
+                // Ignore malformed state
+            }
+        }
+        active.push([sessionId, nowSec + SESSION_TTL_SECONDS]);
+        active.sort((a, b) => b[1] - a[1]);
+        const bounded = Object.fromEntries(active.slice(0, MAX_REVOKED_SESSIONS));
+        await env.DB_CORE.prepare(
+            `INSERT INTO cloud_bg_sync_state (state_key, payload_json, updated_at)
+             VALUES (?, ?, ?)
+             ON CONFLICT(state_key) DO UPDATE SET
+                payload_json = excluded.payload_json,
+                updated_at = excluded.updated_at`
+        )
+            .bind(STATE_KEY_REVOKED_SESSIONS, JSON.stringify(bounded), nowIso)
+            .run();
+    } catch {
+        // Non-fatal in minimal test setups without DB_CORE schema
     }
 }
 
@@ -233,11 +368,14 @@ export async function authenticateWeb(request: Request, env: Env): Promise<WebAu
             return { authenticated: false, authMode, requiresTotp, subject: '' };
         }
         const verified = await verifySessionCookie(getMasterKey(env), token);
+        const valid = Boolean(
+            verified.valid && (!verified.sessionId || !(await isSessionRevoked(env, verified.sessionId)))
+        );
         return {
-            authenticated: verified.valid,
+            authenticated: valid,
             authMode,
             requiresTotp,
-            subject: verified.valid ? 'owner' : ''
+            subject: valid ? 'owner' : ''
         };
     }
 
@@ -245,14 +383,10 @@ export async function authenticateWeb(request: Request, env: Env): Promise<WebAu
 }
 
 /**
- * Verifies Windows VRCX.Agent requests using per-device Bearer token (SHA-256 hash stored in D1)
- * plus mandatory HMAC-SHA256 request signature with ±60s replay protection for paired devices.
+ * Pre-authenticates Windows VRCX.Agent Bearer / Sync Key credentials BEFORE reading potentially large
+ * request bodies (preventing unauthenticated OOM DoS on public agent endpoints).
  */
-export async function authenticateAgent(
-    request: Request,
-    env: Env,
-    rawBody: string | Uint8Array = ''
-): Promise<AgentAuthResult> {
+export async function preAuthenticateAgent(request: Request, env: Env): Promise<AgentAuthResult> {
     const authHeader = request.headers.get('Authorization') ?? '';
     const syncKeyHeader = request.headers.get('X-Sync-Key')?.trim() ?? '';
     const deviceIdHeader = request.headers.get('X-Device-Id')?.trim();
@@ -269,7 +403,8 @@ export async function authenticateAgent(
             return {
                 authenticated: true,
                 deviceId: deviceIdHeader || url.searchParams.get('deviceId')?.trim() || 'default-win-agent',
-                deviceName: 'Windows Sync Agent'
+                deviceName: request.headers.get('X-Device-Name')?.trim() || '',
+                requiresHmac: false
             };
         }
         return { authenticated: false, reason: 'Missing agent sync key' };
@@ -279,7 +414,8 @@ export async function authenticateAgent(
         return {
             authenticated: true,
             deviceId: deviceIdHeader || url.searchParams.get('deviceId')?.trim() || 'win-sync-agent',
-            deviceName: request.headers.get('X-Device-Name')?.trim() || 'Windows PC'
+            deviceName: request.headers.get('X-Device-Name')?.trim() || '',
+            requiresHmac: false
         };
     }
 
@@ -287,7 +423,8 @@ export async function authenticateAgent(
         return {
             authenticated: true,
             deviceId: deviceIdHeader || url.searchParams.get('deviceId')?.trim() || 'default-win-agent',
-            deviceName: 'Admin Token Agent'
+            deviceName: request.headers.get('X-Device-Name')?.trim() || '',
+            requiresHmac: false
         };
     }
 
@@ -302,13 +439,13 @@ export async function authenticateAgent(
         return { authenticated: false, reason: 'Unknown device token' };
     }
 
-    // Enforce mandatory HMAC-SHA256 + replay-window validation for paired devices (non-empty hmac_secret_enc)
-    // on HTTP endpoints so omitting X-Signature/X-Timestamp can never downgrade auth to bare Bearer.
     const hasPairedHmac = Boolean(device.hmac_secret_enc?.trim());
     const isWsUpgrade = url.pathname.startsWith('/ws/');
     const sigHeader = request.headers.get('X-Signature')?.trim();
     const tsHeader = request.headers.get('X-Timestamp')?.trim();
-    if ((hasPairedHmac && !isWsUpgrade) || sigHeader || tsHeader) {
+    const requiresHmac = Boolean((hasPairedHmac && !isWsUpgrade) || sigHeader || tsHeader);
+
+    if (requiresHmac) {
         if (!hasPairedHmac) {
             return { authenticated: false, reason: 'Device is not configured for HMAC authentication' };
         }
@@ -323,29 +460,66 @@ export async function authenticateAgent(
         if (!Number.isFinite(tsNum) || Math.abs(nowSec - tsNum) > AGENT_REPLAY_WINDOW_SEC) {
             return { authenticated: false, reason: 'Timestamp outside replay window' };
         }
-        const [ivB64, cipherB64] = device.hmac_secret_enc.split(':');
-        if (!ivB64 || !cipherB64) {
-            return { authenticated: false, reason: 'Corrupted device HMAC key' };
-        }
-        let hmacSecret: string;
-        try {
-            hmacSecret = await decryptAesGcm(getMasterKey(env), cipherB64, ivB64);
-        } catch {
-            return { authenticated: false, reason: 'Failed to decrypt device HMAC key' };
-        }
-        const bodyHash = await sha256Hex(rawBody);
-        const canonical = `${tsHeader}\n${request.method.toUpperCase()}\n${url.pathname}\n${bodyHash}`;
-        const expectedSig = await hmacSha256Hex(hmacSecret, canonical);
-        if (!timingSafeEqual(expectedSig, sigHeader.toLowerCase())) {
-            return { authenticated: false, reason: 'Invalid HMAC signature' };
-        }
     }
 
     return {
         authenticated: true,
         deviceId: device.device_id,
-        deviceName: device.device_name
+        deviceName: device.device_name,
+        requiresHmac,
+        hmacSecretEnc: device.hmac_secret_enc,
+        fromDeviceTable: true
     };
+}
+
+/**
+ * Completes HMAC-SHA256 body verification for a pre-authenticated agent request.
+ */
+export async function verifyAgentBodyHmac(
+    request: Request,
+    env: Env,
+    preAuth: AgentAuthResult,
+    rawBody: string | Uint8Array
+): Promise<AgentAuthResult> {
+    if (!preAuth.authenticated) {
+        return preAuth;
+    }
+    if (!preAuth.requiresHmac) {
+        return preAuth;
+    }
+    const sigHeader = request.headers.get('X-Signature')?.trim() ?? '';
+    const tsHeader = request.headers.get('X-Timestamp')?.trim() ?? '';
+    const [ivB64, cipherB64] = (preAuth.hmacSecretEnc ?? '').split(':');
+    if (!ivB64 || !cipherB64) {
+        return { authenticated: false, reason: 'Corrupted device HMAC key' };
+    }
+    let hmacSecret: string;
+    try {
+        hmacSecret = await decryptAesGcm(getMasterKey(env), cipherB64, ivB64);
+    } catch {
+        return { authenticated: false, reason: 'Failed to decrypt device HMAC key' };
+    }
+    const url = new URL(request.url);
+    const bodyHash = await sha256Hex(rawBody);
+    const canonical = `${tsHeader}\n${request.method.toUpperCase()}\n${url.pathname}\n${bodyHash}`;
+    const expectedSig = await hmacSha256Hex(hmacSecret, canonical);
+    if (!timingSafeEqual(expectedSig, sigHeader.toLowerCase())) {
+        return { authenticated: false, reason: 'Invalid HMAC signature' };
+    }
+    return preAuth;
+}
+
+/**
+ * Verifies Windows VRCX.Agent requests using per-device Bearer token (SHA-256 hash stored in D1)
+ * plus mandatory HMAC-SHA256 request signature with ±60s replay protection for paired devices.
+ */
+export async function authenticateAgent(
+    request: Request,
+    env: Env,
+    rawBody: string | Uint8Array = ''
+): Promise<AgentAuthResult> {
+    const preAuth = await preAuthenticateAgent(request, env);
+    return verifyAgentBodyHmac(request, env, preAuth, rawBody);
 }
 
 const MAX_AUTH_FAILURES_BEFORE_LOCK = 5;
@@ -489,7 +663,54 @@ export async function handleAuthRoutes(request: Request, env: Env, url: URL): Pr
 
         let body: { passcode?: string; totp?: string };
         try {
-            body = (await request.json()) as { passcode?: string; totp?: string };
+            const maxLoginBytes = 16 * 1024;
+            const contentLength = Number(request.headers.get('Content-Length') ?? '0');
+            if (Number.isFinite(contentLength) && contentLength > maxLoginBytes) {
+                await request.body?.cancel().catch(() => {});
+                return Response.json(
+                    { ok: false, error: { code: 'PAYLOAD_TOO_LARGE', message: 'Login payload too large' } },
+                    { status: 413 }
+                );
+            }
+            let rawText = '';
+            if (request.body) {
+                const reader = request.body.getReader();
+                const chunks: Uint8Array[] = [];
+                let total = 0;
+                try {
+                    while (true) {
+                        const { done, value } = await reader.read();
+                        if (done) break;
+                        if (!value || value.byteLength === 0) continue;
+                        total += value.byteLength;
+                        if (total > maxLoginBytes) {
+                            await reader.cancel().catch(() => {});
+                            return Response.json(
+                                { ok: false, error: { code: 'PAYLOAD_TOO_LARGE', message: 'Login payload too large' } },
+                                { status: 413 }
+                            );
+                        }
+                        chunks.push(value);
+                    }
+                } finally {
+                    reader.releaseLock();
+                }
+                const combined = new Uint8Array(total);
+                let off = 0;
+                for (const c of chunks) {
+                    combined.set(c, off);
+                    off += c.byteLength;
+                }
+                rawText = new TextDecoder().decode(combined);
+            }
+            const parsed = rawText ? JSON.parse(rawText) : {};
+            if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+                return Response.json(
+                    { ok: false, error: { code: 'BAD_REQUEST', message: 'Invalid JSON body' } },
+                    { status: 400 }
+                );
+            }
+            body = parsed as { passcode?: string; totp?: string };
         } catch {
             return Response.json(
                 { ok: false, error: { code: 'BAD_REQUEST', message: 'Invalid JSON body' } },
@@ -567,6 +788,18 @@ export async function handleAuthRoutes(request: Request, env: Env, url: URL): Pr
                 { ok: false, error: { code: 'FORBIDDEN_ORIGIN', message: 'Cross-origin logout request blocked' } },
                 { status: 403 }
             );
+        }
+        const cookies = parseCookies(request.headers.get('Cookie'));
+        const token = cookies[SESSION_COOKIE_NAME];
+        if (token) {
+            try {
+                const verified = await verifySessionCookie(getMasterKey(env), token);
+                if (verified.valid && verified.sessionId) {
+                    await revokeSessionId(env, verified.sessionId);
+                }
+            } catch {
+                // Ignore invalid session cookie during logout
+            }
         }
         const isSecure = url.protocol === 'https:';
         const clearCookie = [

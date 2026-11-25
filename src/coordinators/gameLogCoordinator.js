@@ -14,6 +14,7 @@ import {
 import { i18n } from '../plugins/i18n';
 import { AppDebug, logWebRequest } from '../services/appConfig';
 import { database } from '../services/database';
+import { setSuppressCloudGameLogWrites } from '../services/database/cloud/index.js';
 import { runLastLocationResetFlow, runUpdateCurrentUserLocationFlow } from './locationCoordinator';
 import { getGroupName } from '../shared/utils';
 import { userRequest } from '../api';
@@ -112,12 +113,11 @@ export async function tryLoadPlayerList() {
                 }
                 if (ctx.type === 'OnPlayerLeft') {
                     const playerKey = ctx.userId || ctx.displayName;
-                    if (playerKey) {
-                        locationStore.lastLocation.playerList.delete(playerKey);
-                    }
+                    const deleted = playerKey ? locationStore.lastLocation.playerList.delete(playerKey) : false;
                     if (ctx.userId) {
                         locationStore.lastLocation.friendList.delete(ctx.userId);
-                    } else if (ctx.displayName) {
+                    }
+                    if (!deleted && ctx.displayName) {
                         for (const [k, v] of locationStore.lastLocation.playerList.entries()) {
                             if (v.displayName === ctx.displayName) {
                                 locationStore.lastLocation.playerList.delete(k);
@@ -243,14 +243,17 @@ export async function addGameLogEntry(gameLog, location) {
             break;
         case 'player-joined':
             const joinTime = Date.parse(gameLog.dt);
+            const playerKey = userId || gameLog.displayName;
             const userMap = {
                 displayName: gameLog.displayName,
                 userId,
                 joinTime,
                 lastAvatar: ''
             };
-            locationStore.lastLocation.playerList.set(userId, userMap);
-            const ref = userStore.cachedUsers.get(userId);
+            if (playerKey) {
+                locationStore.lastLocation.playerList.set(playerKey, userMap);
+            }
+            const ref = userId ? userStore.cachedUsers.get(userId) : undefined;
             if (!userId) {
                 console.error('Missing userId:', gameLog.displayName);
             } else if (userId === userStore.currentUser.id) {
@@ -279,16 +282,30 @@ export async function addGameLogEntry(gameLog, location) {
             persistedEntryPromise = database.addGamelogJoinLeaveToDatabase(entry);
             break;
         case 'player-left':
-            const ref1 = locationStore.lastLocation.playerList.get(userId);
+            let leftPlayerKey = userId || gameLog.displayName;
+            let ref1 = leftPlayerKey ? locationStore.lastLocation.playerList.get(leftPlayerKey) : undefined;
+            if (typeof ref1 === 'undefined' && gameLog.displayName) {
+                for (const [k, v] of locationStore.lastLocation.playerList.entries()) {
+                    if (v.displayName === gameLog.displayName) {
+                        leftPlayerKey = k;
+                        ref1 = v;
+                        break;
+                    }
+                }
+            }
             if (typeof ref1 === 'undefined') {
                 break;
             }
             const time = dayjs(gameLog.dt).valueOf() - ref1.joinTime;
-            locationStore.lastLocation.playerList.delete(userId);
-            locationStore.lastLocation.friendList.delete(userId);
-            friendStore.updateFriendLastSeen(userId, gameLog.dt);
+            locationStore.lastLocation.playerList.delete(leftPlayerKey);
+            if (userId) {
+                locationStore.lastLocation.friendList.delete(userId);
+                friendStore.updateFriendLastSeen(userId, gameLog.dt);
+                photonStore.photonLobbyAvatars.delete(userId);
+            } else {
+                locationStore.lastLocation.friendList.delete(leftPlayerKey);
+            }
             gameLogStore.state.lastLocationAvatarList.delete(gameLog.displayName);
-            photonStore.photonLobbyAvatars.delete(userId);
             vrStore.updateVRLastLocation();
             instanceStore.getCurrentInstanceUserList();
             entry = createJoinLeaveEntry('OnPlayerLeft', gameLog.dt, gameLog.displayName, location, userId, time);
@@ -565,13 +582,24 @@ async function updateGameLog(dateTill) {
     await new Promise((resolve) => {
         workerTimers.setTimeout(resolve, 10000);
     });
+    const isWebMode = typeof WEB !== 'undefined' && WEB;
+    const locationStore = useLocationStore();
     await enqueueGameLogTask(async () => {
-        let location = '';
-        for (const gameLog of await gameLogService.getAll()) {
-            if (gameLog.type === 'location') {
-                location = gameLog.location;
+        let location = isWebMode ? locationStore.lastLocation.location || '' : '';
+        if (isWebMode) {
+            setSuppressCloudGameLogWrites(true);
+        }
+        try {
+            for (const gameLog of await gameLogService.getAll()) {
+                if (gameLog.type === 'location') {
+                    location = gameLog.location;
+                }
+                await addGameLogEntry(gameLog, location);
             }
-            await addGameLogEntry(gameLog, location);
+        } finally {
+            if (isWebMode) {
+                setSuppressCloudGameLogWrites(false);
+            }
         }
     });
 }

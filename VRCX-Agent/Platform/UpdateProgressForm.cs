@@ -25,12 +25,15 @@ public sealed class UpdateProgressForm : Form
     private readonly Font _uiFont;
     private readonly Font _headerFont;
 
+    private readonly CancellationTokenSource _closeCts = new();
     private CancellationTokenSource? _downloadCts;
+    private Task _activeDownloadTask = Task.CompletedTask;
 
     /// <summary>
     /// Verified local path of the downloaded Setup executable when DialogResult == DialogResult.OK.
     /// </summary>
     public string? DownloadedInstallerPath { get; private set; }
+    internal Task ActiveDownloadTask => _activeDownloadTask;
 
     public UpdateProgressForm(
         AgentReleaseInfo release,
@@ -43,6 +46,9 @@ public sealed class UpdateProgressForm : Form
         _updater = updater;
         _updatesDir = updatesDir;
 
+        SuspendLayout();
+        AutoScaleDimensions = new SizeF(96F, 96F);
+        AutoScaleMode = AutoScaleMode.Dpi;
         Text = AgentStrings.UpdateDialogTitle;
         if (windowIcon != null)
         {
@@ -52,7 +58,7 @@ public sealed class UpdateProgressForm : Form
         MaximizeBox = false;
         MinimizeBox = false;
         StartPosition = FormStartPosition.CenterScreen;
-        ClientSize = new Size(468, 224);
+        ClientSize = new Size(468, 228);
         _uiFont = new Font(AgentStrings.UiFontFamily, 9.5f);
         _headerFont = new Font(AgentStrings.UiFontFamily, 10.5f, FontStyle.Bold);
         Font = _uiFont;
@@ -61,7 +67,7 @@ public sealed class UpdateProgressForm : Form
         {
             Text = AgentStrings.FormatUpdateDialogHeader(AgentMetadata.Version, release.TagName),
             Location = new Point(20, 16),
-            Size = new Size(428, 24),
+            Size = new Size(428, 26),
             Font = _headerFont
         };
 
@@ -115,6 +121,7 @@ public sealed class UpdateProgressForm : Form
         };
         _cancelButton.Click += (_, _) =>
         {
+            _closeCts.Cancel();
             _downloadCts?.Cancel();
             DialogResult = DialogResult.Cancel;
             Close();
@@ -131,6 +138,8 @@ public sealed class UpdateProgressForm : Form
         });
         AcceptButton = _updateButton;
         CancelButton = _cancelButton;
+        ResumeLayout(false);
+        PerformLayout();
 
         if (autoStart)
         {
@@ -140,17 +149,23 @@ public sealed class UpdateProgressForm : Form
 
     protected override void OnFormClosing(FormClosingEventArgs e)
     {
+        _closeCts.Cancel();
         _downloadCts?.Cancel();
         base.OnFormClosing(e);
     }
 
+    private bool _formDisposed;
+
     protected override void Dispose(bool disposing)
     {
-        if (disposing)
+        if (disposing && !_formDisposed)
         {
+            _formDisposed = true;
+            _closeCts.Cancel();
             _downloadCts?.Cancel();
             _downloadCts?.Dispose();
             _downloadCts = null;
+            _closeCts.Dispose();
             _headerFont.Dispose();
             _uiFont.Dispose();
         }
@@ -199,7 +214,15 @@ public sealed class UpdateProgressForm : Form
 
         _downloadCts?.Cancel();
         _downloadCts?.Dispose();
-        _downloadCts = new CancellationTokenSource(TimeSpan.FromMinutes(10));
+        var localAttemptCts = new CancellationTokenSource();
+        _downloadCts = localAttemptCts;
+        using var timeoutCts = new CancellationTokenSource(TimeSpan.FromMinutes(10));
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(
+            _closeCts.Token,
+            localAttemptCts.Token,
+            timeoutCts.Token);
+        var completion = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        _activeDownloadTask = completion.Task;
 
         var progress = new Progress<(long DownloadedBytes, long TotalBytes)>(report =>
         {
@@ -228,9 +251,9 @@ public sealed class UpdateProgressForm : Form
                 _release,
                 _updatesDir,
                 progress,
-                _downloadCts.Token);
+                linkedCts.Token);
 
-            if (IsDisposed || Disposing)
+            if (IsDisposed || Disposing || _closeCts.IsCancellationRequested || localAttemptCts.IsCancellationRequested)
             {
                 return;
             }
@@ -243,6 +266,17 @@ public sealed class UpdateProgressForm : Form
             DownloadedInstallerPath = installerPath;
             DialogResult = DialogResult.OK;
             Close();
+        }
+        catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested && !_closeCts.IsCancellationRequested && !localAttemptCts.IsCancellationRequested)
+        {
+            if (!IsDisposed && !Disposing)
+            {
+                _progressBar.Style = ProgressBarStyle.Continuous;
+                _progressBar.Value = 0;
+                _statusLabel.ForeColor = Color.Firebrick;
+                _statusLabel.Text = AgentStrings.FormatUpdateFailed("Download timed out (10 min)");
+                _updateButton.Enabled = true;
+            }
         }
         catch (OperationCanceledException)
         {
@@ -262,6 +296,10 @@ public sealed class UpdateProgressForm : Form
                 _statusLabel.Text = AgentStrings.FormatUpdateFailed(ex.Message);
                 _updateButton.Enabled = true;
             }
+        }
+        finally
+        {
+            completion.TrySetResult(true);
         }
     }
 }

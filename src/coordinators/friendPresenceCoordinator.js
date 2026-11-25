@@ -1,6 +1,7 @@
 import { getGroupName, getWorldName, isRealInstance } from '../shared/utils';
 import { AppDebug } from '../services/appConfig';
 import { database } from '../services/database';
+import { isCloudFeedWriteSuppressed } from '../services/database/cloud/index.js';
 import { useFeedStore } from '../stores/feed';
 import { useFriendStore } from '../stores/friend';
 import { useNotificationStore } from '../stores/notification';
@@ -47,6 +48,7 @@ export async function runUpdateFriendDelayedCheckFlow(
         return;
     }
     const isVIP = localFavoriteFriends.has(id);
+    const suppressCloudFeed = typeof WEB !== 'undefined' && WEB && isCloudFeedWriteSuppressed();
     const ref = ctx.ref;
     if (ctx.state !== newState && typeof ctx.ref !== 'undefined') {
         if ((newState === 'offline' || newState === 'active') && ctx.state === 'online') {
@@ -56,25 +58,27 @@ export async function runUpdateFriendDelayedCheckFlow(
             if (newState === 'active') {
                 ctx.ref.$active_for = now();
             }
-            const ts = now();
-            const time = ts - $location_at;
-            worldName = await getWorldName(location);
-            groupName = await getGroupName(location);
-            feed = {
-                created_at: nowIso(),
-                type: 'Offline',
-                userId: ref.id,
-                displayName: ref.displayName,
-                location,
-                worldName,
-                groupName,
-                time
-            };
-            notificationStore.queueFeedNoty(feed);
-            sharedFeedStore.addEntry(feed);
-            const persistedFeed = await database.addOnlineOfflineToDatabase(feed);
-            if (persistedFeed) {
-                feedStore.addFeedEntry(persistedFeed);
+            if (!suppressCloudFeed) {
+                const ts = now();
+                const time = ts - $location_at;
+                worldName = await getWorldName(location);
+                groupName = await getGroupName(location);
+                feed = {
+                    created_at: nowIso(),
+                    type: 'Offline',
+                    userId: ref.id,
+                    displayName: ref.displayName,
+                    location,
+                    worldName,
+                    groupName,
+                    time
+                };
+                notificationStore.queueFeedNoty(feed);
+                sharedFeedStore.addEntry(feed);
+                const persistedFeed = await database.addOnlineOfflineToDatabase(feed);
+                if (persistedFeed) {
+                    feedStore.addFeedEntry(persistedFeed);
+                }
             }
         } else if (newState === 'online' && (ctx.state === 'offline' || ctx.state === 'active')) {
             ctx.ref.$previousLocation = '';
@@ -83,23 +87,25 @@ export async function runUpdateFriendDelayedCheckFlow(
             ctx.ref.$online_for = now();
             ctx.ref.$offline_for = '';
             ctx.ref.$active_for = '';
-            worldName = await getWorldName(location);
-            groupName = await getGroupName(location);
-            feed = {
-                created_at: nowIso(),
-                type: 'Online',
-                userId: id,
-                displayName: ctx.name,
-                location,
-                worldName,
-                groupName,
-                time: ''
-            };
-            notificationStore.queueFeedNoty(feed);
-            sharedFeedStore.addEntry(feed);
-            const persistedFeed = await database.addOnlineOfflineToDatabase(feed);
-            if (persistedFeed) {
-                feedStore.addFeedEntry(persistedFeed);
+            if (!suppressCloudFeed) {
+                worldName = await getWorldName(location);
+                groupName = await getGroupName(location);
+                feed = {
+                    created_at: nowIso(),
+                    type: 'Online',
+                    userId: id,
+                    displayName: ctx.name,
+                    location,
+                    worldName,
+                    groupName,
+                    time: ''
+                };
+                notificationStore.queueFeedNoty(feed);
+                sharedFeedStore.addEntry(feed);
+                const persistedFeed = await database.addOnlineOfflineToDatabase(feed);
+                if (persistedFeed) {
+                    feedStore.addFeedEntry(persistedFeed);
+                }
             }
         }
         if (newState === 'active') {
@@ -211,7 +217,9 @@ export async function runUpdateFriendFlow(
             ctx.name = ref.displayName;
             syncFriendSearchIndex(ctx);
         }
-        if (!watchState.isFriendsLoaded) {
+        if (!watchState.isFriendsLoaded || (isWebMode && isCloudFeedWriteSuppressed())) {
+            pendingOfflineMap.delete(id);
+            ctx.pendingOffline = false;
             await runUpdateFriendDelayedCheckFlow(ctx, stateInput, location, $location_at, { now, nowIso });
             return;
         }

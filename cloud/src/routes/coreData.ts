@@ -12,6 +12,35 @@ function safeJsonParse<T>(raw: string | null | undefined, fallback: T): T {
 
 const MAX_CORE_BATCH_ENTRIES = 500;
 
+function isPlainObject(val: unknown): val is Record<string, unknown> {
+    return Boolean(val) && typeof val === 'object' && !Array.isArray(val);
+}
+
+async function parseJsonObject(request: Request): Promise<Record<string, unknown> | null> {
+    try {
+        const parsed = (await request.json()) as unknown;
+        return isPlainObject(parsed) ? parsed : null;
+    } catch {
+        return null;
+    }
+}
+
+function badJsonResponse(code = 'BAD_REQUEST', message = 'Invalid JSON body'): Response {
+    return Response.json({ ok: false, error: { code, message } }, { status: 400 });
+}
+
+function toBundleStringValue(val: unknown): string {
+    if (typeof val === 'string') return val;
+    if (typeof val === 'object' && val !== null) {
+        try {
+            return JSON.stringify(val);
+        } catch {
+            return '';
+        }
+    }
+    return String(val);
+}
+
 /**
  * Strips plaintext VRChat passwords and raw cookies from `savedCredentials` inside `vrcx_config`
  * so unencrypted config_bundles can never store or leak VRChat session credentials.
@@ -48,8 +77,10 @@ function sanitizeConfigBundleMap(map: Record<string, string>): void {
 export function clampQueryLimit(raw: string | null, fallback: number, max: number): number {
     if (raw == null || raw.trim() === '') return fallback;
     const n = Number(raw);
-    if (!Number.isFinite(n) || n <= 0) return fallback;
-    return Math.min(Math.floor(n), max);
+    if (!Number.isFinite(n)) return fallback;
+    const floored = Math.floor(n);
+    if (floored <= 0) return fallback;
+    return Math.min(floored, max);
 }
 
 export async function incrementCounter(db: D1Database, counterKey: string, delta: number): Promise<void> {
@@ -443,86 +474,130 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
 
     // 2. Bundled config & VRCXStorage persistence (single row upsert)
     if (url.pathname === '/api/config/bundle' && request.method === 'PUT') {
-        const body = (await request.json()) as {
-            bundleKey: 'vrcx_config' | 'vrcx_storage';
-            patch?: Record<string, string | null>;
-            replace?: Record<string, string>;
-        };
-        if (body.bundleKey !== 'vrcx_config' && body.bundleKey !== 'vrcx_storage') {
-            return Response.json(
-                { ok: false, error: { code: 'BAD_BUNDLE_KEY', message: 'Invalid bundleKey' } },
-                { status: 400 }
-            );
+        const body = await parseJsonObject(request);
+        if (!body) return badJsonResponse();
+        const bundleKey = body.bundleKey;
+        if (bundleKey !== 'vrcx_config' && bundleKey !== 'vrcx_storage') {
+            return badJsonResponse('BAD_BUNDLE_KEY', 'Invalid bundleKey');
+        }
+        if (body.replace !== undefined && !isPlainObject(body.replace)) {
+            return badJsonResponse('BAD_REQUEST', 'replace must be a JSON object');
+        }
+        if (body.patch !== undefined && !isPlainObject(body.patch)) {
+            return badJsonResponse('BAD_REQUEST', 'patch must be a JSON object');
         }
 
-        let merged: Record<string, string>;
-        if (body.replace) {
-            merged = { ...body.replace };
-        } else {
-            const existing = await env.DB_CORE.prepare(
-                'SELECT payload_json FROM config_bundles WHERE bundle_key = ? LIMIT 1'
+        if (isPlainObject(body.replace)) {
+            const merged: Record<string, string> = {};
+            for (const [k, v] of Object.entries(body.replace)) {
+                if (v !== null && v !== undefined) {
+                    merged[k] = toBundleStringValue(v);
+                }
+            }
+            if (bundleKey === 'vrcx_config') {
+                sanitizeConfigBundleMap(merged);
+            }
+            const now = new Date().toISOString();
+            await env.DB_CORE.prepare(
+                `INSERT INTO config_bundles (bundle_key, version, payload_json, updated_at)
+                 VALUES (?, 1, ?, ?)
+                 ON CONFLICT(bundle_key) DO UPDATE SET
+                    version = version + 1,
+                    payload_json = excluded.payload_json,
+                    updated_at = excluded.updated_at`
             )
-                .bind(body.bundleKey)
-                .first<{ payload_json: string }>();
-            merged = safeJsonParse<Record<string, string>>(existing?.payload_json, {});
-            for (const [k, v] of Object.entries(body.patch ?? {})) {
-                if (v === null) {
-                    delete merged[k];
-                } else {
-                    merged[k] = String(v);
+                .bind(bundleKey, JSON.stringify(merged), now)
+                .run();
+            return Response.json({ ok: true });
+        }
+
+        // Patch mode uses optimistic CAS on `version` (up to 3 attempts) so concurrent writes never silently overwrite each other.
+        for (let attempt = 0; attempt < 3; attempt++) {
+            const existing = await env.DB_CORE.prepare(
+                'SELECT version, payload_json FROM config_bundles WHERE bundle_key = ? LIMIT 1'
+            )
+                .bind(bundleKey)
+                .first<{ version: number; payload_json: string }>();
+            const merged = safeJsonParse<Record<string, string>>(existing?.payload_json, {});
+            if (isPlainObject(body.patch)) {
+                for (const [k, v] of Object.entries(body.patch)) {
+                    if (v === null) {
+                        delete merged[k];
+                    } else if (v !== undefined) {
+                        merged[k] = toBundleStringValue(v);
+                    }
+                }
+            }
+            if (bundleKey === 'vrcx_config') {
+                sanitizeConfigBundleMap(merged);
+            }
+            const now = new Date().toISOString();
+            const serialized = JSON.stringify(merged);
+            if (existing) {
+                const res = await env.DB_CORE.prepare(
+                    `UPDATE config_bundles
+                     SET version = version + 1, payload_json = ?, updated_at = ?
+                     WHERE bundle_key = ? AND version = ?`
+                )
+                    .bind(serialized, now, bundleKey, existing.version)
+                    .run();
+                if ((res.meta?.changes ?? 0) === 1) {
+                    return Response.json({ ok: true });
+                }
+            } else {
+                const res = await env.DB_CORE.prepare(
+                    `INSERT OR IGNORE INTO config_bundles (bundle_key, version, payload_json, updated_at)
+                     VALUES (?, 1, ?, ?)`
+                )
+                    .bind(bundleKey, serialized, now)
+                    .run();
+                if ((res.meta?.changes ?? 0) === 1) {
+                    return Response.json({ ok: true });
                 }
             }
         }
-        if (body.bundleKey === 'vrcx_config') {
-            sanitizeConfigBundleMap(merged);
-        }
-
-        const now = new Date().toISOString();
-        await env.DB_CORE.prepare(
-            `INSERT INTO config_bundles (bundle_key, version, payload_json, updated_at)
-             VALUES (?, 1, ?, ?)
-             ON CONFLICT(bundle_key) DO UPDATE SET
-                version = version + 1,
-                payload_json = excluded.payload_json,
-                updated_at = excluded.updated_at`
-        )
-            .bind(body.bundleKey, JSON.stringify(merged), now)
-            .run();
-
-        return Response.json({ ok: true });
+        return Response.json(
+            { ok: false, error: { code: 'CONFLICT', message: 'Concurrent config update conflict; please retry' } },
+            { status: 409 }
+        );
     }
 
     // 3. Memos (user / world / avatar) & Notes
     if (url.pathname === '/api/memos') {
         if (request.method === 'PUT') {
-            const body = (await request.json()) as {
-                kind: 'user' | 'world' | 'avatar';
-                id: string;
-                editedAt?: string;
-                memo: string;
-            };
-            const editedAt = body.editedAt || new Date().toISOString();
-            if (body.kind === 'user') {
+            const body = await parseJsonObject(request);
+            if (!body) return badJsonResponse();
+            const kind = typeof body.kind === 'string' ? body.kind : '';
+            const id = typeof body.id === 'string' ? body.id.trim() : '';
+            if (!id) {
+                return badJsonResponse('BAD_MEMO', 'Valid string id is required');
+            }
+            if (body.memo !== undefined && typeof body.memo !== 'string') {
+                return badJsonResponse('BAD_MEMO', 'memo must be a string');
+            }
+            const memo = typeof body.memo === 'string' ? body.memo : '';
+            const editedAt =
+                typeof body.editedAt === 'string' && body.editedAt.trim()
+                    ? body.editedAt.trim()
+                    : new Date().toISOString();
+            if (kind === 'user') {
                 await env.DB_CORE.prepare('INSERT OR REPLACE INTO memos (user_id, edited_at, memo) VALUES (?, ?, ?)')
-                    .bind(body.id, editedAt, body.memo)
+                    .bind(id, editedAt, memo)
                     .run();
-            } else if (body.kind === 'world') {
+            } else if (kind === 'world') {
                 await env.DB_CORE.prepare(
                     'INSERT OR REPLACE INTO world_memos (world_id, edited_at, memo) VALUES (?, ?, ?)'
                 )
-                    .bind(body.id, editedAt, body.memo)
+                    .bind(id, editedAt, memo)
                     .run();
-            } else if (body.kind === 'avatar') {
+            } else if (kind === 'avatar') {
                 await env.DB_CORE.prepare(
                     'INSERT OR REPLACE INTO avatar_memos (avatar_id, edited_at, memo) VALUES (?, ?, ?)'
                 )
-                    .bind(body.id, editedAt, body.memo)
+                    .bind(id, editedAt, memo)
                     .run();
             } else {
-                return Response.json(
-                    { ok: false, error: { code: 'BAD_KIND', message: 'Invalid memo kind' } },
-                    { status: 400 }
-                );
+                return badJsonResponse('BAD_KIND', 'Invalid memo kind');
             }
             return Response.json({ ok: true });
         }
@@ -542,18 +617,11 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
 
     if (url.pathname === '/api/notes') {
         if (request.method === 'PUT') {
-            const body = (await request.json()) as {
-                userId?: unknown;
-                displayName?: unknown;
-                note?: unknown;
-                createdAt?: unknown;
-            };
+            const body = await parseJsonObject(request);
+            if (!body) return badJsonResponse();
             const userId = typeof body.userId === 'string' ? body.userId.trim() : '';
             if (!userId) {
-                return Response.json(
-                    { ok: false, error: { code: 'BAD_NOTE', message: 'Valid string userId is required' } },
-                    { status: 400 }
-                );
+                return badJsonResponse('BAD_NOTE', 'Valid string userId is required');
             }
             const displayName = typeof body.displayName === 'string' ? body.displayName : '';
             const note = typeof body.note === 'string' ? body.note : '';
@@ -576,56 +644,62 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
     // 4. Local Favorites (friend / world / avatar / print)
     if (url.pathname === '/api/favorites') {
         if (request.method === 'POST') {
-            const body = (await request.json()) as {
-                kind: 'friend' | 'world' | 'avatar' | 'print';
-                targetId: string;
-                groupName?: string;
-            };
+            const body = await parseJsonObject(request);
+            if (!body) return badJsonResponse();
+            const kind = typeof body.kind === 'string' ? body.kind : '';
+            const targetId = typeof body.targetId === 'string' ? body.targetId.trim() : '';
+            if (!targetId) {
+                return badJsonResponse('BAD_REQUEST', 'Valid string targetId is required');
+            }
+            if (body.groupName !== undefined && typeof body.groupName !== 'string') {
+                return badJsonResponse('BAD_REQUEST', 'groupName must be a string');
+            }
+            const groupName = typeof body.groupName === 'string' ? body.groupName : '';
             const now = new Date().toISOString();
-            if (body.kind === 'friend') {
+            if (kind === 'friend') {
                 await env.DB_CORE.prepare(
                     'INSERT OR IGNORE INTO favorite_friend (created_at, user_id, group_name) VALUES (?, ?, ?)'
                 )
-                    .bind(now, body.targetId, body.groupName ?? '')
+                    .bind(now, targetId, groupName)
                     .run();
-            } else if (body.kind === 'world') {
+            } else if (kind === 'world') {
                 await env.DB_CORE.prepare(
                     'INSERT OR IGNORE INTO favorite_world (created_at, world_id, group_name) VALUES (?, ?, ?)'
                 )
-                    .bind(now, body.targetId, body.groupName ?? '')
+                    .bind(now, targetId, groupName)
                     .run();
-            } else if (body.kind === 'avatar') {
+            } else if (kind === 'avatar') {
                 await env.DB_CORE.prepare(
                     'INSERT OR IGNORE INTO favorite_avatar (created_at, avatar_id, group_name) VALUES (?, ?, ?)'
                 )
-                    .bind(now, body.targetId, body.groupName ?? '')
+                    .bind(now, targetId, groupName)
                     .run();
-            } else if (body.kind === 'print') {
+            } else if (kind === 'print') {
                 await env.DB_CORE.prepare('INSERT OR IGNORE INTO favorite_print (print_id, created_at) VALUES (?, ?)')
-                    .bind(body.targetId, now)
+                    .bind(targetId, now)
                     .run();
+            } else {
+                return badJsonResponse('BAD_KIND', 'Invalid favorite kind');
             }
             return Response.json({ ok: true });
         }
         if (request.method === 'PATCH') {
-            const body = (await request.json()) as {
-                kind: 'friend' | 'world' | 'avatar';
-                oldGroupName: string;
-                newGroupName: string;
-            };
+            const body = await parseJsonObject(request);
+            if (!body) return badJsonResponse();
+            const kind = typeof body.kind === 'string' ? body.kind : '';
             const table =
-                body.kind === 'friend'
+                kind === 'friend'
                     ? 'favorite_friend'
-                    : body.kind === 'world'
+                    : kind === 'world'
                       ? 'favorite_world'
-                      : body.kind === 'avatar'
+                      : kind === 'avatar'
                         ? 'favorite_avatar'
                         : null;
             if (!table) {
-                return Response.json(
-                    { ok: false, error: { code: 'BAD_KIND', message: 'Invalid kind' } },
-                    { status: 400 }
-                );
+                return badJsonResponse('BAD_KIND', 'Invalid kind');
+            }
+            if (typeof body.oldGroupName !== 'string' || typeof body.newGroupName !== 'string') {
+                return badJsonResponse('BAD_REQUEST', 'oldGroupName and newGroupName must be strings');
             }
             if (body.oldGroupName !== body.newGroupName) {
                 await env.DB_CORE.batch([
@@ -676,16 +750,34 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
     // 5. Avatar tags & avatar history
     if (url.pathname === '/api/avatar-tags') {
         if (request.method === 'POST') {
-            const body = (await request.json()) as { avatarId: string; tag: string; color?: string | null };
+            const body = await parseJsonObject(request);
+            if (!body) return badJsonResponse();
+            const avatarId = typeof body.avatarId === 'string' ? body.avatarId.trim() : '';
+            const tag = typeof body.tag === 'string' ? body.tag.trim() : '';
+            if (!avatarId || !tag) {
+                return badJsonResponse('BAD_REQUEST', 'avatarId and tag are required');
+            }
+            if (body.color !== undefined && body.color !== null && typeof body.color !== 'string') {
+                return badJsonResponse('BAD_REQUEST', 'color must be a string or null');
+            }
             await env.DB_CORE.prepare('INSERT OR REPLACE INTO avatar_tags (avatar_id, tag, color) VALUES (?, ?, ?)')
-                .bind(body.avatarId, body.tag, body.color ?? null)
+                .bind(avatarId, tag, typeof body.color === 'string' ? body.color : null)
                 .run();
             return Response.json({ ok: true });
         }
         if (request.method === 'PATCH') {
-            const body = (await request.json()) as { avatarId: string; tag: string; color: string | null };
+            const body = await parseJsonObject(request);
+            if (!body) return badJsonResponse();
+            const avatarId = typeof body.avatarId === 'string' ? body.avatarId.trim() : '';
+            const tag = typeof body.tag === 'string' ? body.tag.trim() : '';
+            if (!avatarId || !tag) {
+                return badJsonResponse('BAD_REQUEST', 'avatarId and tag are required');
+            }
+            if (body.color !== undefined && body.color !== null && typeof body.color !== 'string') {
+                return badJsonResponse('BAD_REQUEST', 'color must be a string or null');
+            }
             await env.DB_CORE.prepare('UPDATE avatar_tags SET color = ? WHERE avatar_id = ? AND tag = ?')
-                .bind(body.color, body.avatarId, body.tag)
+                .bind(typeof body.color === 'string' ? body.color : null, avatarId, tag)
                 .run();
             return Response.json({ ok: true });
         }
@@ -714,21 +806,26 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
             return Response.json({ ok: true, data: res.results ?? [] });
         }
         if (request.method === 'POST') {
-            const body = (await request.json()) as { avatarId: string; addTime?: number };
+            const body = await parseJsonObject(request);
+            if (!body) return badJsonResponse();
+            const avatarId = typeof body.avatarId === 'string' ? body.avatarId.trim() : '';
+            if (!avatarId) {
+                return badJsonResponse('BAD_REQUEST', 'avatarId is required');
+            }
             const now = new Date().toISOString();
-            if (typeof body.addTime === 'number') {
+            if (typeof body.addTime === 'number' && Number.isFinite(body.addTime)) {
                 await env.DB_CORE.prepare(
                     `INSERT INTO avatar_history (avatar_id, created_at, time) VALUES (?, ?, ?)
                      ON CONFLICT(avatar_id) DO UPDATE SET time = time + excluded.time, created_at = excluded.created_at`
                 )
-                    .bind(body.avatarId, now, body.addTime)
+                    .bind(avatarId, now, body.addTime)
                     .run();
             } else {
                 await env.DB_CORE.prepare(
                     `INSERT INTO avatar_history (avatar_id, created_at, time) VALUES (?, ?, 0)
                      ON CONFLICT(avatar_id) DO UPDATE SET created_at = excluded.created_at`
                 )
-                    .bind(body.avatarId, now)
+                    .bind(avatarId, now)
                     .run();
             }
             return Response.json({ ok: true });
@@ -742,23 +839,21 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
     // 6. Moderation & user_profile
     if (url.pathname === '/api/moderation') {
         if (request.method === 'PUT') {
-            const body = (await request.json()) as {
-                userId: string;
-                updatedAt?: string;
-                displayName?: string;
-                block?: boolean | number;
-                mute?: boolean | number;
-            };
+            const body = await parseJsonObject(request);
+            if (!body) return badJsonResponse();
+            const userId = typeof body.userId === 'string' ? body.userId.trim() : '';
+            if (!userId) {
+                return badJsonResponse('BAD_REQUEST', 'userId is required');
+            }
+            const updatedAt =
+                typeof body.updatedAt === 'string' && body.updatedAt.trim()
+                    ? body.updatedAt.trim()
+                    : new Date().toISOString();
+            const displayName = typeof body.displayName === 'string' ? body.displayName : '';
             await env.DB_CORE.prepare(
                 'INSERT OR REPLACE INTO moderation (user_id, updated_at, display_name, block, mute) VALUES (?, ?, ?, ?, ?)'
             )
-                .bind(
-                    body.userId,
-                    body.updatedAt || new Date().toISOString(),
-                    body.displayName ?? '',
-                    body.block ? 1 : 0,
-                    body.mute ? 1 : 0
-                )
+                .bind(userId, updatedAt, displayName, body.block ? 1 : 0, body.mute ? 1 : 0)
                 .run();
             return Response.json({ ok: true });
         }
@@ -771,18 +866,15 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
 
     if (url.pathname === '/api/user-profiles') {
         if (request.method === 'PUT') {
-            type UserProfileInput = {
-                userId: string;
-                bio?: string;
-                bioLinks?: unknown[];
-                updatedAt?: string;
-            };
-            const body = (await request.json()) as UserProfileInput & { entries?: UserProfileInput[] };
-            const list = Array.isArray(body.entries)
-                ? body.entries.filter((e) => Boolean(e?.userId))
-                : body?.userId
-                  ? [body]
-                  : [];
+            const body = await parseJsonObject(request);
+            if (!body) return badJsonResponse();
+            if (body.entries !== undefined && !Array.isArray(body.entries)) {
+                return badJsonResponse('BAD_REQUEST', 'entries must be an array');
+            }
+            const rawList: unknown[] = Array.isArray(body.entries) ? body.entries : [body];
+            const list = rawList.filter(
+                (e): e is Record<string, unknown> => isPlainObject(e) && typeof e.userId === 'string' && Boolean(e.userId.trim())
+            );
             if (list.length > MAX_CORE_BATCH_ENTRIES) {
                 return Response.json(
                     {
@@ -802,7 +894,12 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
                     chunk.map((e) =>
                         env.DB_CORE.prepare(
                             'INSERT OR REPLACE INTO user_profile (user_id, bio, bio_links, updated_at) VALUES (?, ?, ?, ?)'
-                        ).bind(e.userId, e.bio ?? '', JSON.stringify(e.bioLinks ?? []), e.updatedAt || nowIso)
+                        ).bind(
+                            String(e.userId).trim(),
+                            typeof e.bio === 'string' ? e.bio : '',
+                            JSON.stringify(Array.isArray(e.bioLinks) ? e.bioLinks : []),
+                            typeof e.updatedAt === 'string' && e.updatedAt.trim() ? e.updatedAt.trim() : nowIso
+                        )
                     )
                 );
             }
@@ -824,15 +921,16 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
             return Response.json({ ok: true, data: res.results ?? [] });
         }
         if (request.method === 'POST') {
-            const body = (await request.json()) as {
-                entries: Array<{
-                    user_id: string;
-                    display_name?: string;
-                    trust_level?: string;
-                    friend_number?: number;
-                }>;
-            };
-            const list = body.entries ?? [];
+            const body = await parseJsonObject(request);
+            if (!body) return badJsonResponse();
+            if (body.entries !== undefined && !Array.isArray(body.entries)) {
+                return badJsonResponse('BAD_REQUEST', 'entries must be an array');
+            }
+            const rawEntries = Array.isArray(body.entries) ? body.entries : [];
+            const list = rawEntries.filter(
+                (e): e is Record<string, unknown> =>
+                    isPlainObject(e) && typeof e.user_id === 'string' && Boolean(e.user_id.trim())
+            );
             if (list.length > MAX_CORE_BATCH_ENTRIES) {
                 return Response.json(
                     {
@@ -848,11 +946,17 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
             for (let i = 0; i < list.length; i += 50) {
                 const chunk = list.slice(i, i + 50);
                 await env.DB_CORE.batch(
-                    chunk.map((e) =>
-                        env.DB_CORE.prepare(
+                    chunk.map((e) => {
+                        const fn = Number(e.friend_number ?? 0);
+                        return env.DB_CORE.prepare(
                             'INSERT OR REPLACE INTO friend_log_current (user_id, display_name, trust_level, friend_number) VALUES (?, ?, ?, ?)'
-                        ).bind(e.user_id, e.display_name ?? '', e.trust_level ?? '', e.friend_number ?? 0)
-                    )
+                        ).bind(
+                            String(e.user_id).trim(),
+                            typeof e.display_name === 'string' ? e.display_name : '',
+                            typeof e.trust_level === 'string' ? e.trust_level : '',
+                            Number.isFinite(fn) ? fn : 0
+                        );
+                    })
                 );
             }
             return Response.json({ ok: true, data: { count: list.length } });
@@ -880,19 +984,20 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
             return Response.json({ ok: true, data: res.results ?? [] });
         }
         if (request.method === 'POST') {
-            const body = (await request.json()) as {
-                entries: Array<{
-                    created_at?: string;
-                    type: string;
-                    user_id: string;
-                    display_name?: string;
-                    previous_display_name?: string;
-                    trust_level?: string;
-                    previous_trust_level?: string;
-                    friend_number?: number;
-                }>;
-            };
-            const list = body.entries ?? [];
+            const body = await parseJsonObject(request);
+            if (!body) return badJsonResponse();
+            if (body.entries !== undefined && !Array.isArray(body.entries)) {
+                return badJsonResponse('BAD_REQUEST', 'entries must be an array');
+            }
+            const rawEntries = Array.isArray(body.entries) ? body.entries : [];
+            const list = rawEntries.filter(
+                (e): e is Record<string, unknown> =>
+                    isPlainObject(e) &&
+                    typeof e.type === 'string' &&
+                    Boolean(e.type.trim()) &&
+                    typeof e.user_id === 'string' &&
+                    Boolean(e.user_id.trim())
+            );
             if (list.length > MAX_CORE_BATCH_ENTRIES) {
                 return Response.json(
                     {
@@ -905,25 +1010,27 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
                     { status: 413 }
                 );
             }
+            const nowIso = new Date().toISOString();
             for (let i = 0; i < list.length; i += 50) {
                 const chunk = list.slice(i, i + 50);
                 await env.DB_CORE.batch(
-                    chunk.map((e) =>
-                        env.DB_CORE.prepare(
+                    chunk.map((e) => {
+                        const fn = Number(e.friend_number ?? 0);
+                        return env.DB_CORE.prepare(
                             `INSERT INTO friend_log_history
                              (created_at, type, user_id, display_name, previous_display_name, trust_level, previous_trust_level, friend_number)
                              VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
                         ).bind(
-                            e.created_at || new Date().toISOString(),
-                            e.type,
-                            e.user_id,
-                            e.display_name ?? '',
-                            e.previous_display_name ?? '',
-                            e.trust_level ?? '',
-                            e.previous_trust_level ?? '',
-                            e.friend_number ?? 0
-                        )
-                    )
+                            typeof e.created_at === 'string' && e.created_at.trim() ? e.created_at.trim() : nowIso,
+                            String(e.type).trim(),
+                            String(e.user_id).trim(),
+                            typeof e.display_name === 'string' ? e.display_name : '',
+                            typeof e.previous_display_name === 'string' ? e.previous_display_name : '',
+                            typeof e.trust_level === 'string' ? e.trust_level : '',
+                            typeof e.previous_trust_level === 'string' ? e.previous_trust_level : '',
+                            Number.isFinite(fn) ? fn : 0
+                        );
+                    })
                 );
             }
             if (list.length > 0) {
@@ -932,10 +1039,29 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
             return Response.json({ ok: true, data: { count: list.length } });
         }
         if (request.method === 'DELETE') {
-            const rowId = Number(url.searchParams.get('rowId') ?? '0');
+            const rawRowId = Number(url.searchParams.get('rowId') ?? '0');
+            const rowId = Number.isFinite(rawRowId) && rawRowId > 0 ? Math.floor(rawRowId) : 0;
             if (rowId > 0) {
-                await env.DB_CORE.prepare('DELETE FROM friend_log_history WHERE id = ?').bind(rowId).run();
-                await incrementCounter(env.DB_CORE, 'friend_log_history', -1);
+                const delRes = await env.DB_CORE.prepare('DELETE FROM friend_log_history WHERE id = ?')
+                    .bind(rowId)
+                    .run();
+                if ((delRes.meta?.changes ?? 0) > 0) {
+                    await incrementCounter(env.DB_CORE, 'friend_log_history', -(delRes.meta?.changes ?? 1));
+                }
+            } else {
+                const createdAt = (url.searchParams.get('createdAt') ?? '').trim();
+                const type = (url.searchParams.get('type') ?? '').trim();
+                const userId = (url.searchParams.get('userId') ?? '').trim();
+                if (createdAt && type && userId) {
+                    const delRes = await env.DB_CORE.prepare(
+                        'DELETE FROM friend_log_history WHERE created_at = ? AND type = ? AND user_id = ?'
+                    )
+                        .bind(createdAt, type, userId)
+                        .run();
+                    if ((delRes.meta?.changes ?? 0) > 0) {
+                        await incrementCounter(env.DB_CORE, 'friend_log_history', -(delRes.meta?.changes ?? 1));
+                    }
+                }
             }
             return Response.json({ ok: true });
         }
@@ -953,14 +1079,14 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
             return Response.json({ ok: true, data: res.results ?? [] });
         }
         if (request.method === 'POST') {
-            const body = (await request.json()) as {
-                version?: 1 | 2;
-                entry?: Record<string, unknown>;
-                entries?: Array<Record<string, unknown>>;
-            };
+            const body = await parseJsonObject(request);
+            if (!body) return badJsonResponse();
+            if (body.entries !== undefined && !Array.isArray(body.entries)) {
+                return badJsonResponse('BAD_REQUEST', 'entries must be an array');
+            }
             const list = Array.isArray(body.entries)
-                ? body.entries.filter((x) => Boolean(x && typeof x === 'object'))
-                : body.entry
+                ? body.entries.filter((x): x is Record<string, unknown> => isPlainObject(x))
+                : isPlainObject(body.entry)
                   ? [body.entry]
                   : [];
             if (list.length === 0) {
@@ -985,11 +1111,19 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
                     await env.DB_CORE.batch(
                         chunk.map((e) =>
                             env.DB_CORE.prepare(
-                                `INSERT OR REPLACE INTO notifications_v2
+                                `INSERT INTO notifications_v2
                                  (id, created_at, updated_at, expires_at, type, link, link_text, message, title, image_url, seen, sender_user_id, sender_username, data, responses, details)
-                                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+                                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                 ON CONFLICT(id) DO UPDATE SET
+                                    updated_at = CASE WHEN excluded.updated_at != '' THEN excluded.updated_at ELSE notifications_v2.updated_at END,
+                                    expires_at = CASE
+                                        WHEN excluded.expires_at != '' AND (notifications_v2.expires_at = '' OR excluded.expires_at < notifications_v2.expires_at)
+                                            THEN excluded.expires_at
+                                        ELSE notifications_v2.expires_at
+                                    END,
+                                    seen = MAX(notifications_v2.seen, excluded.seen)`
                             ).bind(
-                                String(e.id ?? crypto.randomUUID()),
+                                typeof e.id === 'string' && e.id.trim() ? e.id.trim() : crypto.randomUUID(),
                                 String(e.createdAt ?? e.created_at ?? nowIso),
                                 String(e.updatedAt ?? e.updated_at ?? ''),
                                 String(e.expiresAt ?? e.expires_at ?? ''),
@@ -1011,17 +1145,21 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
                 }
             } else {
                 let insertedCount = 0;
+                const expiredUpdates: string[] = [];
                 for (let i = 0; i < list.length; i += 50) {
                     const chunk = list.slice(i, i + 50);
+                    const chunkIds: string[] = [];
                     const results = await env.DB_CORE.batch(
                         chunk.map((e) => {
-                            const details = (e.details ?? {}) as Record<string, unknown>;
+                            const id = typeof e.id === 'string' && e.id.trim() ? e.id.trim() : crypto.randomUUID();
+                            chunkIds.push(id);
+                            const details = isPlainObject(e.details) ? e.details : {};
                             return env.DB_CORE.prepare(
                                 `INSERT OR IGNORE INTO notifications
                                  (id, created_at, type, sender_user_id, sender_username, receiver_user_id, message, world_id, world_name, image_url, invite_message, request_message, response_message, expired)
                                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
                             ).bind(
-                                String(e.id ?? crypto.randomUUID()),
+                                id,
                                 String(e.created_at ?? nowIso),
                                 String(e.type ?? ''),
                                 String(e.senderUserId ?? ''),
@@ -1038,8 +1176,22 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
                             );
                         })
                     );
-                    for (const r of results) {
-                        insertedCount += r.meta?.changes ?? 0;
+                    for (let j = 0; j < results.length; j++) {
+                        const changes = results[j]?.meta?.changes ?? 0;
+                        insertedCount += changes;
+                        if (changes === 0 && chunk[j]?.$isExpired) {
+                            expiredUpdates.push(chunkIds[j]!);
+                        }
+                    }
+                }
+                if (expiredUpdates.length > 0) {
+                    for (let i = 0; i < expiredUpdates.length; i += 50) {
+                        const slice = expiredUpdates.slice(i, i + 50);
+                        await env.DB_CORE.batch(
+                            slice.map((id) =>
+                                env.DB_CORE.prepare('UPDATE notifications SET expired = 1 WHERE id = ?').bind(id)
+                            )
+                        );
                     }
                 }
                 if (insertedCount > 0) {
@@ -1049,25 +1201,47 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
             return Response.json({ ok: true, data: { count: list.length } });
         }
         if (request.method === 'PATCH') {
-            const body = (await request.json()) as {
+            let body: {
                 version?: 1 | 2;
                 id: string;
                 expired?: boolean;
                 seen?: boolean;
             };
+            try {
+                const parsed = (await request.json()) as unknown;
+                if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+                    return Response.json(
+                        { ok: false, error: { code: 'BAD_REQUEST', message: 'Invalid JSON body' } },
+                        { status: 400 }
+                    );
+                }
+                body = parsed as typeof body;
+            } catch {
+                return Response.json(
+                    { ok: false, error: { code: 'BAD_REQUEST', message: 'Invalid JSON body' } },
+                    { status: 400 }
+                );
+            }
+            const id = typeof body.id === 'string' ? body.id.trim() : '';
+            if (!id) {
+                return Response.json(
+                    { ok: false, error: { code: 'BAD_REQUEST', message: 'id is required' } },
+                    { status: 400 }
+                );
+            }
             if (body.version === 2) {
                 if (body.expired) {
                     await env.DB_CORE.prepare('UPDATE notifications_v2 SET expires_at = ?, seen = 1 WHERE id = ?')
-                        .bind(new Date().toISOString(), body.id)
+                        .bind(new Date().toISOString(), id)
                         .run();
                 } else if (typeof body.seen === 'boolean') {
                     await env.DB_CORE.prepare('UPDATE notifications_v2 SET seen = ? WHERE id = ?')
-                        .bind(body.seen ? 1 : 0, body.id)
+                        .bind(body.seen ? 1 : 0, id)
                         .run();
                 }
             } else if (typeof body.expired === 'boolean') {
                 await env.DB_CORE.prepare('UPDATE notifications SET expired = ? WHERE id = ?')
-                    .bind(body.expired ? 1 : 0, body.id)
+                    .bind(body.expired ? 1 : 0, id)
                     .run();
             }
             return Response.json({ ok: true });
@@ -1076,7 +1250,11 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
             const version = url.searchParams.get('v') === '2' ? 2 : 1;
             const id = url.searchParams.get('id') ?? '';
             const table = version === 2 ? 'notifications_v2' : 'notifications';
-            await env.DB_CORE.prepare(`DELETE FROM ${table} WHERE id = ?`).bind(id).run();
+            const delRes = await env.DB_CORE.prepare(`DELETE FROM ${table} WHERE id = ?`).bind(id).run();
+            const deleted = delRes.meta?.changes ?? 0;
+            if (version === 1 && deleted > 0) {
+                await incrementCounter(env.DB_CORE, 'notifications', -deleted).catch(() => {});
+            }
             return Response.json({ ok: true });
         }
     }
@@ -1085,10 +1263,13 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
     if (url.pathname === '/api/stats/uptime' && request.method === 'POST') {
         const nowIso = new Date().toISOString();
         const nowMs = Date.parse(nowIso);
-        const [cfgRes, devRes, stateRes] = await env.DB_CORE.batch([
+        const [cfgRes, devRes, stateRes, wsHintRes] = await env.DB_CORE.batch([
             env.DB_CORE.prepare("SELECT payload_json FROM config_bundles WHERE bundle_key = 'vrcx_config' LIMIT 1"),
             env.DB_CORE.prepare('SELECT device_id, last_seen_at FROM cloud_devices'),
-            env.DB_CORE.prepare('SELECT device_id, state_json, updated_at FROM cloud_device_states')
+            env.DB_CORE.prepare('SELECT device_id, state_json, updated_at FROM cloud_device_states'),
+            env.DB_CORE.prepare(
+                "SELECT payload_json, updated_at FROM cloud_bg_sync_state WHERE state_key = 'ws_agent_hint' LIMIT 1"
+            )
         ]);
         const cfgRow = (cfgRes?.results?.[0] ?? null) as { payload_json?: string } | null;
         const cfg = safeJsonParse<Record<string, string>>(cfgRow?.payload_json, {});
@@ -1103,6 +1284,20 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
             nowMs,
             getAgentOnlineWindowMs(syncIntervalSeconds)
         );
+        const wsHintRow = (wsHintRes?.results?.[0] ?? null) as { payload_json?: string; updated_at?: string } | null;
+        const wsHintPayload = safeJsonParse<{ deviceIds?: unknown; deviceId?: string }>(wsHintRow?.payload_json, {});
+        const wsAgentsOnlineHint = Array.isArray(wsHintPayload.deviceIds)
+            ? Array.from(
+                  new Set(
+                      wsHintPayload.deviceIds
+                          .filter((id): id is string => typeof id === 'string')
+                          .map((id) => id.trim())
+                          .filter(Boolean)
+                  )
+              )
+            : typeof wsHintPayload.deviceId === 'string' && wsHintPayload.deviceId.trim()
+              ? [wsHintPayload.deviceId.trim()]
+              : [];
         const deviceStates: Record<string, { state: Record<string, unknown>; updatedAt: string }> = {};
         for (const row of (stateRes?.results ?? []) as Array<{
             device_id: string;
@@ -1120,6 +1315,7 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
             data: {
                 totalUptimeSeconds,
                 httpAgentsOnline,
+                wsAgentsOnlineHint,
                 deviceLastSeen,
                 deviceStates,
                 syncIntervalSeconds,

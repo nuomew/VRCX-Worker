@@ -7,7 +7,8 @@
         "dev": "wrangler dev",
         "typecheck": "tsc --noEmit",
         "test": "vitest run",
-        "deploy": "wrangler deploy"
+        "build:web": "npm --prefix .. run build:web",
+        "deploy": "wrangler deploy -c ../wrangler.jsonc"
     },
     "devDependencies": {
         "@cloudflare/vitest-plugin": "^1.9.1",

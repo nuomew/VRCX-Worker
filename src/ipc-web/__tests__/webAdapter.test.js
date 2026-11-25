@@ -1,6 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
     bootstrapCache,
+    fitPatchForKeepalive,
+    flushStorageNow,
     loadBootstrap,
     saveCloudSyncIntervalSeconds,
     saveWebSyncIntervalSeconds,
@@ -12,13 +14,27 @@ import {
     cloudState,
     getAggregatedGameStartTimes,
     getAggregatedGameState,
-    getOnlineAgentIds
+    getOnlineAgentIds,
+    getPrimaryAgentState
 } from '../cloudState.js';
-import { connectCloudHubWs, disconnectCloudHubWs } from '../apiClient.js';
-import { createAppApiBridge, createDiscordBridge, createLogWatcherBridge } from '../appApiWeb.js';
+import { cloudFetch, connectCloudHubWs, disconnectCloudHubWs } from '../apiClient.js';
+import { refreshCloudAuthAndBootstrap } from '../index.js';
+import {
+    createAppApiBridge,
+    createAssetBundleManagerBridge,
+    createDiscordBridge,
+    createLogWatcherBridge
+} from '../appApiWeb.js';
 import { createWebApiBridge } from '../webApiRemote.js';
-import { applyCloudRssSnapshot } from '../cloudRssSync.js';
-import { createCloudDatabase, resetCloudDatabaseState } from '../../services/database/cloud/index.js';
+import { applyCloudRssSnapshot, pollCloudRssFeed, resetCloudRssSyncState } from '../cloudRssSync.js';
+import {
+    createCloudDatabase,
+    isCloudFeedWriteSuppressed,
+    resetCloudDatabaseState,
+    setSuppressCloudFeedWrites,
+    setSuppressCloudGameLogWrites
+} from '../../services/database/cloud/index.js';
+import { watchState } from '../../services/watchState.js';
 import { formatTotalUptime } from '../../components/statusBarUtils.js';
 import { formatCloudPhotoDateTime, groupCloudScreenshotsByDate } from '../cloudGalleryUtils.js';
 
@@ -59,6 +75,7 @@ describe('WEB cloud adapter (stateless)', () => {
     });
 
     afterEach(() => {
+        disconnectCloudHubWs();
         vi.useRealTimers();
         vi.restoreAllMocks();
     });
@@ -162,7 +179,11 @@ describe('WEB cloud adapter (stateless)', () => {
         expect(okStart).toBe(true);
         const [url, init] = fetchSpy.mock.calls[0];
         expect(url).toBe('/api/commands');
-        expect(JSON.parse(init.body)).toEqual({ action: 'launch_vrc', params: { launchUrl } });
+        expect(JSON.parse(init.body)).toEqual({
+            action: 'launch_vrc',
+            params: { launchUrl },
+            requireOnline: true
+        });
     });
 
     it('exposes stateless cloud database repository methods backed by REST endpoints', async () => {
@@ -450,7 +471,8 @@ describe('WEB cloud adapter (stateless)', () => {
             expect(await appApi.StartGame(`${fullUrl} --no-vr`)).toBe(true);
             expect(JSON.parse(fetchSpy.mock.calls[0][1].body)).toEqual({
                 action: 'launch_vrc',
-                params: { launchUrl: fullUrl, desktopMode: true }
+                params: { launchUrl: fullUrl, desktopMode: true },
+                requireOnline: true
             });
 
             // TryOpenInstanceInVrc appends &attach=1 automatically
@@ -458,7 +480,8 @@ describe('WEB cloud adapter (stateless)', () => {
             expect(await appApi.TryOpenInstanceInVrc(fullUrl)).toBe(true);
             expect(JSON.parse(fetchSpy.mock.calls[1][1].body)).toEqual({
                 action: 'launch_vrc',
-                params: { launchUrl: `${fullUrl}&attach=1` }
+                params: { launchUrl: `${fullUrl}&attach=1` },
+                requireOnline: true
             });
         } finally {
             delete (/** @type {any} */ (globalThis).window);
@@ -1495,5 +1518,1034 @@ describe('WEB cloud adapter (stateless)', () => {
         // 9. P1-5: resetCloudDatabaseState clears in-memory session caches on logout
         resetCloudDatabaseState();
         expect(await db.getMutualGraphSnapshot()).toEqual(new Map());
+    });
+
+    it('covers Wave 4 frontend fixes (401 cleanup, config retry & immediate translation flush, presence freshness, table sizes, delete queues, Avatar filter, bypassCache)', async () => {
+        const db = createCloudDatabase({ userId: 'usr_me', userPrefix: 'usr_me', maxTableSize: 500 });
+        cloudState.authenticated = true;
+        bootstrapCache.loaded = true;
+        bootstrapCache.configs = {};
+        bootstrapCache.storage = {};
+        bootstrapCache.statsCounters = { feed_gps: 1 };
+
+        // P2-11: Avatar-only feed filter short-circuits locally with zero fetch
+        const callsBeforeAvatar = fetchSpy.mock.calls.length;
+        expect(await db.lookupFeedDatabase(['Avatar'], [], 50)).toEqual([]);
+        expect(fetchSpy.mock.calls.length).toBe(callsBeforeAvatar);
+
+        // P2-14: getGpsTableSize refreshes /api/stats/table-sizes once across parallel calls
+        fetchSpy.mockResolvedValueOnce(
+            mockOk({ sizes: { feed_gps: 42, feed_status: 17 }, maxFriendLogNumber: 9 })
+        );
+        const [gpsSize, statusSize] = await Promise.all([db.getGpsTableSize(), db.getStatusTableSize()]);
+        expect(gpsSize).toBe(42);
+        expect(statusSize).toBe(17);
+        expect(fetchSpy.mock.calls.length).toBe(callsBeforeAvatar + 1);
+
+        // P2-12: deleteFriendLogHistory composite fallback when rowId is absent + pending queue eviction
+        fetchSpy.mockResolvedValueOnce(mockOk({}));
+        await db.deleteFriendLogHistory({
+            created_at: '2026-11-25T05:00:00.000Z',
+            type: 'DisplayName',
+            userId: 'usr_f1'
+        });
+        expect(fetchSpy.mock.calls.at(-1)[0]).toContain('/api/friend-log/history?');
+        expect(fetchSpy.mock.calls.at(-1)[0]).toContain('userId=usr_f1');
+
+        await db.setFriendLogCurrent({ userId: 'usr_temp', displayName: 'Tmp', trustLevel: 'User', friendNumber: 1 });
+        fetchSpy.mockResolvedValueOnce(mockOk({}));
+        await db.deleteFriendLogCurrent('usr_temp');
+        const callsAfterDelete = fetchSpy.mock.calls.length;
+        await vi.advanceTimersByTimeAsync(10_000);
+        // Queued upsert for usr_temp must have been evicted before debounce flush fired
+        expect(fetchSpy.mock.calls.length).toBe(callsAfterDelete);
+
+        // P2-13: applyCloudPresenceUpdate does not overwrite newer WS state with older D1 snapshot
+        cloudState.deviceStates = {
+            pc_fresh: {
+                state: { vrcRunning: true, currentLocation: 'wrld_new:1' },
+                updatedAt: '2026-11-25T10:05:00.000Z'
+            }
+        };
+        applyCloudPresenceUpdate({
+            deviceStates: {
+                pc_fresh: {
+                    state: { vrcRunning: false, currentLocation: 'wrld_old:1' },
+                    updatedAt: '2026-11-25T10:00:00.000Z'
+                }
+            }
+        });
+        expect(cloudState.deviceStates.pc_fresh.state.currentLocation).toBe('wrld_new:1');
+
+        // P1-13 & P2-17: translation API endpoint flushes immediately (0ms) and failed config flush re-queues for retry
+        fetchSpy.mockRejectedValueOnce(new Error('temporary network drop'));
+        scheduleConfigPatch('config:VRCX_translationAPIEndpoint', 'https://custom.llm.example/v1/chat/completions');
+        await vi.advanceTimersByTimeAsync(10);
+        expect(fetchSpy.mock.calls.at(-1)[0]).toBe('/api/config/bundle');
+        // Retry succeeds on subsequent retry timer without losing the key
+        fetchSpy.mockResolvedValueOnce(mockOk({}));
+        await vi.advanceTimersByTimeAsync(16_000);
+        expect(fetchSpy.mock.calls.at(-1)[0]).toBe('/api/config/bundle');
+        expect(JSON.parse(fetchSpy.mock.calls.at(-1)[1].body).patch['config:VRCX_translationAPIEndpoint']).toBe(
+            'https://custom.llm.example/v1/chat/completions'
+        );
+
+        // P2-15: batched GET preserves bypassCache flag
+        cloudState.wsAgentsOnline = [];
+        cloudState.cloudFallbackAllowed = true;
+        const webApi = createWebApiBridge();
+        fetchSpy.mockResolvedValueOnce(
+            mockOk({
+                route: 'cloud_direct',
+                results: [
+                    { status: 200, data: '{"a":1}' },
+                    { status: 200, data: '{"b":2}' }
+                ]
+            })
+        );
+        await Promise.all([
+            webApi.ExecuteJson(
+                JSON.stringify({ url: 'https://api.vrchat.cloud/api/1/users/usr_a', method: 'GET', bypassCache: true })
+            ),
+            webApi.ExecuteJson(
+                JSON.stringify({ url: 'https://api.vrchat.cloud/api/1/users/usr_b', method: 'GET' })
+            )
+        ]);
+        const batchPayload = JSON.parse(fetchSpy.mock.calls.at(-1)[1].body);
+        expect(batchPayload.requests[0].bypassCache).toBe(true);
+        expect(batchPayload.requests[1].bypassCache).toBeUndefined();
+
+        // P0-4: Feed & friend_log_history suppression helper works synchronously and skips addFriendLogHistoryArray
+        expect(isCloudFeedWriteSuppressed()).toBe(false);
+        setSuppressCloudFeedWrites(true);
+        expect(isCloudFeedWriteSuppressed()).toBe(true);
+        const callsBeforeSuppressedLog = fetchSpy.mock.calls.length;
+        await db.addFriendLogHistoryArray([
+            { created_at: '2026-11-25T05:00:00Z', type: 'DisplayName', userId: 'usr_f1', displayName: 'New' }
+        ]);
+        expect(fetchSpy.mock.calls.length).toBe(callsBeforeSuppressedLog);
+        setSuppressCloudFeedWrites(false);
+        expect(isCloudFeedWriteSuppressed()).toBe(false);
+
+        // P1-10: pollCloudRssFeed discards stale response if user logs out while request is in flight,
+        // and forceSync is never swallowed by an in-flight passive /api/rss/feed poll
+        resetCloudRssSyncState();
+        watchState.isLoggedIn = true;
+        cloudState.authenticated = true;
+        /** @type {(res: Response) => void} */
+        let resolvePassive = () => {};
+        fetchSpy.mockImplementationOnce(
+            () =>
+                new Promise((resolve) => {
+                    resolvePassive = resolve;
+                })
+        );
+        const passivePoll = pollCloudRssFeed({ forceSync: false });
+        // Request a forced sync while passive /api/rss/feed is in flight
+        fetchSpy.mockResolvedValueOnce(
+            mockOk({ changed: false, syncedAt: '2026-11-25T10:10:00Z' })
+        );
+        const forcePoll = pollCloudRssFeed({ forceSync: true });
+        resolvePassive(mockOk({ changed: false, syncedAt: '2026-11-25T10:09:00Z' }));
+        await Promise.all([passivePoll, forcePoll]);
+        expect(fetchSpy.mock.calls.at(-2)[0]).toContain('/api/rss/feed');
+        expect(fetchSpy.mock.calls.at(-1)[0]).toContain('/api/rss/sync');
+
+        // In-flight poll discarded after logout
+        /** @type {(res: Response) => void} */
+        let resolveStaleRss = () => {};
+        fetchSpy.mockImplementationOnce(
+            () =>
+                new Promise((resolve) => {
+                    resolveStaleRss = resolve;
+                })
+        );
+        const stalePoll = pollCloudRssFeed({ forceSync: true });
+        watchState.isLoggedIn = false;
+        resetCloudRssSyncState();
+        resolveStaleRss(mockOk({ changed: true, syncedAt: '2026-11-25T10:15:00Z', onlineFriends: [] }));
+        expect(await stalePoll).toBeNull();
+
+        // P2-16: 401 response clears bootstrapCache and marks unauthenticated
+        cloudState.authenticated = true;
+        bootstrapCache.loaded = true;
+        bootstrapCache.configs = { keep: 'no' };
+        fetchSpy.mockResolvedValueOnce(new Response('Unauthorized', { status: 401 }));
+        await expect(cloudFetch('/api/feed?limit=5')).rejects.toThrow('Cloud authentication required');
+        expect(cloudState.authenticated).toBe(false);
+        expect(bootstrapCache.loaded).toBe(false);
+        expect(bootstrapCache.configs).toEqual({});
+
+        // Wave 5 P1-1: Immediate 0ms translation endpoint flush must NOT be delayed to 8000ms by sibling config writes
+        cloudState.authenticated = true;
+        bootstrapCache.loaded = true;
+        bootstrapCache.configs = {};
+        fetchSpy.mockResolvedValueOnce(mockOk({}));
+        scheduleConfigPatch('config:VRCX_translationAPIEndpoint', 'https://fast.llm.example/v1/chat/completions');
+        scheduleConfigPatch('config:VRCX_translationAPIModel', 'gpt-test');
+        await vi.advanceTimersByTimeAsync(20);
+        const fastFlushBody = JSON.parse(fetchSpy.mock.calls.at(-1)[1].body);
+        expect(fastFlushBody.patch['config:VRCX_translationAPIEndpoint']).toBe(
+            'https://fast.llm.example/v1/chat/completions'
+        );
+        expect(fastFlushBody.patch['config:VRCX_translationAPIModel']).toBe('gpt-test');
+
+        // Wave 5 P1-2: applyCloudPresenceUpdate preserves newer WS state even when replaceDeviceMap is true
+        cloudState.deviceStates = {
+            pc_ws: {
+                state: { vrcRunning: true, currentLocation: 'wrld_ws_latest:1' },
+                updatedAt: '2026-11-25T12:05:00.000Z'
+            }
+        };
+        applyCloudPresenceUpdate({
+            replaceDeviceMap: true,
+            deviceLastSeen: { pc_ws: Date.now() },
+            deviceStates: {
+                pc_ws: {
+                    state: { vrcRunning: false, currentLocation: 'wrld_d1_stale:1' },
+                    updatedAt: '2026-11-25T12:00:00.000Z'
+                }
+            }
+        });
+        expect(cloudState.deviceStates.pc_ws.state.currentLocation).toBe('wrld_ws_latest:1');
+    });
+
+    it('covers Wave 6 convergence fixes: chunked Activity V2 writes, V1 seen preservation & V2 unread non-resurrection, Bio profile cache sync, entity prefix invalidation, and flushStorageNow retry', async () => {
+        const db = createCloudDatabase({ userId: 'usr_me', userPrefix: 'usr_me', maxTableSize: 500 });
+
+        // 1. P1-1: replaceActivitySessionsV2 chunks >800 sessions (replace=true on chunk 0, replace=false on chunk 1)
+        const manySessions = Array.from({ length: 1050 }, (_, idx) => ({
+            start: 1_700_000_000_000 + idx * 60_000,
+            end: 1_700_000_030_000 + idx * 60_000
+        }));
+        fetchSpy.mockResolvedValueOnce(mockOk({})).mockResolvedValueOnce(mockOk({}));
+        await db.replaceActivitySessionsV2('usr_me', manySessions);
+        expect(fetchSpy).toHaveBeenCalledTimes(2);
+        const firstChunk = JSON.parse(fetchSpy.mock.calls[0][1].body);
+        const secondChunk = JSON.parse(fetchSpy.mock.calls[1][1].body);
+        expect(firstChunk.replace).toBe(true);
+        expect(firstChunk.sessions).toHaveLength(800);
+        expect(secondChunk.replace).toBe(false);
+        expect(secondChunk.sessions).toHaveLength(250);
+
+        // Chunk-0 failure aborts remaining chunks instead of inserting duplicates on top of stale sessions
+        const callsBeforeFail = fetchSpy.mock.calls.length;
+        fetchSpy.mockRejectedValueOnce(new Error('chunk 0 failed'));
+        await db.replaceActivitySessionsV2('usr_me', manySessions);
+        expect(fetchSpy.mock.calls.length - callsBeforeFail).toBe(1);
+
+        fetchSpy.mockResolvedValueOnce(mockOk([]));
+        await db.getActivitySessionsV2('usr_me');
+        expect(fetchSpy.mock.calls.at(-1)[0]).toContain('limit=2000');
+
+        // 2. P1-2 & P1-4: applyCloudRssSnapshot preserves v1 undefined seen, does not resurrect already-known v2 unread, and syncs Cron Bio to bootstrapCache.userProfiles
+        const mockFriendStore = { friends: new Map(), initFriendLogHistoryTable: vi.fn() };
+        const mockUserStore = { currentUser: { id: 'usr_me' } };
+        const mockFeedStore = { feedTableLookup: vi.fn() };
+        const mockNotifStore = {
+            notificationTable: {
+                data: [
+                    { id: 'not_v1_exist', created_at: '2026-11-25T07:00:00Z', type: 'invite' },
+                    {
+                        id: 'not_v2_known',
+                        createdAt: '2026-11-25T07:05:00Z',
+                        updatedAt: '2026-11-25T07:05:00Z',
+                        seen: false,
+                        type: 'boop',
+                        version: 2
+                    }
+                ]
+            },
+            unseenNotifications: []
+        };
+        bootstrapCache.userProfiles.clear();
+        applyCloudRssSnapshot(
+            {
+                changed: true,
+                syncedAt: '2026-11-25T08:00:00Z',
+                onlineFriends: [],
+                recentFeeds: [
+                    {
+                        type: 'Bio',
+                        userId: 'usr_bio_friend',
+                        created_at: '2026-11-25T07:59:00Z',
+                        bio: 'Synced bio from Cron',
+                        bioLinks: ['https://cron.example']
+                    }
+                ],
+                notificationsV1: [
+                    { id: 'not_v1_exist', created_at: '2026-11-25T07:00:00Z', type: 'invite' },
+                    { id: 'not_v1_new', created_at: '2026-11-25T07:50:00Z', type: 'invite' }
+                ],
+                notificationsV2: [
+                    {
+                        id: 'not_v2_known',
+                        createdAt: '2026-11-25T07:05:00Z',
+                        updatedAt: '2026-11-25T07:05:00Z',
+                        seen: false,
+                        type: 'boop'
+                    }
+                ]
+            },
+            {
+                friendStore: mockFriendStore,
+                userStore: mockUserStore,
+                feedStore: mockFeedStore,
+                notificationStore: mockNotifStore
+            }
+        );
+        const v1Merged = mockNotifStore.notificationTable.data.find((n) => n.id === 'not_v1_exist');
+        expect(v1Merged.seen).toBeUndefined();
+        // Existing v2 with unchanged updatedAt must NOT resurrect in unseenNotifications
+        expect(mockNotifStore.unseenNotifications).toEqual(['not_v1_new']);
+        expect(bootstrapCache.userProfiles.get('usr_bio_friend')).toEqual({
+            userId: 'usr_bio_friend',
+            bio: 'Synced bio from Cron',
+            bioLinks: ['https://cron.example'],
+            updatedAt: '2026-11-25T07:59:00Z'
+        });
+
+        // 3. P1-3: webApiRemote invalidates parent entity + user groups on group sub-path writes, and clears cache on 401
+        cloudState.webSyncIntervalSeconds = 300;
+        cloudState.wsAgentsOnline = [];
+        cloudState.cloudFallbackAllowed = true;
+        const webApi = createWebApiBridge();
+        const grpDetailUrl = 'https://api.vrchat.cloud/api/1/groups/grp_w6_1?includeRoles=true';
+        const userGroupsUrl = 'https://api.vrchat.cloud/api/1/users/usr_me/groups';
+        fetchSpy.mockResolvedValueOnce(
+            mockOk({
+                route: 'cloud_direct',
+                results: [
+                    { status: 200, data: '{"name":"OldGrp"}' },
+                    { status: 200, data: '["grp_old"]' }
+                ]
+            })
+        );
+        await Promise.all([
+            webApi.ExecuteJson(JSON.stringify({ url: grpDetailUrl, method: 'GET' })),
+            webApi.ExecuteJson(JSON.stringify({ url: userGroupsUrl, method: 'GET' }))
+        ]);
+
+        fetchSpy.mockResolvedValueOnce(mockOk({ status: 200, data: '{}' }));
+        await webApi.ExecuteJson(
+            JSON.stringify({ url: 'https://api.vrchat.cloud/api/1/groups/grp_w6_1/join', method: 'POST', body: '{}' })
+        );
+        fetchSpy.mockResolvedValueOnce(
+            mockOk({
+                route: 'cloud_direct',
+                results: [
+                    { status: 200, data: '{"name":"NewGrp"}' },
+                    { status: 200, data: '["grp_new"]' }
+                ]
+            })
+        );
+        const [gAfter, ugAfter] = await Promise.all([
+            webApi.ExecuteJson(JSON.stringify({ url: grpDetailUrl, method: 'GET' })),
+            webApi.ExecuteJson(JSON.stringify({ url: userGroupsUrl, method: 'GET' }))
+        ]);
+        expect(JSON.parse(gAfter).message).toBe('{"name":"NewGrp"}');
+        expect(JSON.parse(ugAfter).message).toBe('["grp_new"]');
+
+        // 401 clears webApiRemote read cache so subsequent GETs do not serve previous session's cached payload
+        fetchSpy.mockResolvedValueOnce(new Response('Unauthorized', { status: 401 }));
+        await expect(cloudFetch('/api/feed?limit=1')).rejects.toThrow();
+        fetchSpy.mockResolvedValueOnce(mockOk({ status: 200, data: '{"name":"Post401Grp"}' }));
+        const after401 = await webApi.ExecuteJson(JSON.stringify({ url: grpDetailUrl, method: 'GET' }));
+        expect(JSON.parse(after401).message).toBe('{"name":"Post401Grp"}');
+
+        // 4. P2-3: flushStorageNow schedules automatic retry after a transient failure
+        cloudState.authenticated = true;
+        bootstrapCache.loaded = true;
+        bootstrapCache.storage = {};
+        scheduleStoragePatch('storage_retry_key', 'v1');
+        fetchSpy.mockRejectedValueOnce(new Error('transient net err'));
+        await expect(flushStorageNow()).rejects.toThrow('transient net err');
+        fetchSpy.mockResolvedValueOnce(mockOk({}));
+        await vi.advanceTimersByTimeAsync(16_000);
+        expect(fetchSpy.mock.calls.at(-1)[0]).toBe('/api/config/bundle');
+        expect(JSON.parse(fetchSpy.mock.calls.at(-1)[1].body).patch.storage_retry_key).toBe('v1');
+    });
+
+    it('covers Wave 7 fixes: persisted Activity V2 syncState via scheduleStoragePatch, serialized FIFO WS rowIds, composite delete, in-buffer notification mutation, self-filtered GameLog search, and DeleteCache variant', async () => {
+        const db = createCloudDatabase({ userId: 'usr_me', userPrefix: 'usr_me', maxTableSize: 500 });
+
+        // 1. Frontend P1-3 + P1-2: Activity V2 syncState persists via scheduleStoragePatch (coalesced with other vrcx_storage writes) and hydrates across reloads
+        cloudState.authenticated = true;
+        bootstrapCache.loaded = true;
+        bootstrapCache.storage = {};
+        fetchSpy.mockResolvedValueOnce(mockOk({}));
+        scheduleStoragePatch('other_storage_key', 'hello');
+        await db.upsertActivitySyncStateV2({
+            userId: 'usr_friend_act',
+            updatedAt: 1764000000000,
+            sourceLastCreatedAt: '2026-11-25T10:00:00.000Z',
+            pendingSessionStartAt: null,
+            cachedRangeDays: 30,
+            lastSourceType: 'friend'
+        });
+        await vi.advanceTimersByTimeAsync(8_500);
+        // Coalesced into a SINGLE PUT /api/config/bundle containing both storage keys (zero concurrent RMW clobber!)
+        expect(fetchSpy).toHaveBeenCalledTimes(1);
+        expect(fetchSpy.mock.calls[0][0]).toBe('/api/config/bundle');
+        const coalescedBody = JSON.parse(fetchSpy.mock.calls[0][1].body);
+        expect(coalescedBody.bundleKey).toBe('vrcx_storage');
+        expect(coalescedBody.patch.other_storage_key).toBe('hello');
+        expect(coalescedBody.patch['cloud:activitySyncStateV2']).toContain('usr_friend_act');
+
+        // Simulate reload: clear in-memory database state while keeping bootstrapCache.storage populated
+        const persistedRaw = bootstrapCache.storage['cloud:activitySyncStateV2'];
+        expect(typeof persistedRaw).toBe('string');
+        resetCloudDatabaseState();
+        bootstrapCache.storage['cloud:activitySyncStateV2'] = persistedRaw;
+        const hydrated = await db.getActivitySyncStateV2('usr_friend_act');
+        expect(hydrated).toMatchObject({
+            userId: 'usr_friend_act',
+            sourceLastCreatedAt: '2026-11-25T10:00:00.000Z',
+            cachedRangeDays: 30
+        });
+
+        // P2-3: Failed replaceActivitySessionsV2 prevents stranding a persisted syncState for that user
+        fetchSpy.mockRejectedValueOnce(new Error('D1 transient write failure'));
+        await db.replaceActivitySessionsV2('usr_act_fail', [{ start: 1000, end: 5000 }]);
+        await db.upsertActivitySyncStateV2({
+            userId: 'usr_act_fail',
+            updatedAt: 1764000001000,
+            sourceLastCreatedAt: '2026-11-25T10:01:00.000Z',
+            cachedRangeDays: 30
+        });
+        expect(bootstrapCache.storage['cloud:activitySyncStateV2']).not.toContain('usr_act_fail');
+
+        // 2. Frontend P1-4 + P1-1: multi-event async WS gamelog.batch delivers strictly serialized FIFO rowIds without LIFO scrambling
+        const recordedRows = [];
+        let asyncQueue = Promise.resolve();
+        const prevWindow = globalThis.window;
+        const sockets = [];
+        const OrigWs = globalThis.WebSocket;
+        class FakeWs {
+            constructor() {
+                this.readyState = 1;
+                sockets.push(this);
+            }
+            send() {}
+            close() {
+                this.readyState = 3;
+            }
+        }
+        globalThis.WebSocket = /** @type {any} */ (FakeWs);
+        globalThis.window = /** @type {any} */ ({
+            location: { protocol: 'https:', host: 'example.com' },
+            $bridge: {
+                addGameLogEvent(rawJson) {
+                    const parsed = JSON.parse(rawJson);
+                    const task = async () => {
+                        await Promise.resolve();
+                        if (parsed[2] === 'location') {
+                            const res = await db.addGamelogLocationToDatabase({
+                                created_at: parsed[1],
+                                location: parsed[3],
+                                worldName: parsed[4]
+                            });
+                            recordedRows.push({ type: 'Location', rowId: res.rowId });
+                        } else if (parsed[2] === 'player-joined') {
+                            const res = await db.addGamelogJoinLeaveToDatabase({
+                                created_at: parsed[1],
+                                type: 'OnPlayerJoined',
+                                displayName: parsed[3],
+                                userId: parsed[4]
+                            });
+                            recordedRows.push({ type: 'OnPlayerJoined', displayName: parsed[3], rowId: res.rowId });
+                        }
+                    };
+                    asyncQueue = asyncQueue.then(task);
+                    return asyncQueue;
+                }
+            }
+        });
+        try {
+            createLogWatcherBridge();
+            cloudState.authenticated = true;
+            connectCloudHubWs();
+            const ws = sockets.at(-1);
+            ws.onmessage({
+                data: JSON.stringify({
+                    type: 'gamelog.batch',
+                    payload: {
+                        events: [
+                            { type: 'Location', created_at: '2026-11-25T10:04:00.000Z', location: 'wrld_fifo:1', worldName: 'FIFO World', rowId: 101 },
+                            { type: 'OnPlayerJoined', created_at: '2026-11-25T10:04:01.000Z', displayName: 'Alice', userId: 'usr_a', rowId: 202 },
+                            { type: 'OnPlayerJoined', created_at: '2026-11-25T10:04:02.000Z', displayName: 'Bob', userId: 'usr_b', rowId: 203 }
+                        ]
+                    }
+                })
+            });
+            await vi.advanceTimersByTimeAsync(10);
+            await asyncQueue;
+            expect(recordedRows).toEqual([
+                { type: 'Location', rowId: 101 },
+                { type: 'OnPlayerJoined', displayName: 'Alice', rowId: 202 },
+                { type: 'OnPlayerJoined', displayName: 'Bob', rowId: 203 }
+            ]);
+        } finally {
+            disconnectCloudHubWs();
+            globalThis.WebSocket = OrigWs;
+            globalThis.window = prevWindow;
+        }
+
+        // Single-event negative temp IDs are unique and pass discriminator params on composite DELETE
+        setSuppressCloudGameLogWrites(true, 0);
+        const tempA = await db.addGamelogEventToDatabase({ created_at: '2026-11-25T10:05:01.000Z', data: 'ev_alpha' });
+        const tempB = await db.addGamelogEventToDatabase({ created_at: '2026-11-25T10:05:01.000Z', data: 'ev_beta' });
+        setSuppressCloudGameLogWrites(false);
+        expect(tempA.rowId).toBeLessThan(0);
+        expect(tempB.rowId).toBeLessThan(0);
+        expect(tempA.rowId).not.toBe(tempB.rowId);
+
+        fetchSpy.mockResolvedValueOnce(mockOk({}));
+        await db.deleteGameLogEntry({
+            rowId: tempA.rowId,
+            type: 'Event',
+            created_at: '2026-11-25T10:05:01.000Z',
+            data: 'ev_alpha'
+        });
+        expect(fetchSpy.mock.calls.at(-1)[0]).toContain('/api/gamelog?kind=Event&createdAt=');
+        expect(fetchSpy.mock.calls.at(-1)[0]).toContain('data=ev_alpha');
+
+        fetchSpy.mockResolvedValueOnce(mockOk({}));
+        await db.updateGamelogVideoPlayName({
+            rowId: tempB.rowId,
+            videoUrl: 'https://youtu.be/abc',
+            videoName: 'Resolved Title'
+        });
+        const patchVideoBody = JSON.parse(fetchSpy.mock.calls.at(-1)[1].body);
+        expect(patchVideoBody.rowId).toBeUndefined();
+        expect(patchVideoBody.videoUrl).toBe('https://youtu.be/abc');
+
+        // 3. Frontend P2-1: in-buffer notification seen/expired mutates queued batch without racy 0-row PATCH
+        const callsBeforeNotif = fetchSpy.mock.calls.length;
+        await db.addNotificationToDatabase({ id: 'not_buf_v1', type: 'invite', message: 'hi', $isExpired: false });
+        await db.updateNotificationExpired({ id: 'not_buf_v1' });
+        await db.addNotificationV2ToDatabase({ id: 'not_buf_v2', type: 'boop', seen: false });
+        await db.seenNotificationV2('not_buf_v2');
+        await db.expireNotificationV2('not_buf_v2');
+        expect(fetchSpy.mock.calls.length).toBe(callsBeforeNotif);
+
+        fetchSpy.mockResolvedValueOnce(mockOk({ count: 1 }));
+        fetchSpy.mockResolvedValueOnce(mockOk({ count: 1 }));
+        await vi.advanceTimersByTimeAsync(10_500);
+        const notifCalls = fetchSpy.mock.calls.slice(callsBeforeNotif);
+        expect(notifCalls).toHaveLength(2);
+        const v1PostBody = JSON.parse(notifCalls[0][1].body);
+        const v2PostBody = JSON.parse(notifCalls[1][1].body);
+        expect(v1PostBody.entries[0].$isExpired).toBe(true);
+        expect(v2PostBody.entries[0].seen).toBe(true);
+        expect(v2PostBody.entries[0].expiresAt).toBeTruthy();
+
+        // 4. Frontend P2-2: searchGameLogDatabase passes excludeUserId and filters self join/leave rows, while direct getGameLogByLocation keeps self rows
+        fetchSpy.mockResolvedValueOnce(
+            mockOk({
+                locationRows: [],
+                joinLeaveRows: [
+                    { id: 10, created_at: '2026-11-25T10:10:00Z', type: 'OnPlayerJoined', display_name: 'Me', user_id: 'usr_me', location: 'wrld_x:1', time: 0 },
+                    { id: 11, created_at: '2026-11-25T10:11:00Z', type: 'OnPlayerJoined', display_name: 'Alice', user_id: 'usr_alice', location: 'wrld_x:1', time: 0 }
+                ]
+            })
+        );
+        const searched = await db.searchGameLogDatabase('Alice');
+        expect(fetchSpy.mock.calls.at(-1)[0]).toContain('excludeUserId=usr_me');
+        expect(searched.map((r) => r.userId)).toEqual(['usr_alice']);
+
+        fetchSpy.mockResolvedValueOnce(
+            mockOk([
+                { rowId: 10, created_at: '2026-11-25T10:10:00Z', type: 'OnPlayerJoined', displayName: 'Me', userId: 'usr_me', location: 'wrld_x:1' }
+            ])
+        );
+        const directByLoc = await db.getGameLogByLocation('wrld_x:1');
+        expect(fetchSpy.mock.calls.at(-1)[0]).not.toContain('excludeUserId=');
+        expect(directByLoc).toHaveLength(1);
+
+        // 5. Cross-Layer P2-3 + Agent P1-1: AssetBundleManager.DeleteCache forwards variant='security' and skips blank id
+        const abm = createAssetBundleManagerBridge();
+        const callsBeforeAbm = fetchSpy.mock.calls.length;
+        await abm.DeleteCache('');
+        expect(fetchSpy.mock.calls.length).toBe(callsBeforeAbm);
+
+        fetchSpy.mockResolvedValueOnce(mockOk({ cmdId: 'cmd_cache_1' }));
+        await abm.DeleteCache('file_single_123', 1, 'security', 0);
+        expect(fetchSpy.mock.calls.at(-1)[0]).toBe('/api/commands');
+        expect(JSON.parse(fetchSpy.mock.calls.at(-1)[1].body)).toEqual({
+            action: 'clear_cache',
+            params: { scope: 'single', id: 'file_single_123', variant: 'security' }
+        });
+    });
+
+    it('covers Wave 8 frontend fixes: WS auto-connect via presence hint, WS 401 probe & presence wipe, friend/file cache invalidation, RSS short backoff, persistent world/avatar cache & clean avatar history, and gamelog search/stats parity', async () => {
+        // 1. Presence wsAgentsOnlineHint auto-connects /ws/web; closing before onopen probes /api/auth/me -> 401 clears devices and stops reconnect storm
+        const OrigWs = globalThis.WebSocket;
+        const prevWindow = globalThis.window;
+        const sockets = [];
+        class MockWs {
+            static OPEN = 1;
+            static CONNECTING = 0;
+            constructor(url) {
+                this.url = url;
+                this.readyState = 0;
+                this.closed = false;
+                sockets.push(this);
+            }
+            send() {}
+            close() {
+                this.closed = true;
+                this.readyState = 3;
+            }
+        }
+        globalThis.WebSocket = MockWs;
+        globalThis.window = {
+            location: { protocol: 'https:', host: 'vrcx.example.workers.dev' },
+            addEventListener: vi.fn(),
+            removeEventListener: vi.fn()
+        };
+        try {
+            cloudState.authenticated = true;
+            cloudState.agentsOnline = ['win-existing'];
+            cloudState.deviceStates = { 'win-existing': { state: { vrcRunning: true } } };
+            applyCloudPresenceUpdate({ wsAgentsOnlineHint: ['win-ws-hint'] });
+            expect(sockets.length).toBeGreaterThanOrEqual(1);
+            expect(sockets.at(-1).url).toContain('/ws/web');
+
+            // Simulate handshake failure (onclose without prior onopen) while session expired (401 from /api/auth/me)
+            fetchSpy.mockResolvedValueOnce(new Response('Unauthorized', { status: 401 }));
+            const firstWsCount = sockets.length;
+            sockets.at(-1).onclose({ code: 1006, reason: '' });
+            await vi.advanceTimersByTimeAsync(10_000);
+            expect(cloudState.authenticated).toBe(false);
+            expect(cloudState.agentsOnline).toEqual([]);
+            expect(cloudState.wsAgentsOnline).toEqual([]);
+            expect(cloudState.deviceStates).toEqual({});
+            // Must NOT spawn reconnect sockets after 401 lock
+            expect(sockets.length).toBe(firstWsCount);
+
+            // Cloudflare Access 302 opaqueredirect on /api/auth/me also triggers clean unlock and sets authMode
+            cloudState.authenticated = true;
+            cloudState.authMode = 'passcode';
+            applyCloudPresenceUpdate({ wsAgentsOnlineHint: ['win-ws-cf'] });
+            fetchSpy.mockResolvedValueOnce({ type: 'opaqueredirect', status: 0, ok: false });
+            const cfWsCount = sockets.length;
+            sockets.at(-1).onclose({ code: 1006, reason: '' });
+            await vi.advanceTimersByTimeAsync(10_000);
+            expect(cloudState.authenticated).toBe(false);
+            expect(cloudState.authMode).toBe('cloudflare_access');
+            expect(sockets.length).toBe(cfWsCount);
+        } finally {
+            disconnectCloudHubWs();
+            globalThis.WebSocket = OrigWs;
+            globalThis.window = prevWindow;
+            cloudState.authenticated = true;
+        }
+
+        // 2. webApiRemote invalidates /api/1/users/{id} on singular /user/{id}, /auth/user/friends/{id}, notif /accept, and /api/1/file/{id}
+        const webApi = createWebApiBridge();
+        const mkVrcRes = (payload) =>
+            mockOk({ status: 200, data: JSON.stringify(payload), route: 'cloud_direct' });
+        fetchSpy
+            .mockResolvedValueOnce(mkVrcRes({ id: 'usr_c1', displayName: 'One' }))
+            .mockResolvedValueOnce(mkVrcRes({ id: 'usr_c2', displayName: 'Two' }))
+            .mockResolvedValueOnce(mkVrcRes({ id: 'file_c1', name: 'File1' }))
+            // Writes
+            .mockResolvedValueOnce(mkVrcRes({ ok: true }))
+            .mockResolvedValueOnce(mkVrcRes({ ok: true }))
+            .mockResolvedValueOnce(mkVrcRes({ ok: true }))
+            // Refetches after invalidation (must hit network, not stale browser cache)
+            .mockResolvedValueOnce(mkVrcRes({ id: 'usr_c1', displayName: 'OneFresh' }))
+            .mockResolvedValueOnce(mkVrcRes({ id: 'usr_c2', displayName: 'TwoFresh' }))
+            .mockResolvedValueOnce(mkVrcRes({ id: 'file_c1', name: 'File1Fresh' }))
+            // Notification accept clears /api/1/users/ cache
+            .mockResolvedValueOnce(mkVrcRes({ ok: true }))
+            .mockResolvedValueOnce(mkVrcRes({ id: 'usr_c1', displayName: 'OneAfterAccept' }));
+
+        await webApi.Execute({ url: 'https://api.vrchat.cloud/api/1/users/usr_c1', method: 'GET' });
+        await webApi.Execute({ url: 'https://api.vrchat.cloud/api/1/users/usr_c2', method: 'GET' });
+        await webApi.Execute({ url: 'https://api.vrchat.cloud/api/1/file/file_c1', method: 'GET' });
+
+        await webApi.Execute({ url: 'https://api.vrchat.cloud/api/1/user/usr_c1/friendRequest', method: 'POST' });
+        await webApi.Execute({ url: 'https://api.vrchat.cloud/api/1/auth/user/friends/usr_c2', method: 'DELETE' });
+        await webApi.Execute({ url: 'https://api.vrchat.cloud/api/1/file/file_c1/1', method: 'DELETE' });
+
+        const parseExecBody = async (opts) => JSON.parse((await webApi.Execute(opts)).Item2);
+        const u1Fresh = await parseExecBody({ url: 'https://api.vrchat.cloud/api/1/users/usr_c1', method: 'GET' });
+        const u2Fresh = await parseExecBody({ url: 'https://api.vrchat.cloud/api/1/users/usr_c2', method: 'GET' });
+        const f1Fresh = await parseExecBody({ url: 'https://api.vrchat.cloud/api/1/file/file_c1', method: 'GET' });
+        expect(u1Fresh.displayName).toBe('OneFresh');
+        expect(u2Fresh.displayName).toBe('TwoFresh');
+        expect(f1Fresh.name).toBe('File1Fresh');
+
+        await webApi.Execute({ url: 'https://api.vrchat.cloud/api/1/auth/user/notifications/not_acc_1/accept', method: 'PUT' });
+        const u1AfterAcc = await parseExecBody({ url: 'https://api.vrchat.cloud/api/1/users/usr_c1', method: 'GET' });
+        expect(u1AfterAcc.displayName).toBe('OneAfterAccept');
+
+        // 3. Passive RSS transient failure backs off briefly (15s) instead of locking out full 300s interval
+        resetCloudRssSyncState();
+        cloudState.webSyncIntervalSeconds = 300;
+        const prevLoggedIn = watchState.isLoggedIn;
+        watchState.isLoggedIn = true;
+        try {
+            fetchSpy.mockResolvedValueOnce(mockErr('UPSTREAM_500', 'transient', 500));
+            await expect(pollCloudRssFeed({ forceSync: false })).rejects.toThrow();
+            const callsAfterFail = fetchSpy.mock.calls.length;
+            // Within 15s backoff window -> skipped
+            await vi.advanceTimersByTimeAsync(5_000);
+            await pollCloudRssFeed({ forceSync: false });
+            expect(fetchSpy.mock.calls.length).toBe(callsAfterFail);
+            // After 15s backoff elapses (still far below 300s) -> retries automatically
+            fetchSpy.mockResolvedValueOnce(mockOk({ changed: false }));
+            await vi.advanceTimersByTimeAsync(12_000);
+            await pollCloudRssFeed({ forceSync: false });
+            expect(fetchSpy.mock.calls.length).toBe(callsAfterFail + 1);
+        } finally {
+            watchState.isLoggedIn = prevLoggedIn;
+        }
+
+        // 4. Local World/Avatar cache persists to bootstrapCache.storage across reload; getAvatarHistory skips uncached stubs while timeSpent preserves totals
+        resetCloudDatabaseState();
+        const db = createCloudDatabase({ userId: 'usr_me' });
+        await db.addWorldToCache({ id: 'wrld_persist_1', name: 'Persisted World', authorId: 'usr_w_auth', imageUrl: 'https://img/w.png' });
+        await db.addAvatarToCache({ id: 'avtr_persist_1', name: 'Persisted Avatar', authorId: 'usr_a_auth', imageUrl: 'https://img/a.png' });
+        expect(bootstrapCache.storage['cloud:worldMetaCache']).toContain('wrld_persist_1');
+        expect(bootstrapCache.storage['cloud:avatarMetaCache']).toContain('avtr_persist_1');
+
+        // Simulate page reload (clears in-memory Maps, keeps bootstrapCache.storage)
+        resetCloudDatabaseState();
+        const hydratedWorld = await db.getCachedWorldById('wrld_persist_1');
+        const hydratedAvatar = await db.getCachedAvatarById('avtr_persist_1');
+        expect(hydratedWorld?.name).toBe('Persisted World');
+        expect(hydratedAvatar?.name).toBe('Persisted Avatar');
+
+        // getAvatarHistory omits uncached stub (preventing blank-authorId pollution) while getAllAvatarTimeSpent keeps raw times
+        fetchSpy.mockResolvedValueOnce(
+            mockOk([
+                { avatar_id: 'avtr_persist_1', created_at: '2026-11-25T10:00:00Z', time: 120 },
+                { avatar_id: 'avtr_uncached_99', created_at: '2026-11-25T10:05:00Z', time: 300 }
+            ])
+        );
+        const avtrHist = await db.getAvatarHistory('usr_me', 50);
+        expect(avtrHist.map((a) => a.id)).toEqual(['avtr_persist_1']);
+        expect(avtrHist[0].authorId).toBe('usr_a_auth');
+
+        fetchSpy.mockResolvedValueOnce(
+            mockOk([
+                { avatar_id: 'avtr_persist_1', time: 120 },
+                { avatar_id: 'avtr_uncached_99', time: 300 }
+            ])
+        );
+        const timeMap = await db.getAllAvatarTimeSpent();
+        expect(timeMap.get('avtr_persist_1')).toBe(120);
+        expect(timeMap.get('avtr_uncached_99')).toBe(300);
+
+        // 5. searchGameLogDatabase maps VideoPlay/Event/PortalSpawn/External + getLastVisit/getLastSeen/getUserStats/getPreviousDisplayNamesByUserId parity
+        fetchSpy.mockResolvedValueOnce(
+            mockOk({
+                locationRows: [],
+                joinLeaveRows: [],
+                videoPlayRows: [{ id: 1, created_at: '2026-11-25T12:04:00Z', video_url: 'https://youtu.be/v1', video_name: 'Song', location: 'wrld_1:1' }],
+                eventRows: [{ id: 2, created_at: '2026-11-25T12:03:00Z', data: 'EventMsg' }],
+                portalSpawnRows: [{ id: 3, created_at: '2026-11-25T12:02:00Z', display_name: 'Alice', world_name: 'PortalDest', instance_id: 'wrld_2:2' }],
+                externalRows: [{ id: 4, created_at: '2026-11-25T12:01:00Z', message: 'ExtMsg', display_name: 'Bot' }]
+            })
+        );
+        const extraSearch = await db.searchGameLogDatabase('Needle');
+        expect(extraSearch.map((r) => r.type)).toEqual(['VideoPlay', 'Event', 'PortalSpawn', 'External']);
+
+        fetchSpy.mockResolvedValueOnce(
+            mockOk({ lastVisit: '2026-11-25T12:30:00Z', secondLastVisit: '2026-11-25T11:30:00Z', visits: 2, totalTime: 600 })
+        );
+        const lastVisitInCurrent = await db.getLastVisit('wrld_w8_cur', true);
+        expect(lastVisitInCurrent.created_at).toBe('2026-11-25T11:30:00Z');
+
+        fetchSpy.mockResolvedValueOnce(
+            mockOk({
+                lastSeen: '2026-11-25T12:40:00Z',
+                secondLastSeen: '2026-11-25T11:40:00Z',
+                joinCount: 2,
+                timeSpent: 900,
+                previousDisplayNames: [
+                    ['OldNick', '2026-11-25T11:00:00Z'],
+                    ['NewNick', '2026-11-25T12:00:00Z']
+                ]
+            })
+        );
+        const lastSeenInCurrent = await db.getLastSeen('usr_w8_prev', true);
+        expect(lastSeenInCurrent.created_at).toBe('2026-11-25T11:40:00Z');
+        const prevNamesMap = await db.getPreviousDisplayNamesByUserId('usr_w8_prev');
+        expect(prevNamesMap instanceof Map).toBe(true);
+        expect(prevNamesMap.get('OldNick')).toBe('2026-11-25T11:00:00Z');
+
+        // 6. pagehide keepalive strips oversized rebuildable world/avatar meta caches to keep payload <= 64 KiB and preserve critical storage keys
+        const safeKeepalivePatch = fitPatchForKeepalive('vrcx_storage', {
+            critical_key: 'keep-me',
+            'cloud:worldMetaCache': 'X'.repeat(70_000)
+        });
+        expect(safeKeepalivePatch.critical_key).toBe('keep-me');
+        expect(safeKeepalivePatch['cloud:worldMetaCache']).toBeUndefined();
+        expect(new TextEncoder().encode(JSON.stringify({ bundleKey: 'vrcx_storage', patch: safeKeepalivePatch })).byteLength).toBeLessThanOrEqual(56_000);
+    });
+
+    it('covers Wave 9 Web fixes: Cloudflare Access redirect detection, hub close on unauthorized, offline getPrimaryAgentState, truncated RSS guard, data-URL cache skip, and TryOpenInstanceInVrc offline fast-fail', async () => {
+        // 1. cloudFetch with redirect:'manual' detects 302 Access redirect on BOTH regular API routes AND /api/auth/me
+        cloudState.authenticated = true;
+        cloudState.hubDialogOpen = true;
+        cloudState.authMode = 'passcode_session';
+        fetchSpy.mockResolvedValueOnce(
+            new Response(null, { status: 302, headers: { Location: 'https://team.cloudflareaccess.com/login' } })
+        );
+        await expect(cloudFetch('/api/bootstrap')).rejects.toThrow(/Cloudflare Access/i);
+        expect(cloudState.authenticated).toBe(false);
+        expect(cloudState.hubDialogOpen).toBe(false);
+        expect(cloudState.authMode).toBe('cloudflare_access');
+        expect(fetchSpy.mock.calls.at(-1)[1].redirect).toBe('manual');
+
+        // Cold-start / retry refreshCloudAuthAndBootstrap() hitting Cloudflare Access 302 on /api/auth/me
+        // must set authMode='cloudflare_access' and keep authCheckFailed=false (no retry loop).
+        cloudState.authMode = 'open_setup';
+        cloudState.authCheckFailed = false;
+        fetchSpy.mockResolvedValueOnce(
+            new Response(null, { status: 302, headers: { Location: 'https://team.cloudflareaccess.com/login' } })
+        );
+        expect(await refreshCloudAuthAndBootstrap()).toBe(false);
+        expect(cloudState.authenticated).toBe(false);
+        expect(cloudState.authMode).toBe('cloudflare_access');
+        expect(cloudState.authCheckFailed).toBe(false);
+
+        // 2. getPrimaryAgentState returns null when no agent is currently online (never leaks stale offline device state)
+        cloudState.authenticated = true;
+        cloudState.wsAgentsOnline = [];
+        cloudState.deviceLastSeen = { 'win-old': Date.now() - 3_600_000 };
+        cloudState.deviceStates = { 'win-old': { state: { vrcRunning: true }, updatedAt: '2026-11-24T00:00:00Z' } };
+        expect(getPrimaryAgentState()).toBeNull();
+
+        // 3. AppApi.FindScreenshotsBySearch returns '[]'; TryOpenInstanceInVrc returns false immediately when offline
+        const appApi = createAppApiBridge();
+        const callsBeforeSearch = fetchSpy.mock.calls.length;
+        expect(await appApi.FindScreenshotsBySearch('any')).toBe('[]');
+        expect(await appApi.TryOpenInstanceInVrc('vrchat://launch?id=wrld_11111111-1111-1111-1111-111111111111:123')).toBe(
+            false
+        );
+        expect(fetchSpy.mock.calls.length).toBe(callsBeforeSearch);
+
+        // 4. applyCloudRssSnapshot preserves unseen online friends when onlineFriendsTruncated=true,
+        // treats platform:'offline' as offline, and fills missing isFriend=true for Tier-3 minimal snapshots
+        resetCloudRssSyncState();
+        const existingFriend = { id: 'usr_truncated_501', state: 'online', ref: { id: 'usr_truncated_501' } };
+        const appliedUsers = [];
+        const fakeFriendStore = {
+            friends: new Map([['usr_truncated_501', existingFriend]]),
+            runInSortedFriendsBatch: (fn) => fn()
+        };
+        const fakeUserStore = { currentUser: { id: 'usr_self' } };
+        const fakeFeedStore = { feedTableLookup: vi.fn() };
+        const fakeNotyStore = { notificationTable: { data: [] } };
+        applyCloudRssSnapshot(
+            {
+                changed: true,
+                syncedAt: '2026-11-25T17:00:00.000Z',
+                onlineFriendsTruncated: true,
+                onlineFriends: [{ id: 'usr_offline_plat', displayName: 'OfflinePlat', platform: 'offline' }]
+            },
+            {
+                friendStore: fakeFriendStore,
+                userStore: fakeUserStore,
+                feedStore: fakeFeedStore,
+                notificationStore: fakeNotyStore,
+                applyUser: (u) => appliedUsers.push(u)
+            }
+        );
+        expect(appliedUsers).toHaveLength(1);
+        expect(appliedUsers[0]).toMatchObject({
+            id: 'usr_offline_plat',
+            state: 'offline',
+            isFriend: true
+        });
+        expect(existingFriend.state).toBe('online');
+
+        // 5. webApiRemote skips caching data:image/* Data URLs and oversized (>256 KiB) responses
+        cloudState.webSyncIntervalSeconds = 300;
+        const webApi = createWebApiBridge();
+        const imgUrl = 'https://api.vrchat.cloud/api/1/file/file_w9_img/1/file';
+        fetchSpy.mockResolvedValueOnce(mockOk({ status: 200, data: 'data:image/png;base64,iVBORw0KGgo=' }));
+        fetchSpy.mockResolvedValueOnce(mockOk({ status: 200, data: 'data:image/png;base64,iVBORw0KGgo=2' }));
+        const img1 = await webApi.ExecuteJson(JSON.stringify({ url: imgUrl, method: 'GET' }));
+        const img2 = await webApi.ExecuteJson(JSON.stringify({ url: imgUrl, method: 'GET' }));
+        expect(JSON.parse(img1).message).toBe('data:image/png;base64,iVBORw0KGgo=');
+        expect(JSON.parse(img2).message).toBe('data:image/png;base64,iVBORw0KGgo=2');
+    });
+
+    it('chunks getSessionsEventsForSegments beyond 75 locations and normalizes raw boop V2 notifications on DB/RSS load', async () => {
+        // 1. getSessionsEventsForSegments deduplicates & chunks >75 locations into 75+75+10 batches and sorts ascending
+        const db = createCloudDatabase({ userId: 'usr_self_chunk' });
+        const tags = Array.from({ length: 160 }, (_, i) => `wrld_chunk:${i}`);
+        tags.push('wrld_chunk:0', ''); // duplicate + empty should be stripped before chunking
+        fetchSpy
+            .mockResolvedValueOnce(
+                mockOk([{ type: 'OnPlayerJoined', created_at: '2026-11-25T10:03:00.000Z', location: 'wrld_chunk:0' }])
+            )
+            .mockResolvedValueOnce(
+                mockOk([{ type: 'VideoPlay', created_at: '2026-11-25T10:01:00.000Z', location: 'wrld_chunk:80' }])
+            )
+            .mockResolvedValueOnce(
+                mockOk([{ type: 'OnPlayerLeft', created_at: '2026-11-25T10:02:00.000Z', location: 'wrld_chunk:155' }])
+            );
+        const startCalls = fetchSpy.mock.calls.length;
+        const merged = await db.getSessionsEventsForSegments(tags, '2026-11-25T09:00:00.000Z', '2026-11-25T11:00:00.000Z');
+        const batchCalls = fetchSpy.mock.calls.slice(startCalls);
+        expect(batchCalls).toHaveLength(3);
+        expect(JSON.parse(batchCalls[0][1].body).locations).toHaveLength(75);
+        expect(JSON.parse(batchCalls[1][1].body).locations).toHaveLength(75);
+        expect(JSON.parse(batchCalls[2][1].body).locations).toHaveLength(10);
+        expect(merged.map((r) => r.created_at)).toEqual([
+            '2026-11-25T10:01:00.000Z',
+            '2026-11-25T10:02:00.000Z',
+            '2026-11-25T10:03:00.000Z'
+        ]);
+
+        // 2. getNotificationsV2 and applyCloudRssSnapshot normalize legacy raw boop notifications
+        fetchSpy.mockResolvedValueOnce(
+            mockOk([
+                {
+                    id: 'boop_db_1',
+                    created_at: '2026-11-25T12:00:00.000Z',
+                    type: 'boop',
+                    title: 'Alice booped you!',
+                    message: '',
+                    image_url: '',
+                    details: JSON.stringify({ emojiId: 'file_custom_emoji', emojiVersion: 3 }),
+                    responses: '[]'
+                }
+            ])
+        );
+        const v2List = await db.getNotificationsV2();
+        expect(v2List[0]).toMatchObject({
+            id: 'boop_db_1',
+            title: '',
+            message: 'Alice booped you!',
+            imageUrl: 'https://api.vrchat.cloud/api/1/file/file_custom_emoji/3'
+        });
+
+        resetCloudRssSyncState();
+        const fakeNotyStore = { notificationTable: { data: [] }, unseenNotifications: [] };
+        applyCloudRssSnapshot(
+            {
+                changed: true,
+                syncedAt: '2026-11-25T12:05:00.000Z',
+                onlineFriendsTruncated: true,
+                onlineFriends: [],
+                notificationsV2: [
+                    {
+                        id: 'boop_rss_1',
+                        created_at: '2026-11-25T12:04:00.000Z',
+                        type: 'boop',
+                        title: 'Bob booped you!',
+                        message: '',
+                        image_url: '',
+                        details: { emojiId: 'default_wave', emojiVersion: 1 },
+                        responses: []
+                    }
+                ]
+            },
+            {
+                friendStore: { friends: new Map(), runInSortedFriendsBatch: (fn) => fn() },
+                userStore: { currentUser: { id: 'usr_self' } },
+                feedStore: { feedTableLookup: vi.fn() },
+                notificationStore: fakeNotyStore,
+                applyUser: vi.fn()
+            }
+        );
+        expect(fakeNotyStore.notificationTable.data[0]).toMatchObject({
+            id: 'boop_rss_1',
+            title: '',
+            message: 'Bob booped you! wave',
+            imageUrl: 'default_wave'
+        });
+
+        // 3. addGamelogJoinLeaveBulk chunks >100 items and assigns valid numeric rowId on every entry (both normal & suppressed)
+        const bulkItems = Array.from({ length: 120 }, (_, i) => ({
+            type: 'OnPlayerLeft',
+            created_at: `2026-11-25T13:00:${String(i % 60).padStart(2, '0')}.000Z`,
+            displayName: `User${i}`,
+            userId: `usr_bulk_${i}`,
+            location: 'wrld_bulk:1'
+        }));
+        fetchSpy
+            .mockResolvedValueOnce(mockOk({ inserted: 100, rowIds: Array.from({ length: 100 }, (_, i) => 500 + i) }))
+            .mockResolvedValueOnce(mockOk({ inserted: 20, rowIds: Array.from({ length: 20 }, (_, i) => 700 + i) }));
+        const bulkCallStart = fetchSpy.mock.calls.length;
+        const bulkPersisted = await db.addGamelogJoinLeaveBulk(bulkItems);
+        const bulkCalls = fetchSpy.mock.calls.slice(bulkCallStart);
+        expect(bulkCalls).toHaveLength(2);
+        expect(JSON.parse(bulkCalls[0][1].body).items).toHaveLength(100);
+        expect(JSON.parse(bulkCalls[1][1].body).items).toHaveLength(20);
+        expect(bulkPersisted).toHaveLength(120);
+        expect(bulkPersisted[0].rowId).toBe(500);
+        expect(bulkPersisted[100].rowId).toBe(700);
+        expect(new Set(bulkPersisted.map((e) => e.rowId)).size).toBe(120);
+
+        // 4. applyCloudRssSnapshot preserves local v1 $isExpired and earlier v2 expiresAt (never resurrects hidden notifications)
+        resetCloudRssSyncState();
+        const notyStore = {
+            notificationTable: {
+                data: [
+                    {
+                        id: 'n1_hidden',
+                        created_at: '2026-11-25T12:00:00.000Z',
+                        type: 'invite',
+                        seen: true,
+                        $isExpired: true
+                    },
+                    {
+                        id: 'n2_hidden',
+                        created_at: '2026-11-25T12:01:00.000Z',
+                        updatedAt: '2026-11-25T12:01:00.000Z',
+                        expiresAt: '2026-11-25T12:02:00.000Z',
+                        type: 'group.announcement',
+                        seen: true,
+                        version: 2
+                    }
+                ]
+            },
+            unseenNotifications: []
+        };
+        applyCloudRssSnapshot(
+            {
+                changed: true,
+                syncedAt: '2026-11-25T12:05:00.000Z',
+                onlineFriendsTruncated: true,
+                onlineFriends: [],
+                notificationsV1: [
+                    {
+                        id: 'n1_hidden',
+                        created_at: '2026-11-25T12:00:00.000Z',
+                        type: 'invite',
+                        expired: 0
+                    }
+                ],
+                notificationsV2: [
+                    {
+                        id: 'n2_hidden',
+                        created_at: '2026-11-25T12:01:00.000Z',
+                        updated_at: '2026-11-25T12:01:00.000Z',
+                        expires_at: '2026-12-25T12:01:00.000Z',
+                        type: 'group.announcement',
+                        seen: 0
+                    }
+                ]
+            },
+            {
+                friendStore: { friends: new Map(), runInSortedFriendsBatch: (fn) => fn() },
+                userStore: { currentUser: { id: 'usr_self' } },
+                feedStore: { feedTableLookup: vi.fn() },
+                notificationStore: notyStore,
+                applyUser: vi.fn()
+            }
+        );
+        const byNotyId = new Map(notyStore.notificationTable.data.map((r) => [r.id, r]));
+        expect(byNotyId.get('n1_hidden')?.$isExpired).toBe(true);
+        expect(byNotyId.get('n2_hidden')?.expiresAt).toBe('2026-11-25T12:02:00.000Z');
     });
 });

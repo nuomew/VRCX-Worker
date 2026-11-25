@@ -23,6 +23,7 @@ const ALLOWED_HOST_SUFFIXES = [
     'api.avtrdb.com',
     'www.googleapis.com',
     'translation.googleapis.com',
+    'api.openai.com',
     'r2.cloudflarestorage.com',
     'api.github.com'
 ];
@@ -31,6 +32,98 @@ const ALLOWED_HOST_SUFFIXES = [
 const AWS_S3_HOST_RE = /^(?:[a-z0-9-]+\.)?s3(?:[.-][a-z0-9-]+)?\.amazonaws\.com$/;
 const MAX_IMAGE_PROXY_BYTES = 15 * 1024 * 1024; // 15 MiB cap for binary image Data URL conversion
 const MAX_TEXT_PROXY_BYTES = 16 * 1024 * 1024; // 16 MiB cap for upstream text responses
+
+/**
+ * Builds DB_CORE statements to purge account-scoped baseline state on logout or VRChat account switch.
+ */
+async function buildPurgeAccountScopedCoreStatements(
+    env: Env,
+    options: { dropCookieVault?: boolean; clearBackoff?: boolean } = {}
+): Promise<D1PreparedStatement[]> {
+    const stmts: D1PreparedStatement[] = [
+        env.DB_CORE.prepare(
+            "DELETE FROM cloud_bg_sync_state WHERE state_key IN ('friends_snapshot', 'friend_log_owner')"
+        ),
+        env.DB_CORE.prepare('DELETE FROM friend_log_current')
+    ];
+    if (options.dropCookieVault) {
+        stmts.push(env.DB_CORE.prepare("DELETE FROM cloud_cookie_vault WHERE account_key = 'default'"));
+    }
+    if (options.clearBackoff) {
+        const metaRow = await env.DB_CORE.prepare(
+            "SELECT payload_json FROM cloud_bg_sync_state WHERE state_key = 'poller_meta' LIMIT 1"
+        )
+            .first<{ payload_json?: string }>()
+            .catch(() => null);
+        if (metaRow?.payload_json) {
+            try {
+                const parsed = JSON.parse(metaRow.payload_json) as Record<string, unknown>;
+                if (
+                    parsed.nextAllowedAt ||
+                    parsed.lastStatus === 'auth_expired' ||
+                    parsed.lastStatus === 'no_session'
+                ) {
+                    parsed.nextAllowedAt = '';
+                    parsed.lastRunAt = '';
+                    if (parsed.lastStatus === 'auth_expired' || parsed.lastStatus === 'no_session') {
+                        parsed.lastError = '';
+                        parsed.lastStatus = 'never';
+                    }
+                    stmts.push(
+                        env.DB_CORE.prepare(
+                            `UPDATE cloud_bg_sync_state SET payload_json = ?, updated_at = ? WHERE state_key = 'poller_meta'`
+                        ).bind(JSON.stringify(parsed), new Date().toISOString())
+                    );
+                }
+            } catch {
+                // Ignore malformed poller_meta
+            }
+        }
+    }
+    return stmts;
+}
+
+/**
+ * Purges account-scoped cached/baseline state on logout or VRChat account switch so a new account
+ * never inherits stale friend snapshots, friend_log_current rows, or auth_expired backoff gates.
+ */
+async function purgeAccountScopedSyncState(
+    env: Env,
+    options: { dropCookieVault?: boolean; clearBackoff?: boolean } = {}
+): Promise<void> {
+    const stmts = await buildPurgeAccountScopedCoreStatements(env, options);
+    await Promise.all([env.DB_CORE.batch(stmts).catch(() => {}), clearAllVrcCache(env).catch(() => {})]);
+}
+
+/**
+ * Atomically switches the encrypted cookie vault AND purges previous-account baseline state in a single
+ * DB_CORE batch transaction (flanked by DB_CACHE clears) so concurrent Cron/Web reads never observe torn
+ * `(new_auth + old_friends_snapshot)` state.
+ */
+async function saveCookieJarAndPurgeAccountStateAtomic(
+    env: Env,
+    jar: Record<string, string>,
+    options: { clearBackoff?: boolean; accountKey?: string } = {}
+): Promise<{ saved: boolean; updatedAt: string }> {
+    const accountKey = options.accountKey ?? 'default';
+    await clearAllVrcCache(env).catch(() => {});
+    const [{ ciphertextB64, ivB64 }, purgeStmts] = await Promise.all([
+        encryptAesGcm(getMasterKey(env), JSON.stringify(jar)),
+        buildPurgeAccountScopedCoreStatements(env, { clearBackoff: options.clearBackoff })
+    ]);
+    const now = new Date().toISOString();
+    const upsertVaultStmt = env.DB_CORE.prepare(
+        `INSERT INTO cloud_cookie_vault (account_key, ciphertext_b64, iv_b64, source_device_id, updated_at)
+         VALUES (?, ?, ?, 'cloud-worker', ?)
+         ON CONFLICT(account_key) DO UPDATE SET
+            ciphertext_b64 = excluded.ciphertext_b64,
+            iv_b64 = excluded.iv_b64,
+            updated_at = excluded.updated_at`
+    ).bind(accountKey, ciphertextB64, ivB64, now);
+    await env.DB_CORE.batch([...purgeStmts, upsertVaultStmt]);
+    await clearAllVrcCache(env).catch(() => {});
+    return { saved: true, updatedAt: now };
+}
 
 function hasHeaderCaseInsensitive(headers: Record<string, string> | undefined, targetName: string): boolean {
     if (!headers || typeof headers !== 'object') return false;
@@ -100,6 +193,7 @@ interface WebApiExecutePayload {
     fileMD5?: string;
     preferCloudDirect?: boolean;
     bypassCache?: boolean;
+    translationTestEndpoint?: boolean;
 }
 
 function isPrivateIpv4Octets(a: number, b: number): boolean {
@@ -115,32 +209,43 @@ function isPrivateIpv4Octets(a: number, b: number): boolean {
 }
 
 function isPrivateOrLocalHost(hostname: string): boolean {
-    const h = hostname.toLowerCase().replace(/^\[|\]$/g, '');
+    const h = hostname.toLowerCase().replace(/^\[|\]$/g, '').replace(/\.+$/, '');
     if (!h || h === 'localhost' || h.endsWith('.localhost') || h.endsWith('.local') || h.endsWith('.internal')) {
         return true;
     }
     if (h.includes(':')) {
-        // IPv6 loopback, unspecified, ULA (fc00::/7), link-local (fe80::/10), and IPv4-mapped addresses.
+        // IPv6 loopback, unspecified, ULA (fc00::/7), link-local (fe80::/10), deprecated site-local (fec0::/10),
+        // multicast (ff00::/8), NAT64 (64:ff9b::/96 & 64:ff9b:1::/48), deprecated IPv4-compatible (0000::/96),
+        // and IPv4-mapped (::ffff:0:0/96) addresses.
         if (
             h === '::' ||
             h === '::1' ||
             h === '0:0:0:0:0:0:0:0' ||
             h === '0:0:0:0:0:0:0:1' ||
             /^f[cd][0-9a-f]{2}:/i.test(h) ||
-            /^fe[89ab][0-9a-f]:/i.test(h)
+            /^fe[89ab][0-9a-f]:/i.test(h) ||
+            /^fe[cdef][0-9a-f]:/i.test(h) ||
+            /^ff[0-9a-f]{2}:/i.test(h) ||
+            /^64:ff9b(?::1)?:/i.test(h) ||
+            /^0:0:0:0:0:0:/i.test(h)
         ) {
             return true;
         }
-        const mappedDotted = h.match(/^::ffff:(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+        const normalizedMapped = h.startsWith('0:0:0:0:0:ffff:') ? `::ffff:${h.slice('0:0:0:0:0:ffff:'.length)}` : h;
+        const mappedDotted = normalizedMapped.match(/^::ffff:(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
         if (mappedDotted) {
             return isPrivateIpv4Octets(Number(mappedDotted[1]), Number(mappedDotted[2]));
         }
-        const mappedHex = h.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+        const mappedHex = normalizedMapped.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
         if (mappedHex) {
             const hi = parseInt(mappedHex[1]!, 16);
             return isPrivateIpv4Octets((hi >> 8) & 0xff, hi & 0xff);
         }
-        if (h.startsWith('::ffff:')) {
+        if (normalizedMapped.startsWith('::ffff:')) {
+            return true;
+        }
+        // Any remaining `::...` address belongs to deprecated 0000::/96 (e.g. ::127.0.0.1 / ::7f00:1) or reserved space.
+        if (h.startsWith('::')) {
             return true;
         }
         return false;
@@ -152,42 +257,109 @@ function isPrivateOrLocalHost(hostname: string): boolean {
     return false;
 }
 
+interface RedirectFetchResult {
+    response: Response;
+    finalUrl: string;
+    vrchatCookieHeaders: Headers[];
+}
+
+function parseCookieHeaderMap(cookieHeader: string | null): Record<string, string> {
+    const out: Record<string, string> = {};
+    if (!cookieHeader) return out;
+    for (const part of cookieHeader.split(';')) {
+        const idx = part.indexOf('=');
+        if (idx <= 0) continue;
+        const k = part.slice(0, idx).trim();
+        const v = part.slice(idx + 1).trim();
+        if (k) out[k] = v;
+    }
+    return out;
+}
+
+function isValidJsonText(raw: string): boolean {
+    const trimmed = raw.trim();
+    if (!trimmed) return false;
+    try {
+        JSON.parse(trimmed);
+        return true;
+    } catch {
+        return false;
+    }
+}
+
 async function fetchWithAllowlistedRedirects(
     initialUrl: string,
     init: RequestInit,
-    isUrlAllowed: (candidate: string) => boolean | Promise<boolean>,
-    maxRedirects = 3
-): Promise<Response> {
+    isUrlAllowed: (candidate: string, method: string) => boolean | Promise<boolean>,
+    options: { maxRedirects?: number; budget?: { remaining: number } } = {}
+): Promise<RedirectFetchResult> {
+    const maxRedirects = options.maxRedirects ?? 3;
+    const budget = options.budget;
     let currentUrl = initialUrl;
     let currentInit: RequestInit = { ...init, redirect: 'manual' };
+    const vrchatCookieHeaders: Headers[] = [];
     for (let hop = 0; hop <= maxRedirects; hop++) {
+        if (budget) {
+            if (budget.remaining <= 0) {
+                throw new Error('Upstream subrequest budget exceeded');
+            }
+            budget.remaining--;
+        }
         const res = await fetch(currentUrl, currentInit);
+        const currentIsVrcAuth = isVrchatAuthTarget(currentUrl);
+        if (currentIsVrcAuth) {
+            vrchatCookieHeaders.push(res.headers);
+        }
         if (![301, 302, 303, 307, 308].includes(res.status)) {
-            return res;
+            return { response: res, finalUrl: currentUrl, vrchatCookieHeaders };
         }
         const location = res.headers.get('Location');
         if (!location) {
-            return res;
+            return { response: res, finalUrl: currentUrl, vrchatCookieHeaders };
         }
+        // Always cancel intermediate redirect bodies to prevent leaking Workers' 6 concurrent connection slots.
+        await res.body?.cancel().catch(() => {});
         if (hop === maxRedirects) {
             throw new Error('Too many redirects from upstream target');
         }
         const prevOrigin = new URL(currentUrl).origin;
         const nextUrl = new URL(location, currentUrl).toString();
-        const allowed = await isUrlAllowed(nextUrl);
+        const curMethod = (currentInit.method ?? 'GET').toUpperCase();
+        const convertToGet = res.status === 303 || ((res.status === 301 || res.status === 302) && curMethod === 'POST');
+        const nextMethod = convertToGet ? 'GET' : curMethod;
+        const allowed = await isUrlAllowed(nextUrl, nextMethod);
         if (!allowed) {
             throw new Error('Redirect target is not in allowlist');
         }
         const nextHeaders = new Headers(currentInit.headers);
+        const nextIsVrcAuth = isVrchatAuthTarget(nextUrl);
         if (new URL(nextUrl).origin !== prevOrigin) {
-            nextHeaders.delete('Cookie');
             nextHeaders.delete('Authorization');
+            // Preserve VRChat session cookies across VRChat subdomain hops (e.g. vrchat.com <-> api.vrchat.cloud),
+            // while stripping cookies before redirecting to any non-VRChat or public host.
+            if (!nextIsVrcAuth) {
+                nextHeaders.delete('Cookie');
+            }
         }
-        const nextMethod = res.status === 303 ? 'GET' : currentInit.method;
+        if (currentIsVrcAuth && nextIsVrcAuth) {
+            const hopJar = parseCookieHeaderMap(nextHeaders.get('Cookie'));
+            if (mergeSetCookies(hopJar, res.headers)) {
+                const updatedCookieHeader = buildCookieHeader(hopJar);
+                if (updatedCookieHeader) {
+                    nextHeaders.set('Cookie', updatedCookieHeader);
+                } else {
+                    nextHeaders.delete('Cookie');
+                }
+            }
+        }
+        if (convertToGet) {
+            nextHeaders.delete('Content-Type');
+            nextHeaders.delete('Content-Length');
+        }
         currentInit = {
             ...currentInit,
             method: nextMethod,
-            body: res.status === 303 ? undefined : currentInit.body,
+            body: convertToGet ? undefined : currentInit.body,
             headers: nextHeaders,
             redirect: 'manual'
         };
@@ -299,11 +471,72 @@ function uint8ArrayToBase64(bytes: Uint8Array): string {
 }
 
 /**
- * Reads an upstream response body matching desktop Dotnet/WebApi.cs behavior:
- * binary image / octet-stream responses are returned as `data:image/png;base64,...` Data URLs
- * so FullscreenImagePreview copy/download works seamlessly in Web mode.
+ * Allows the authenticated owner to test an unsaved public HTTPS OpenAI-compatible translation endpoint
+ * (`/models` or `/chat/completions`) before saving it to vrcx_config, while still strictly blocking SSRF.
  */
-async function readUpstreamResponseBody(upstream: Response): Promise<{ bodyText: string; isBinaryImage: boolean }> {
+function isAllowedTranslationTestUrl(rawUrl: string, method: string): boolean {
+    let target: URL;
+    try {
+        target = new URL(rawUrl);
+    } catch {
+        return false;
+    }
+    if (target.protocol !== 'https:' || isPrivateOrLocalHost(target.hostname)) {
+        return false;
+    }
+    const p = target.pathname.toLowerCase();
+    const upper = method.toUpperCase();
+    if (upper === 'GET' && p.endsWith('/models')) return true;
+    if (upper === 'POST' && p.endsWith('/chat/completions')) return true;
+    return false;
+}
+
+function detectImageMime(bytes: Uint8Array, contentTypeHeader: string): string {
+    if (bytes.length >= 4 && bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) {
+        return 'image/png';
+    }
+    if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) {
+        return 'image/jpeg';
+    }
+    if (
+        bytes.length >= 12 &&
+        bytes[0] === 0x52 &&
+        bytes[1] === 0x49 &&
+        bytes[2] === 0x46 &&
+        bytes[3] === 0x46 &&
+        bytes[8] === 0x57 &&
+        bytes[9] === 0x45 &&
+        bytes[10] === 0x42 &&
+        bytes[11] === 0x50
+    ) {
+        return 'image/webp';
+    }
+    if (bytes.length >= 4 && bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x38) {
+        return 'image/gif';
+    }
+    const rawMime = contentTypeHeader.split(';')[0]?.trim().toLowerCase() ?? '';
+    if (rawMime.startsWith('image/')) {
+        return rawMime;
+    }
+    if (rawMime === 'application/octet-stream') {
+        return 'application/octet-stream';
+    }
+    return 'image/png';
+}
+
+/**
+ * Reads an upstream response body matching desktop Dotnet/WebApi.cs behavior:
+ * binary image / octet-stream responses are returned as `data:<actual-mime>;base64,...` Data URLs
+ * so FullscreenImagePreview copy/download preserves true encoding and converts cleanly to PNG on copy.
+ */
+async function readUpstreamResponseBody(
+    upstream: Response,
+    requestMethod = 'GET'
+): Promise<{ bodyText: string; isBinaryImage: boolean }> {
+    if (requestMethod.toUpperCase() === 'HEAD' || upstream.status === 204 || upstream.status === 304) {
+        await upstream.body?.cancel().catch(() => {});
+        return { bodyText: '', isBinaryImage: false };
+    }
     const ct = (upstream.headers.get('content-type') ?? '').toLowerCase();
     if (ct.includes('image/') || ct.includes('application/octet-stream')) {
         const bytes = await readResponseBytesWithLimit(
@@ -311,9 +544,10 @@ async function readUpstreamResponseBody(upstream: Response): Promise<{ bodyText:
             MAX_IMAGE_PROXY_BYTES,
             'Image response exceeds 15 MiB proxy limit'
         );
+        const mime = detectImageMime(bytes, ct);
         const b64 = uint8ArrayToBase64(bytes);
         return {
-            bodyText: `data:image/png;base64,${b64}`,
+            bodyText: `data:${mime};base64,${b64}`,
             isBinaryImage: true
         };
     }
@@ -338,18 +572,17 @@ function base64ToUint8Array(b64: string): Uint8Array {
     return out;
 }
 
-export async function loadCookieJar(env: Env, accountKey = 'default'): Promise<Record<string, string>> {
-    const row = await env.DB_CORE.prepare(
-        'SELECT ciphertext_b64, iv_b64 FROM cloud_cookie_vault WHERE account_key = ? LIMIT 1'
-    )
-        .bind(accountKey)
-        .first<{ ciphertext_b64: string; iv_b64: string }>();
-
-    if (!row) {
-        return {};
+export async function decryptCookieJarVaultRow(
+    env: Env,
+    row: { ciphertext_b64?: string; iv_b64?: string; updated_at?: string } | null | undefined
+): Promise<{ jar: Record<string, string>; updatedAt: string }> {
+    if (!row?.ciphertext_b64 || !row?.iv_b64) {
+        return { jar: {}, updatedAt: row?.updated_at || '' };
     }
+    // Resolve master key outside decryption catch so missing COOKIE_MASTER_KEY misconfiguration surfaces explicitly.
+    const masterKey = getMasterKey(env);
     try {
-        const plain = await decryptAesGcm(getMasterKey(env), row.ciphertext_b64, row.iv_b64);
+        const plain = await decryptAesGcm(masterKey, row.ciphertext_b64, row.iv_b64);
         const parsed = JSON.parse(plain) as Record<string, unknown>;
         const jar: Record<string, string> = {};
         for (const [k, v] of Object.entries(parsed)) {
@@ -357,30 +590,80 @@ export async function loadCookieJar(env: Env, accountKey = 'default'): Promise<R
                 jar[k] = v;
             }
         }
-        return jar;
+        return { jar, updatedAt: row.updated_at || '' };
     } catch {
-        return {};
+        return { jar: {}, updatedAt: row.updated_at || '' };
     }
+}
+
+export async function loadCookieJarWithMeta(
+    env: Env,
+    accountKey = 'default'
+): Promise<{ jar: Record<string, string>; updatedAt: string }> {
+    const row = await env.DB_CORE.prepare(
+        'SELECT ciphertext_b64, iv_b64, updated_at FROM cloud_cookie_vault WHERE account_key = ? LIMIT 1'
+    )
+        .bind(accountKey)
+        .first<{ ciphertext_b64: string; iv_b64: string; updated_at: string }>();
+
+    if (!row) {
+        return { jar: {}, updatedAt: '' };
+    }
+    return decryptCookieJarVaultRow(env, row);
+}
+
+export async function loadCookieJar(env: Env, accountKey = 'default'): Promise<Record<string, string>> {
+    const { jar } = await loadCookieJarWithMeta(env, accountKey);
+    return jar;
+}
+
+export async function buildConditionalSaveCookieJarStatement(
+    env: Env,
+    jar: Record<string, string>,
+    accountKey = 'default',
+    expectedUpdatedAt?: string
+): Promise<D1PreparedStatement> {
+    const { ciphertextB64, ivB64 } = await encryptAesGcm(getMasterKey(env), JSON.stringify(jar));
+    const now = new Date().toISOString();
+    return expectedUpdatedAt
+        ? env.DB_CORE.prepare(
+              `UPDATE cloud_cookie_vault
+               SET ciphertext_b64 = ?, iv_b64 = ?, updated_at = ?
+               WHERE account_key = ? AND updated_at = ?`
+          ).bind(ciphertextB64, ivB64, now, accountKey, expectedUpdatedAt)
+        : env.DB_CORE.prepare(
+              `UPDATE cloud_cookie_vault
+               SET ciphertext_b64 = ?, iv_b64 = ?, updated_at = ?
+               WHERE account_key = ?`
+          ).bind(ciphertextB64, ivB64, now, accountKey);
 }
 
 export async function saveCookieJar(
     env: Env,
     jar: Record<string, string>,
     accountKey = 'default',
-    options: { requireExisting?: boolean } = {}
-): Promise<void> {
+    options: { requireExisting?: boolean; expectedUpdatedAt?: string } = {}
+): Promise<{ saved: boolean; updatedAt: string }> {
     const { ciphertextB64, ivB64 } = await encryptAesGcm(getMasterKey(env), JSON.stringify(jar));
     const now = new Date().toISOString();
     if (options.requireExisting) {
-        // Never resurrect a session that the user logged out and deleted concurrently.
-        await env.DB_CORE.prepare(
-            `UPDATE cloud_cookie_vault
-             SET ciphertext_b64 = ?, iv_b64 = ?, updated_at = ?
-             WHERE account_key = ?`
-        )
-            .bind(ciphertextB64, ivB64, now, accountKey)
-            .run();
-        return;
+        // Never resurrect a logged-out session or clobber a concurrent account switch (optimistic CAS on updated_at).
+        const res = options.expectedUpdatedAt
+            ? await env.DB_CORE.prepare(
+                  `UPDATE cloud_cookie_vault
+                   SET ciphertext_b64 = ?, iv_b64 = ?, updated_at = ?
+                   WHERE account_key = ? AND updated_at = ?`
+              )
+                  .bind(ciphertextB64, ivB64, now, accountKey, options.expectedUpdatedAt)
+                  .run()
+            : await env.DB_CORE.prepare(
+                  `UPDATE cloud_cookie_vault
+                   SET ciphertext_b64 = ?, iv_b64 = ?, updated_at = ?
+                   WHERE account_key = ?`
+              )
+                  .bind(ciphertextB64, ivB64, now, accountKey)
+                  .run();
+        return { saved: (res.meta?.changes ?? 0) > 0, updatedAt: now };
     }
     await env.DB_CORE.prepare(
         `INSERT INTO cloud_cookie_vault (account_key, ciphertext_b64, iv_b64, source_device_id, updated_at)
@@ -392,10 +675,19 @@ export async function saveCookieJar(
     )
         .bind(accountKey, ciphertextB64, ivB64, now)
         .run();
+    return { saved: true, updatedAt: now };
 }
 
-export function mergeSetCookies(jar: Record<string, string>, headers: Headers): boolean {
+interface SetCookieDelta {
+    changed: boolean;
+    set: Record<string, string>;
+    deleted: Set<string>;
+}
+
+function mergeSetCookiesWithDelta(jar: Record<string, string>, headers: Headers): SetCookieDelta {
     let changed = false;
+    const set: Record<string, string> = {};
+    const deleted = new Set<string>();
     const rawList: string[] = [];
     const headersWithGetSetCookie = headers as Headers & { getSetCookie?: () => string[] };
     if (typeof headersWithGetSetCookie.getSetCookie === 'function') {
@@ -443,16 +735,26 @@ export function mergeSetCookies(jar: Record<string, string>, headers: Headers): 
         }
 
         if (expired) {
+            delete set[name];
+            deleted.add(name);
             if (name in jar) {
                 delete jar[name];
                 changed = true;
             }
-        } else if (jar[name] !== val) {
-            jar[name] = val;
-            changed = true;
+        } else {
+            deleted.delete(name);
+            set[name] = val;
+            if (jar[name] !== val) {
+                jar[name] = val;
+                changed = true;
+            }
         }
     }
-    return changed;
+    return { changed, set, deleted };
+}
+
+export function mergeSetCookies(jar: Record<string, string>, headers: Headers): boolean {
+    return mergeSetCookiesWithDelta(jar, headers).changed;
 }
 
 export function buildCookieHeader(jar: Record<string, string>): string {
@@ -522,38 +824,77 @@ function buildUpstreamRequestInit(payload: WebApiExecutePayload, cookieHeader: s
     return { method, headers };
 }
 
+function encodeUtf8Base64(text: string): string {
+    const bytes = new TextEncoder().encode(text);
+    let bin = '';
+    for (let i = 0; i < bytes.length; i++) {
+        bin += String.fromCharCode(bytes[i]!);
+    }
+    return btoa(bin);
+}
+
+function decodeUtf8Base64(b64: string): string {
+    const bin = atob(b64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) {
+        bytes[i] = bin.charCodeAt(i);
+    }
+    return new TextDecoder().decode(bytes);
+}
+
 export async function handleVrcProxyRoutes(request: Request, env: Env, url: URL): Promise<Response | null> {
     if (url.pathname === '/api/vrc/cookies') {
         if (request.method === 'GET') {
             const jar = await loadCookieJar(env);
-            const encoded = btoa(JSON.stringify(jar));
+            const encoded = encodeUtf8Base64(JSON.stringify(jar));
             return Response.json({ ok: true, data: { cookies: encoded, count: Object.keys(jar).length } });
         }
         if (request.method === 'PUT') {
-            const body = (await request.json()) as { cookies?: string };
+            let rawBody: unknown;
+            try {
+                rawBody = await request.json();
+            } catch {
+                return Response.json(
+                    { ok: false, error: { code: 'BAD_REQUEST', message: 'Invalid JSON body' } },
+                    { status: 400 }
+                );
+            }
+            if (!rawBody || typeof rawBody !== 'object' || Array.isArray(rawBody)) {
+                return Response.json(
+                    { ok: false, error: { code: 'BAD_REQUEST', message: 'Invalid JSON body' } },
+                    { status: 400 }
+                );
+            }
+            const body = rawBody as { cookies?: unknown };
+            if (body.cookies !== undefined && typeof body.cookies !== 'string') {
+                return Response.json(
+                    { ok: false, error: { code: 'BAD_COOKIES', message: 'cookies field must be a string' } },
+                    { status: 400 }
+                );
+            }
             const prevJar = await loadCookieJar(env).catch(() => ({}) as Record<string, string>);
             if (!body.cookies) {
-                await saveCookieJar(env, {});
-                if (prevJar.auth) {
-                    await clearAllVrcCache(env).catch(() => {});
-                    await env.DB_CORE.prepare("DELETE FROM cloud_bg_sync_state WHERE state_key = 'friends_snapshot'")
-                        .run()
-                        .catch(() => {});
-                }
+                await purgeAccountScopedSyncState(env, { dropCookieVault: true });
                 return Response.json({ ok: true });
             }
             try {
-                const decoded = JSON.parse(atob(body.cookies)) as Record<string, unknown>;
+                const decoded = JSON.parse(decodeUtf8Base64(body.cookies)) as unknown;
+                if (!decoded || typeof decoded !== 'object' || Array.isArray(decoded)) {
+                    return Response.json(
+                        { ok: false, error: { code: 'BAD_COOKIES', message: 'Invalid encoded cookie payload' } },
+                        { status: 400 }
+                    );
+                }
                 const jar: Record<string, string> = {};
-                for (const [k, v] of Object.entries(decoded)) {
+                for (const [k, v] of Object.entries(decoded as Record<string, unknown>)) {
                     if (typeof v === 'string') jar[k] = v;
                 }
-                await saveCookieJar(env, jar);
                 if ((prevJar.auth ?? '') !== (jar.auth ?? '')) {
-                    await clearAllVrcCache(env).catch(() => {});
-                    await env.DB_CORE.prepare("DELETE FROM cloud_bg_sync_state WHERE state_key = 'friends_snapshot'")
-                        .run()
-                        .catch(() => {});
+                    await saveCookieJarAndPurgeAccountStateAtomic(env, jar, {
+                        clearBackoff: Boolean(jar.auth?.trim())
+                    });
+                } else {
+                    await saveCookieJar(env, jar);
                 }
                 return Response.json({ ok: true });
             } catch {
@@ -564,11 +905,7 @@ export async function handleVrcProxyRoutes(request: Request, env: Env, url: URL)
             }
         }
         if (request.method === 'DELETE') {
-            await env.DB_CORE.batch([
-                env.DB_CORE.prepare('DELETE FROM cloud_cookie_vault WHERE account_key = ?').bind('default'),
-                env.DB_CORE.prepare("DELETE FROM cloud_bg_sync_state WHERE state_key = 'friends_snapshot'")
-            ]);
-            await clearAllVrcCache(env).catch(() => {});
+            await purgeAccountScopedSyncState(env, { dropCookieVault: true });
             return Response.json({ ok: true });
         }
     }
@@ -621,7 +958,14 @@ export async function handleVrcProxyRoutes(request: Request, env: Env, url: URL)
     if (url.pathname === '/api/vrc/execute' && request.method === 'POST') {
         let payload: WebApiExecutePayload;
         try {
-            payload = (await request.json()) as WebApiExecutePayload;
+            const parsed = (await request.json()) as unknown;
+            if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+                return Response.json(
+                    { ok: false, error: { code: 'BAD_REQUEST', message: 'Invalid JSON payload' } },
+                    { status: 400 }
+                );
+            }
+            payload = parsed as WebApiExecutePayload;
         } catch {
             return Response.json(
                 { ok: false, error: { code: 'BAD_REQUEST', message: 'Invalid JSON payload' } },
@@ -629,9 +973,25 @@ export async function handleVrcProxyRoutes(request: Request, env: Env, url: URL)
             );
         }
 
+        if (payload.method !== undefined && typeof payload.method !== 'string') {
+            return Response.json(
+                { ok: false, error: { code: 'BAD_REQUEST', message: 'method must be a string' } },
+                { status: 400 }
+            );
+        }
+        if (typeof payload.url !== 'string' || !payload.url.trim()) {
+            return Response.json(
+                { ok: false, error: { code: 'FORBIDDEN_TARGET', message: 'Target URL is not in VRChat allowlist' } },
+                { status: 403 }
+            );
+        }
+        const method = (payload.method?.trim() || 'GET').toUpperCase();
+        const isTranslationTest =
+            Boolean(payload?.translationTestEndpoint) && isAllowedTranslationTestUrl(payload.url, method);
         const urlAllowed =
-            Boolean(payload?.url) &&
-            (isAllowedTargetUrl(payload.url) || (await isConfiguredPublicTranslationUrl(env, payload.url)));
+            isAllowedTargetUrl(payload.url) ||
+            isTranslationTest ||
+            (await isConfiguredPublicTranslationUrl(env, payload.url));
         if (!urlAllowed) {
             return Response.json(
                 { ok: false, error: { code: 'FORBIDDEN_TARGET', message: 'Target URL is not in VRChat allowlist' } },
@@ -639,7 +999,6 @@ export async function handleVrcProxyRoutes(request: Request, env: Env, url: URL)
             );
         }
 
-        const method = (payload.method || 'GET').toUpperCase();
         const hasAuthHeader = hasHeaderCaseInsensitive(payload.headers, 'authorization');
         const isUpload = Boolean(
             payload.uploadImage ||
@@ -674,6 +1033,13 @@ export async function handleVrcProxyRoutes(request: Request, env: Env, url: URL)
         }
 
         const needsAuthCookie = isVrchatAuthTarget(payload.url);
+        const targetPathname = (() => {
+            try {
+                return new URL(payload.url).pathname;
+            } catch {
+                return '';
+            }
+        })();
 
         // Strategy 1: Prefer online Windows VRCX.Agent residential-IP relay for authenticated VRChat requests.
         // Public/third-party allowlisted endpoints do not need residential IP or VRChat cookies
@@ -681,6 +1047,10 @@ export async function handleVrcProxyRoutes(request: Request, env: Env, url: URL)
         const skipAgentRelay =
             Boolean(payload.preferCloudDirect) || (!needsAuthCookie && env.VRC_ALLOW_CLOUD_FALLBACK !== 'false');
         if (!skipAgentRelay) {
+            const preRelayAuthCookie =
+                cacheMeta && needsAuthCookie
+                    ? ((await loadCookieJar(env).catch(() => ({}) as Record<string, string>)).auth ?? '')
+                    : '';
             const hub = env.AGENT_HUB.get(env.AGENT_HUB.idFromName('primary'));
             const rpcRes = await hub.fetch(
                 new Request('https://agent-hub.internal/rpc/vrc-http', {
@@ -703,13 +1073,39 @@ export async function handleVrcProxyRoutes(request: Request, env: Env, url: URL)
                     }
                     const status = rpcJson.data.status ?? 200;
                     const bodyText = rpcJson.data.data ?? '';
-                    const isBinaryImage = bodyText.startsWith('data:image/');
-                    if (isMutation && status >= 200 && status < 300) {
+                    const isBinaryImage = bodyText.startsWith('data:image/') || bodyText.startsWith('data:application/');
+                    const isLogoutCall = needsAuthCookie && targetPathname === '/api/1/logout';
+                    if (
+                        isLogoutCall &&
+                        ((status >= 200 && status < 300) || status === 401 || status === 403)
+                    ) {
                         await invalidateVrcCacheOnWrite(env, payload.url).catch(() => {});
-                    } else if (cacheMeta && !isBinaryImage && status >= 200 && status < 300) {
-                        await putCachedVrcResponses(env, [
-                            { url: payload.url, tier: cacheMeta.tier, status, bodyText, ttlMs: cacheMeta.ttlMs }
-                        ]).catch(() => {});
+                        await purgeAccountScopedSyncState(env, { dropCookieVault: true });
+                    } else if ((isMutation || hasAuthHeader) && status >= 200 && status < 300) {
+                        if (needsAuthCookie) {
+                            await invalidateVrcCacheOnWrite(env, payload.url).catch(() => {});
+                            if (hasAuthHeader) {
+                                // Clear friends_snapshot, friend_log_current/owner AND stale cloud_cookie_vault on
+                                // Basic-Auth account switch so concurrent in-flight Strategy 1 GETs fail
+                                // the auth-cookie check and Cron/Strategy 2 cannot reuse the previous account's session.
+                                await purgeAccountScopedSyncState(env, {
+                                    dropCookieVault: true,
+                                    clearBackoff: true
+                                });
+                            }
+                        }
+                    } else if (cacheMeta && !isBinaryImage && status >= 200 && status < 300 && isValidJsonText(bodyText)) {
+                        let safeToCache = !needsAuthCookie;
+                        if (needsAuthCookie && preRelayAuthCookie) {
+                            const currentAuth =
+                                (await loadCookieJar(env).catch(() => ({}) as Record<string, string>)).auth ?? '';
+                            safeToCache = currentAuth === preRelayAuthCookie;
+                        }
+                        if (safeToCache) {
+                            await putCachedVrcResponses(env, [
+                                { url: payload.url, tier: cacheMeta.tier, status, bodyText, ttlMs: cacheMeta.ttlMs }
+                            ]).catch(() => {});
+                        }
                     }
                     return Response.json({
                         ok: true,
@@ -720,6 +1116,25 @@ export async function handleVrcProxyRoutes(request: Request, env: Env, url: URL)
                         }
                     });
                 }
+            } else if (isMutation && rpcRes.status !== 503) {
+                // Never replay a non-idempotent write to cloud_direct after an Agent RPC timeout (504) or gateway error.
+                const errJson = (await rpcRes.json().catch(() => null)) as {
+                    error?: { code?: string; message?: string };
+                } | null;
+                return Response.json(
+                    {
+                        ok: false,
+                        error: {
+                            code: errJson?.error?.code ?? 'AGENT_RPC_FAILED',
+                            message:
+                                errJson?.error?.message ??
+                                `Agent RPC failed for write request (HTTP ${rpcRes.status}); aborted cloud replay`
+                        }
+                    },
+                    { status: rpcRes.status >= 400 && rpcRes.status < 600 ? rpcRes.status : 504 }
+                );
+            } else {
+                await rpcRes.body?.cancel().catch(() => {});
             }
         }
 
@@ -737,43 +1152,162 @@ export async function handleVrcProxyRoutes(request: Request, env: Env, url: URL)
             );
         }
 
-        const jar = needsAuthCookie ? await loadCookieJar(env) : {};
-        const init = buildUpstreamRequestInit(payload, needsAuthCookie ? buildCookieHeader(jar) : '');
+        // Only explicit Basic-Auth login/account-switch may create/replace the vault from scratch;
+        // cookie-bearing probes (unauthenticated GET /api/1/auth/user and 2FA verify) enforce requireExisting + CAS
+        // so they can never resurrect a logged-out session or clobber a concurrent account switch.
+        const isLoginEstablish = hasAuthHeader;
+
+        let jar: Record<string, string> = {};
+        let initialCookieUpdatedAt = '';
+        let prevAuthCookie = '';
+        if (needsAuthCookie) {
+            const loaded = await loadCookieJarWithMeta(env);
+            prevAuthCookie = loaded.jar.auth ?? '';
+            initialCookieUpdatedAt = loaded.updatedAt;
+            // On explicit Basic-Auth login/account-switch, start from a clean jar so stale account cookies are never sent or retained.
+            jar = isLoginEstablish ? {} : loaded.jar;
+        }
+        let init: RequestInit;
+        try {
+            init = buildUpstreamRequestInit(payload, needsAuthCookie ? buildCookieHeader(jar) : '');
+        } catch (err) {
+            return Response.json(
+                {
+                    ok: false,
+                    error: {
+                        code: 'BAD_REQUEST',
+                        message: err instanceof Error ? err.message : 'Invalid upstream request payload'
+                    }
+                },
+                { status: 400 }
+            );
+        }
 
         try {
-            const upstream = await fetchWithAllowlistedRedirects(
+            const { response: upstream, vrchatCookieHeaders } = await fetchWithAllowlistedRedirects(
                 payload.url,
                 init,
-                async (candidate) => isAllowedTargetUrl(candidate) || (await isConfiguredPublicTranslationUrl(env, candidate))
+                async (candidate, candidateMethod) =>
+                    isAllowedTargetUrl(candidate) ||
+                    (isTranslationTest && isAllowedTranslationTestUrl(candidate, candidateMethod)) ||
+                    (await isConfiguredPublicTranslationUrl(env, candidate))
             );
+            let effectiveAuthForCache = prevAuthCookie;
             if (needsAuthCookie) {
-                const cookieChanged = mergeSetCookies(jar, upstream.headers);
+                let cookieChanged = false;
+                const incomingSet: Record<string, string> = {};
+                const incomingDeleted = new Set<string>();
+                for (const h of vrchatCookieHeaders) {
+                    const delta = mergeSetCookiesWithDelta(jar, h);
+                    if (delta.changed) {
+                        cookieChanged = true;
+                    }
+                    for (const [k, v] of Object.entries(delta.set)) {
+                        incomingDeleted.delete(k);
+                        incomingSet[k] = v;
+                    }
+                    for (const k of delta.deleted) {
+                        delete incomingSet[k];
+                        incomingDeleted.add(k);
+                    }
+                }
                 if (cookieChanged) {
-                    const isLoginOrAuthEstablish =
-                        hasAuthHeader ||
-                        payload.url.includes('/api/1/auth/twofactorauth') ||
-                        payload.url.includes('/api/1/auth/user');
-                    await saveCookieJar(env, jar, 'default', { requireExisting: !isLoginOrAuthEstablish });
+                    const nextAuthCookie = jar.auth ?? '';
+                    effectiveAuthForCache = nextAuthCookie || prevAuthCookie;
+                    // Allow establishing/replacing the vault row only on explicit Basic-Auth login or when upstream
+                    // genuinely issues a brand-new `auth` cookie on a 2xx response (e.g. QR login / fresh auth establish).
+                    // Ordinary probes returning only auxiliary cookies like `__cf_bm` always enforce requireExisting + CAS.
+                    const upstreamIssuedNewAuth =
+                        Boolean(nextAuthCookie) &&
+                        nextAuthCookie !== prevAuthCookie &&
+                        upstream.status >= 200 &&
+                        upstream.status < 300;
+                    const canEstablishNewSession = isLoginEstablish || upstreamIssuedNewAuth;
+                    // Strict guard:
+                    // - Explicit Basic-Auth establishment only writes when upstream returns 2xx AND an auth cookie.
+                    // - Ordinary probes without a new auth cookie only update an ALREADY-LOADED vault row (non-empty
+                    //   initialCookieUpdatedAt) so an in-flight unauthenticated probe can never run an unconditional UPDATE
+                    //   that clobbers a concurrent login inserted while the probe was in flight.
+                    const allowSave = isLoginEstablish
+                        ? Boolean(nextAuthCookie) && upstream.status >= 200 && upstream.status < 300
+                        : canEstablishNewSession || Boolean(initialCookieUpdatedAt);
+                    if (allowSave) {
+                        let jarToSave = jar;
+                        // If a non-Basic-Auth request switched from one auth cookie to another, rebuild from a fresh jar
+                        // so stale session cookies (such as the previous account's twoFactorAuth) are never retained.
+                        if (!isLoginEstablish && upstreamIssuedNewAuth && prevAuthCookie && nextAuthCookie !== prevAuthCookie) {
+                            const freshJar: Record<string, string> = {};
+                            for (const h of vrchatCookieHeaders) {
+                                mergeSetCookies(freshJar, h);
+                            }
+                            jarToSave = freshJar;
+                        }
+                        const isAccountSwitch = Boolean(
+                            canEstablishNewSession && nextAuthCookie && nextAuthCookie !== prevAuthCookie
+                        );
+                        const saveResult = isAccountSwitch
+                            ? await saveCookieJarAndPurgeAccountStateAtomic(env, jarToSave, { clearBackoff: true })
+                            : await saveCookieJar(env, jarToSave, 'default', {
+                                  requireExisting: !canEstablishNewSession,
+                                  expectedUpdatedAt: canEstablishNewSession ? undefined : initialCookieUpdatedAt || undefined
+                              });
+                        // If a concurrent request rotated an auxiliary cookie (e.g. __cf_bm) for the SAME session while
+                        // this request received an important auth/2FA cookie update or explicit deletion, reload & retry once.
+                        if (!saveResult.saved && !canEstablishNewSession && prevAuthCookie) {
+                            const hasCriticalCookieDelta =
+                                Boolean(incomingSet.twoFactorAuth) ||
+                                Boolean(incomingSet.auth) ||
+                                incomingDeleted.has('twoFactorAuth') ||
+                                incomingDeleted.has('auth');
+                            if (hasCriticalCookieDelta) {
+                                const latest = await loadCookieJarWithMeta(env);
+                                if (latest.updatedAt && (latest.jar.auth ?? '') === prevAuthCookie) {
+                                    const retriedJar: Record<string, string> = { ...latest.jar, ...incomingSet };
+                                    for (const delName of incomingDeleted) {
+                                        delete retriedJar[delName];
+                                    }
+                                    await saveCookieJar(env, retriedJar, 'default', {
+                                        requireExisting: true,
+                                        expectedUpdatedAt: latest.updatedAt
+                                    });
+                                }
+                            }
+                        }
+                    }
                 }
             }
-            const { bodyText: text, isBinaryImage } = await readUpstreamResponseBody(upstream);
+            const { bodyText: text, isBinaryImage } = await readUpstreamResponseBody(upstream, method);
             const wafBlocked =
                 !isBinaryImage &&
                 upstream.status === 403 &&
                 (upstream.headers.has('cf-mitigated') || text.includes('Just a moment'));
 
-            if (isMutation && upstream.status >= 200 && upstream.status < 300) {
+            const isLogoutCall = needsAuthCookie && targetPathname === '/api/1/logout';
+            if (isLogoutCall && ((upstream.status >= 200 && upstream.status < 300) || upstream.status === 401 || upstream.status === 403)) {
                 await invalidateVrcCacheOnWrite(env, payload.url).catch(() => {});
-            } else if (cacheMeta && !isBinaryImage && upstream.status >= 200 && upstream.status < 300) {
-                await putCachedVrcResponses(env, [
-                    {
-                        url: payload.url,
-                        tier: cacheMeta.tier,
-                        status: upstream.status,
-                        bodyText: text,
-                        ttlMs: cacheMeta.ttlMs
-                    }
-                ]).catch(() => {});
+                await purgeAccountScopedSyncState(env, { dropCookieVault: true });
+            } else if ((isMutation || hasAuthHeader) && upstream.status >= 200 && upstream.status < 300) {
+                if (needsAuthCookie) {
+                    await invalidateVrcCacheOnWrite(env, payload.url).catch(() => {});
+                }
+            } else if (cacheMeta && !isBinaryImage && upstream.status >= 200 && upstream.status < 300 && isValidJsonText(text)) {
+                let safeToCache = !needsAuthCookie;
+                if (needsAuthCookie && effectiveAuthForCache) {
+                    const currentAuth =
+                        (await loadCookieJar(env).catch(() => ({}) as Record<string, string>)).auth ?? '';
+                    safeToCache = currentAuth === effectiveAuthForCache;
+                }
+                if (safeToCache) {
+                    await putCachedVrcResponses(env, [
+                        {
+                            url: payload.url,
+                            tier: cacheMeta.tier,
+                            status: upstream.status,
+                            bodyText: text,
+                            ttlMs: cacheMeta.ttlMs
+                        }
+                    ]).catch(() => {});
+                }
             }
 
             return Response.json({
@@ -817,7 +1351,14 @@ export async function handleVrcProxyRoutes(request: Request, env: Env, url: URL)
 
         let body: { requests?: WebApiExecutePayload[] };
         try {
-            body = (await request.json()) as { requests?: WebApiExecutePayload[] };
+            const parsed = (await request.json()) as unknown;
+            if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+                return Response.json(
+                    { ok: false, error: { code: 'BAD_REQUEST', message: 'Invalid JSON payload' } },
+                    { status: 400 }
+                );
+            }
+            body = parsed as { requests?: WebApiExecutePayload[] };
         } catch {
             return Response.json(
                 { ok: false, error: { code: 'BAD_REQUEST', message: 'Invalid JSON payload' } },
@@ -830,11 +1371,31 @@ export async function handleVrcProxyRoutes(request: Request, env: Env, url: URL)
             return Response.json({ ok: true, data: { results: [], route: 'cloud_cache' } });
         }
 
+        const isBatchReadOnlyItemAllowed = (
+            item: WebApiExecutePayload | undefined
+        ): item is WebApiExecutePayload => {
+            if (!item || typeof item !== 'object' || Array.isArray(item)) return false;
+            if (item.method !== undefined && typeof item.method !== 'string') return false;
+            const method = (item.method?.trim() || 'GET').toUpperCase();
+            if (method !== 'GET' || typeof item.url !== 'string' || !item.url.trim() || !isAllowedTargetUrl(item.url)) {
+                return false;
+            }
+            if (hasHeaderCaseInsensitive(item.headers, 'authorization')) return false;
+            if (
+                item.uploadImage ||
+                item.uploadImageLegacy ||
+                item.uploadFilePUT ||
+                item.uploadImagePrint ||
+                item.uploadPrintImage
+            ) {
+                return false;
+            }
+            return true;
+        };
+
         const webSyncSec = await getConfiguredWebSyncSeconds(env);
         const writePlans = items.map((item) => {
-            const method = (item?.method || 'GET').toUpperCase();
-            const hasAuthHeader = hasHeaderCaseInsensitive(item?.headers, 'authorization');
-            if (method !== 'GET' || !item?.url || !isAllowedTargetUrl(item.url) || hasAuthHeader) {
+            if (!isBatchReadOnlyItemAllowed(item)) {
                 return null;
             }
             return classifyVrcCacheUrl(item.url, webSyncSec);
@@ -846,8 +1407,7 @@ export async function handleVrcProxyRoutes(request: Request, env: Env, url: URL)
         const missIndexes: number[] = [];
         for (let i = 0; i < items.length; i++) {
             const item = items[i];
-            const method = (item?.method || 'GET').toUpperCase();
-            if (method !== 'GET' || !item?.url || !isAllowedTargetUrl(item.url)) {
+            if (!isBatchReadOnlyItemAllowed(item)) {
                 continue;
             }
             if (!readPlans[i] || !cacheHits.has(item.url)) {
@@ -856,6 +1416,8 @@ export async function handleVrcProxyRoutes(request: Request, env: Env, url: URL)
         }
 
         let jar: Record<string, string> = {};
+        let initialCookieUpdatedAt = '';
+        let initialAuthCookie = '';
         let cookieHeader = '';
         let cookieChanged = false;
         if (missIndexes.length > 0) {
@@ -864,7 +1426,10 @@ export async function handleVrcProxyRoutes(request: Request, env: Env, url: URL)
                 return Boolean(u) && isVrchatAuthTarget(u);
             });
             if (needsAuthCookie) {
-                jar = await loadCookieJar(env);
+                const loaded = await loadCookieJarWithMeta(env);
+                jar = loaded.jar;
+                initialCookieUpdatedAt = loaded.updatedAt;
+                initialAuthCookie = loaded.jar.auth ?? '';
                 cookieHeader = buildCookieHeader(jar);
             }
         }
@@ -875,16 +1440,18 @@ export async function handleVrcProxyRoutes(request: Request, env: Env, url: URL)
             status: number;
             bodyText: string;
             ttlMs: number;
+            needsAuth: boolean;
         }> = [];
 
+        // Cap total upstream fetches across all batch items + redirects to stay safely under Workers Free 50-subrequest limit.
+        const batchFetchBudget = { remaining: 24 };
         const results = await Promise.all(
             items.map(async (item, idx) => {
-                const method = (item?.method || 'GET').toUpperCase();
-                if (method !== 'GET' || !item?.url || !isAllowedTargetUrl(item.url)) {
+                if (!isBatchReadOnlyItemAllowed(item)) {
                     return {
                         status: 403,
                         data: '',
-                        error: 'Batch only allows read-only GET requests on VRChat allowlist'
+                        error: 'Batch only allows unauthenticated read-only GET requests on VRChat allowlist'
                     };
                 }
                 const readPlan = readPlans[idx];
@@ -898,25 +1465,48 @@ export async function handleVrcProxyRoutes(request: Request, env: Env, url: URL)
                     };
                 }
                 const targetNeedsAuthCookie = isVrchatAuthTarget(item.url);
-                const init = buildUpstreamRequestInit(
-                    { ...item, method: 'GET' },
-                    targetNeedsAuthCookie ? cookieHeader : ''
-                );
+                let init: RequestInit;
                 try {
-                    const upstream = await fetchWithAllowlistedRedirects(item.url, init, (candidate) =>
-                        isAllowedTargetUrl(candidate)
+                    init = buildUpstreamRequestInit(
+                        { url: item.url, method: 'GET', headers: item.headers },
+                        targetNeedsAuthCookie ? cookieHeader : ''
                     );
-                    if (targetNeedsAuthCookie && mergeSetCookies(jar, upstream.headers)) {
-                        cookieChanged = true;
+                } catch (err) {
+                    return {
+                        status: 400,
+                        data: '',
+                        error: err instanceof Error ? err.message : 'Invalid batch item request'
+                    };
+                }
+                try {
+                    const { response: upstream, vrchatCookieHeaders } = await fetchWithAllowlistedRedirects(
+                        item.url,
+                        init,
+                        (candidate) => isAllowedTargetUrl(candidate),
+                        { maxRedirects: 2, budget: batchFetchBudget }
+                    );
+                    if (targetNeedsAuthCookie) {
+                        for (const h of vrchatCookieHeaders) {
+                            if (mergeSetCookies(jar, h)) {
+                                cookieChanged = true;
+                            }
+                        }
                     }
-                    const { bodyText: text, isBinaryImage } = await readUpstreamResponseBody(upstream);
-                    if (writePlan && !isBinaryImage && upstream.status >= 200 && upstream.status < 300) {
+                    const { bodyText: text, isBinaryImage } = await readUpstreamResponseBody(upstream, 'GET');
+                    if (
+                        writePlan &&
+                        !isBinaryImage &&
+                        upstream.status >= 200 &&
+                        upstream.status < 300 &&
+                        isValidJsonText(text)
+                    ) {
                         toWriteCache.push({
                             url: item.url,
                             tier: writePlan.tier,
                             status: upstream.status,
                             bodyText: text,
-                            ttlMs: writePlan.ttlMs
+                            ttlMs: writePlan.ttlMs,
+                            needsAuth: targetNeedsAuthCookie
                         });
                     }
                     return {
@@ -934,10 +1524,25 @@ export async function handleVrcProxyRoutes(request: Request, env: Env, url: URL)
         );
 
         if (toWriteCache.length > 0) {
-            await putCachedVrcResponses(env, toWriteCache).catch(() => {});
+            const publicEntries = toWriteCache.filter((x) => !x.needsAuth);
+            const authEntries = toWriteCache.filter((x) => x.needsAuth);
+            let allowAuthCache = false;
+            if (authEntries.length > 0 && initialAuthCookie) {
+                const currentAuth = (await loadCookieJar(env).catch(() => ({}) as Record<string, string>)).auth ?? '';
+                allowAuthCache = currentAuth === initialAuthCookie;
+            }
+            const safeEntries = allowAuthCache ? [...publicEntries, ...authEntries] : publicEntries;
+            if (safeEntries.length > 0) {
+                await putCachedVrcResponses(env, safeEntries).catch(() => {});
+            }
         }
-        if (cookieChanged) {
-            await saveCookieJar(env, jar, 'default', { requireExisting: true });
+        // Read-only batches may only persist auxiliary cookie refreshes (e.g. __cf_bm) for an existing authenticated
+        // session with a known updated_at CAS token, never overwriting a concurrent login on an initially empty vault.
+        if (cookieChanged && initialAuthCookie && initialCookieUpdatedAt && (jar.auth ?? '') === initialAuthCookie) {
+            await saveCookieJar(env, jar, 'default', {
+                requireExisting: true,
+                expectedUpdatedAt: initialCookieUpdatedAt
+            });
         }
 
         return Response.json({

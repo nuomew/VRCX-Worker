@@ -1,4 +1,4 @@
-; Inno Setup 6 installer script for VRCX.Agent (Windows Companion for VRCX-Worker)
+﻿; Inno Setup 6 installer script for VRCX.Agent (Windows Companion for VRCX-Worker)
 ; Built per-user (zero UAC elevation) into %LocalAppData%\Programs\VRCX.Agent
 ; with default-enabled background auto-start (HKCU Run) and clean upgrade/uninstall.
 
@@ -6,7 +6,7 @@
   #define AppVersion "1.10.6"
 #endif
 #ifndef SourceDir
-  #define SourceDir "..\..\build\VRCX-Agent"
+  #define SourceDir "..\..\build\VRCX-Agent\publish-selfcontained"
 #endif
 #ifndef OutputDir
   #define OutputDir "..\..\build\Installer"
@@ -78,13 +78,47 @@ Name: "{group}\{cm:UninstallShortcut}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\VRCX.Agent"; Filename: "{app}\VRCX.Agent.exe"; IconFilename: "{app}\VRCX.ico"; Tasks: desktopicon
 
 [Registry]
-Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "VRCX.Agent"; ValueData: """{app}\VRCX.Agent.exe"" --autostart"; Tasks: autostart; Flags: uninsdeletevalue
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "VRCX.Agent"; ValueData: """{app}\VRCX.Agent.exe"" --autostart"; Tasks: autostart; Check: ShouldWriteAutoStart; Flags: uninsdeletevalue
 
 [Run]
 Filename: "{app}\VRCX.Agent.exe"; Description: "{cm:LaunchAfterInstall}"; Flags: nowait postinstall skipifsilent
 Filename: "{app}\VRCX.Agent.exe"; Parameters: "--autostart"; Flags: nowait skipifnotsilent
 
 [Code]
+var
+  WasAlreadyInstalled: Boolean;
+  HadExistingAutoStart: Boolean;
+
+function InitializeSetup(): Boolean;
+var
+  ExistingRunValue: String;
+begin
+  WasAlreadyInstalled := RegKeyExists(
+    HKEY_CURRENT_USER,
+    'Software\Microsoft\Windows\CurrentVersion\Uninstall\{7F4D9C2E-6A38-4D91-9B14-6E2A11C9D8B0}_is1'
+  );
+  HadExistingAutoStart := RegQueryStringValue(
+    HKEY_CURRENT_USER,
+    'Software\Microsoft\Windows\CurrentVersion\Run',
+    'VRCX.Agent',
+    ExistingRunValue
+  ) and (Trim(ExistingRunValue) <> '');
+  Result := True;
+end;
+
+function ShouldWriteAutoStart(): Boolean;
+begin
+  { On silent upgrades, respect the user's live HKCU Run state so disabling auto-start from the tray persists across updates. }
+  if WasAlreadyInstalled and WizardSilent() then
+  begin
+    Result := HadExistingAutoStart;
+  end
+  else
+  begin
+    Result := True;
+  end;
+end;
+
 procedure StopRunningAgent();
 var
   ResultCode: Integer;

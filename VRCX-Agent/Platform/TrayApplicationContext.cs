@@ -58,6 +58,7 @@ public sealed class TrayApplicationContext : ApplicationContext
     private readonly System.Windows.Forms.Timer _singleClickTimer;
     private readonly SynchronizationContext? _uiSyncContext;
     private readonly RegisteredWaitHandle? _wakeWaitHandle;
+    private readonly CancellationToken _shutdownToken;
 
     private AgentConfig _config;
     private volatile HttpClient _cloudHttp;
@@ -71,29 +72,65 @@ public sealed class TrayApplicationContext : ApplicationContext
     private string _autoUpdatingTag = string.Empty;
     private string _failedAutoUpdateTag = string.Empty;
     private string _lastNotifiedUpdateTag = string.Empty;
+    private string _pendingAutoInstallPath = string.Empty;
     private bool _balloonPointsToUpdate;
-    private DateTimeOffset _lastDoubleClickAtUtc = DateTimeOffset.MinValue;
-    private DateTimeOffset _lastSyncSuccessAt = DateTimeOffset.MinValue;
+    private long _lastDoubleClickMonoMs;
+    private long _lastSyncSuccessUtcTicks;
+    private long _lastSyncSuccessMonoMs;
     private int _consecutiveFailures;
     private string _lastSyncError = string.Empty;
     private string _lastSentStateSignature = string.Empty;
+    private long _configGeneration;
+    private int _rerunForcedSyncRequested;
+
+    private AgentConfig GetConfigSnapshot()
+    {
+        lock (_configLock)
+        {
+            return _config.Clone();
+        }
+    }
+
+    private DateTimeOffset GetLastSyncSuccessUtc()
+    {
+        long ticks = Interlocked.Read(ref _lastSyncSuccessUtcTicks);
+        return ticks > 0 ? new DateTimeOffset(ticks, TimeSpan.Zero) : DateTimeOffset.MinValue;
+    }
+
+    private void RecordLastSyncSuccess(DateTimeOffset utcNow)
+    {
+        Interlocked.Exchange(ref _lastSyncSuccessUtcTicks, utcNow.UtcTicks);
+        Interlocked.Exchange(ref _lastSyncSuccessMonoMs, Environment.TickCount64);
+    }
+
+    private Icon? CloneDialogIconSafe()
+    {
+        try
+        {
+            return (Icon)_trayIconAsset.Clone();
+        }
+        catch
+        {
+            return null;
+        }
+    }
 
     public TrayApplicationContext(bool startedByAutoStart = false, EventWaitHandle? showSettingsEvent = null)
     {
+        _shutdownToken = _cts.Token;
         _configStore = new AgentConfigStore();
         _config = _configStore.LoadConfig();
 
         _scheduleGate = new SyncScheduleGate(_config.EffectiveSyncIntervalSeconds);
-        _cloudHttp = ProxyHttpClientFactory.CreateHttpClient(_config);
-        _screenshotHttp = ProxyHttpClientFactory.CreateHttpClient(_config, TimeSpan.FromSeconds(180));
+        (_cloudHttp, _screenshotHttp) = CreateStartupHttpClientsWithFallback();
         _syncClient = new HttpSyncClient(() => _cloudHttp);
         _updater = new AgentUpdater(
             () => _cloudHttp,
-            () => ProxyHttpClientFactory.CreateHttpClient(_config, TimeSpan.FromMinutes(10)));
+            () => CreateSafeUpdaterHttpClient());
         _logCollector = new LogTailCollector(_configStore.DataDirectory);
-        _screenshotPipeline = new ScreenshotPipeline(() => _config, () => _screenshotHttp, _configStore.DataDirectory);
+        _screenshotPipeline = new ScreenshotPipeline(GetConfigSnapshot, () => _screenshotHttp, _configStore.DataDirectory);
         _processMonitor = new LocalProcessMonitor();
-        _commandExecutor = new RemoteCommandExecutor(() => _config, ct => RunSyncCycleAsync(force: true, ct));
+        _commandExecutor = new RemoteCommandExecutor(GetConfigSnapshot, ct => RunSyncCycleAsync(force: true, ct));
 
         VRCX.Discord.Instance.Init();
 
@@ -130,33 +167,7 @@ public sealed class TrayApplicationContext : ApplicationContext
         _autoStartItem.Click += (_, _) => ToggleAutoStart(_autoStartItem.Checked);
 
         _checkUpdateItem = new ToolStripMenuItem(AgentStrings.FormatMenuCheckUpdate(AgentMetadata.Version));
-        _checkUpdateItem.Click += (_, _) =>
-        {
-            if (_activeUpdateDialog != null && !_activeUpdateDialog.IsDisposed)
-            {
-                if (_activeUpdateDialog.WindowState == FormWindowState.Minimized)
-                {
-                    _activeUpdateDialog.WindowState = FormWindowState.Normal;
-                }
-                _activeUpdateDialog.BringToFront();
-                _activeUpdateDialog.Activate();
-                return;
-            }
-            if (_isAutoUpdating)
-            {
-                string tag = string.IsNullOrWhiteSpace(_autoUpdatingTag) ? "latest" : _autoUpdatingTag;
-                ShowNoticeMessage(AgentStrings.FormatDialogAutoDownloadingUpdate(tag), MessageBoxIcon.Information);
-                return;
-            }
-            if (_availableUpdate != null && _availableUpdate.IsUpdateAvailable)
-            {
-                ShowUpdateDialog(_availableUpdate, autoStart: true);
-            }
-            else
-            {
-                _ = CheckForUpdatesAsync(manual: true, _cts.Token);
-            }
-        };
+        _checkUpdateItem.Click += (_, _) => HandleCheckUpdateAction();
 
         _menuFont = new Font(AgentStrings.UiFontFamily, 9.5f);
         var menu = new ContextMenuStrip
@@ -169,7 +180,7 @@ public sealed class TrayApplicationContext : ApplicationContext
         menu.Items.Add(_proxyModeItem);
         menu.Items.Add(_syncScreenshotsItem);
         menu.Items.Add(_compressScreenshotsItem);
-        menu.Items.Add(AgentStrings.MenuSyncNow, null, (_, _) => _ = RunSyncCycleAsync(force: true, _cts.Token));
+        menu.Items.Add(AgentStrings.MenuSyncNow, null, (_, _) => _ = Task.Run(() => RunSyncCycleAsync(force: true, _shutdownToken)));
         menu.Items.Add(AgentStrings.MenuOpenWebUi, null, (_, _) => OpenCloudWebUi());
         menu.Items.Add(_autoStartItem);
         menu.Items.Add(_checkUpdateItem);
@@ -200,7 +211,8 @@ public sealed class TrayApplicationContext : ApplicationContext
         _trayIcon.MouseClick += (_, e) =>
         {
             if (e.Button != MouseButtons.Left) return;
-            if ((DateTimeOffset.UtcNow - _lastDoubleClickAtUtc).TotalMilliseconds < 450) return;
+            long lastDbl = Interlocked.Read(ref _lastDoubleClickMonoMs);
+            if (lastDbl > 0 && (Environment.TickCount64 - lastDbl) < 450) return;
             _singleClickTimer.Stop();
             _singleClickTimer.Start();
         };
@@ -208,14 +220,14 @@ public sealed class TrayApplicationContext : ApplicationContext
         {
             if (e.Button != MouseButtons.Left) return;
             _singleClickTimer.Stop();
-            _lastDoubleClickAtUtc = DateTimeOffset.UtcNow;
+            Interlocked.Exchange(ref _lastDoubleClickMonoMs, Environment.TickCount64);
             OpenCloudWebUi();
         };
         _trayIcon.BalloonTipClicked += (_, _) =>
         {
-            if (_balloonPointsToUpdate && !_isAutoUpdating && _availableUpdate != null && _availableUpdate.IsUpdateAvailable)
+            if (_balloonPointsToUpdate)
             {
-                ShowUpdateDialog(_availableUpdate, autoStart: true);
+                HandleCheckUpdateAction();
             }
         };
 
@@ -227,10 +239,10 @@ public sealed class TrayApplicationContext : ApplicationContext
                 showSettingsEvent,
                 (_, timedOut) =>
                 {
-                    if (timedOut || _cts.IsCancellationRequested) return;
+                    if (timedOut || _isExiting || _shutdownToken.IsCancellationRequested) return;
                     _uiSyncContext?.Post(_ =>
                     {
-                        if (_cts.IsCancellationRequested) return;
+                        if (_isExiting || _shutdownToken.IsCancellationRequested) return;
                         ShowSyncSettingsDialog();
                     }, null);
                 },
@@ -240,8 +252,8 @@ public sealed class TrayApplicationContext : ApplicationContext
         }
 
         UpdateTrayStatus();
-        _ = Task.Run(() => BackgroundSyncLoopAsync(_cts.Token));
-        _ = Task.Run(() => AutoUpdateCheckLoopAsync(_cts.Token));
+        _ = Task.Run(() => BackgroundSyncLoopAsync(_shutdownToken));
+        _ = Task.Run(() => AutoUpdateCheckLoopAsync(_shutdownToken));
 
         if (!_config.IsConfigured)
         {
@@ -259,7 +271,7 @@ public sealed class TrayApplicationContext : ApplicationContext
                 void OpenInitialSettings(object? sender, EventArgs e)
                 {
                     Application.Idle -= OpenInitialSettings;
-                    if (!_cts.IsCancellationRequested && !_config.IsConfigured)
+                    if (!_isExiting && !_shutdownToken.IsCancellationRequested && !_config.IsConfigured)
                     {
                         ShowSyncSettingsDialog();
                     }
@@ -276,9 +288,10 @@ public sealed class TrayApplicationContext : ApplicationContext
         {
             try
             {
-                string logDir = string.IsNullOrWhiteSpace(_config.VrChatLogDirectory)
+                AgentConfig cfg = GetConfigSnapshot();
+                string logDir = string.IsNullOrWhiteSpace(cfg.VrChatLogDirectory)
                     ? LogTailCollector.ResolveDefaultVrChatLogDirectory()
-                    : _config.VrChatLogDirectory;
+                    : cfg.VrChatLogDirectory;
 
                 // Always tail local VRChat logs and persist to local offline queue (zero network requests).
                 int newlyParsed = _logCollector.PollLogDirectory(logDir);
@@ -287,7 +300,7 @@ public sealed class TrayApplicationContext : ApplicationContext
                 bool procChanged = false;
                 if (tick % 2 == 0)
                 {
-                    procChanged = _processMonitor.Refresh(_config);
+                    procChanged = _processMonitor.Refresh(cfg);
                 }
 
                 if (newlyParsed > 0 || procChanged)
@@ -295,12 +308,13 @@ public sealed class TrayApplicationContext : ApplicationContext
                     UpdateTrayStatus();
                 }
 
-                // Trigger an immediate state push when VRChat or SteamVR starts/stops (debounced >= 5s) so the Web
-                // StatusBar turns green right away; idle cycles strictly obey SyncScheduleGate with zero extra traffic.
+                // Trigger an immediate state push when VRChat or SteamVR starts/stops (debounced >= 5s via monotonic clock)
+                // so the Web StatusBar turns green right away; idle cycles strictly obey SyncScheduleGate with zero extra traffic.
+                long lastSuccessMono = Interlocked.Read(ref _lastSyncSuccessMonoMs);
                 bool immediateStatePush = procChanged
-                    && (DateTimeOffset.UtcNow - _lastSyncSuccessAt) >= TimeSpan.FromSeconds(5);
+                    && (lastSuccessMono <= 0 || (Environment.TickCount64 - lastSuccessMono) >= 5_000L);
 
-                if (_config.IsConfigured && (immediateStatePush || _scheduleGate.IsDue(DateTimeOffset.UtcNow)))
+                if (cfg.IsConfigured && (immediateStatePush || _scheduleGate.IsDueNow()))
                 {
                     await RunSyncCycleAsync(force: immediateStatePush, ct).ConfigureAwait(false);
                 }
@@ -330,9 +344,11 @@ public sealed class TrayApplicationContext : ApplicationContext
     private async Task RunSyncCycleAsync(bool force, CancellationToken ct)
     {
         AgentConfig cfg;
+        long startGen;
         lock (_configLock)
         {
-            cfg = _config;
+            cfg = _config.Clone();
+            startGen = Interlocked.Read(ref _configGeneration);
         }
         if (!cfg.IsConfigured)
         {
@@ -341,9 +357,15 @@ public sealed class TrayApplicationContext : ApplicationContext
 
         if (!await _syncLock.WaitAsync(0, ct).ConfigureAwait(false))
         {
+            // Never silently drop a forced sync (e.g. right after Test & Save) while a previous sync is in flight.
+            if (force)
+            {
+                Interlocked.Exchange(ref _rerunForcedSyncRequested, 1);
+            }
             return;
         }
 
+        Interlocked.Exchange(ref _rerunForcedSyncRequested, 0);
         try
         {
             // Always capture fresh VRChat/SteamVR process state before building the sync snapshot.
@@ -359,137 +381,155 @@ public sealed class TrayApplicationContext : ApplicationContext
             var commandsToExecute = new List<PendingRemoteCommand>();
             AgentSyncResponse? lastResponse = null;
 
-            // Drain up to 5 batches within this scheduled sync window so buffered offline events catch up cleanly.
-            for (int round = 0; round < 5 && !ct.IsCancellationRequested; round++)
+            try
             {
-                List<GameLogEventItem> rawBatch = _logCollector.PeekBatch(BatchUploadLimit);
-                LogCursorState cursor = _logCollector.SnapshotCursor();
-                LiveAgentState? stateToSend = BuildStateIfChangedOrForced(
-                    force || rawBatch.Count > 0 || round == 0,
-                    out string? pendingStateSignature);
-
-                int budgetBytes = HttpSyncClient.MaxSyncPayloadBytes;
-                AgentSyncResponse response;
-                int consumedCount;
-
-                while (true)
+                // Drain up to 5 batches within this scheduled sync window so buffered offline events catch up cleanly.
+                for (int round = 0; round < 5 && !ct.IsCancellationRequested; round++)
                 {
-                    (List<GameLogEventItem> batch, consumedCount) = HttpSyncClient.FitEventsToPayloadBudget(rawBatch, budgetBytes);
-                    try
+                    (List<GameLogEventItem> rawBatch, long batchHeadSeq) = _logCollector.PeekBatchWithSeq(BatchUploadLimit);
+                    LogCursorState cursor = _logCollector.SnapshotCursor();
+                    LiveAgentState? stateToSend = BuildStateIfChangedOrForced(
+                        force || rawBatch.Count > 0 || round == 0,
+                        out string? pendingStateSignature);
+
+                    int stateBytes = stateToSend != null
+                        ? System.Text.Encoding.UTF8.GetByteCount(Newtonsoft.Json.JsonConvert.SerializeObject(stateToSend)) + 2048
+                        : 2048;
+                    int budgetBytes = Math.Max(4096, HttpSyncClient.MaxSyncPayloadBytes - stateBytes);
+                    AgentSyncResponse? response = null;
+                    int consumedCount = 0;
+                    bool triedSingleTruncated = false;
+
+                    while (true)
                     {
-                        response = await _syncClient.SyncOnceAsync(
-                            cfg,
-                            batch,
-                            cursor,
-                            stateToSend,
-                            ct).ConfigureAwait(false);
-                        break;
-                    }
-                    catch (HttpRequestException ex) when (ex.StatusCode == System.Net.HttpStatusCode.RequestEntityTooLarge && batch.Count > 1 && budgetBytes > 8192)
-                    {
-                        budgetBytes = Math.Max(8192, budgetBytes / 2);
-                        Log.Warn("Sync batch rejected with HTTP 413; shrinking payload budget to {Budget} bytes and retrying.", budgetBytes);
-                    }
-                }
-
-                lastResponse = response;
-                if (pendingStateSignature != null)
-                {
-                    _lastSentStateSignature = pendingStateSignature;
-                }
-
-                if (consumedCount > 0)
-                {
-                    _logCollector.AcknowledgeBatch(consumedCount);
-                }
-
-                if (response.PendingCommands.Count > 0)
-                {
-                    commandsToExecute.AddRange(response.PendingCommands);
-                }
-
-                _consecutiveFailures = 0;
-                _lastSyncError = string.Empty;
-                _lastSyncSuccessAt = DateTimeOffset.UtcNow;
-
-                if (_logCollector.OfflineQueueCount == 0 || rawBatch.Count < BatchUploadLimit)
-                {
-                    break;
-                }
-            }
-
-            // Apply the authoritative Web-configured sync interval and device name onto the latest live config
-            // so concurrent user edits in SyncSettingsForm or tray toggles are never overwritten.
-            if (lastResponse != null)
-            {
-                int webInterval = _scheduleGate.ApplyServerSchedule(lastResponse, DateTimeOffset.UtcNow);
-                string webDeviceName = (lastResponse.DeviceName ?? string.Empty).Trim();
-                lock (_configLock)
-                {
-                    bool sameEndpoint =
-                        string.Equals(_config.CloudUrl, cfg.CloudUrl, StringComparison.Ordinal) &&
-                        string.Equals(_config.SyncSecret, cfg.SyncSecret, StringComparison.Ordinal);
-                    if (sameEndpoint)
-                    {
-                        bool configDirty = false;
-                        if (_config.SyncIntervalSeconds != webInterval)
+                        List<GameLogEventItem> batch;
+                        if (triedSingleTruncated && rawBatch.Count > 0)
                         {
-                            _config.SyncIntervalSeconds = webInterval;
-                            configDirty = true;
+                            batch = new List<GameLogEventItem> { HttpSyncClient.TruncateOversizedEvent(rawBatch[0], maxDataChars: 512) };
+                            consumedCount = 1;
                         }
-                        if (!string.IsNullOrEmpty(webDeviceName) && !string.Equals(_config.DeviceName, webDeviceName, StringComparison.Ordinal))
+                        else
                         {
-                            _config.DeviceName = webDeviceName;
-                            configDirty = true;
+                            (batch, consumedCount) = HttpSyncClient.FitEventsToPayloadBudget(rawBatch, budgetBytes);
                         }
-                        if (configDirty)
+
+                        try
                         {
-                            _configStore.SaveConfig(_config);
+                            response = await _syncClient.SyncOnceAsync(
+                                cfg,
+                                batch,
+                                cursor,
+                                stateToSend,
+                                ct).ConfigureAwait(false);
+                            break;
                         }
-                    }
-                }
-            }
-
-            // Upload any locally queued screenshots strictly inside this scheduled sync window.
-            await FlushQueuedScreenshotsAsync(ct).ConfigureAwait(false);
-
-            UpdateTrayStatus();
-
-            // Execute each remote command independently so a single failure never blocks remaining commands.
-            foreach (PendingRemoteCommand cmd in commandsToExecute)
-            {
-                if (ct.IsCancellationRequested) break;
-                try
-                {
-                    if (string.Equals(cmd.Action, "sync_now", StringComparison.OrdinalIgnoreCase))
-                    {
-                        await _syncClient.ReportCommandResultAsync(
-                            cfg,
-                            new CommandExecutionResult
+                        catch (HttpRequestException ex) when (ex.StatusCode == System.Net.HttpStatusCode.RequestEntityTooLarge)
+                        {
+                            if (batch.Count > 1 && budgetBytes > 4096)
                             {
-                                CmdId = cmd.CmdId,
-                                Status = "succeeded",
-                                Message = "Scheduled HTTP sync already completed"
-                            },
-                            ct).ConfigureAwait(false);
+                                budgetBytes = Math.Max(4096, budgetBytes / 2);
+                                Log.Warn("Sync batch rejected with HTTP 413; shrinking payload budget to {Budget} bytes and retrying.", budgetBytes);
+                                continue;
+                            }
+                            if (batch.Count == 1 && !triedSingleTruncated)
+                            {
+                                triedSingleTruncated = true;
+                                Log.Warn("Single sync event rejected with HTTP 413; retrying with aggressively truncated payload.");
+                                continue;
+                            }
+                            if (batch.Count == 1 && rawBatch.Count > 0)
+                            {
+                                // Poison-pill single event still rejected with 413 after truncation: drop it to unblock queue.
+                                Log.Error("Dropping unrecoverable HTTP 413 poison-pill GameLog event ({Type}) to unblock offline queue.", rawBatch[0].Type);
+                                _logCollector.AcknowledgeBatch(1, batchHeadSeq);
+                                response = null;
+                                consumedCount = 0;
+                                break;
+                            }
+                            throw;
+                        }
+                    }
+
+                    if (response == null)
+                    {
+                        if (_logCollector.OfflineQueueCount == 0)
+                        {
+                            break;
+                        }
                         continue;
                     }
 
-                    CommandExecutionResult result = await _commandExecutor.ExecuteAsync(
-                        cmd.CmdId,
-                        cmd.Action,
-                        cmd.Params ?? new Dictionary<string, object?>(),
-                        ct).ConfigureAwait(false);
+                    lastResponse = response;
+                    if (pendingStateSignature != null)
+                    {
+                        _lastSentStateSignature = pendingStateSignature;
+                    }
 
-                    await _syncClient.ReportCommandResultAsync(cfg, result, ct).ConfigureAwait(false);
+                    if (consumedCount > 0)
+                    {
+                        _logCollector.AcknowledgeBatch(consumedCount, batchHeadSeq);
+                    }
+
+                    if (response.PendingCommands.Count > 0)
+                    {
+                        commandsToExecute.AddRange(response.PendingCommands);
+                    }
+
+                    _consecutiveFailures = 0;
+                    _lastSyncError = string.Empty;
+                    RecordLastSyncSuccess(DateTimeOffset.UtcNow);
+
+                    if (_logCollector.OfflineQueueCount == 0 || rawBatch.Count < BatchUploadLimit)
+                    {
+                        break;
+                    }
                 }
-                catch (OperationCanceledException) when (ct.IsCancellationRequested)
+
+                // Apply the authoritative Web-configured sync interval and device name onto the latest live config
+                // so concurrent user edits in SyncSettingsForm or tray toggles are never overwritten.
+                if (lastResponse != null)
                 {
-                    break;
+                    int webInterval = _scheduleGate.ApplyServerSchedule(lastResponse, DateTimeOffset.UtcNow);
+                    string webDeviceName = (lastResponse.DeviceName ?? string.Empty).Trim();
+                    lock (_configLock)
+                    {
+                        bool sameEndpoint =
+                            string.Equals(_config.CloudUrl, cfg.CloudUrl, StringComparison.Ordinal) &&
+                            string.Equals(_config.SyncSecret, cfg.SyncSecret, StringComparison.Ordinal);
+                        if (sameEndpoint)
+                        {
+                            bool configDirty = false;
+                            AgentConfig nextCfg = _config.Clone();
+                            if (nextCfg.SyncIntervalSeconds != webInterval)
+                            {
+                                nextCfg.SyncIntervalSeconds = webInterval;
+                                configDirty = true;
+                            }
+                            if (!string.IsNullOrEmpty(webDeviceName) && !string.Equals(nextCfg.DeviceName, webDeviceName, StringComparison.Ordinal))
+                            {
+                                nextCfg.DeviceName = webDeviceName;
+                                configDirty = true;
+                            }
+                            if (configDirty)
+                            {
+                                _config = nextCfg;
+                                _configStore.SaveConfig(nextCfg);
+                            }
+                        }
+                    }
                 }
-                catch (Exception cmdEx)
+
+                // Upload any locally queued screenshots strictly inside this scheduled sync window.
+                await FlushQueuedScreenshotsAsync(ct).ConfigureAwait(false);
+
+                UpdateTrayStatus();
+            }
+            finally
+            {
+                // Execute any commands already claimed from the server even if a later drain round or screenshot upload fails.
+                if (commandsToExecute.Count > 0 && !ct.IsCancellationRequested)
                 {
-                    Log.Warn(cmdEx, "Failed to execute or report remote command {CmdId} ({Action}).", cmd.CmdId, cmd.Action);
+                    await ExecuteClaimedCommandsAsync(cfg, commandsToExecute, ct).ConfigureAwait(false);
                 }
             }
         }
@@ -499,21 +539,113 @@ public sealed class TrayApplicationContext : ApplicationContext
         }
         catch (Exception ex)
         {
-            _consecutiveFailures = Math.Min(_consecutiveFailures + 1, 6);
-            _scheduleGate.ApplyFailureBackoff(_consecutiveFailures, DateTimeOffset.UtcNow);
-            _lastSyncError = ex.Message;
-            Log.Warn(ex, "Scheduled HTTP sync failed. Next retry at {NextAt}.", _scheduleGate.NextSyncAtUtc);
-            UpdateTrayStatus();
+            // Ignore stale failure from a superseded pre-save config so it cannot clobber the newly saved state or backoff.
+            if (Interlocked.Read(ref _configGeneration) == startGen)
+            {
+                _consecutiveFailures = Math.Min(_consecutiveFailures + 1, 6);
+                _scheduleGate.ApplyFailureBackoff(_consecutiveFailures, DateTimeOffset.UtcNow);
+                _lastSyncError = ex.Message;
+                Log.Warn(ex, "Scheduled HTTP sync failed. Next retry at {NextAt}.", _scheduleGate.NextSyncAtUtc);
+                UpdateTrayStatus();
+            }
+            else
+            {
+                Log.Debug(ex, "Ignored sync failure from superseded configuration generation.");
+            }
         }
         finally
         {
             _syncLock.Release();
+            if (!ct.IsCancellationRequested && Interlocked.Exchange(ref _rerunForcedSyncRequested, 0) == 1)
+            {
+                _ = Task.Run(() => RunSyncCycleAsync(force: true, ct));
+            }
+        }
+    }
+
+    private void HandleCheckUpdateAction()
+    {
+        if (_activeUpdateDialog != null && !_activeUpdateDialog.IsDisposed)
+        {
+            if (_activeUpdateDialog.WindowState == FormWindowState.Minimized)
+            {
+                _activeUpdateDialog.WindowState = FormWindowState.Normal;
+            }
+            _activeUpdateDialog.BringToFront();
+            _activeUpdateDialog.Activate();
+            return;
+        }
+        if (TryHandlePendingAutoInstallOnUiThread())
+        {
+            return;
+        }
+        if (_isAutoUpdating)
+        {
+            string tag = string.IsNullOrWhiteSpace(_autoUpdatingTag) ? "latest" : _autoUpdatingTag;
+            ShowNoticeMessage(AgentStrings.FormatDialogAutoDownloadingUpdate(tag), MessageBoxIcon.Information);
+            return;
+        }
+        if (_availableUpdate != null &&
+            _availableUpdate.IsUpdateAvailable &&
+            (!IsInstalledBuild() ||
+                (!string.IsNullOrWhiteSpace(_availableUpdate.SetupDownloadUrl) &&
+                 AgentUpdater.IsValidSha256(_availableUpdate.ExpectedSha256))))
+        {
+            HandleManualOrPromptedUpdate(_availableUpdate);
+        }
+        else
+        {
+            _ = CheckForUpdatesAsync(manual: true, _shutdownToken);
+        }
+    }
+
+    private async Task ExecuteClaimedCommandsAsync(
+        AgentConfig cfg,
+        IReadOnlyList<PendingRemoteCommand> commandsToExecute,
+        CancellationToken ct)
+    {
+        // Execute each remote command independently so a single failure never blocks remaining commands.
+        foreach (PendingRemoteCommand cmd in commandsToExecute)
+        {
+            if (ct.IsCancellationRequested) break;
+            try
+            {
+                if (string.Equals(cmd.Action, "sync_now", StringComparison.OrdinalIgnoreCase))
+                {
+                    await _syncClient.ReportCommandResultAsync(
+                        cfg,
+                        new CommandExecutionResult
+                        {
+                            CmdId = cmd.CmdId,
+                            Status = "succeeded",
+                            Message = "Scheduled HTTP sync already completed"
+                        },
+                        ct).ConfigureAwait(false);
+                    continue;
+                }
+
+                CommandExecutionResult result = await _commandExecutor.ExecuteAsync(
+                    cmd.CmdId,
+                    cmd.Action,
+                    cmd.Params ?? new Dictionary<string, object?>(),
+                    ct).ConfigureAwait(false);
+
+                await _syncClient.ReportCommandResultAsync(cfg, result, ct).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                break;
+            }
+            catch (Exception cmdEx)
+            {
+                Log.Warn(cmdEx, "Failed to execute or report remote command {CmdId} ({Action}).", cmd.CmdId, cmd.Action);
+            }
         }
     }
 
     private async Task FlushQueuedScreenshotsAsync(CancellationToken ct)
     {
-        if (!_config.AutoUploadScreenshots) return;
+        if (!GetConfigSnapshot().AutoUploadScreenshots) return;
 
         EnqueueExistingUnsyncedScreenshots(maxBatch: 30);
 
@@ -599,20 +731,25 @@ public sealed class TrayApplicationContext : ApplicationContext
 
     private void EnqueueExistingUnsyncedScreenshots(int maxBatch)
     {
-        if (!_config.AutoUploadScreenshots) return;
+        AgentConfig cfg = GetConfigSnapshot();
+        if (!cfg.AutoUploadScreenshots) return;
 
         int currentQueued;
+        HashSet<string> skipPaths;
         lock (_pendingScreenshots)
         {
             currentQueued = _pendingScreenshots.Count;
+            skipPaths = new HashSet<string>(_permanentlyFailedScreenshotPaths, StringComparer.OrdinalIgnoreCase);
+            skipPaths.UnionWith(_queuedScreenshotPaths);
+            skipPaths.UnionWith(_inFlightCapturePaths);
         }
         if (currentQueued >= 10) return;
 
-        string logDir = string.IsNullOrWhiteSpace(_config.VrChatLogDirectory)
+        string logDir = string.IsNullOrWhiteSpace(cfg.VrChatLogDirectory)
             ? LogTailCollector.ResolveDefaultVrChatLogDirectory()
-            : _config.VrChatLogDirectory;
+            : cfg.VrChatLogDirectory;
         string photosDir = ScreenshotPipeline.ResolveVrChatPhotosDirectory(logDir);
-        List<PendingScreenshotTask> discovered = _screenshotPipeline.ScanUnsyncedScreenshots(photosDir, maxBatch);
+        List<PendingScreenshotTask> discovered = _screenshotPipeline.ScanUnsyncedScreenshots(photosDir, maxBatch, skipPaths);
         if (discovered.Count == 0) return;
 
         int enqueued = 0;
@@ -670,7 +807,7 @@ public sealed class TrayApplicationContext : ApplicationContext
             : string.Join(",", currentPlayers
                 .Select(p => $"{p.UserId}:{p.DisplayName}")
                 .OrderBy(s => s, StringComparer.Ordinal));
-        string sig = $"{state.VrcRunning}|{state.VrcStartedAt}|{state.SteamVrRunning}|{state.SteamVrStartedAt}|{state.CurrentLocation}|{state.CurrentWorldName}|{state.PlayerCount}|{playersSig}|{state.OfflineQueueCount}";
+        string sig = $"{state.VrcRunning}|{state.VrcStartedAt}|{state.SteamVrRunning}|{state.SteamVrStartedAt}|{state.CacheSizeBytes}|{state.CurrentLocation}|{state.CurrentWorldName}|{state.PlayerCount}|{playersSig}|{state.OfflineQueueCount}";
         if (sig != _lastSentStateSignature)
         {
             pendingSignature = sig;
@@ -678,7 +815,7 @@ public sealed class TrayApplicationContext : ApplicationContext
         }
         // Skip unchanged state on idle heartbeats to avoid waking AgentHubDO unnecessarily on Cloudflare Free tier.
         pendingSignature = null;
-        return allowHeartbeat && _lastSyncSuccessAt == DateTimeOffset.MinValue ? state : null;
+        return allowHeartbeat && GetLastSyncSuccessUtc() == DateTimeOffset.MinValue ? state : null;
     }
 
     private void OnScreenshotCaptured(GameLogEventItem ev)
@@ -699,7 +836,9 @@ public sealed class TrayApplicationContext : ApplicationContext
             _inFlightCapturePaths.Add(normalizedPath);
         }
 
-        LogTailCollector.LiveRoomSnapshot room = _logCollector.SnapshotLiveRoomState();
+        // Prefer the point-in-time snapshot captured at the exact screenshot log line so subsequent
+        // room exits / log rotations cannot overwrite or clear screenshot metadata.
+        LogTailCollector.LiveRoomSnapshot room = ev.CapturedRoomSnapshot ?? _logCollector.SnapshotLiveRoomState();
         var task = new PendingScreenshotTask
         {
             LocalPath = ev.LocalScreenshotPath,
@@ -715,8 +854,8 @@ public sealed class TrayApplicationContext : ApplicationContext
         {
             try
             {
-                await _screenshotPipeline.EmbedLocalMetadataOnlyAsync(task, _cts.Token).ConfigureAwait(false);
-                if (_config.AutoUploadScreenshots && !_screenshotPipeline.HasAlreadyUploaded(task.LocalPath))
+                await _screenshotPipeline.EmbedLocalMetadataOnlyAsync(task, _shutdownToken).ConfigureAwait(false);
+                if (GetConfigSnapshot().AutoUploadScreenshots && !_screenshotPipeline.HasAlreadyUploaded(task.LocalPath))
                 {
                     bool enqueued = false;
                     lock (_pendingScreenshots)
@@ -760,25 +899,48 @@ public sealed class TrayApplicationContext : ApplicationContext
             return;
         }
 
-        using var dialog = new SyncSettingsForm(_config, _syncClient, AgentConfigStore.IsAutoStartEnabled(), _trayIcon.Icon);
+        bool initialAutoStart = AgentConfigStore.IsAutoStartEnabled();
+        using Icon? dialogIcon = CloneDialogIconSafe();
+        using var dialog = new SyncSettingsForm(GetConfigSnapshot(), _syncClient, initialAutoStart, dialogIcon);
         _activeSettingsDialog = dialog;
         try
         {
-            if (dialog.ShowDialog() == DialogResult.OK && dialog.SavedConfig != null)
+            DialogResult result = dialog.ShowDialog();
+            if (_isExiting || _shutdownToken.IsCancellationRequested)
+            {
+                return;
+            }
+            if (result == DialogResult.OK && dialog.SavedConfig != null)
             {
                 bool wasScreenshotSyncEnabled;
+                bool wasCompressEnabled;
+                AgentConfig savedCfg;
                 lock (_configLock)
                 {
                     wasScreenshotSyncEnabled = _config.AutoUploadScreenshots;
+                    wasCompressEnabled = _config.CompressScreenshots;
                     _config = dialog.SavedConfig;
+                    savedCfg = _config.Clone();
+                    Interlocked.Increment(ref _configGeneration);
                     _configStore.SaveConfig(_config);
                 }
-                AgentConfigStore.SetAutoStartEnabled(dialog.AutoStartEnabled);
-                _autoStartItem.Checked = dialog.AutoStartEnabled;
-                _proxyModeItem.Checked = _config.ProxyEnabled;
-                _syncScreenshotsItem.Checked = _config.AutoUploadScreenshots;
-                _compressScreenshotsItem.Checked = _config.CompressScreenshots;
-                _compressScreenshotsItem.Enabled = _config.AutoUploadScreenshots;
+                if (!wasCompressEnabled && savedCfg.CompressScreenshots)
+                {
+                    lock (_pendingScreenshots)
+                    {
+                        _permanentlyFailedScreenshotPaths.Clear();
+                    }
+                }
+                bool autoStartFailed = false;
+                if (dialog.AutoStartEnabled != initialAutoStart)
+                {
+                    autoStartFailed = !AgentConfigStore.SetAutoStartEnabled(dialog.AutoStartEnabled);
+                }
+                _autoStartItem.Checked = AgentConfigStore.IsAutoStartEnabled();
+                _proxyModeItem.Checked = savedCfg.ProxyEnabled;
+                _syncScreenshotsItem.Checked = savedCfg.AutoUploadScreenshots;
+                _compressScreenshotsItem.Checked = savedCfg.CompressScreenshots;
+                _compressScreenshotsItem.Enabled = savedCfg.AutoUploadScreenshots;
                 RebuildCloudHttpClient();
                 _consecutiveFailures = 0;
                 _lastSyncError = string.Empty;
@@ -786,63 +948,99 @@ public sealed class TrayApplicationContext : ApplicationContext
 
                 if (dialog.InitialSyncResponse != null)
                 {
-                    _lastSyncSuccessAt = DateTimeOffset.UtcNow;
-                    _scheduleGate.ApplyServerSchedule(dialog.InitialSyncResponse, _lastSyncSuccessAt);
+                    DateTimeOffset nowUtc = DateTimeOffset.UtcNow;
+                    RecordLastSyncSuccess(nowUtc);
+                    _scheduleGate.ApplyServerSchedule(dialog.InitialSyncResponse, nowUtc);
+                    // Backwards-compatibility guard: if an older server returned claimed commands on the probe,
+                    // execute them immediately instead of silently dropping them.
+                    if (dialog.InitialSyncResponse.PendingCommands.Count > 0)
+                    {
+                        var probeCommands = dialog.InitialSyncResponse.PendingCommands.ToList();
+                        _ = Task.Run(() => ExecuteClaimedCommandsAsync(savedCfg, probeCommands, _shutdownToken));
+                    }
                 }
-                else
-                {
-                    _scheduleGate.ResetForImmediateHandshake();
-                }
+                // Keep the authoritative interval while arming immediate execution for the real business sync
+                // (so an in-flight pre-save sync cannot defer the first real upload by a full sync interval).
+                _scheduleGate.ResetForImmediateHandshake();
 
                 UpdateTrayStatus();
 
-                if (_config.AutoUploadScreenshots && _config.IsConfigured && (!wasScreenshotSyncEnabled || dialog.InitialSyncResponse != null))
+                // Always perform an immediate real business sync right after Test & Save on a background thread
+                // so buffered GameLogs, live VRChat/SteamVR state, and screenshots upload without blocking UI.
+                if (savedCfg.IsConfigured)
                 {
-                    _ = RunSyncCycleAsync(force: true, _cts.Token);
+                    Interlocked.Exchange(ref _rerunForcedSyncRequested, 1);
+                    _ = Task.Run(() => RunSyncCycleAsync(force: true, _shutdownToken));
                 }
 
-                string nextLocal = _scheduleGate.NextSyncAtUtc == DateTimeOffset.MinValue
+                DateTimeOffset nextSyncUtc = _scheduleGate.NextSyncAtUtc;
+                string nextLocal = nextSyncUtc == DateTimeOffset.MinValue
                     ? AgentStrings.NextSyncNowLabel
-                    : _scheduleGate.NextSyncAtUtc.ToLocalTime().ToString("HH:mm:ss");
+                    : nextSyncUtc.ToLocalTime().ToString("HH:mm:ss");
 
-                string displayDevice = string.IsNullOrWhiteSpace(_config.DeviceName) ? "Windows PC" : _config.DeviceName;
+                string displayDevice = string.IsNullOrWhiteSpace(savedCfg.DeviceName) ? "Windows PC" : savedCfg.DeviceName;
                 _balloonPointsToUpdate = false;
                 _trayIcon.ShowBalloonTip(
                     3500,
                     AgentStrings.AppTitle,
                     AgentStrings.FormatBalloonConnected(
                         displayDevice,
-                        ProxyHttpClientFactory.DescribeMode(_config),
+                        ProxyHttpClientFactory.DescribeMode(savedCfg),
                         _scheduleGate.IntervalSeconds,
                         nextLocal),
                     ToolTipIcon.Info);
+                if (autoStartFailed)
+                {
+                    MessageBox.Show(
+                        AgentStrings.BalloonAutoStartFailed,
+                        AgentStrings.AppTitle,
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Warning);
+                }
             }
         }
         finally
         {
             _activeSettingsDialog = null;
+            string deferredInstallPath = _pendingAutoInstallPath;
+            _pendingAutoInstallPath = string.Empty;
+            if (!string.IsNullOrWhiteSpace(deferredInstallPath) && !_isExiting && !_shutdownToken.IsCancellationRequested)
+            {
+                if (File.Exists(deferredInstallPath))
+                {
+                    LaunchDownloadedInstallerAndExit(deferredInstallPath);
+                }
+                else
+                {
+                    RestoreCheckUpdateMenuText();
+                }
+            }
         }
     }
 
     private void ToggleSyncScreenshots(bool enabled)
     {
+        AgentConfig cfg;
         lock (_configLock)
         {
-            _config.AutoUploadScreenshots = enabled;
-            _configStore.SaveConfig(_config);
+            AgentConfig next = _config.Clone();
+            next.AutoUploadScreenshots = enabled;
+            _config = next;
+            _configStore.SaveConfig(next);
+            cfg = next.Clone();
         }
         _compressScreenshotsItem.Enabled = enabled;
         UpdateTrayStatus();
-        if (enabled && _config.IsConfigured)
+        if (enabled && cfg.IsConfigured)
         {
-            _ = RunSyncCycleAsync(force: true, _cts.Token);
+            _ = Task.Run(() => RunSyncCycleAsync(force: true, _shutdownToken));
         }
         _balloonPointsToUpdate = false;
         _trayIcon.ShowBalloonTip(
             2500,
             AgentStrings.AppTitle,
             enabled
-                ? (_config.CompressScreenshots
+                ? (cfg.CompressScreenshots
                     ? AgentStrings.BalloonScreenshotSyncOnCompressed
                     : AgentStrings.BalloonScreenshotSyncOnOriginal)
                 : AgentStrings.BalloonScreenshotSyncOff,
@@ -851,10 +1049,26 @@ public sealed class TrayApplicationContext : ApplicationContext
 
     private void ToggleCompressScreenshots(bool compress)
     {
+        AgentConfig cfg;
         lock (_configLock)
         {
-            _config.CompressScreenshots = compress;
-            _configStore.SaveConfig(_config);
+            AgentConfig next = _config.Clone();
+            next.CompressScreenshots = compress;
+            _config = next;
+            _configStore.SaveConfig(next);
+            cfg = next.Clone();
+        }
+        if (compress)
+        {
+            // Previously rejected oversized (>25 MiB) originals can now succeed once compressed.
+            lock (_pendingScreenshots)
+            {
+                _permanentlyFailedScreenshotPaths.Clear();
+            }
+            if (cfg.AutoUploadScreenshots && cfg.IsConfigured)
+            {
+                _ = Task.Run(() => RunSyncCycleAsync(force: true, _shutdownToken));
+            }
         }
         _balloonPointsToUpdate = false;
         _trayIcon.ShowBalloonTip(
@@ -868,23 +1082,139 @@ public sealed class TrayApplicationContext : ApplicationContext
 
     private void ToggleAutoStart(bool enabled)
     {
-        AgentConfigStore.SetAutoStartEnabled(enabled);
+        bool ok = AgentConfigStore.SetAutoStartEnabled(enabled);
+        bool actual = AgentConfigStore.IsAutoStartEnabled();
+        _autoStartItem.Checked = actual;
         _balloonPointsToUpdate = false;
+        if (!ok)
+        {
+            _trayIcon.ShowBalloonTip(
+                3500,
+                AgentStrings.AppTitle,
+                AgentStrings.BalloonAutoStartFailed,
+                ToolTipIcon.Warning);
+            return;
+        }
         _trayIcon.ShowBalloonTip(
             2500,
             AgentStrings.AppTitle,
-            enabled ? AgentStrings.BalloonAutoStartOn : AgentStrings.BalloonAutoStartOff,
+            actual ? AgentStrings.BalloonAutoStartOn : AgentStrings.BalloonAutoStartOff,
             ToolTipIcon.Info);
+    }
+
+    private (HttpClient Cloud, HttpClient Screenshot) CreateStartupHttpClientsWithFallback()
+    {
+        try
+        {
+            return (
+                ProxyHttpClientFactory.CreateHttpClient(_config),
+                ProxyHttpClientFactory.CreateHttpClient(_config, TimeSpan.FromSeconds(180))
+            );
+        }
+        catch (Exception ex) when (_config.ProxyEnabled)
+        {
+            // Self-heal corrupted proxy configuration on startup instead of entering a permanent crash loop.
+            Log.Warn(ex, "Invalid saved proxy configuration on startup; falling back to direct mode.");
+            lock (_configLock)
+            {
+                _config.ProxyEnabled = false;
+                try { _configStore.SaveConfig(_config); } catch { /* Best-effort persist */ }
+            }
+            return (
+                ProxyHttpClientFactory.CreateHttpClient(_config),
+                ProxyHttpClientFactory.CreateHttpClient(_config, TimeSpan.FromSeconds(180))
+            );
+        }
+    }
+
+    private HttpClient CreateSafeUpdaterHttpClient()
+    {
+        AgentConfig snapshot;
+        lock (_configLock)
+        {
+            snapshot = _config;
+        }
+        try
+        {
+            return ProxyHttpClientFactory.CreateHttpClient(snapshot, TimeSpan.FromMinutes(10));
+        }
+        catch
+        {
+            var direct = new AgentConfig { ProxyEnabled = false };
+            return ProxyHttpClientFactory.CreateHttpClient(direct, TimeSpan.FromMinutes(10));
+        }
     }
 
     private void ToggleProxyMode(bool enableProxy)
     {
+        if (enableProxy)
+        {
+            string proxyAddress;
+            lock (_configLock)
+            {
+                proxyAddress = _config.ProxyAddress;
+            }
+            var (ok, _, err) = ProxyHttpClientFactory.NormalizeAndValidateProxyUri(proxyAddress);
+            if (!ok)
+            {
+                // Revert menu state and notify user without persisting an invalid proxy configuration.
+                _proxyModeItem.Checked = false;
+                ShowNoticeMessage(err, MessageBoxIcon.Warning);
+                return;
+            }
+        }
+
+        // Build new HTTP clients before persisting so any unexpected validation error cannot brick saved config.
+        AgentConfig candidate;
         lock (_configLock)
         {
-            _config.ProxyEnabled = enableProxy;
-            _configStore.SaveConfig(_config);
+            candidate = new AgentConfig
+            {
+                ProxyEnabled = enableProxy,
+                ProxyAddress = _config.ProxyAddress
+            };
         }
-        RebuildCloudHttpClient();
+        HttpClient nextCloud;
+        HttpClient nextScreenshot;
+        try
+        {
+            nextCloud = ProxyHttpClientFactory.CreateHttpClient(candidate);
+            try
+            {
+                nextScreenshot = ProxyHttpClientFactory.CreateHttpClient(candidate, TimeSpan.FromSeconds(180));
+            }
+            catch
+            {
+                nextCloud.Dispose();
+                throw;
+            }
+        }
+        catch (Exception ex)
+        {
+            _proxyModeItem.Checked = !enableProxy;
+            ShowNoticeMessage(ex.Message, MessageBoxIcon.Warning);
+            return;
+        }
+
+        HttpClient oldClient = _cloudHttp;
+        HttpClient oldScreenshotClient = _screenshotHttp;
+        AgentConfig updatedCfg;
+        lock (_configLock)
+        {
+            AgentConfig next = _config.Clone();
+            next.ProxyEnabled = enableProxy;
+            _config = next;
+            Interlocked.Increment(ref _configGeneration);
+            _configStore.SaveConfig(next);
+            updatedCfg = next.Clone();
+        }
+        _cloudHttp = nextCloud;
+        _screenshotHttp = nextScreenshot;
+        _failedAutoUpdateTag = string.Empty;
+        _availableUpdate = null;
+        _ = Task.Delay(TimeSpan.FromSeconds(45)).ContinueWith(_ => oldClient.Dispose());
+        _ = Task.Delay(TimeSpan.FromSeconds(190)).ContinueWith(_ => oldScreenshotClient.Dispose());
+
         _consecutiveFailures = 0;
         _lastSyncError = string.Empty;
         UpdateTrayStatus();
@@ -893,7 +1223,7 @@ public sealed class TrayApplicationContext : ApplicationContext
         _trayIcon.ShowBalloonTip(
             3000,
             AgentStrings.AppTitle,
-            AgentStrings.FormatBalloonProxySwitched(ProxyHttpClientFactory.DescribeMode(_config)),
+            AgentStrings.FormatBalloonProxySwitched(ProxyHttpClientFactory.DescribeMode(updatedCfg)),
             ToolTipIcon.Info);
     }
 
@@ -901,29 +1231,26 @@ public sealed class TrayApplicationContext : ApplicationContext
     {
         HttpClient oldClient = _cloudHttp;
         HttpClient oldScreenshotClient = _screenshotHttp;
-        AgentConfig snapshot;
-        lock (_configLock)
-        {
-            snapshot = _config;
-        }
+        AgentConfig snapshot = GetConfigSnapshot();
         _cloudHttp = ProxyHttpClientFactory.CreateHttpClient(snapshot);
         _screenshotHttp = ProxyHttpClientFactory.CreateHttpClient(snapshot, TimeSpan.FromSeconds(180));
         // Clear cached failed-update/stale-release state so switching proxy immediately retries fresh release checks.
         _failedAutoUpdateTag = string.Empty;
         _availableUpdate = null;
         // Delay disposal so any in-flight HTTP request finishes cleanly without ObjectDisposedException.
-        _ = Task.Delay(TimeSpan.FromSeconds(25)).ContinueWith(_ => oldClient.Dispose());
+        _ = Task.Delay(TimeSpan.FromSeconds(45)).ContinueWith(_ => oldClient.Dispose());
         _ = Task.Delay(TimeSpan.FromSeconds(190)).ContinueWith(_ => oldScreenshotClient.Dispose());
     }
 
     private void OpenCloudWebUi()
     {
-        if (string.IsNullOrWhiteSpace(_config.CloudUrl))
+        string cloudUrl = GetConfigSnapshot().CloudUrl;
+        if (string.IsNullOrWhiteSpace(cloudUrl))
         {
             ShowSyncSettingsDialog();
             return;
         }
-        if (Uri.TryCreate(_config.CloudUrl, UriKind.Absolute, out Uri? uri) &&
+        if (Uri.TryCreate(cloudUrl, UriKind.Absolute, out Uri? uri) &&
             (uri.Scheme == Uri.UriSchemeHttps || uri.Scheme == Uri.UriSchemeHttp))
         {
             try
@@ -945,11 +1272,8 @@ public sealed class TrayApplicationContext : ApplicationContext
     {
         if (_isExiting) return;
 
-        AgentConfig cfg;
-        lock (_configLock)
-        {
-            cfg = _config;
-        }
+        AgentConfig cfg = GetConfigSnapshot();
+        DateTimeOffset lastSyncSuccessUtc = GetLastSyncSuccessUtc();
 
         string syncText;
         if (!cfg.IsConfigured)
@@ -960,9 +1284,9 @@ public sealed class TrayApplicationContext : ApplicationContext
         {
             syncText = AgentStrings.StatusSyncError;
         }
-        else if (_lastSyncSuccessAt != DateTimeOffset.MinValue)
+        else if (lastSyncSuccessUtc != DateTimeOffset.MinValue)
         {
-            syncText = AgentStrings.FormatStatusSynced(_lastSyncSuccessAt.ToLocalTime().ToString("HH:mm:ss"));
+            syncText = AgentStrings.FormatStatusSynced(lastSyncSuccessUtc.ToLocalTime().ToString("HH:mm:ss"));
         }
         else
         {
@@ -975,8 +1299,9 @@ public sealed class TrayApplicationContext : ApplicationContext
         int pendingShots;
         lock (_pendingScreenshots) pendingShots = _pendingScreenshots.Count;
 
-        string nextPart = cfg.IsConfigured && _scheduleGate.NextSyncAtUtc != DateTimeOffset.MinValue
-            ? AgentStrings.FormatNextSyncPart(_scheduleGate.NextSyncAtUtc.ToLocalTime().ToString("HH:mm:ss"), _scheduleGate.IntervalSeconds)
+        DateTimeOffset nextSyncUtc = _scheduleGate.NextSyncAtUtc;
+        string nextPart = cfg.IsConfigured && nextSyncUtc != DateTimeOffset.MinValue
+            ? AgentStrings.FormatNextSyncPart(nextSyncUtc.ToLocalTime().ToString("HH:mm:ss"), _scheduleGate.IntervalSeconds)
             : string.Empty;
         string queuePart = (pendingLogs > 0 || pendingShots > 0)
             ? AgentStrings.FormatQueuePart(pendingLogs, pendingShots)
@@ -1017,7 +1342,7 @@ public sealed class TrayApplicationContext : ApplicationContext
 
         while (!ct.IsCancellationRequested)
         {
-            if (_config.AutoCheckUpdates)
+            if (GetConfigSnapshot().AutoCheckUpdates)
             {
                 await CheckForUpdatesAsync(manual: false, ct).ConfigureAwait(false);
             }
@@ -1033,8 +1358,31 @@ public sealed class TrayApplicationContext : ApplicationContext
         }
     }
 
+    private bool TryHandlePendingAutoInstallOnUiThread()
+    {
+        if (string.IsNullOrWhiteSpace(_pendingAutoInstallPath) || !File.Exists(_pendingAutoInstallPath))
+        {
+            return false;
+        }
+        if (_activeSettingsDialog != null && !_activeSettingsDialog.IsDisposed)
+        {
+            string tag = _availableUpdate?.TagName ?? "latest";
+            ShowNoticeMessage(AgentStrings.FormatBalloonAutoInstallingUpdate(tag), MessageBoxIcon.Information);
+            return true;
+        }
+        string pendingPath = _pendingAutoInstallPath;
+        _pendingAutoInstallPath = string.Empty;
+        LaunchDownloadedInstallerAndExit(pendingPath);
+        return true;
+    }
+
     private async Task CheckForUpdatesAsync(bool manual, CancellationToken ct)
     {
+        if (manual && !string.IsNullOrWhiteSpace(_pendingAutoInstallPath) && File.Exists(_pendingAutoInstallPath))
+        {
+            RunOnUiThread(() => { _ = TryHandlePendingAutoInstallOnUiThread(); });
+            return;
+        }
         if (manual && _isAutoUpdating)
         {
             string tag = string.IsNullOrWhiteSpace(_autoUpdatingTag) ? "latest" : _autoUpdatingTag;
@@ -1053,6 +1401,10 @@ public sealed class TrayApplicationContext : ApplicationContext
             {
                 RunOnUiThread(() =>
                 {
+                    if (TryHandlePendingAutoInstallOnUiThread())
+                    {
+                        return;
+                    }
                     if (_isAutoUpdating)
                     {
                         string tag = string.IsNullOrWhiteSpace(_autoUpdatingTag) ? "latest" : _autoUpdatingTag;
@@ -1092,12 +1444,13 @@ public sealed class TrayApplicationContext : ApplicationContext
                     {
                         _checkUpdateItem.Enabled = true;
                         _checkUpdateItem.Text = AgentStrings.FormatMenuUpdateAvailable(release.TagName);
-                        ShowUpdateDialog(release, autoStart: true);
+                        HandleManualOrPromptedUpdate(release);
                     });
                 }
-                else if (_config.AutoCheckUpdates &&
+                else if (GetConfigSnapshot().AutoCheckUpdates &&
                          IsInstalledBuild() &&
                          !string.IsNullOrWhiteSpace(release.SetupDownloadUrl) &&
+                         AgentUpdater.IsValidSha256(release.ExpectedSha256) &&
                          !string.Equals(_failedAutoUpdateTag, release.TagName, StringComparison.OrdinalIgnoreCase))
                 {
                     autoUpdateTarget = release;
@@ -1115,7 +1468,7 @@ public sealed class TrayApplicationContext : ApplicationContext
                             _trayIcon.ShowBalloonTip(
                                 6000,
                                 AgentStrings.AppTitle,
-                                AgentStrings.FormatBalloonUpdateAvailable(release.TagName, AgentMetadata.Version),
+                                AgentStrings.FormatBalloonUpdateAvailableManual(release.TagName, AgentMetadata.Version),
                                 ToolTipIcon.Info);
                         }
                     });
@@ -1155,7 +1508,7 @@ public sealed class TrayApplicationContext : ApplicationContext
                 if (manual)
                 {
                     _balloonPointsToUpdate = false;
-                    string mode = ProxyHttpClientFactory.DescribeMode(_config);
+                    string mode = ProxyHttpClientFactory.DescribeMode(GetConfigSnapshot());
                     ShowNoticeMessage(
                         AgentStrings.FormatBalloonUpdateCheckFailed($"{ex.Message} [{mode}]"),
                         MessageBoxIcon.Warning);
@@ -1244,11 +1597,21 @@ public sealed class TrayApplicationContext : ApplicationContext
 
             if (ct.IsCancellationRequested || !File.Exists(installerPath))
             {
+                if (!ct.IsCancellationRequested)
+                {
+                    RunOnUiThread(RestoreCheckUpdateMenuText);
+                }
                 return;
             }
 
             RunOnUiThread(() =>
             {
+                if (_activeSettingsDialog != null && !_activeSettingsDialog.IsDisposed)
+                {
+                    // Defer silent install until the user closes the modal settings dialog.
+                    _pendingAutoInstallPath = installerPath;
+                    return;
+                }
                 _balloonPointsToUpdate = false;
                 _trayIcon.ShowBalloonTip(
                     3500,
@@ -1280,6 +1643,33 @@ public sealed class TrayApplicationContext : ApplicationContext
         }
     }
 
+    private void HandleManualOrPromptedUpdate(AgentReleaseInfo release)
+    {
+        if (!IsInstalledBuild())
+        {
+            ShowNoticeMessage(
+                AgentStrings.FormatPortableUpdateNotice(release.TagName, AgentMetadata.Version),
+                MessageBoxIcon.Information);
+            string target = AgentUpdater.IsTrustedDownloadUrl(release.HtmlUrl)
+                ? release.HtmlUrl
+                : AgentUpdater.ReleasesPageUrl;
+            try
+            {
+                using Process? _ = Process.Start(new ProcessStartInfo
+                {
+                    FileName = target,
+                    UseShellExecute = true
+                });
+            }
+            catch
+            {
+                // Ignore browser launch errors
+            }
+            return;
+        }
+        ShowUpdateDialog(release, autoStart: true);
+    }
+
     private void ShowUpdateDialog(AgentReleaseInfo release, bool autoStart = false)
     {
         if (_activeUpdateDialog != null && !_activeUpdateDialog.IsDisposed)
@@ -1301,11 +1691,18 @@ public sealed class TrayApplicationContext : ApplicationContext
         }
 
         string updatesDir = Path.Combine(_configStore.DataDirectory, "updates");
-        using var dialog = new UpdateProgressForm(release, _updater, updatesDir, _trayIcon.Icon, autoStart);
+        using Icon? dialogIcon = CloneDialogIconSafe();
+        using var dialog = new UpdateProgressForm(release, _updater, updatesDir, dialogIcon, autoStart);
         _activeUpdateDialog = dialog;
+        Task downloadTail = Task.CompletedTask;
         try
         {
-            if (dialog.ShowDialog() == DialogResult.OK &&
+            DialogResult result = dialog.ShowDialog();
+            if (_isExiting || _shutdownToken.IsCancellationRequested)
+            {
+                return;
+            }
+            if (result == DialogResult.OK &&
                 !string.IsNullOrWhiteSpace(dialog.DownloadedInstallerPath) &&
                 File.Exists(dialog.DownloadedInstallerPath))
             {
@@ -1314,13 +1711,33 @@ public sealed class TrayApplicationContext : ApplicationContext
         }
         finally
         {
+            downloadTail = dialog.ActiveDownloadTask;
             _activeUpdateDialog = null;
-            Interlocked.Exchange(ref _updateDownloadActive, 0);
+            if (downloadTail.IsCompleted)
+            {
+                Interlocked.Exchange(ref _updateDownloadActive, 0);
+            }
+            else
+            {
+                _ = downloadTail.ContinueWith(
+                    _ => Interlocked.Exchange(ref _updateDownloadActive, 0),
+                    TaskScheduler.Default);
+            }
         }
     }
 
     private void LaunchDownloadedInstallerAndExit(string installerPath)
     {
+        // Briefly let an in-flight sync batch flush before launching Setup so offline queues stay clean.
+        bool acquiredSync = false;
+        try
+        {
+            acquiredSync = _syncLock.Wait(TimeSpan.FromSeconds(3));
+        }
+        catch
+        {
+            // Ignore lock wait failure during shutdown
+        }
         try
         {
             var psi = new ProcessStartInfo
@@ -1330,6 +1747,7 @@ public sealed class TrayApplicationContext : ApplicationContext
                 WorkingDirectory = Path.GetDirectoryName(installerPath) ?? _configStore.DataDirectory
             };
             psi.ArgumentList.Add("/SILENT");
+            psi.ArgumentList.Add("/SUPPRESSMSGBOXES");
             psi.ArgumentList.Add("/NORESTART");
             using Process? _ = Process.Start(psi);
             ShutdownAndExit();
@@ -1338,8 +1756,28 @@ public sealed class TrayApplicationContext : ApplicationContext
         {
             Log.Warn(ex, "Failed to launch downloaded VRCX.Agent installer {Path}.", installerPath);
             _balloonPointsToUpdate = false;
-            ShowNoticeMessage(AgentStrings.FormatUpdateFailed(ex.Message), MessageBoxIcon.Error);
+            if (!_isExiting)
+            {
+                RestoreCheckUpdateMenuText();
+                ShowNoticeMessage(AgentStrings.FormatUpdateFailed(ex.Message), MessageBoxIcon.Error);
+            }
         }
+        finally
+        {
+            if (acquiredSync)
+            {
+                try { _syncLock.Release(); } catch { /* ignore */ }
+            }
+        }
+    }
+
+    private void RestoreCheckUpdateMenuText()
+    {
+        if (_isExiting || _checkUpdateItem.IsDisposed) return;
+        _checkUpdateItem.Enabled = true;
+        _checkUpdateItem.Text = _availableUpdate != null && _availableUpdate.IsUpdateAvailable
+            ? AgentStrings.FormatMenuUpdateAvailable(_availableUpdate.TagName)
+            : AgentStrings.FormatMenuCheckUpdate(AgentMetadata.Version);
     }
 
     /// <summary>
@@ -1359,12 +1797,12 @@ public sealed class TrayApplicationContext : ApplicationContext
 
     private void RunOnUiThread(Action action)
     {
-        if (_isExiting || _cts.IsCancellationRequested) return;
+        if (_isExiting || _shutdownToken.IsCancellationRequested) return;
         if (_uiSyncContext != null)
         {
             _uiSyncContext.Post(_ =>
             {
-                if (_isExiting || _cts.IsCancellationRequested) return;
+                if (_isExiting || _shutdownToken.IsCancellationRequested) return;
                 try
                 {
                     action();
@@ -1380,7 +1818,7 @@ public sealed class TrayApplicationContext : ApplicationContext
         {
             strip.BeginInvoke(new Action(() =>
             {
-                if (_isExiting || _cts.IsCancellationRequested) return;
+                if (_isExiting || _shutdownToken.IsCancellationRequested) return;
                 action();
             }));
             return;
@@ -1419,26 +1857,52 @@ public sealed class TrayApplicationContext : ApplicationContext
         return (SystemIcons.Application, false);
     }
 
-    private void ShutdownAndExit()
+    private void CleanupResources()
     {
         if (_isExiting) return;
         _isExiting = true;
 
         try { _cts.Cancel(); } catch { /* ignore */ }
-        _singleClickTimer.Stop();
-        _singleClickTimer.Dispose();
-        _wakeWaitHandle?.Unregister(null);
-        VRCX.Discord.Instance.Exit();
-        _trayIcon.Visible = false;
-        ContextMenuStrip? menu = _trayIcon.ContextMenuStrip;
-        _trayIcon.ContextMenuStrip = null;
-        _trayIcon.Dispose();
-        menu?.Dispose();
-        _menuFont.Dispose();
+        // Close any open modal dialog cleanly BEFORE disposing tray icon / menu controls to prevent ObjectDisposedException.
+        try
+        {
+            if (_activeSettingsDialog != null && !_activeSettingsDialog.IsDisposed)
+            {
+                _activeSettingsDialog.Close();
+            }
+        }
+        catch { /* ignore */ }
+        try
+        {
+            if (_activeUpdateDialog != null && !_activeUpdateDialog.IsDisposed)
+            {
+                _activeUpdateDialog.Close();
+            }
+        }
+        catch { /* ignore */ }
+        try { _singleClickTimer.Stop(); } catch { /* ignore */ }
+        try { _singleClickTimer.Dispose(); } catch { /* ignore */ }
+        try { _wakeWaitHandle?.Unregister(null); } catch { /* ignore */ }
+        try { VRCX.Discord.Instance.Exit(); } catch { /* ignore */ }
+        try { _trayIcon.Visible = false; } catch { /* ignore */ }
+        try
+        {
+            ContextMenuStrip? menu = _trayIcon.ContextMenuStrip;
+            _trayIcon.ContextMenuStrip = null;
+            _trayIcon.Dispose();
+            menu?.Dispose();
+        }
+        catch { /* ignore */ }
+        try { _menuFont.Dispose(); } catch { /* ignore */ }
         if (_ownsTrayIcon)
         {
-            _trayIconAsset.Dispose();
+            try { _trayIconAsset.Dispose(); } catch { /* ignore */ }
         }
+    }
+
+    private void ShutdownAndExit()
+    {
+        CleanupResources();
         // Leave _syncLock, _updateCheckLock, and HTTP clients alive during final unwind so in-flight
         // background tasks exit cleanly via CancellationToken without ObjectDisposedException.
         ExitThread();
@@ -1448,6 +1912,7 @@ public sealed class TrayApplicationContext : ApplicationContext
     {
         if (disposing)
         {
+            CleanupResources();
             try { _cts.Dispose(); } catch { /* ignore */ }
         }
         base.Dispose(disposing);

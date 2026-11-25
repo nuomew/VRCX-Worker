@@ -3677,6 +3677,10 @@
         "unlock": {
             "title": "VRCX Cloud Unlock",
             "cf_access_desc": "Protected by Cloudflare Access. Please sign in through your Access portal and reload.",
+            "cf_access_reload": "Re-authenticate / Reload",
+            "check_failed_desc": "Failed to verify cloud session status. Check your network connection and retry.",
+            "retry_check": "Retry Connection",
+            "retrying": "Retrying...",
             "passcode_desc": "Enter your private cloud passcode.",
             "passcode_totp_desc": "Enter your private cloud passcode and 6-digit TOTP code.",
             "passcode_placeholder": "Cloud Passcode",

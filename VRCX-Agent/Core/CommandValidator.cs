@@ -32,6 +32,14 @@ public static class CommandValidator
         @"^[A-Za-z0-9._-]{1,64}$",
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
+    private static readonly Regex CacheItemIdRegex = new(
+        @"^[A-Za-z0-9_.-]{1,128}$",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+
+    private static readonly Regex CacheVariantRegex = new(
+        @"^[A-Za-z0-9_.-]{0,64}$",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+
     private static readonly Regex AwsS3HostRegex = new(
         @"^(?:[a-z0-9-]+\.)?s3(?:[.-][a-z0-9-]+)?\.amazonaws\.com$",
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
@@ -71,8 +79,227 @@ public static class CommandValidator
                 return (false, "launchUrl must be a valid vrchat://launch?id=wrld_<uuid>:<instance> link.");
             }
         }
+        else if (action == "clear_cache")
+        {
+            string scope = "all";
+            if (parameters != null && parameters.TryGetValue("scope", out var rawScope) && rawScope != null)
+            {
+                if (rawScope is not string rawScopeStr)
+                {
+                    return (false, "clear_cache scope must be a string ('all' or 'single').");
+                }
+                scope = rawScopeStr.Trim().ToLowerInvariant();
+            }
+            if (!string.IsNullOrEmpty(scope) && scope != "all" && scope != "single")
+            {
+                return (false, "clear_cache scope must be 'all' or 'single'.");
+            }
+            if (scope == "single")
+            {
+                string itemId = parameters != null && parameters.TryGetValue("id", out var rawId) && rawId is string rawIdStr
+                    ? rawIdStr.Trim()
+                    : string.Empty;
+                if (!IsValidCacheItemId(itemId))
+                {
+                    return (false, "clear_cache with scope='single' requires a valid cache folder id.");
+                }
+                if (parameters != null && parameters.TryGetValue("variant", out var rawVariant) && rawVariant != null)
+                {
+                    if (rawVariant is not string rawVariantStr || !IsValidCacheVariant(rawVariantStr))
+                    {
+                        return (false, "clear_cache variant contains invalid characters.");
+                    }
+                }
+            }
+        }
 
         return (true, string.Empty);
+    }
+
+    public static bool IsValidCacheItemId(string? itemId)
+    {
+        if (string.IsNullOrWhiteSpace(itemId)) return false;
+        string trimmed = itemId.Trim();
+        return trimmed != "." &&
+               trimmed != ".." &&
+               !trimmed.Contains("..", StringComparison.Ordinal) &&
+               CacheItemIdRegex.IsMatch(trimmed);
+    }
+
+    public static bool IsValidCacheVariant(string? variant)
+    {
+        if (string.IsNullOrEmpty(variant)) return true;
+        string trimmed = variant.Trim();
+        return !trimmed.Contains("..", StringComparison.Ordinal) && CacheVariantRegex.IsMatch(trimmed);
+    }
+
+    public static string ComputeVrChatCacheFolderHash(string itemId, string variant = "")
+    {
+        string input = string.IsNullOrEmpty(variant) ? itemId : itemId + variant;
+        return Convert.ToHexString(
+            System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(input)))[..16];
+    }
+
+    /// <summary>
+    /// Resolves VRChat's active cache directory, respecting custom `"cache_directory"` in
+    /// `%LocalAppData%Low\VRChat\VRChat\config.json` (matching upstream desktop VRCX `Folders.cs`).
+    /// </summary>
+    public static string ResolveVrChatCacheDirectory(string? vrchatAppDataDirOverride = null)
+    {
+        string vrcAppData = vrchatAppDataDirOverride ?? string.Empty;
+        if (string.IsNullOrWhiteSpace(vrcAppData))
+        {
+            string localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+            string? appDataRoot = string.IsNullOrEmpty(localAppData) ? null : System.IO.Directory.GetParent(localAppData)?.FullName;
+            if (string.IsNullOrEmpty(appDataRoot)) return string.Empty;
+            vrcAppData = System.IO.Path.Combine(appDataRoot, "LocalLow", "VRChat", "VRChat");
+        }
+
+        string defaultPath = System.IO.Path.Combine(vrcAppData, "Cache-WindowsPlayer");
+        try
+        {
+            string configPath = System.IO.Path.Combine(vrcAppData, "config.json");
+            if (!System.IO.File.Exists(configPath))
+            {
+                return defaultPath;
+            }
+            string rawJson = System.IO.File.ReadAllText(configPath, System.Text.Encoding.UTF8);
+            if (string.IsNullOrWhiteSpace(rawJson))
+            {
+                return defaultPath;
+            }
+            var obj = Newtonsoft.Json.JsonConvert.DeserializeObject<Newtonsoft.Json.Linq.JObject>(rawJson);
+            string? configuredDir = obj?.Value<string>("cache_directory")?.Trim();
+            if (string.IsNullOrWhiteSpace(configuredDir) || !System.IO.Directory.Exists(configuredDir))
+            {
+                return defaultPath;
+            }
+            return System.IO.Path.Combine(configuredDir, "Cache-WindowsPlayer");
+        }
+        catch
+        {
+            return defaultPath;
+        }
+    }
+
+    public static CommandExecutionResult ClearVrChatCacheInDirectory(
+        string cmdId,
+        string cacheDir,
+        string scope,
+        string itemId,
+        string variant = "",
+        Action<Exception, string>? onSkipLocked = null)
+    {
+        string normalizedScope = string.IsNullOrWhiteSpace(scope) ? "all" : scope.Trim().ToLowerInvariant();
+        if (normalizedScope != "all" && normalizedScope != "single")
+        {
+            return new CommandExecutionResult
+            {
+                CmdId = cmdId,
+                Status = "failed",
+                Message = $"Unsupported clear_cache scope '{normalizedScope}'"
+            };
+        }
+
+        if (normalizedScope == "single")
+        {
+            if (!IsValidCacheItemId(itemId) || !IsValidCacheVariant(variant))
+            {
+                return new CommandExecutionResult
+                {
+                    CmdId = cmdId,
+                    Status = "failed",
+                    Message = "clear_cache with scope='single' requires a valid cache folder id"
+                };
+            }
+            if (string.IsNullOrEmpty(cacheDir) || !System.IO.Directory.Exists(cacheDir))
+            {
+                return new CommandExecutionResult
+                {
+                    CmdId = cmdId,
+                    Status = "succeeded",
+                    Message = "VRChat cache directory does not exist"
+                };
+            }
+            string fullRoot = System.IO.Path.GetFullPath(cacheDir)
+                .TrimEnd(System.IO.Path.DirectorySeparatorChar, System.IO.Path.AltDirectorySeparatorChar)
+                + System.IO.Path.DirectorySeparatorChar;
+            string trimmedId = itemId.Trim();
+            string trimmedVariant = (variant ?? string.Empty).Trim();
+            var candidateFolderNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            {
+                trimmedId,
+                ComputeVrChatCacheFolderHash(trimmedId, string.Empty),
+                ComputeVrChatCacheFolderHash(trimmedId, trimmedVariant)
+            };
+            if (string.IsNullOrEmpty(trimmedVariant))
+            {
+                // Also match modern VRChat default "security" variant bundles when callers omit variant.
+                candidateFolderNames.Add(ComputeVrChatCacheFolderHash(trimmedId, "security"));
+            }
+            int removedSingle = 0;
+            foreach (string subDir in System.IO.Directory.EnumerateDirectories(cacheDir))
+            {
+                string folderName = System.IO.Path.GetFileName(subDir);
+                if (!candidateFolderNames.Contains(folderName))
+                {
+                    continue;
+                }
+                string fullSubDir = System.IO.Path.GetFullPath(subDir);
+                if (!fullSubDir.StartsWith(fullRoot, StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+                try
+                {
+                    System.IO.Directory.Delete(fullSubDir, recursive: true);
+                    removedSingle++;
+                }
+                catch (Exception ex)
+                {
+                    onSkipLocked?.Invoke(ex, fullSubDir);
+                }
+            }
+            return new CommandExecutionResult
+            {
+                CmdId = cmdId,
+                Status = "succeeded",
+                Message = removedSingle > 0
+                    ? $"Cleared VRChat cache folder '{trimmedId}'"
+                    : $"VRChat cache folder '{trimmedId}' not found"
+            };
+        }
+
+        if (string.IsNullOrEmpty(cacheDir) || !System.IO.Directory.Exists(cacheDir))
+        {
+            return new CommandExecutionResult
+            {
+                CmdId = cmdId,
+                Status = "succeeded",
+                Message = "VRChat cache directory does not exist"
+            };
+        }
+
+        int deletedDirs = 0;
+        foreach (string subDir in System.IO.Directory.EnumerateDirectories(cacheDir))
+        {
+            try
+            {
+                System.IO.Directory.Delete(subDir, recursive: true);
+                deletedDirs++;
+            }
+            catch (Exception ex)
+            {
+                onSkipLocked?.Invoke(ex, subDir);
+            }
+        }
+
+        return new CommandExecutionResult
+        {
+            CmdId = cmdId,
+            Status = "succeeded",
+            Message = $"Cleared {deletedDirs} VRChat cache folder(s)"
+        };
     }
 
     public static bool IsValidLaunchUrl(string? launchUrl)

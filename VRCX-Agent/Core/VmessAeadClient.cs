@@ -403,26 +403,29 @@ public static class VmessAeadClient
 
     private static async Task<Stream> OpenWebSocketTransportAsync(VmessConfig config, CancellationToken ct)
     {
-        string scheme = config.UseTls ? "wss" : "ws";
         string serverHostForUri = config.Server.Contains(':') && !config.Server.StartsWith("[", StringComparison.Ordinal)
             ? $"[{config.Server}]"
             : config.Server;
-        var wsUri = new Uri($"{scheme}://{serverHostForUri}:{config.Port}{config.EffectiveWsPath}");
+        // Always use ws:// with ClientWebSocket when TLS is enabled and perform TLS manually in ConnectCallback.
+        // .NET's SocketsHttpHandler unconditionally overwrites SslOptions.TargetHost with request.Headers.Host ?? uri.IdnHost
+        // for wss:// URIs, which breaks VMess WS+TLS nodes whose SNI differs from Host or connect IP.
+        var wsUri = new Uri($"ws://{serverHostForUri}:{config.Port}{config.EffectiveWsPath}");
 
         var ws = new ClientWebSocket();
         ws.Options.KeepAliveInterval = TimeSpan.FromSeconds(30);
         ws.Options.SetRequestHeader(
             "User-Agent",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36");
-        if (!string.IsNullOrWhiteSpace(config.PrimaryHost))
+        if (!string.IsNullOrWhiteSpace(config.PrimaryHost) || config.UseTls)
         {
-            ws.Options.SetRequestHeader("Host", config.PrimaryHost);
+            // Restore standard wss:// Host header semantics (prefer explicit Host, then TLS SNI for preferred-IP nodes,
+            // then server host omitting :443) because wsUri uses ws:// to avoid SocketsHttpHandler overwriting TargetHost.
+            ws.Options.SetRequestHeader("Host", config.EffectiveWsHostHeader);
         }
 
         HttpMessageInvoker? invoker = null;
         try
         {
-            // Use custom SocketsHttpHandler so SNI can differ from connect IP/host (standard CDN/preferred-IP VMess WS+TLS).
             var wsHandler = new SocketsHttpHandler
             {
                 UseProxy = false,
@@ -431,15 +434,40 @@ public static class VmessAeadClient
             };
             if (config.UseTls)
             {
-                wsHandler.SslOptions = new SslClientAuthenticationOptions
+                wsHandler.ConnectCallback = async (_, cbCt) =>
                 {
-                    TargetHost = config.EffectiveSni,
-                    EnabledSslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13
+                    var tcp = new TcpClient { NoDelay = true };
+                    try
+                    {
+                        await tcp.ConnectAsync(config.Server, config.Port, cbCt).ConfigureAwait(false);
+                        var ssl = new SslStream(tcp.GetStream(), leaveInnerStreamOpen: false);
+                        try
+                        {
+                            var sslOpts = new SslClientAuthenticationOptions
+                            {
+                                TargetHost = config.EffectiveSni,
+                                EnabledSslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13,
+                                ApplicationProtocols = new List<SslApplicationProtocol> { SslApplicationProtocol.Http11 }
+                            };
+                            if (config.AllowInsecure)
+                            {
+                                sslOpts.RemoteCertificateValidationCallback = (_, _, _, _) => true;
+                            }
+                            await ssl.AuthenticateAsClientAsync(sslOpts, cbCt).ConfigureAwait(false);
+                            return ssl;
+                        }
+                        catch
+                        {
+                            await ssl.DisposeAsync().ConfigureAwait(false);
+                            throw;
+                        }
+                    }
+                    catch
+                    {
+                        tcp.Dispose();
+                        throw;
+                    }
                 };
-                if (config.AllowInsecure)
-                {
-                    wsHandler.SslOptions.RemoteCertificateValidationCallback = (_, _, _, _) => true;
-                }
             }
             invoker = new HttpMessageInvoker(wsHandler, disposeHandler: true);
             await ws.ConnectAsync(wsUri, invoker, ct).ConfigureAwait(false);
@@ -725,7 +753,7 @@ public static class VmessAeadClient
         private bool _readEof;
         private byte[] _readRemainder = Array.Empty<byte>();
         private int _readRemainderOffset;
-        private bool _disposed;
+        private int _disposed;
 
         public VmessAeadStream(Stream transport, VmessConfig config, string destHost, int destPort)
         {
@@ -853,10 +881,14 @@ public static class VmessAeadClient
 
         public override async ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken ct = default)
         {
+            if (Volatile.Read(ref _disposed) != 0)
+            {
+                throw new ObjectDisposedException(nameof(VmessAeadStream));
+            }
             await _writeLock.WaitAsync(ct).ConfigureAwait(false);
             try
             {
-                if (_disposed)
+                if (Volatile.Read(ref _disposed) != 0)
                 {
                     throw new ObjectDisposedException(nameof(VmessAeadStream));
                 }
@@ -1005,66 +1037,61 @@ public static class VmessAeadClient
 
         protected override void Dispose(bool disposing)
         {
-            if (!_disposed && disposing)
+            if (disposing && Interlocked.Exchange(ref _disposed, 1) == 0)
             {
-                _writeLock.Wait();
+                // Close underlying transport immediately without blocking on _writeLock so stalled
+                // WriteAsync/ReadAsync calls abort cleanly and never deadlock or hit ObjectDisposedException on _writeLock.
                 try
                 {
-                    if (!_disposed)
-                    {
-                        _disposed = true;
-                        _transport.Dispose();
-                    }
+                    _transport.Dispose();
                 }
-                finally
+                catch
                 {
-                    _writeLock.Release();
+                    // Ignore transport teardown errors
                 }
-                _writeLock.Dispose();
             }
             base.Dispose(disposing);
         }
 
         public override async ValueTask DisposeAsync()
         {
-            bool shouldDisposeLock = false;
-            if (!_disposed)
+            if (Interlocked.Exchange(ref _disposed, 1) == 0)
             {
-                await _writeLock.WaitAsync().ConfigureAwait(false);
+                bool lockAcquired = false;
                 try
                 {
-                    if (!_disposed)
+                    // Only attempt a best-effort EOF marker if no write is currently stalled on the transport.
+                    lockAcquired = await _writeLock.WaitAsync(TimeSpan.FromMilliseconds(100)).ConfigureAwait(false);
+                    if (lockAcquired && _pendingHeaderBytes == null && _securityByte == 0x03)
                     {
-                        _disposed = true;
-                        shouldDisposeLock = true;
-                        try
-                        {
-                            if (_pendingHeaderBytes == null && _securityByte == 0x03)
-                            {
-                                // Best-effort EOF marker chunk serialized with WriteAsync
-                                byte[] chunkNonce = NextChunkNonce(_requestBodyIv, ref _writeCount);
-                                byte[] eofTag = AesGcmSeal(_requestBodyKey, chunkNonce, ReadOnlySpan<byte>.Empty, ReadOnlySpan<byte>.Empty);
-                                byte[] frame = new byte[2 + eofTag.Length];
-                                BinaryPrimitives.WriteUInt16BigEndian(frame.AsSpan(0, 2), (ushort)eofTag.Length);
-                                Buffer.BlockCopy(eofTag, 0, frame, 2, eofTag.Length);
-                                using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(300));
-                                await _transport.WriteAsync(frame, cts.Token).ConfigureAwait(false);
-                            }
-                        }
-                        catch
-                        {
-                            // Transport may already be closed by peer
-                        }
-                        await _transport.DisposeAsync().ConfigureAwait(false);
+                        byte[] chunkNonce = NextChunkNonce(_requestBodyIv, ref _writeCount);
+                        byte[] eofTag = AesGcmSeal(_requestBodyKey, chunkNonce, ReadOnlySpan<byte>.Empty, ReadOnlySpan<byte>.Empty);
+                        byte[] frame = new byte[2 + eofTag.Length];
+                        BinaryPrimitives.WriteUInt16BigEndian(frame.AsSpan(0, 2), (ushort)eofTag.Length);
+                        Buffer.BlockCopy(eofTag, 0, frame, 2, eofTag.Length);
+                        using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(300));
+                        await _transport.WriteAsync(frame, cts.Token).ConfigureAwait(false);
                     }
+                }
+                catch
+                {
+                    // Transport may already be closed or stalled
                 }
                 finally
                 {
-                    _writeLock.Release();
+                    if (lockAcquired)
+                    {
+                        _writeLock.Release();
+                    }
                 }
-                if (shouldDisposeLock)
+
+                try
                 {
-                    _writeLock.Dispose();
+                    await _transport.DisposeAsync().ConfigureAwait(false);
+                }
+                catch
+                {
+                    // Ignore transport teardown errors
                 }
             }
             await base.DisposeAsync().ConfigureAwait(false);

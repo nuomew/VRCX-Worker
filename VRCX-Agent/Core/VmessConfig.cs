@@ -1,5 +1,7 @@
 using System;
 using System.Collections.Generic;
+using System.Net;
+using System.Net.Sockets;
 using System.Text;
 using Newtonsoft.Json.Linq;
 
@@ -48,7 +50,25 @@ public sealed class VmessConfig
     }
 
     public string EffectiveHttpHeaderHost =>
-        !string.IsNullOrWhiteSpace(PrimaryHost) ? PrimaryHost : Server;
+        FormatHostForHttpHeader(!string.IsNullOrWhiteSpace(PrimaryHost) ? PrimaryHost : Server);
+
+    /// <summary>
+    /// Formats a hostname or IP literal for HTTP/WebSocket Host headers (wrapping bare IPv6 literals in brackets
+    /// while leaving valid `hostname:port`, `ipv4:port`, and already-bracketed `[ipv6]:port` untouched).
+    /// </summary>
+    public static string FormatHostForHttpHeader(string? host)
+    {
+        string trimmed = (host ?? string.Empty).Trim();
+        if (string.IsNullOrEmpty(trimmed) || trimmed.StartsWith("[", StringComparison.Ordinal))
+        {
+            return trimmed;
+        }
+        if (IPAddress.TryParse(trimmed, out IPAddress? ip) && ip.AddressFamily == AddressFamily.InterNetworkV6)
+        {
+            return $"[{trimmed}]";
+        }
+        return trimmed;
+    }
 
     /// <summary>
     /// Maps VMess security string to wire protocol Security byte.
@@ -245,11 +265,49 @@ public sealed class VmessConfig
                 headerType = ht.Trim().ToLowerInvariant();
             }
         }
-        string host = query.TryGetValue("obfsParam", out string? op) ? op : (query.TryGetValue("host", out string? h) ? h : string.Empty);
-        string path = query.TryGetValue("path", out string? p) ? p : "/";
+        string host = string.Empty;
+        string path = query.TryGetValue("path", out string? p) ? p : string.Empty;
+        if (query.TryGetValue("obfsParam", out string? op) && !string.IsNullOrWhiteSpace(op))
+        {
+            string trimmedOp = op.Trim();
+            if (trimmedOp.StartsWith("{", StringComparison.Ordinal))
+            {
+                try
+                {
+                    var opJson = JObject.Parse(trimmedOp);
+                    host = opJson["Host"]?.Value<string>()
+                        ?? opJson["host"]?.Value<string>()
+                        ?? string.Empty;
+                    if (string.IsNullOrWhiteSpace(path))
+                    {
+                        path = opJson["Path"]?.Value<string>()
+                            ?? opJson["path"]?.Value<string>()
+                            ?? string.Empty;
+                    }
+                }
+                catch
+                {
+                    host = trimmedOp;
+                }
+            }
+            else
+            {
+                host = trimmedOp;
+            }
+        }
+        if (string.IsNullOrWhiteSpace(host) && query.TryGetValue("host", out string? h))
+        {
+            host = h;
+        }
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            path = "/";
+        }
         string tlsVal = query.TryGetValue("tls", out string? t) ? t.ToLowerInvariant() : string.Empty;
         bool useTls = IsTruthy(tlsVal) || tlsVal == "tls";
-        string sni = query.TryGetValue("peer", out string? peer) ? peer : (query.TryGetValue("sni", out string? s) ? s : string.Empty);
+        string sni = (query.TryGetValue("peer", out string? peer) && !string.IsNullOrWhiteSpace(peer))
+            ? peer
+            : (query.TryGetValue("sni", out string? s) ? s : string.Empty);
         string alpn = query.TryGetValue("alpn", out string? a) ? a : string.Empty;
         bool allowInsecure =
             (query.TryGetValue("allowInsecure", out string? ai) && IsTruthy(ai)) ||
@@ -283,6 +341,12 @@ public sealed class VmessConfig
         error = string.Empty;
 
         server = (server ?? string.Empty).Trim();
+        if (server.Length >= 2 &&
+            server.StartsWith("[", StringComparison.Ordinal) &&
+            server.EndsWith("]", StringComparison.Ordinal))
+        {
+            server = server.Substring(1, server.Length - 2).Trim();
+        }
         if (string.IsNullOrWhiteSpace(server))
         {
             error = AgentStrings.InvalidVmessUrlMessage;
@@ -318,6 +382,85 @@ public sealed class VmessConfig
             return false;
         }
 
+        static bool HasInvalidHeaderTokenChars(string value)
+        {
+            foreach (char ch in value)
+            {
+                if (char.IsControl(ch) || char.IsWhiteSpace(ch))
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        string cleanHost = (host ?? string.Empty).Trim();
+        if (!string.IsNullOrEmpty(cleanHost))
+        {
+            var hostParts = new List<string>();
+            foreach (string seg in cleanHost.Split(',', StringSplitOptions.RemoveEmptyEntries))
+            {
+                string trimmedSeg = seg.Trim();
+                if (trimmedSeg.Length == 0 || HasInvalidHeaderTokenChars(trimmedSeg))
+                {
+                    error = AgentStrings.InvalidVmessUrlMessage;
+                    return false;
+                }
+                hostParts.Add(trimmedSeg);
+            }
+            cleanHost = string.Join(",", hostParts);
+        }
+
+        string cleanSni = (sni ?? string.Empty).Trim();
+        if (!string.IsNullOrEmpty(cleanSni) && HasInvalidHeaderTokenChars(cleanSni))
+        {
+            error = AgentStrings.InvalidVmessUrlMessage;
+            return false;
+        }
+
+        string cleanAlpn = (alpn ?? string.Empty).Trim();
+        if (!string.IsNullOrEmpty(cleanAlpn))
+        {
+            var alpnParts = new List<string>();
+            foreach (string seg in cleanAlpn.Split(',', StringSplitOptions.RemoveEmptyEntries))
+            {
+                string trimmedSeg = seg.Trim();
+                if (trimmedSeg.Length == 0 || HasInvalidHeaderTokenChars(trimmedSeg))
+                {
+                    error = AgentStrings.InvalidVmessUrlMessage;
+                    return false;
+                }
+                alpnParts.Add(trimmedSeg);
+            }
+            cleanAlpn = string.Join(",", alpnParts);
+        }
+
+        string normalizedPath;
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            normalizedPath = "/";
+        }
+        else
+        {
+            var pathParts = new List<string>();
+            foreach (string rawSeg in path.Split(',', StringSplitOptions.RemoveEmptyEntries))
+            {
+                string seg = rawSeg.Trim();
+                if (seg.Length == 0) continue;
+                if (!seg.StartsWith("/", StringComparison.Ordinal))
+                {
+                    seg = "/" + seg;
+                }
+                if (HasInvalidHeaderTokenChars(seg) || !Uri.TryCreate($"ws://example.com{seg}", UriKind.Absolute, out _))
+                {
+                    error = AgentStrings.InvalidVmessUrlMessage;
+                    return false;
+                }
+                pathParts.Add(seg);
+            }
+            normalizedPath = pathParts.Count > 0 ? string.Join(",", pathParts) : "/";
+        }
+
         config = new VmessConfig
         {
             Remarks = (remarks ?? string.Empty).Trim(),
@@ -329,14 +472,41 @@ public sealed class VmessConfig
             Security = string.IsNullOrWhiteSpace(scy) ? "auto" : scy.Trim().ToLowerInvariant(),
             Network = net,
             HeaderType = string.IsNullOrWhiteSpace(headerType) ? "none" : headerType,
-            Host = (host ?? string.Empty).Trim(),
-            Path = string.IsNullOrWhiteSpace(path) ? "/" : path.Trim(),
+            Host = cleanHost,
+            Path = normalizedPath,
             UseTls = useTls,
-            Sni = (sni ?? string.Empty).Trim(),
-            Alpn = (alpn ?? string.Empty).Trim(),
+            Sni = cleanSni,
+            Alpn = cleanAlpn,
             AllowInsecure = allowInsecure
         };
         return true;
+    }
+
+    /// <summary>
+    /// Resolves the HTTP `Host` header for WebSocket transport: explicit `Host` first, then TLS `Sni`
+    /// (critical for Cloudflare preferred-IP WS+TLS nodes where `add` is an IP and only `sni` carries the domain),
+    /// finally falling back to the formatted server host (and non-default port for TLS).
+    /// </summary>
+    public string EffectiveWsHostHeader
+    {
+        get
+        {
+            if (!string.IsNullOrWhiteSpace(PrimaryHost))
+            {
+                return FormatHostForHttpHeader(PrimaryHost);
+            }
+            if (UseTls && !string.IsNullOrWhiteSpace(Sni))
+            {
+                string cleanSni = FormatHostForHttpHeader(Sni);
+                return Port == 443 ? cleanSni : $"{cleanSni}:{Port}";
+            }
+            string serverHost = FormatHostForHttpHeader(Server);
+            if (UseTls)
+            {
+                return Port == 443 ? serverHost : $"{serverHost}:{Port}";
+            }
+            return Port == 80 ? serverHost : $"{serverHost}:{Port}";
+        }
     }
 
     private static string ExtractFirstCsvValue(string? raw)

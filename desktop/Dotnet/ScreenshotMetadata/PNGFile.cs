@@ -43,7 +43,8 @@ public class PNGFile : IDisposable
     {
         ReadAndCacheMetadata();
 
-        var chunk = metadataChunkCache.FirstOrDefault((chunk) => chunkTypeFilter.HasFlag(chunk.ChunkTypeEnum));
+        var chunk = metadataChunkCache.FirstOrDefault((chunk) =>
+            chunk.ChunkTypeEnum != PNGChunkTypeFilter.UNKNOWN && chunkTypeFilter.HasFlag(chunk.ChunkTypeEnum));
         if (chunk == null || chunk.IsZero())
             return null;
 
@@ -110,6 +111,9 @@ public class PNGFile : IDisposable
         fileStream.Write(chunkBytes, 0, chunkBytes.Length);
         fileStream.Write(fileBytes, 0, fileBytes.Length);
 
+        chunk.Index = newChunkPosition;
+        metadataChunkCache.Add(chunk);
+
         return true;
     }
 
@@ -175,7 +179,8 @@ public class PNGFile : IDisposable
     {
         ReadAndCacheMetadata();
 
-        return metadataChunkCache.FindAll((chunk) => chunk.ChunkTypeEnum.HasFlag(chunkTypeFilter));
+        return metadataChunkCache.FindAll((chunk) =>
+            chunk.ChunkTypeEnum != PNGChunkTypeFilter.UNKNOWN && chunkTypeFilter.HasFlag(chunk.ChunkTypeEnum));
     }
 
     /// <summary>
@@ -193,7 +198,7 @@ public class PNGFile : IDisposable
         int chunksRead = 0;
         byte[] buffer = new byte[4];
 
-        while (currentIndex < fileStream.Length)
+        while (currentIndex <= fileStream.Length - CHUNK_NONDATA_SIZE)
         {
             if (chunksRead >= MAX_CHUNKS_TO_READ)
                 yield break;
@@ -270,14 +275,17 @@ public class PNGFile : IDisposable
         byte[] trailingBytesBuffer = new byte[8192];
         fileStream.ReadExactly(trailingBytesBuffer, 0, 8192);
 
-        for (int i = 0; i < trailingBytesBuffer.Length - searchChunkBytes.Length; i++)
+        for (int i = 0; i <= trailingBytesBuffer.Length - searchChunkBytes.Length; i++)
         {
             if (trailingBytesBuffer[i] == searchChunkBytes[0] &&
                 trailingBytesBuffer[i + 1] == searchChunkBytes[1] &&
                 trailingBytesBuffer[i + 2] == searchChunkBytes[2] &&
                 trailingBytesBuffer[i + 3] == searchChunkBytes[3])
             {
-                fileStream.Seek(fileStream.Length - trailingBytesBuffer.Length - CHUNK_NONDATA_SIZE + i - CHUNK_FIELD_SIZE, SeekOrigin.Begin);
+                long chunkStart = fileStream.Length - trailingBytesBuffer.Length - CHUNK_NONDATA_SIZE + i - CHUNK_FIELD_SIZE;
+                if (chunkStart < pngSignatureBytes.Length)
+                    continue;
+                fileStream.Seek(chunkStart, SeekOrigin.Begin);
 
                 byte[] buffer = new byte[4];
 
@@ -289,8 +297,8 @@ public class PNGFile : IDisposable
                     Array.Reverse(buffer, 0, 4);
 
                 int chunkLength = BitConverter.ToInt32(buffer, 0);
-                if (chunkLength < 0 || chunkLength > fileStream.Length - i - CHUNK_NONDATA_SIZE)
-                    return null;
+                if (chunkLength < 0 || chunkLength > fileStream.Length - chunkStart - CHUNK_NONDATA_SIZE)
+                    continue;
 
                 // Read chunk type
                 fileStream.ReadExactly(buffer, 0, CHUNK_FIELD_SIZE);
@@ -301,16 +309,23 @@ public class PNGFile : IDisposable
                 byte[] chunkData = new byte[chunkLength];
                 fileStream.ReadExactly(chunkData, 0, chunkLength);
 
-                // Skip CRC (4 bytes)
-                fileStream.Seek(CHUNK_FIELD_SIZE, SeekOrigin.Current);
+                // Verify 4-byte big-endian CRC so accidental ASCII matches inside compressed IDAT bytes are rejected.
+                fileStream.ReadExactly(buffer, 0, CHUNK_FIELD_SIZE);
+                if (BitConverter.IsLittleEndian)
+                    Array.Reverse(buffer, 0, 4);
+                uint fileCrc = BitConverter.ToUInt32(buffer, 0);
 
                 PNGChunk chunk = new PNGChunk
                 {
+                    Index = (int)chunkStart,
                     Length = chunkLength,
                     ChunkType = chunkType,
                     ChunkTypeEnum = ChunkNameToEnum(chunkType),
                     Data = chunkData,
                 };
+
+                if (fileCrc != chunk.CalculateCRC())
+                    continue;
 
                 return chunk;
             }
@@ -406,6 +421,7 @@ public class PNGFile : IDisposable
         if (fileStream.Length < 57)
             return false; // Ignore files smaller than the absolute minimum size any PNG file could theoretically be (Signature + IHDR + IDAT + IEND)
 
+        fileStream.Seek(0, SeekOrigin.Begin);
         var signature = new byte[8];
         if (fileStream.Read(signature, 0, 8) < 8) return false;
 

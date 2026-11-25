@@ -1,5 +1,7 @@
-import { cloudFetch } from '../../../ipc-web/apiClient.js';
-import { bootstrapCache } from '../../../ipc-web/bootstrapCache.js';
+import { cloudFetch, onCloudUnauthorized } from '../../../ipc-web/apiClient.js';
+import { bootstrapCache, scheduleStoragePatch } from '../../../ipc-web/bootstrapCache.js';
+import { AppDebug } from '../../appConfig.js';
+import { applyBoopLegacyHandling } from '../../../shared/utils/notificationTransforms.js';
 
 /**
  * Pure stateless cloud implementation of VRCX's `database` repository contract.
@@ -7,6 +9,91 @@ import { bootstrapCache } from '../../../ipc-web/bootstrapCache.js';
  */
 const sessionWorldCache = new Map();
 const sessionAvatarCache = new Map();
+const WORLD_META_CACHE_STORAGE_KEY = 'cloud:worldMetaCache';
+const AVATAR_META_CACHE_STORAGE_KEY = 'cloud:avatarMetaCache';
+const MAX_PERSISTED_META_CACHE = 80;
+let worldMetaHydrated = false;
+let avatarMetaHydrated = false;
+
+function compactWorldMeta(entry) {
+    return {
+        id: String(entry.id || ''),
+        name: String(entry.name || ''),
+        authorId: String(entry.authorId || ''),
+        authorName: String(entry.authorName || ''),
+        description: typeof entry.description === 'string' ? entry.description.slice(0, 120) : '',
+        thumbnailImageUrl: String(entry.thumbnailImageUrl || ''),
+        imageUrl: String(entry.imageUrl || ''),
+        releaseStatus: String(entry.releaseStatus || 'public'),
+        tags: Array.isArray(entry.tags) ? entry.tags.slice(0, 8) : [],
+        capacity: Number(entry.capacity || 0),
+        visits: Number(entry.visits || 0),
+        favorites: Number(entry.favorites || 0),
+        created_at: String(entry.created_at || ''),
+        updated_at: String(entry.updated_at || '')
+    };
+}
+
+function compactAvatarMeta(entry) {
+    return {
+        id: String(entry.id || ''),
+        name: String(entry.name || ''),
+        authorId: String(entry.authorId || ''),
+        authorName: String(entry.authorName || ''),
+        description: typeof entry.description === 'string' ? entry.description.slice(0, 120) : '',
+        thumbnailImageUrl: String(entry.thumbnailImageUrl || ''),
+        imageUrl: String(entry.imageUrl || ''),
+        releaseStatus: String(entry.releaseStatus || 'public'),
+        created_at: String(entry.created_at || ''),
+        updated_at: String(entry.updated_at || '')
+    };
+}
+
+function hydrateWorldMetaCache() {
+    if (worldMetaHydrated) return;
+    worldMetaHydrated = true;
+    const raw = bootstrapCache.storage?.[WORLD_META_CACHE_STORAGE_KEY];
+    if (typeof raw !== 'string' || !raw) return;
+    try {
+        const parsed = JSON.parse(raw);
+        if (!Array.isArray(parsed)) return;
+        for (const item of parsed) {
+            if (item && typeof item === 'object' && item.id && !sessionWorldCache.has(item.id)) {
+                sessionWorldCache.set(item.id, item);
+            }
+        }
+    } catch {
+        // Ignore corrupt persisted world cache
+    }
+}
+
+function hydrateAvatarMetaCache() {
+    if (avatarMetaHydrated) return;
+    avatarMetaHydrated = true;
+    const raw = bootstrapCache.storage?.[AVATAR_META_CACHE_STORAGE_KEY];
+    if (typeof raw !== 'string' || !raw) return;
+    try {
+        const parsed = JSON.parse(raw);
+        if (!Array.isArray(parsed)) return;
+        for (const item of parsed) {
+            if (item && typeof item === 'object' && item.id && !sessionAvatarCache.has(item.id)) {
+                sessionAvatarCache.set(item.id, item);
+            }
+        }
+    } catch {
+        // Ignore corrupt persisted avatar cache
+    }
+}
+
+function persistWorldMetaCache() {
+    const entries = Array.from(sessionWorldCache.values()).slice(-MAX_PERSISTED_META_CACHE).map(compactWorldMeta);
+    scheduleStoragePatch(WORLD_META_CACHE_STORAGE_KEY, JSON.stringify(entries));
+}
+
+function persistAvatarMetaCache() {
+    const entries = Array.from(sessionAvatarCache.values()).slice(-MAX_PERSISTED_META_CACHE).map(compactAvatarMeta);
+    scheduleStoragePatch(AVATAR_META_CACHE_STORAGE_KEY, JSON.stringify(entries));
+}
 const sessionMutualGraph = {
     friends: new Set(),
     links: new Map(),
@@ -14,6 +101,10 @@ const sessionMutualGraph = {
 };
 const sessionActivitySyncState = new Map();
 const sessionActivityBuckets = new Map();
+const failedActivitySessionSyncUsers = new Set();
+const ACTIVITY_SYNC_STATE_STORAGE_KEY = 'cloud:activitySyncStateV2';
+const MAX_PERSISTED_ACTIVITY_SYNC_STATES = 30;
+let activitySyncStateHydrated = false;
 
 /** @type {Record<string, any>[]} */
 let pendingFeedBatch = [];
@@ -21,6 +112,68 @@ let pendingFeedBatch = [];
 let feedFlushTimer = null;
 let suppressFeedWriteDepth = 0;
 let suppressGameLogWriteDepth = 0;
+/** @type {{ rowId: number; createdAt: string; type: string } | null} */
+let activeCloudGameLogRowMeta = null;
+let syntheticTempRowId = 0;
+
+function allocateSyntheticTempRowId() {
+    syntheticTempRowId += 1;
+    return -syntheticTempRowId;
+}
+
+function hydrateActivitySyncStateFromBootstrap() {
+    if (activitySyncStateHydrated) return;
+    activitySyncStateHydrated = true;
+    const raw = bootstrapCache.storage?.[ACTIVITY_SYNC_STATE_STORAGE_KEY];
+    if (typeof raw !== 'string' || !raw) return;
+    try {
+        const parsed = JSON.parse(raw);
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return;
+        for (const [uid, entry] of Object.entries(parsed)) {
+            if (!uid || !entry || typeof entry !== 'object') continue;
+            if (!sessionActivitySyncState.has(uid)) {
+                sessionActivitySyncState.set(uid, { ...entry, userId: uid });
+            }
+        }
+    } catch {
+        // Ignore corrupt persisted sync state
+    }
+}
+
+function serializePersistedActivitySyncStates() {
+    /** @type {Record<string, Record<string, any>>} */
+    const compact = {};
+    const entries = Array.from(sessionActivitySyncState.entries())
+        .filter(([uid]) => !failedActivitySessionSyncUsers.has(uid))
+        .slice(-MAX_PERSISTED_ACTIVITY_SYNC_STATES);
+    for (const [uid, state] of entries) {
+        if (!uid || !state || typeof state !== 'object') continue;
+        compact[uid] = {
+            userId: uid,
+            updatedAt: state.updatedAt ?? 0,
+            sourceLastCreatedAt: state.sourceLastCreatedAt ?? '',
+            pendingSessionStartAt: state.pendingSessionStartAt ?? null,
+            cachedRangeDays: state.cachedRangeDays ?? 0,
+            lastSourceType: state.lastSourceType ?? ''
+        };
+    }
+    return JSON.stringify(compact);
+}
+
+function scheduleActivitySyncStatePersist() {
+    // Route through bootstrapCache.scheduleStoragePatch so all vrcx_storage mutations coalesce
+    // into a single authenticated, retryable PUT /api/config/bundle and single pagehide flush.
+    scheduleStoragePatch(ACTIVITY_SYNC_STATE_STORAGE_KEY, serializePersistedActivitySyncStates());
+}
+
+/**
+ * Clears in-memory Activity V2 sync state cache (invoked on VRCXStorage.Clear() and logout).
+ */
+export function clearCloudActivitySyncStateCache() {
+    sessionActivitySyncState.clear();
+    failedActivitySessionSyncUsers.clear();
+    activitySyncStateHydrated = false;
+}
 
 /**
  * Suppresses redundant client-side Feed DB writes while applying server-authoritative
@@ -32,12 +185,69 @@ export function setSuppressCloudFeedWrites(active) {
 }
 
 /**
- * Suppresses redundant client-side GameLog DB writes while applying real-time WS
- * `gamelog.batch` events that the Windows Agent has already persisted to DB_GAMELOG.
- * @param {boolean} active
+ * Returns whether server-authoritative Cloud RSS Feed write suppression is currently active.
+ * Async callers should capture this synchronously before any `await`.
+ * @returns {boolean}
  */
-export function setSuppressCloudGameLogWrites(active) {
-    suppressGameLogWriteDepth = Math.max(0, suppressGameLogWriteDepth + (active ? 1 : -1));
+export function isCloudFeedWriteSuppressed() {
+    return suppressFeedWriteDepth > 0;
+}
+
+/**
+ * Binds the server-assigned D1 rowId metadata for the currently executing serialized WS GameLog event.
+ * @param {{ rowId: number; createdAt?: string; type?: string } | null} meta
+ */
+export function setActiveCloudGameLogRowMeta(meta) {
+    if (meta && Number(meta.rowId) > 0) {
+        activeCloudGameLogRowMeta = {
+            rowId: Math.floor(Number(meta.rowId)),
+            createdAt: typeof meta.createdAt === 'string' ? meta.createdAt : '',
+            type: typeof meta.type === 'string' ? meta.type : ''
+        };
+    } else {
+        activeCloudGameLogRowMeta = null;
+    }
+}
+
+export function clearActiveCloudGameLogRowMeta() {
+    activeCloudGameLogRowMeta = null;
+}
+
+/**
+ * Suppresses redundant client-side GameLog DB writes while applying real-time WS
+ * `gamelog.batch` events or local game-stop resets.
+ * @param {boolean} active
+ * @param {number} [serverRowId]
+ */
+export function setSuppressCloudGameLogWrites(active, serverRowId = 0) {
+    if (active) {
+        suppressGameLogWriteDepth += 1;
+        if (Number(serverRowId) > 0) {
+            setActiveCloudGameLogRowMeta({ rowId: Number(serverRowId) });
+        }
+    } else {
+        suppressGameLogWriteDepth = Math.max(0, suppressGameLogWriteDepth - 1);
+        if (suppressGameLogWriteDepth === 0) {
+            activeCloudGameLogRowMeta = null;
+        }
+    }
+}
+
+function resolveSuppressedGameLogRowId(entry, expectedType = '') {
+    if (Number(entry?.rowId) > 0) {
+        return Math.floor(Number(entry.rowId));
+    }
+    if (activeCloudGameLogRowMeta && activeCloudGameLogRowMeta.rowId > 0) {
+        const meta = activeCloudGameLogRowMeta;
+        const entryType = expectedType || String(entry?.type || '');
+        const matchesCreatedAt = !meta.createdAt || !entry?.created_at || entry.created_at === meta.createdAt;
+        const matchesType = !meta.type || !entryType || entryType === meta.type;
+        if (matchesCreatedAt && matchesType) {
+            activeCloudGameLogRowMeta = null;
+            return meta.rowId;
+        }
+    }
+    return allocateSyntheticTempRowId();
 }
 
 /**
@@ -47,11 +257,17 @@ export function setSuppressCloudGameLogWrites(active) {
 export function resetCloudDatabaseState() {
     sessionWorldCache.clear();
     sessionAvatarCache.clear();
+    worldMetaHydrated = false;
+    avatarMetaHydrated = false;
     sessionMutualGraph.friends.clear();
     sessionMutualGraph.links.clear();
     sessionMutualGraph.meta.clear();
     sessionActivitySyncState.clear();
     sessionActivityBuckets.clear();
+    failedActivitySessionSyncUsers.clear();
+    activitySyncStateHydrated = false;
+    suppressGameLogWriteDepth = 0;
+    activeCloudGameLogRowMeta = null;
     worldStatsCache.clear();
     worldStatsInflight.clear();
     userStatsCache.clear();
@@ -80,6 +296,40 @@ export function resetCloudDatabaseState() {
     }
     pendingNotificationsV1.clear();
     pendingNotificationsV2.clear();
+    lastTableSizesFetchedAt = 0;
+    tableSizesInflight = null;
+}
+
+onCloudUnauthorized(resetCloudDatabaseState);
+
+const TABLE_SIZES_REFRESH_COOLDOWN_MS = 3_000;
+let lastTableSizesFetchedAt = 0;
+/** @type {Promise<Record<string, number> | null> | null} */
+let tableSizesInflight = null;
+
+async function refreshTableSizesIfStale() {
+    const now = Date.now();
+    if (now - lastTableSizesFetchedAt < TABLE_SIZES_REFRESH_COOLDOWN_MS) {
+        return bootstrapCache.statsCounters;
+    }
+    if (!tableSizesInflight) {
+        tableSizesInflight = cloudFetch('/api/stats/table-sizes')
+            .then((res) => {
+                if (res && typeof res.sizes === 'object' && res.sizes) {
+                    bootstrapCache.statsCounters = {
+                        ...bootstrapCache.statsCounters,
+                        ...res.sizes
+                    };
+                    lastTableSizesFetchedAt = Date.now();
+                }
+                return bootstrapCache.statsCounters;
+            })
+            .catch(() => bootstrapCache.statsCounters)
+            .finally(() => {
+                tableSizesInflight = null;
+            });
+    }
+    return tableSizesInflight;
 }
 
 /** @type {Map<string, Record<string, any>>} */
@@ -382,49 +632,65 @@ export function createCloudDatabase(dbVars) {
         // ===== tableSize (reads stats_counters in DB_CORE, zero COUNT(*) full scans) =====
         async getMaxFriendLogNumber() {
             const res = await cloudFetch('/api/stats/table-sizes').catch(() => ({ maxFriendLogNumber: 0 }));
+            if (res && typeof res.sizes === 'object' && res.sizes) {
+                bootstrapCache.statsCounters = { ...bootstrapCache.statsCounters, ...res.sizes };
+                lastTableSizesFetchedAt = Date.now();
+            }
             return res.maxFriendLogNumber || 0;
         },
         async getGpsTableSize() {
-            return bootstrapCache.statsCounters.feed_gps ?? 0;
+            const sizes = (await refreshTableSizesIfStale()) || bootstrapCache.statsCounters;
+            return sizes.feed_gps ?? 0;
         },
         async getStatusTableSize() {
-            return bootstrapCache.statsCounters.feed_status ?? 0;
+            const sizes = (await refreshTableSizesIfStale()) || bootstrapCache.statsCounters;
+            return sizes.feed_status ?? 0;
         },
         async getBioTableSize() {
-            return bootstrapCache.statsCounters.feed_bio ?? 0;
+            const sizes = (await refreshTableSizesIfStale()) || bootstrapCache.statsCounters;
+            return sizes.feed_bio ?? 0;
         },
         async getAvatarTableSize() {
             return 0;
         },
         async getOnlineOfflineTableSize() {
-            return bootstrapCache.statsCounters.feed_online_offline ?? 0;
+            const sizes = (await refreshTableSizesIfStale()) || bootstrapCache.statsCounters;
+            return sizes.feed_online_offline ?? 0;
         },
         async getFriendLogHistoryTableSize() {
-            return bootstrapCache.statsCounters.friend_log_history ?? 0;
+            const sizes = (await refreshTableSizesIfStale()) || bootstrapCache.statsCounters;
+            return sizes.friend_log_history ?? 0;
         },
         async getNotificationTableSize() {
-            return bootstrapCache.statsCounters.notifications ?? 0;
+            const sizes = (await refreshTableSizesIfStale()) || bootstrapCache.statsCounters;
+            return sizes.notifications ?? 0;
         },
         async getLocationTableSize() {
-            return bootstrapCache.statsCounters.gamelog_location ?? 0;
+            const sizes = (await refreshTableSizesIfStale()) || bootstrapCache.statsCounters;
+            return sizes.gamelog_location ?? 0;
         },
         async getJoinLeaveTableSize() {
-            return bootstrapCache.statsCounters.gamelog_join_leave ?? 0;
+            const sizes = (await refreshTableSizesIfStale()) || bootstrapCache.statsCounters;
+            return sizes.gamelog_join_leave ?? 0;
         },
         async getPortalSpawnTableSize() {
-            return bootstrapCache.statsCounters.gamelog_portal_spawn ?? 0;
+            const sizes = (await refreshTableSizesIfStale()) || bootstrapCache.statsCounters;
+            return sizes.gamelog_portal_spawn ?? 0;
         },
         async getVideoPlayTableSize() {
-            return bootstrapCache.statsCounters.gamelog_video_play ?? 0;
+            const sizes = (await refreshTableSizesIfStale()) || bootstrapCache.statsCounters;
+            return sizes.gamelog_video_play ?? 0;
         },
         async getResourceLoadTableSize() {
             return 0;
         },
         async getEventTableSize() {
-            return bootstrapCache.statsCounters.gamelog_event ?? 0;
+            const sizes = (await refreshTableSizesIfStale()) || bootstrapCache.statsCounters;
+            return sizes.gamelog_event ?? 0;
         },
         async getExternalTableSize() {
-            return bootstrapCache.statsCounters.gamelog_external ?? 0;
+            const sizes = (await refreshTableSizesIfStale()) || bootstrapCache.statsCounters;
+            return sizes.gamelog_external ?? 0;
         },
 
         // ===== memos & notes =====
@@ -555,17 +821,31 @@ export function createCloudDatabase(dbVars) {
             }));
         },
 
-        // ===== worldFavorites & session world cache (never written to D1) =====
+        // ===== worldFavorites & compacted persistent world metadata cache (bounded LRU in vrcx_storage) =====
         async addWorldToCache(entry) {
-            if (entry?.id) sessionWorldCache.set(entry.id, { ...entry });
+            hydrateWorldMetaCache();
+            if (!entry?.id) return;
+            sessionWorldCache.delete(entry.id);
+            sessionWorldCache.set(entry.id, { ...entry });
+            while (sessionWorldCache.size > MAX_PERSISTED_META_CACHE) {
+                const oldestKey = sessionWorldCache.keys().next().value;
+                if (oldestKey === undefined) break;
+                sessionWorldCache.delete(oldestKey);
+            }
+            persistWorldMetaCache();
         },
         async removeWorldFromCache(worldId) {
-            sessionWorldCache.delete(worldId);
+            hydrateWorldMetaCache();
+            if (sessionWorldCache.delete(worldId)) {
+                persistWorldMetaCache();
+            }
         },
         async getWorldCache() {
+            hydrateWorldMetaCache();
             return Array.from(sessionWorldCache.values());
         },
         async getCachedWorldById(id) {
+            hydrateWorldMetaCache();
             return sessionWorldCache.get(id) || null;
         },
         async addWorldToFavorites(worldId, groupName) {
@@ -613,17 +893,31 @@ export function createCloudDatabase(dbVars) {
             }));
         },
 
-        // ===== avatarFavorites, avatarHistory & session avatar cache =====
+        // ===== avatarFavorites, avatarHistory & compacted persistent avatar metadata cache =====
         async addAvatarToCache(entry) {
-            if (entry?.id) sessionAvatarCache.set(entry.id, { ...entry });
+            hydrateAvatarMetaCache();
+            if (!entry?.id) return;
+            sessionAvatarCache.delete(entry.id);
+            sessionAvatarCache.set(entry.id, { ...entry });
+            while (sessionAvatarCache.size > MAX_PERSISTED_META_CACHE) {
+                const oldestKey = sessionAvatarCache.keys().next().value;
+                if (oldestKey === undefined) break;
+                sessionAvatarCache.delete(oldestKey);
+            }
+            persistAvatarMetaCache();
         },
         async removeAvatarFromCache(avatarId) {
-            sessionAvatarCache.delete(avatarId);
+            hydrateAvatarMetaCache();
+            if (sessionAvatarCache.delete(avatarId)) {
+                persistAvatarMetaCache();
+            }
         },
         async getAvatarCache() {
+            hydrateAvatarMetaCache();
             return Array.from(sessionAvatarCache.values());
         },
         async getCachedAvatarById(id) {
+            hydrateAvatarMetaCache();
             return sessionAvatarCache.get(id) || null;
         },
         async addAvatarToHistory(avatarId) {
@@ -636,6 +930,7 @@ export function createCloudDatabase(dbVars) {
             }).catch(() => {});
         },
         async getAvatarHistory(currentUserId = '', limit = 100) {
+            hydrateAvatarMetaCache();
             const rows = await cloudFetch(`/api/avatar-history?limit=${Math.min(limit, 200)}`).catch(() => []);
             if (!Array.isArray(rows)) return [];
             const out = [];
@@ -643,38 +938,43 @@ export function createCloudDatabase(dbVars) {
                 const id = String(r.avatar_id || r.id || '').trim();
                 if (!id) continue;
                 const cached = sessionAvatarCache.get(id);
-                if (currentUserId && cached?.authorId && cached.authorId === currentUserId) {
+                // Avoid returning synthetic blank-authorId stubs that would overwrite avatarStore.cachedAvatars
+                // or bypass the currentUserId own-avatar filter.
+                if (!cached) {
+                    continue;
+                }
+                if (currentUserId && cached.authorId && cached.authorId === currentUserId) {
                     continue;
                 }
                 out.push({
-                    ...(cached || {}),
+                    ...cached,
                     id,
                     avatarId: id,
-                    authorId: cached?.authorId || '',
-                    authorName: cached?.authorName || '',
-                    name: cached?.name || id,
-                    description: cached?.description || '',
-                    imageUrl: cached?.imageUrl || '',
-                    thumbnailImageUrl: cached?.thumbnailImageUrl || '',
-                    releaseStatus: cached?.releaseStatus || 'public',
-                    created_at: r.created_at || cached?.created_at || '',
+                    created_at: r.created_at || cached.created_at || '',
                     time: Number(r.time) || 0
                 });
             }
             return out;
         },
         async getAvatarTimeSpent(avatarId) {
-            const rows = await this.getAvatarHistory('', 200);
-            const found = rows.find((r) => r.id === avatarId || r.avatarId === avatarId);
+            const rows = await cloudFetch('/api/avatar-history?limit=200').catch(() => []);
+            const found = Array.isArray(rows)
+                ? rows.find((r) => String(r.avatar_id || r.id || '').trim() === avatarId)
+                : null;
             return {
-                timeSpent: found ? found.time : 0,
+                timeSpent: found ? Number(found.time) || 0 : 0,
                 avatarId
             };
         },
         async getAllAvatarTimeSpent() {
-            const rows = await this.getAvatarHistory('', 200);
+            const rows = await cloudFetch('/api/avatar-history?limit=200').catch(() => []);
             const map = new Map();
-            for (const r of rows) map.set(r.id || r.avatarId, r.time);
+            if (Array.isArray(rows)) {
+                for (const r of rows) {
+                    const id = String(r.avatar_id || r.id || '').trim();
+                    if (id) map.set(id, Number(r.time) || 0);
+                }
+            }
             return map;
         },
         async clearAvatarHistory() {
@@ -855,6 +1155,7 @@ export function createCloudDatabase(dbVars) {
             queueUserProfileWrite(next);
         },
         async deleteUserProfile(userId) {
+            pendingUserProfiles.delete(userId);
             bootstrapCache.userProfiles.delete(userId);
             await cloudFetch(`/api/user-profiles?userId=${encodeURIComponent(userId)}`, { method: 'DELETE' });
         },
@@ -893,6 +1194,7 @@ export function createCloudDatabase(dbVars) {
             }
         },
         async deleteFriendLogCurrent(userId) {
+            pendingFriendLogCurrent.delete(userId);
             await cloudFetch(`/api/friend-log/current?userId=${encodeURIComponent(userId)}`, { method: 'DELETE' });
         },
         async getFriendLogHistory() {
@@ -913,6 +1215,7 @@ export function createCloudDatabase(dbVars) {
             await this.addFriendLogHistoryArray([entry]);
         },
         async addFriendLogHistoryArray(inputData) {
+            if (suppressFeedWriteDepth > 0) return;
             const entries = (inputData || []).map((e) => ({
                 created_at: e.created_at || new Date().toISOString(),
                 type: e.type,
@@ -955,6 +1258,13 @@ export function createCloudDatabase(dbVars) {
         async deleteFriendLogHistory(entry) {
             if (entry?.rowId) {
                 await cloudFetch(`/api/friend-log/history?rowId=${entry.rowId}`, { method: 'DELETE' });
+            } else if (entry?.created_at && entry?.type && entry?.userId) {
+                const params = new URLSearchParams({
+                    createdAt: String(entry.created_at),
+                    type: String(entry.type),
+                    userId: String(entry.userId)
+                });
+                await cloudFetch(`/api/friend-log/history?${params.toString()}`, { method: 'DELETE' });
             }
         },
 
@@ -1016,9 +1326,16 @@ export function createCloudDatabase(dbVars) {
             queueNotificationWrite(1, entry);
         },
         async deleteNotification(rowId) {
+            pendingNotificationsV1.delete(String(rowId));
             await cloudFetch(`/api/notifications?v=1&id=${encodeURIComponent(rowId)}`, { method: 'DELETE' });
         },
         async updateNotificationExpired(entry) {
+            const key = String(entry?.id || '');
+            const queued = key ? pendingNotificationsV1.get(key) : undefined;
+            if (queued) {
+                queued.$isExpired = true;
+                return;
+            }
             await cloudFetch('/api/notifications', {
                 method: 'PATCH',
                 json: { version: 1, id: entry.id, expired: true }
@@ -1040,7 +1357,7 @@ export function createCloudDatabase(dbVars) {
             return rows.map((r) => {
                 const createdAt = r.created_at || r.createdAt || '';
                 const parsedResponses = parseJson(r.responses, []);
-                return {
+                const item = {
                     id: r.id || '',
                     createdAt,
                     created_at: createdAt,
@@ -1060,21 +1377,39 @@ export function createCloudDatabase(dbVars) {
                     details: parseJson(r.details, {}),
                     version: 2
                 };
+                if (item.type === 'boop' && item.title && item.details?.emojiId) {
+                    applyBoopLegacyHandling(item, AppDebug.endpointDomain);
+                }
+                return item;
             });
         },
         async addNotificationV2ToDatabase(entry) {
             queueNotificationWrite(2, entry);
         },
         async expireNotificationV2(id) {
+            const key = String(id || '');
+            const queued = key ? pendingNotificationsV2.get(key) : undefined;
+            if (queued) {
+                queued.seen = true;
+                queued.expiresAt = new Date().toISOString();
+                return;
+            }
             await cloudFetch('/api/notifications', {
                 method: 'PATCH',
                 json: { version: 2, id, expired: true, seen: true }
             });
         },
         async seenNotificationV2(id) {
+            const key = String(id || '');
+            const queued = key ? pendingNotificationsV2.get(key) : undefined;
+            if (queued) {
+                queued.seen = true;
+                return;
+            }
             await cloudFetch('/api/notifications', { method: 'PATCH', json: { version: 2, id, seen: true } });
         },
         async deleteNotificationV2(id) {
+            pendingNotificationsV2.delete(String(id));
             await cloudFetch(`/api/notifications?v=2&id=${encodeURIComponent(id)}`, { method: 'DELETE' });
         },
 
@@ -1104,11 +1439,17 @@ export function createCloudDatabase(dbVars) {
             const q = String(search || '').trim();
             if (!q) return this.lookupGameLogDatabase(filters, vipList, maxEntries);
             if (q.startsWith('wrld_') || q.startsWith('grp_')) {
-                return this.getGameLogByLocation(q, filters, vipList);
+                return this.getGameLogByLocation(q, filters, vipList, { excludeSelf: true });
             }
-            const data = await cloudFetch(
-                `/api/gamelog/search?q=${encodeURIComponent(q)}&limit=${Math.min(maxEntries || 50, 100)}`
-            ).catch(() => null);
+            const selfUserId = String(dbVars?.userId || '').trim();
+            const searchParams = new URLSearchParams({
+                q,
+                limit: String(Math.min(maxEntries || 50, 100))
+            });
+            if (selfUserId) {
+                searchParams.set('excludeUserId', selfUserId);
+            }
+            const data = await cloudFetch(`/api/gamelog/search?${searchParams.toString()}`).catch(() => null);
             if (!data) return [];
             const merged = [
                 ...(data.locationRows || []).map((r) => ({
@@ -1129,27 +1470,80 @@ export function createCloudDatabase(dbVars) {
                     location: r.location,
                     userId: r.user_id,
                     time: r.time
+                })),
+                ...(data.videoPlayRows || []).map((r) => ({
+                    rowId: r.id,
+                    created_at: r.created_at,
+                    type: 'VideoPlay',
+                    videoUrl: r.video_url,
+                    videoName: r.video_name,
+                    videoId: r.video_id,
+                    location: r.location,
+                    displayName: r.display_name,
+                    userId: r.user_id
+                })),
+                ...(data.eventRows || []).map((r) => ({
+                    rowId: r.id,
+                    created_at: r.created_at,
+                    type: 'Event',
+                    data: r.data
+                })),
+                ...(data.portalSpawnRows || []).map((r) => ({
+                    rowId: r.id,
+                    created_at: r.created_at,
+                    type: 'PortalSpawn',
+                    displayName: r.display_name,
+                    location: r.location,
+                    userId: r.user_id,
+                    instanceId: r.instance_id,
+                    worldName: r.world_name
+                })),
+                ...(data.externalRows || []).map((r) => ({
+                    rowId: r.id,
+                    created_at: r.created_at,
+                    type: 'External',
+                    message: r.message,
+                    displayName: r.display_name,
+                    userId: r.user_id,
+                    location: r.location
                 }))
             ];
             merged.sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || '')));
             const vipSet = Array.isArray(vipList) && vipList.length > 0 ? new Set(vipList) : null;
             return merged.filter((r) => {
+                if (
+                    selfUserId &&
+                    (r.type === 'OnPlayerJoined' || r.type === 'OnPlayerLeft') &&
+                    r.userId === selfUserId
+                ) {
+                    return false;
+                }
                 if (Array.isArray(filters) && filters.length > 0 && !filters.includes(r.type)) {
                     return false;
                 }
-                if (vipSet && r.type !== 'Location' && (!r.userId || !vipSet.has(r.userId))) {
+                if (vipSet && r.type !== 'Location' && r.type !== 'Event' && (!r.userId || !vipSet.has(r.userId))) {
                     return false;
                 }
                 return true;
             });
         },
-        async getGameLogByLocation(instanceId, filters, vipList) {
-            const rows = await cloudFetch(`/api/gamelog/by-location?location=${encodeURIComponent(instanceId)}`).catch(
-                () => []
-            );
+        async getGameLogByLocation(instanceId, filters, vipList, options = {}) {
+            const selfUserId = options?.excludeSelf ? String(dbVars?.userId || '').trim() : '';
+            const params = new URLSearchParams({ location: String(instanceId || '') });
+            if (selfUserId) {
+                params.set('excludeUserId', selfUserId);
+            }
+            const rows = await cloudFetch(`/api/gamelog/by-location?${params.toString()}`).catch(() => []);
             const list = Array.isArray(rows) ? rows : [];
             const vipSet = Array.isArray(vipList) && vipList.length > 0 ? new Set(vipList) : null;
             return list.filter((r) => {
+                if (
+                    selfUserId &&
+                    (r.type === 'OnPlayerJoined' || r.type === 'OnPlayerLeft') &&
+                    r.userId === selfUserId
+                ) {
+                    return false;
+                }
                 if (Array.isArray(filters) && filters.length > 0 && !filters.includes(r.type)) {
                     return false;
                 }
@@ -1160,7 +1554,7 @@ export function createCloudDatabase(dbVars) {
             });
         },
         async addGamelogLocationToDatabase(entry) {
-            if (suppressGameLogWriteDepth > 0) return { ...entry, rowId: Date.now() };
+            if (suppressGameLogWriteDepth > 0) return { ...entry, rowId: resolveSuppressedGameLogRowId(entry, 'Location') };
             const res = await cloudFetch('/api/gamelog', {
                 method: 'POST',
                 json: { item: { ...entry, type: 'Location' } }
@@ -1175,7 +1569,7 @@ export function createCloudDatabase(dbVars) {
             }).catch(() => {});
         },
         async addGamelogJoinLeaveToDatabase(entry) {
-            if (suppressGameLogWriteDepth > 0) return { ...entry, rowId: Date.now() };
+            if (suppressGameLogWriteDepth > 0) return { ...entry, rowId: resolveSuppressedGameLogRowId(entry, entry?.type || '') };
             const res = await cloudFetch('/api/gamelog', {
                 method: 'POST',
                 json: { item: entry }
@@ -1184,12 +1578,34 @@ export function createCloudDatabase(dbVars) {
         },
         async addGamelogJoinLeaveBulk(entries) {
             if (!Array.isArray(entries) || entries.length === 0) return [];
-            if (suppressGameLogWriteDepth > 0) return entries;
-            await cloudFetch('/api/gamelog', { method: 'POST', json: { items: entries } }).catch(() => {});
-            return entries;
+            if (suppressGameLogWriteDepth > 0) {
+                return entries.map((entry) => ({
+                    ...entry,
+                    rowId: resolveSuppressedGameLogRowId(entry, entry?.type || '')
+                }));
+            }
+            // Server accepts at most 100 items per POST /api/gamelog; chunk and preserve returned rowIds.
+            const CHUNK_SIZE = 100;
+            const persisted = [];
+            for (let i = 0; i < entries.length; i += CHUNK_SIZE) {
+                const chunk = entries.slice(i, i + CHUNK_SIZE);
+                const res = await cloudFetch('/api/gamelog', {
+                    method: 'POST',
+                    json: { items: chunk }
+                }).catch(() => null);
+                const rowIds = Array.isArray(res?.rowIds) ? res.rowIds : [];
+                for (let j = 0; j < chunk.length; j += 1) {
+                    const id = Number(rowIds[j]);
+                    persisted.push({
+                        ...chunk[j],
+                        rowId: Number.isFinite(id) && id > 0 ? Math.floor(id) : allocateSyntheticTempRowId()
+                    });
+                }
+            }
+            return persisted;
         },
         async addGamelogPortalSpawnToDatabase(entry) {
-            if (suppressGameLogWriteDepth > 0) return { ...entry, rowId: Date.now() };
+            if (suppressGameLogWriteDepth > 0) return { ...entry, rowId: resolveSuppressedGameLogRowId(entry, 'PortalSpawn') };
             const res = await cloudFetch('/api/gamelog', {
                 method: 'POST',
                 json: { item: { ...entry, type: 'PortalSpawn' } }
@@ -1197,7 +1613,7 @@ export function createCloudDatabase(dbVars) {
             return res?.lastRowId ? { ...entry, rowId: res.lastRowId } : undefined;
         },
         async addGamelogVideoPlayToDatabase(entry) {
-            if (suppressGameLogWriteDepth > 0) return { ...entry, rowId: Date.now() };
+            if (suppressGameLogWriteDepth > 0) return { ...entry, rowId: resolveSuppressedGameLogRowId(entry, 'VideoPlay') };
             const res = await cloudFetch('/api/gamelog', {
                 method: 'POST',
                 json: { item: { ...entry, type: 'VideoPlay' } }
@@ -1205,13 +1621,18 @@ export function createCloudDatabase(dbVars) {
             return res?.lastRowId ? { ...entry, rowId: res.lastRowId } : undefined;
         },
         async updateGamelogVideoPlayName(rowIdOrEntry, videoName) {
-            const payload =
+            if (suppressGameLogWriteDepth > 0) return;
+            const rawPayload =
                 rowIdOrEntry && typeof rowIdOrEntry === 'object'
                     ? { op: 'update_video_name', ...rowIdOrEntry }
                     : { op: 'update_video_name', rowId: rowIdOrEntry, videoName: videoName ?? '' };
+            // Strip synthetic negative rowIds so the server falls back to matching by videoUrl instead of id = -1.
+            if (Number(rawPayload.rowId) <= 0) {
+                delete rawPayload.rowId;
+            }
             await cloudFetch('/api/gamelog', {
                 method: 'PATCH',
-                json: payload
+                json: rawPayload
             }).catch(() => {});
         },
         async addGamelogResourceLoadToDatabase() {
@@ -1219,7 +1640,7 @@ export function createCloudDatabase(dbVars) {
             return undefined;
         },
         async addGamelogEventToDatabase(entry) {
-            if (suppressGameLogWriteDepth > 0) return { ...entry, rowId: Date.now() };
+            if (suppressGameLogWriteDepth > 0) return { ...entry, rowId: resolveSuppressedGameLogRowId(entry, 'Event') };
             const res = await cloudFetch('/api/gamelog', {
                 method: 'POST',
                 json: { item: { ...entry, type: 'Event' } }
@@ -1227,18 +1648,21 @@ export function createCloudDatabase(dbVars) {
             return res?.lastRowId ? { ...entry, rowId: res.lastRowId } : undefined;
         },
         async addGamelogExternalToDatabase(entry) {
-            if (suppressGameLogWriteDepth > 0) return { ...entry, rowId: Date.now() };
+            if (suppressGameLogWriteDepth > 0) return { ...entry, rowId: resolveSuppressedGameLogRowId(entry, 'External') };
             const res = await cloudFetch('/api/gamelog', {
                 method: 'POST',
                 json: { item: { ...entry, type: 'External' } }
             }).catch(() => null);
             return res?.lastRowId ? { ...entry, rowId: res.lastRowId } : undefined;
         },
-        async getLastVisit(worldId) {
+        async getLastVisit(worldId, currentWorldMatch = false) {
             const stats = await fetchWorldStatsCached(worldId);
+            const createdAt = currentWorldMatch
+                ? stats.secondLastVisit || stats.lastVisit || ''
+                : stats.lastVisit || '';
             return {
-                created_at: stats.lastVisit || '',
-                worldId: stats.lastVisit ? worldId : ''
+                created_at: createdAt,
+                worldId: createdAt ? worldId : ''
             };
         },
         async getVisitCount(worldId) {
@@ -1305,24 +1729,34 @@ export function createCloudDatabase(dbVars) {
             }
             return data;
         },
-        async getUserStats(input) {
+        async getUserStats(input, inCurrentWorld = false) {
             const userId = typeof input === 'string' ? input : input?.id || input?.userId || '';
             const s = await fetchUserStatsCached(userId);
+            const prevNames = new Map();
+            if (Array.isArray(s.previousDisplayNames)) {
+                for (const pair of s.previousDisplayNames) {
+                    if (Array.isArray(pair) && pair[0]) {
+                        prevNames.set(String(pair[0]), String(pair[1] || ''));
+                    }
+                }
+            }
+            const lastSeen = inCurrentWorld ? s.secondLastSeen || s.lastSeen || '' : s.lastSeen || '';
             return {
                 joinCount: Number(s.joinCount) || 0,
                 timeSpent: Number(s.timeSpent) || 0,
-                lastSeen: s.lastSeen || '',
+                lastSeen,
                 userId,
-                previousDisplayNames: new Map(),
+                previousDisplayNames: prevNames,
                 instances: Array.isArray(s.instances) ? s.instances : [],
                 recentEvents: Array.isArray(s.recentEvents) ? s.recentEvents : []
             };
         },
-        async getLastSeen(input) {
+        async getLastSeen(input, inCurrentWorld = false) {
             const userId = typeof input === 'string' ? input : input?.id || input?.userId || '';
             const s = await fetchUserStatsCached(userId);
+            const createdAt = inCurrentWorld ? s.secondLastSeen || s.lastSeen || '' : s.lastSeen || '';
             return {
-                created_at: s.lastSeen || '',
+                created_at: createdAt,
                 userId
             };
         },
@@ -1465,8 +1899,11 @@ export function createCloudDatabase(dbVars) {
             }
             return entries;
         },
-        async getPreviousDisplayNamesByUserId() {
-            return new Map();
+        async getPreviousDisplayNamesByUserId(input) {
+            const userId = typeof input === 'string' ? input : input?.id || input?.userId || '';
+            if (!userId) return new Map();
+            const stats = await this.getUserStats(userId);
+            return stats.previousDisplayNames;
         },
         async getGameLogInstancesTime() {
             return new Map();
@@ -1593,11 +2030,24 @@ export function createCloudDatabase(dbVars) {
             });
         },
         async deleteGameLogEntry(input) {
-            if (input?.rowId && input?.type) {
-                await cloudFetch(`/api/gamelog?kind=${encodeURIComponent(input.type)}&rowId=${input.rowId}`, {
-                    method: 'DELETE'
-                });
+            if (!input?.type) return;
+            const params = new URLSearchParams({ kind: String(input.type) });
+            const numericId = Number(input.rowId);
+            if (Number.isFinite(numericId) && numericId > 0) {
+                params.set('rowId', String(Math.floor(numericId)));
+            } else if (input.created_at) {
+                params.set('createdAt', String(input.created_at));
+                if (input.location) params.set('location', String(input.location));
+                if (input.displayName) params.set('displayName', String(input.displayName));
+                if (input.videoUrl) params.set('videoUrl', String(input.videoUrl));
+                if (typeof input.data === 'string') params.set('data', input.data);
+                if (typeof input.message === 'string') params.set('message', input.message);
+            } else {
+                return;
             }
+            await cloudFetch(`/api/gamelog?${params.toString()}`, {
+                method: 'DELETE'
+            });
         },
         async deleteGameLogVideoPlay(input) {
             await this.deleteGameLogEntry({ ...input, type: 'VideoPlay' });
@@ -1619,16 +2069,32 @@ export function createCloudDatabase(dbVars) {
             if (!Array.isArray(locationTags) || locationTags.length === 0) {
                 return [];
             }
-            const rows = await cloudFetch('/api/gamelog/sessions/events', {
-                method: 'POST',
-                json: {
-                    locations: locationTags,
-                    afterDate: String(afterDate || ''),
-                    beforeDate: String(beforeDate || ''),
-                    selfUserId: String(dbVars.userId || '')
+            const uniqueTags = Array.from(new Set(locationTags.map((s) => String(s || '').trim()).filter(Boolean)));
+            if (uniqueTags.length === 0) {
+                return [];
+            }
+            // Server accepts at most 75 unique locations per request; chunk to prevent silent tail truncation.
+            const CHUNK_SIZE = 75;
+            const out = [];
+            for (let i = 0; i < uniqueTags.length; i += CHUNK_SIZE) {
+                const chunk = uniqueTags.slice(i, i + CHUNK_SIZE);
+                const rows = await cloudFetch('/api/gamelog/sessions/events', {
+                    method: 'POST',
+                    json: {
+                        locations: chunk,
+                        afterDate: String(afterDate || ''),
+                        beforeDate: String(beforeDate || ''),
+                        selfUserId: String(dbVars.userId || '')
+                    }
+                }).catch(() => []);
+                if (Array.isArray(rows) && rows.length > 0) {
+                    out.push(...rows);
                 }
-            }).catch(() => []);
-            return Array.isArray(rows) ? rows : [];
+            }
+            if (uniqueTags.length > CHUNK_SIZE && out.length > 1) {
+                out.sort((a, b) => String(a.created_at ?? '').localeCompare(String(b.created_at ?? '')));
+            }
+            return out;
         },
         async getSessionsLocationSegmentsByAnchor(sinceDate, limit = 30) {
             const params = new URLSearchParams({
@@ -1645,15 +2111,15 @@ export function createCloudDatabase(dbVars) {
         // ===== feed =====
         async addGPSToDatabase(entry) {
             queueFeedWrite({ ...entry, type: 'GPS' });
-            return { ...entry, rowId: Date.now() };
+            return { ...entry, rowId: allocateSyntheticTempRowId() };
         },
         async addStatusToDatabase(entry) {
             queueFeedWrite({ ...entry, type: 'Status' });
-            return { ...entry, rowId: Date.now() };
+            return { ...entry, rowId: allocateSyntheticTempRowId() };
         },
         async addBioToDatabase(entry) {
             queueFeedWrite({ ...entry, type: 'Bio' });
-            return { ...entry, rowId: Date.now() };
+            return { ...entry, rowId: allocateSyntheticTempRowId() };
         },
         async addAvatarToDatabase() {
             // Excluded from cloud D1 by default to protect 500 MB Free shard cap.
@@ -1662,11 +2128,15 @@ export function createCloudDatabase(dbVars) {
         async purgeAvatarFeedData() {},
         async addOnlineOfflineToDatabase(entry) {
             queueFeedWrite(entry);
-            return { ...entry, rowId: Date.now() };
+            return { ...entry, rowId: allocateSyntheticTempRowId() };
         },
         async lookupFeedDatabase(filters, vipList, maxEntries = 100, dateFrom = '', dateTo = '') {
             const limit = Math.min(maxEntries || 100, 100);
             const hasFilters = Array.isArray(filters) && filters.length > 0;
+            const supportedFeedTypes = new Set(['GPS', 'Status', 'Bio', 'Online', 'Offline']);
+            if (hasFilters && filters.every((t) => !supportedFeedTypes.has(t))) {
+                return [];
+            }
             const hasVip = Array.isArray(vipList) && vipList.length > 0;
             const cleanDateFrom = String(dateFrom || '').trim();
             const cleanDateTo = String(dateTo || '').trim();
@@ -1833,15 +2303,31 @@ export function createCloudDatabase(dbVars) {
             return Array.isArray(rows) ? rows : [];
         },
         async getActivitySyncStateV2(userId) {
+            hydrateActivitySyncStateFromBootstrap();
             return sessionActivitySyncState.get(userId) || null;
         },
         async upsertActivitySyncStateV2(state) {
-            if (state?.userId) sessionActivitySyncState.set(state.userId, state);
+            if (!state?.userId) return;
+            hydrateActivitySyncStateFromBootstrap();
+            const uid = String(state.userId);
+            // Refresh LRU insertion order and cap persisted sync states to keep vrcx_storage compact.
+            sessionActivitySyncState.delete(uid);
+            sessionActivitySyncState.set(uid, { ...state, userId: uid });
+            while (sessionActivitySyncState.size > MAX_PERSISTED_ACTIVITY_SYNC_STATES) {
+                const oldestKey = sessionActivitySyncState.keys().next().value;
+                if (oldestKey === undefined) break;
+                sessionActivitySyncState.delete(oldestKey);
+            }
+            // Do not persist syncState to cloud storage if the corresponding activity_sessions_v2 write failed,
+            // so the next page reload cleanly triggers a full rebuild instead of stranding an empty cache.
+            if (!failedActivitySessionSyncUsers.has(uid)) {
+                scheduleActivitySyncStatePersist();
+            }
         },
         async getActivitySessionsV2(userId) {
-            const rows = await cloudFetch(`/api/activity/sessions?userId=${encodeURIComponent(userId)}`).catch(
-                () => []
-            );
+            const rows = await cloudFetch(
+                `/api/activity/sessions?userId=${encodeURIComponent(userId)}&limit=2000`
+            ).catch(() => []);
             return (Array.isArray(rows) ? rows : []).map((r) => ({
                 start: Number(r.start_at) || 0,
                 end: Number(r.end_at) || 0,
@@ -1850,29 +2336,88 @@ export function createCloudDatabase(dbVars) {
             }));
         },
         async replaceActivitySessionsV2(userId, sessions = []) {
-            await cloudFetch('/api/activity/sessions', {
-                method: 'POST',
-                json: { userId, replace: true, sessions }
-            }).catch(() => {});
+            const uid = String(userId || '');
+            const list = Array.isArray(sessions) ? sessions : [];
+            const CHUNK_SIZE = 800;
+            if (uid) failedActivitySessionSyncUsers.delete(uid);
+            try {
+                if (list.length === 0) {
+                    await cloudFetch('/api/activity/sessions', {
+                        method: 'POST',
+                        json: { userId, replace: true, sessions: [] }
+                    });
+                    return;
+                }
+                // Abort remaining chunks immediately if chunk 0 (replace: true) or any prior chunk fails
+                // so subsequent INSERT chunks never duplicate rows on top of stale sessions.
+                for (let i = 0; i < list.length; i += CHUNK_SIZE) {
+                    await cloudFetch('/api/activity/sessions', {
+                        method: 'POST',
+                        json: {
+                            userId,
+                            replace: i === 0,
+                            sessions: list.slice(i, i + CHUNK_SIZE)
+                        }
+                    });
+                }
+            } catch {
+                // Mark failed and revoke any persisted syncState for this user so next reload rebuilds cleanly.
+                if (uid) {
+                    failedActivitySessionSyncUsers.add(uid);
+                    if (sessionActivitySyncState.has(uid)) {
+                        scheduleActivitySyncStatePersist();
+                    }
+                }
+            }
         },
         async appendActivitySessionsV2(inputOrUserId, maybeSessions) {
-            const payload =
+            const userId =
+                inputOrUserId && typeof inputOrUserId === 'object' ? inputOrUserId.userId : inputOrUserId;
+            const uid = String(userId || '');
+            const replaceFromStartAt =
                 inputOrUserId && typeof inputOrUserId === 'object'
-                    ? {
-                          userId: inputOrUserId.userId,
-                          replace: false,
-                          replaceFromStartAt: inputOrUserId.replaceFromStartAt ?? null,
-                          sessions: inputOrUserId.sessions || []
-                      }
-                    : {
-                          userId: inputOrUserId,
-                          replace: false,
-                          sessions: maybeSessions || []
-                      };
-            await cloudFetch('/api/activity/sessions', {
-                method: 'POST',
-                json: payload
-            }).catch(() => {});
+                    ? (inputOrUserId.replaceFromStartAt ?? null)
+                    : null;
+            const list =
+                inputOrUserId && typeof inputOrUserId === 'object'
+                    ? Array.isArray(inputOrUserId.sessions)
+                        ? inputOrUserId.sessions
+                        : []
+                    : Array.isArray(maybeSessions)
+                      ? maybeSessions
+                      : [];
+            const CHUNK_SIZE = 800;
+            if (uid) failedActivitySessionSyncUsers.delete(uid);
+            try {
+                if (list.length === 0) {
+                    if (replaceFromStartAt !== null) {
+                        await cloudFetch('/api/activity/sessions', {
+                            method: 'POST',
+                            json: { userId, replace: false, replaceFromStartAt, sessions: [] }
+                        });
+                    }
+                    return;
+                }
+                for (let i = 0; i < list.length; i += CHUNK_SIZE) {
+                    await cloudFetch('/api/activity/sessions', {
+                        method: 'POST',
+                        json: {
+                            userId,
+                            replace: false,
+                            ...(i === 0 && replaceFromStartAt !== null ? { replaceFromStartAt } : {}),
+                            sessions: list.slice(i, i + CHUNK_SIZE)
+                        }
+                    });
+                }
+            } catch {
+                // Non-fatal: revoke persisted syncState for this user so next reload does not skip missing sessions.
+                if (uid) {
+                    failedActivitySessionSyncUsers.add(uid);
+                    if (sessionActivitySyncState.has(uid)) {
+                        scheduleActivitySyncStatePersist();
+                    }
+                }
+            }
         },
         async getActivityBucketCacheV2(params) {
             if (!params || typeof params !== 'object') return null;

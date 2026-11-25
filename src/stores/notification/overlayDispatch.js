@@ -151,8 +151,18 @@ export function createOverlayDispatch({
         if (WINDOWS) {
             AppApi.DesktopNotification(displayName, message, image);
         } else if (typeof WEB !== 'undefined' && WEB) {
-            if (typeof Notification !== 'undefined' && Notification.permission === 'granted') {
-                new Notification(displayName || 'VRCX', { body: message, icon: image || undefined });
+            if (typeof Notification !== 'undefined') {
+                if (Notification.permission === 'granted') {
+                    new Notification(displayName || 'VRCX', { body: message, icon: image || undefined });
+                } else if (Notification.permission === 'default') {
+                    Notification.requestPermission()
+                        .then((permission) => {
+                            if (permission === 'granted') {
+                                new Notification(displayName || 'VRCX', { body: message, icon: image || undefined });
+                            }
+                        })
+                        .catch(() => {});
+                }
             }
         } else {
             window.electron.desktopNotification(displayName, message, image);

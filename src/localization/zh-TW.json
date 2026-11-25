@@ -3339,7 +3339,11 @@
         "agent_idle": "Win 伴侶待命",
         "unlock": {
             "title": "解鎖 VRCX 雲端",
+            "check_failed_desc": "無法驗證雲端登入狀態（可能是網路異常或服務端暫時不可用），請點擊重試。",
+            "retrying": "重試中...",
+            "retry_check": "重試連線",
             "cf_access_desc": "此站點受 Cloudflare Access 保護，請先透過 Access 登入後重新整理頁面。",
+            "cf_access_reload": "重新整理以透過 Cloudflare Access 登入",
             "passcode_desc": "請輸入私人雲端存取密碼。",
             "passcode_totp_desc": "請輸入私人雲端存取密碼與 6 位數動態驗證碼（TOTP）。",
             "passcode_placeholder": "雲端存取密碼",

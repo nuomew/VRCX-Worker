@@ -279,7 +279,7 @@
             </div>
         </SettingsGroup>
 
-        <SettingsGroup :title="t('view.settings.advanced.advanced.database_cleanup.header')">
+        <SettingsGroup v-if="!isWeb" :title="t('view.settings.advanced.advanced.database_cleanup.header')">
             <SettingsItem
                 :label="t('view.settings.advanced.advanced.database_cleanup.auto_cleanup')"
                 :description="t('view.settings.advanced.advanced.database_cleanup.auto_cleanup_description')">
@@ -318,6 +318,7 @@
         </SettingsGroup>
 
         <Dialog
+            v-if="!isWeb"
             :open="isPurgeDialogVisible"
             @update:open="
                 (open) => {

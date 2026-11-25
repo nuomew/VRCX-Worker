@@ -109,7 +109,8 @@ function pairCursor(leftCursor, rightCursor) {
 }
 
 export const useActivityStore = defineStore('Activity', () => {
-    const fullCacheReady = ref(false);
+    // Web mode skips the eager 10-year startup rebuild and loads arbitrary ranges on demand from /api/activity/source.
+    const fullCacheReady = ref(typeof WEB !== 'undefined' && WEB);
     let fullCacheBuildRunning = false;
     let fullCacheBuildAborted = false;
 

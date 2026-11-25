@@ -500,13 +500,13 @@
         favoriteAvatars,
         favoriteAvatarGroups,
         localAvatarFavorites,
+        localAvatarFavoritesList,
         selectedFavoriteAvatars,
         isFavoriteLoading,
         localAvatarFavoriteGroups,
         avatarImportDialogInput
     } = storeToRefs(favoriteStore);
-    const { showAvatarImportDialog, localAvatarFavGroupLength, localAvatarFavoritesList, handleFavoriteGroup } =
-        favoriteStore;
+    const { showAvatarImportDialog, localAvatarFavGroupLength, handleFavoriteGroup } = favoriteStore;
     const { avatarHistory } = storeToRefs(useAvatarStore());
     import { promptClearAvatarHistory, showAvatarDialog, applyAvatar } from '../../coordinators/avatarCoordinator';
     const { t } = useI18n();
@@ -1092,7 +1092,7 @@
         };
         refreshCancelToken.value = token;
         try {
-            for (const avatarId of localAvatarFavoritesList) {
+            for (const avatarId of localAvatarFavoritesList.value) {
                 if (token.cancelled) {
                     break;
                 }

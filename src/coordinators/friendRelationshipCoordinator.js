@@ -1,6 +1,7 @@
 import { i18n } from '../plugins/i18n';
 
 import { database } from '../services/database';
+import { isCloudFeedWriteSuppressed } from '../services/database/cloud/index.js';
 import { friendRequest, userRequest } from '../api';
 import { getNameColour } from '../shared/utils';
 import { handleFavoriteDelete } from './favoriteCoordinator';
@@ -178,6 +179,7 @@ export function updateFriendship(ref) {
 
     const { friendLogTable } = storeToRefs(friendStore);
     const { friendLog } = friendStore;
+    const suppressCloudFeed = typeof WEB !== 'undefined' && WEB && isCloudFeedWriteSuppressed();
 
     const ctx = friendLog.get(ref.id);
     if (!watchState.isFriendsLoaded || typeof ctx === 'undefined') {
@@ -191,19 +193,6 @@ export function updateFriendship(ref) {
     }
     if (ctx.displayName !== ref.displayName) {
         if (ctx.displayName) {
-            const friendLogHistoryDisplayName = {
-                created_at: new Date().toJSON(),
-                type: 'DisplayName',
-                userId: ref.id,
-                displayName: ref.displayName,
-                previousDisplayName: ctx.displayName,
-                friendNumber: ref.$friendNumber
-            };
-            // Sentry: VRCX-WEB-2A7
-            friendLogTable.value?.data.push(friendLogHistoryDisplayName);
-            database.addFriendLogHistory(friendLogHistoryDisplayName);
-            notificationStore.queueFriendLogNoty(friendLogHistoryDisplayName);
-            sharedFeedStore.addEntry(friendLogHistoryDisplayName);
             const friendLogCurrent = {
                 userId: ref.id,
                 displayName: ref.displayName,
@@ -211,9 +200,24 @@ export function updateFriendship(ref) {
                 friendNumber: ref.$friendNumber
             };
             friendLog.set(ref.id, friendLogCurrent);
-            database.setFriendLogCurrent(friendLogCurrent);
+            if (!suppressCloudFeed) {
+                const friendLogHistoryDisplayName = {
+                    created_at: new Date().toJSON(),
+                    type: 'DisplayName',
+                    userId: ref.id,
+                    displayName: ref.displayName,
+                    previousDisplayName: ctx.displayName,
+                    friendNumber: ref.$friendNumber
+                };
+                // Sentry: VRCX-WEB-2A7
+                friendLogTable.value?.data.push(friendLogHistoryDisplayName);
+                database.addFriendLogHistory(friendLogHistoryDisplayName);
+                notificationStore.queueFriendLogNoty(friendLogHistoryDisplayName);
+                sharedFeedStore.addEntry(friendLogHistoryDisplayName);
+                database.setFriendLogCurrent(friendLogCurrent);
+                uiStore.notifyMenu('friend-log');
+            }
             ctx.displayName = ref.displayName;
-            uiStore.notifyMenu('friend-log');
         }
     }
     if (ref.$trustLevel && ctx.trustLevel && ctx.trustLevel !== ref.$trustLevel) {
@@ -228,22 +232,12 @@ export function updateFriendship(ref) {
                 friendNumber: ref.$friendNumber
             };
             friendLog.set(ref.id, friendLogCurrent3);
-            database.setFriendLogCurrent(friendLogCurrent3);
+            if (!suppressCloudFeed) {
+                database.setFriendLogCurrent(friendLogCurrent3);
+            }
+            ctx.trustLevel = ref.$trustLevel;
             return;
         }
-        const friendLogHistoryTrustLevel = {
-            created_at: new Date().toJSON(),
-            type: 'TrustLevel',
-            userId: ref.id,
-            displayName: ref.displayName,
-            trustLevel: ref.$trustLevel,
-            previousTrustLevel: ctx.trustLevel,
-            friendNumber: ref.$friendNumber
-        };
-        friendLogTable.value.data.push(friendLogHistoryTrustLevel);
-        database.addFriendLogHistory(friendLogHistoryTrustLevel);
-        notificationStore.queueFriendLogNoty(friendLogHistoryTrustLevel);
-        sharedFeedStore.addEntry(friendLogHistoryTrustLevel);
         const friendLogCurrent2 = {
             userId: ref.id,
             displayName: ref.displayName,
@@ -251,8 +245,23 @@ export function updateFriendship(ref) {
             friendNumber: ref.$friendNumber
         };
         friendLog.set(ref.id, friendLogCurrent2);
-        database.setFriendLogCurrent(friendLogCurrent2);
-        uiStore.notifyMenu('friend-log');
+        if (!suppressCloudFeed) {
+            const friendLogHistoryTrustLevel = {
+                created_at: new Date().toJSON(),
+                type: 'TrustLevel',
+                userId: ref.id,
+                displayName: ref.displayName,
+                trustLevel: ref.$trustLevel,
+                previousTrustLevel: ctx.trustLevel,
+                friendNumber: ref.$friendNumber
+            };
+            friendLogTable.value.data.push(friendLogHistoryTrustLevel);
+            database.addFriendLogHistory(friendLogHistoryTrustLevel);
+            notificationStore.queueFriendLogNoty(friendLogHistoryTrustLevel);
+            sharedFeedStore.addEntry(friendLogHistoryTrustLevel);
+            database.setFriendLogCurrent(friendLogCurrent2);
+            uiStore.notifyMenu('friend-log');
+        }
     }
     ctx.trustLevel = ref.$trustLevel;
 }
@@ -292,6 +301,22 @@ export function userOnFriend(ref) {
         !friendStore.friendLog.has(ref.id) &&
         ref.id !== userStore.currentUser.id
     ) {
+        if (typeof WEB !== 'undefined' && WEB && isCloudFeedWriteSuppressed()) {
+            // During server-authoritative Cloud RSS snapshots, backgroundFeedSync already persisted
+            // the Friend log row to D1; only update local in-memory maps without firing extra VRChat API calls.
+            friendStore.addFriend(ref.id, ref.state);
+            const friendCtx = friendStore.friends.get(ref.id);
+            if (friendCtx) {
+                syncFriendSearchIndex(friendCtx);
+            }
+            friendStore.friendLog.set(ref.id, {
+                userId: ref.id,
+                displayName: ref.displayName || '',
+                trustLevel: ref.$trustLevel || '',
+                friendNumber: ref.$friendNumber || 0
+            });
+            return;
+        }
         addFriendship(ref.id);
     }
 }

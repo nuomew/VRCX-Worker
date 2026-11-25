@@ -40,7 +40,7 @@ public sealed class AgentUpdater
     public const string LatestWebRedirectUrl = "https://github.com/nuomew/VRCX-Worker/releases/latest";
 
     private static readonly Regex SemVerRegex = new(@"^v?(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$", RegexOptions.IgnoreCase | RegexOptions.Compiled);
-    private static readonly Regex TagInUrlRegex = new(@"/releases/tag/(v?\d+\.\d+\.\d+)(?:[/?#]|$)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    private static readonly Regex TagInUrlRegex = new(@"/releases/tag/(v?\d+\.\d+\.\d+)(?:[/?#""'<\s]|$)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
     private static readonly Regex SafeAssetFileNameRegex = new(@"^[A-Za-z0-9._-]+\.exe$", RegexOptions.Compiled);
     private static readonly Regex Sha256HexRegex = new(@"^[0-9a-f]{64}$", RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
@@ -366,7 +366,7 @@ public sealed class AgentUpdater
         // Remove any previously downloaded installers or stale temporary files before downloading a new version.
         CleanupOldInstallers(destinationDirectory);
         string finalPath = Path.Combine(destinationDirectory, fileName);
-        string partPath = finalPath + ".part";
+        string partPath = $"{finalPath}.{Guid.NewGuid():N}.part";
 
         HttpClient? ownedClient = _downloadHttpFactory != null ? _downloadHttpFactory() : null;
         HttpClient client = ownedClient ?? _httpProvider();

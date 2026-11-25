@@ -1,13 +1,17 @@
 <template>
     <!-- 1. Cloud Access / Passcode Unlock Overlay (only when ADMIN_PASSCODE is set and unauthenticated) -->
-    <div
-        v-if="isWeb && cloudState.initialized && !cloudState.authenticated"
-        class="fixed inset-0 z-[9999] flex items-center justify-center bg-background/95 backdrop-blur-sm p-4">
+    <Teleport to="body">
+        <div
+            v-if="isWeb && cloudState.initialized && !cloudState.authenticated"
+            class="fixed inset-0 z-[20000] flex items-center justify-center bg-background/95 backdrop-blur-sm p-4">
         <div class="w-full max-w-sm rounded-xl border border-border bg-card p-6 shadow-2xl space-y-4">
             <div class="space-y-1">
                 <h2 class="text-lg font-semibold text-foreground">{{ t('cloud_hub.unlock.title') }}</h2>
                 <p class="text-xs text-muted-foreground">
-                    <template v-if="cloudState.authMode === 'cloudflare_access'">
+                    <template v-if="cloudState.authCheckFailed">
+                        {{ t('cloud_hub.unlock.check_failed_desc') }}
+                    </template>
+                    <template v-else-if="cloudState.authMode === 'cloudflare_access'">
                         {{ t('cloud_hub.unlock.cf_access_desc') }}
                     </template>
                     <template v-else-if="cloudState.requiresTotp">
@@ -19,7 +23,29 @@
                 </p>
             </div>
 
-            <form v-if="cloudState.authMode !== 'cloudflare_access'" class="space-y-3" @submit.prevent="submitUnlock">
+            <div v-if="cloudState.authCheckFailed" class="space-y-3">
+                <p v-if="cloudState.authCheckError" class="text-xs text-destructive break-words">
+                    {{ cloudState.authCheckError }}
+                </p>
+                <button
+                    type="button"
+                    :disabled="retryingAuthCheck"
+                    class="w-full rounded-md bg-primary px-3 py-2 text-sm font-medium text-primary-foreground hover:opacity-90 disabled:opacity-50"
+                    @click="retryAuthCheck">
+                    {{ retryingAuthCheck ? t('cloud_hub.unlock.retrying') : t('cloud_hub.unlock.retry_check') }}
+                </button>
+            </div>
+
+            <div v-else-if="cloudState.authMode === 'cloudflare_access'" class="space-y-3">
+                <button
+                    type="button"
+                    class="w-full rounded-md bg-primary px-3 py-2 text-sm font-medium text-primary-foreground hover:opacity-90"
+                    @click="reloadForCloudflareAccess">
+                    {{ t('cloud_hub.unlock.cf_access_reload') }}
+                </button>
+            </div>
+
+            <form v-else class="space-y-3" @submit.prevent="submitUnlock">
                 <input
                     v-model="passcode"
                     type="password"
@@ -45,12 +71,14 @@
                 </button>
             </form>
         </div>
-    </div>
+        </div>
+    </Teleport>
 
     <!-- 2. VRCX Cloud Hub Modal (HTTP Sync, Remote Commands, Free-Tier Quota & WAF Probe) -->
-    <div
-        v-if="isWeb && cloudState.hubDialogOpen"
-        class="fixed inset-0 z-[9990] flex items-center justify-center bg-black/60 backdrop-blur-xs p-3">
+    <Teleport to="body">
+        <div
+            v-if="isWeb && cloudState.hubDialogOpen"
+            class="fixed inset-0 z-[19990] flex items-center justify-center bg-black/60 backdrop-blur-xs p-3">
         <div
             class="flex max-h-[86vh] w-full max-w-3xl flex-col overflow-hidden rounded-xl border border-border bg-card text-foreground shadow-2xl">
             <div class="flex items-center justify-between border-b border-border px-5 py-3.5">
@@ -58,14 +86,14 @@
                     <span
                         class="inline-block size-2.5 rounded-full"
                         :class="
-                            cloudState.agentsOnline.length > 0 || recentSyncedCount > 0
+                            liveOnlineAgentsCount > 0 || recentSyncedCount > 0
                                 ? 'bg-status-online'
                                 : 'bg-status-offline-alt'
                         " />
                     <h2 class="text-sm font-semibold">{{ t('cloud_hub.title') }}</h2>
                     <span class="rounded bg-muted px-2 py-0.5 text-[11px] text-muted-foreground">
-                        <template v-if="cloudState.agentsOnline.length > 0">
-                            {{ t('cloud_hub.agent_online', { count: cloudState.agentsOnline.length }) }}
+                        <template v-if="liveOnlineAgentsCount > 0">
+                            {{ t('cloud_hub.agent_online', { count: liveOnlineAgentsCount }) }}
                         </template>
                         <template v-else-if="recentSyncedCount > 0">
                             {{ t('cloud_hub.agent_synced', { count: recentSyncedCount }) }}
@@ -82,12 +110,12 @@
             </div>
 
             <!-- Tabs -->
-            <div class="flex gap-1 border-b border-border px-4 pt-2 text-xs">
+            <div class="flex gap-1 overflow-x-auto border-b border-border px-4 pt-2 text-xs">
                 <button
                     v-for="tab in tabs"
                     :key="tab.id"
                     type="button"
-                    class="rounded-t-md px-3 py-2 font-medium transition-colors"
+                    class="whitespace-nowrap shrink-0 rounded-t-md px-3 py-2 font-medium transition-colors"
                     :class="
                         activeTab === tab.id
                             ? 'border-b-2 border-primary text-foreground'
@@ -163,11 +191,15 @@
                                     class="min-w-[180px] flex-1 rounded-md border border-input bg-background px-3 py-1.5 text-xs text-foreground" />
                                 <button
                                     type="button"
-                                    class="rounded-md bg-primary px-3 py-1.5 font-medium text-primary-foreground"
+                                    class="rounded-md bg-primary px-3 py-1.5 font-medium text-primary-foreground disabled:opacity-50"
+                                    :disabled="creatingSyncSecret"
                                     @click="createSyncSecret">
                                     {{ t('cloud_hub.devices.create_secret_btn') }}
                                 </button>
                             </div>
+                            <p v-if="deviceActionError" class="text-[11px] text-destructive">
+                                {{ deviceActionError }}
+                            </p>
                         </div>
 
                         <div
@@ -240,6 +272,9 @@
                         <div class="font-medium text-foreground">
                             {{ t('cloud_hub.devices.configured_list', { count: devices.length }) }}
                         </div>
+                        <p v-if="deviceActionError" class="text-[11px] text-destructive">
+                            {{ deviceActionError }}
+                        </p>
                         <div
                             v-if="devices.length === 0"
                             class="rounded-lg border border-dashed border-border p-4 text-muted-foreground">
@@ -262,7 +297,7 @@
                                     <span class="font-mono text-[11px] text-muted-foreground">{{ dev.device_id }}</span>
                                 </div>
                                 <div class="text-muted-foreground">
-                                    v{{ dev.agent_version || '1.1.0' }} ·
+                                    v{{ dev.agent_version || '1.10.6' }} ·
                                     {{
                                         t('cloud_hub.devices.last_sync', {
                                             time: dev.last_seen_at || t('cloud_hub.devices.never_synced')
@@ -272,7 +307,8 @@
                             </div>
                             <button
                                 type="button"
-                                class="rounded border border-destructive/40 px-2.5 py-1 text-destructive hover:bg-destructive/10"
+                                class="rounded border border-destructive/40 px-2.5 py-1 text-destructive hover:bg-destructive/10 disabled:opacity-50"
+                                :disabled="revokingDeviceId === dev.device_id"
                                 @click="revokeDevice(dev.device_id)">
                                 {{ t('cloud_hub.devices.revoke') }}
                             </button>
@@ -388,15 +424,22 @@
                 </div>
             </div>
         </div>
-    </div>
+        </div>
+    </Teleport>
 </template>
 
 <script setup>
-    import { computed, ref, watch } from 'vue';
+    import { computed, onBeforeUnmount, ref, watch } from 'vue';
     import { useI18n } from 'vue-i18n';
     import { cloudFetch } from '../../ipc-web/apiClient';
-    import { loadBootstrap, saveCloudSyncIntervalSeconds } from '../../ipc-web/bootstrapCache';
-    import { applyCloudPresenceUpdate, cloudState, getAgentOnlineWindowMs } from '../../ipc-web/cloudState';
+    import { saveCloudSyncIntervalSeconds } from '../../ipc-web/bootstrapCache';
+    import { refreshCloudAuthAndBootstrap } from '../../ipc-web/index';
+    import {
+        applyCloudPresenceUpdate,
+        cloudState,
+        getAgentOnlineWindowMs,
+        getOnlineAgentIds
+    } from '../../ipc-web/cloudState';
     import { links } from '../../shared/constants/link';
 
     const { t } = useI18n();
@@ -407,6 +450,7 @@
     const totpCode = ref('');
     const unlockError = ref('');
     const unlocking = ref(false);
+    const retryingAuthCheck = ref(false);
 
     const tabs = computed(() => [
         { id: 'devices', label: t('cloud_hub.tabs.devices') },
@@ -419,6 +463,11 @@
     const newDeviceName = ref('');
     const createdSyncKey = ref('');
     const createdDeviceName = ref('');
+    const creatingSyncSecret = ref(false);
+    const revokingDeviceId = ref('');
+    const deviceActionError = ref('');
+    const nowTick = ref(Date.now());
+    let presenceTickTimer = null;
     const copiedField = ref('');
     const syncIntervalInput = ref(cloudState.syncIntervalSeconds || 60);
     const savingSyncInterval = ref(false);
@@ -454,12 +503,13 @@
         }
     }
 
+    const liveOnlineAgentsCount = computed(() => getOnlineAgentIds(nowTick.value).length);
     const recentSyncedCount = computed(() => devices.value.filter((d) => isRecentlySynced(d.last_seen_at)).length);
 
     function isRecentlySynced(lastSeenIso) {
         if (!lastSeenIso) return false;
         const ts = Date.parse(lastSeenIso);
-        return Number.isFinite(ts) && Date.now() - ts <= getAgentOnlineWindowMs();
+        return Number.isFinite(ts) && nowTick.value - ts <= getAgentOnlineWindowMs();
     }
 
     async function copyText(text, field) {
@@ -475,6 +525,23 @@
         }
     }
 
+    async function retryAuthCheck() {
+        if (retryingAuthCheck.value) return;
+        retryingAuthCheck.value = true;
+        try {
+            await refreshCloudAuthAndBootstrap();
+            if (cloudState.authenticated) {
+                window.location.reload();
+            }
+        } finally {
+            retryingAuthCheck.value = false;
+        }
+    }
+
+    function reloadForCloudflareAccess() {
+        window.location.reload();
+    }
+
     async function submitUnlock() {
         unlockError.value = '';
         unlocking.value = true;
@@ -484,9 +551,9 @@
                 json: { passcode: passcode.value, totp: totpCode.value || undefined }
             });
             cloudState.authenticated = true;
-            await loadBootstrap();
             window.location.reload();
         } catch (err) {
+            cloudState.authenticated = false;
             unlockError.value = err?.message || t('cloud_hub.unlock.failed');
         } finally {
             unlocking.value = false;
@@ -502,7 +569,10 @@
 
     async function loadDevices() {
         try {
-            const list = await cloudFetch('/api/agent/devices');
+            const [list, hubStatus] = await Promise.all([
+                cloudFetch('/api/agent/devices'),
+                cloudFetch('/api/agent/status').catch(() => null)
+            ]);
             if (!Array.isArray(list)) return;
             devices.value = list;
             const deviceLastSeen = {};
@@ -514,29 +584,55 @@
                     }
                 }
             }
-            applyCloudPresenceUpdate({ deviceLastSeen, replaceDeviceMap: true });
+            applyCloudPresenceUpdate({
+                deviceLastSeen,
+                wsAgentsOnline: Array.isArray(hubStatus?.agentsOnline) ? hubStatus.agentsOnline : undefined,
+                deviceStates:
+                    hubStatus?.deviceStates && typeof hubStatus.deviceStates === 'object'
+                        ? hubStatus.deviceStates
+                        : undefined,
+                replaceDeviceMap: true
+            });
         } catch (err) {
             console.warn('[cloud] Failed to load paired devices:', err);
         }
     }
 
     async function createSyncSecret() {
-        const name = (newDeviceName.value || '').trim() || t('cloud_hub.devices.default_device_name');
-        const data = await cloudFetch('/api/agent/sync-key', {
-            method: 'POST',
-            json: { deviceName: name }
-        });
-        createdSyncKey.value = data.syncKey;
-        createdDeviceName.value = data.deviceName || name;
-        await loadDevices();
+        if (creatingSyncSecret.value) return;
+        creatingSyncSecret.value = true;
+        deviceActionError.value = '';
+        try {
+            const name = (newDeviceName.value || '').trim() || t('cloud_hub.devices.default_device_name');
+            const data = await cloudFetch('/api/agent/sync-key', {
+                method: 'POST',
+                json: { deviceName: name }
+            });
+            createdSyncKey.value = data.syncKey;
+            createdDeviceName.value = data.deviceName || name;
+            await loadDevices();
+        } catch (err) {
+            deviceActionError.value = err?.message || String(err);
+        } finally {
+            creatingSyncSecret.value = false;
+        }
     }
 
     async function revokeDevice(deviceId) {
-        await cloudFetch(`/api/agent/devices?deviceId=${encodeURIComponent(deviceId)}`, { method: 'DELETE' });
-        delete cloudState.deviceStates[deviceId];
-        delete cloudState.deviceLastSeen[deviceId];
-        cloudState.wsAgentsOnline = cloudState.wsAgentsOnline.filter((id) => id !== deviceId);
-        await loadDevices();
+        if (!deviceId || revokingDeviceId.value) return;
+        revokingDeviceId.value = deviceId;
+        deviceActionError.value = '';
+        try {
+            await cloudFetch(`/api/agent/devices?deviceId=${encodeURIComponent(deviceId)}`, { method: 'DELETE' });
+            delete cloudState.deviceStates[deviceId];
+            delete cloudState.deviceLastSeen[deviceId];
+            cloudState.wsAgentsOnline = cloudState.wsAgentsOnline.filter((id) => id !== deviceId);
+            await loadDevices();
+        } catch (err) {
+            deviceActionError.value = err?.message || String(err);
+        } finally {
+            revokingDeviceId.value = '';
+        }
     }
 
     async function loadCommands() {
@@ -583,12 +679,35 @@
         else if (id === 'quota') loadQuota();
     }
 
+    function stopPresenceTick() {
+        if (presenceTickTimer) {
+            clearInterval(presenceTickTimer);
+            presenceTickTimer = null;
+        }
+    }
+
     watch(
         () => cloudState.hubDialogOpen,
         (open) => {
             if (open) {
+                nowTick.value = Date.now();
+                stopPresenceTick();
+                presenceTickTimer = setInterval(() => {
+                    nowTick.value = Date.now();
+                }, 15_000);
                 selectTab(activeTab.value);
+            } else {
+                stopPresenceTick();
+                // Clear sensitive one-time sync key and transient errors whenever the Hub closes or session expires.
+                createdSyncKey.value = '';
+                createdDeviceName.value = '';
+                deviceActionError.value = '';
+                copiedField.value = '';
             }
         }
     );
+
+    onBeforeUnmount(() => {
+        stopPresenceTick();
+    });
 </script>

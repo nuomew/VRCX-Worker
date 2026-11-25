@@ -10,10 +10,10 @@
                         </SidebarMenuButton>
                     </DropdownMenuTrigger>
                     <DropdownMenuContent side="right" align="start" class="w-56">
-                        <DropdownMenuItem @click="emit('show-changelog')">
+                        <DropdownMenuItem v-if="!isWeb" @click="emit('show-changelog')">
                             <span>{{ t('nav_menu.changelog') }}</span>
                         </DropdownMenuItem>
-                        <DropdownMenuSeparator />
+                        <DropdownMenuSeparator v-if="!isWeb" />
                         <DropdownMenuLabel>{{ t('nav_menu.resources') }}</DropdownMenuLabel>
                         <DropdownMenuItem @click="emit('support-link', 'wiki')">
                             <span>{{ t('nav_menu.wiki') }}</span>

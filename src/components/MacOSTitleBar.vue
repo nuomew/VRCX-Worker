@@ -13,8 +13,9 @@
 <script setup>
     import { computed, onMounted } from 'vue';
 
+    const isWeb = typeof WEB !== 'undefined' && WEB;
     const isMacOS = computed(() => {
-        return navigator.platform.indexOf('Mac') > -1;
+        return !isWeb && navigator.platform.indexOf('Mac') > -1;
     });
 
     onMounted(() => {

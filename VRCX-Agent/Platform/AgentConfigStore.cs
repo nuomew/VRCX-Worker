@@ -88,29 +88,33 @@ public sealed class AgentConfigStore
         }
     }
 
-    public static void SetAutoStartEnabled(bool enabled)
+    public static bool SetAutoStartEnabled(bool enabled)
     {
-        if (!OperatingSystem.IsWindows()) return;
+        if (!OperatingSystem.IsWindows()) return false;
         try
         {
-            using RegistryKey? key = Registry.CurrentUser.OpenSubKey(RunRegistryPath, writable: true);
-            if (key == null) return;
             if (enabled)
             {
+                // Fresh Windows user profiles may not yet have HKCU\...\Run; CreateSubKey creates or opens it safely.
+                using RegistryKey? key = Registry.CurrentUser.CreateSubKey(RunRegistryPath, writable: true);
                 string? exePath = Environment.ProcessPath;
-                if (!string.IsNullOrWhiteSpace(exePath))
+                if (key == null || string.IsNullOrWhiteSpace(exePath))
                 {
-                    key.SetValue(RunRegistryValueName, $"\"{exePath}\" --autostart");
+                    return false;
                 }
+                key.SetValue(RunRegistryValueName, $"\"{exePath}\" --autostart");
+                return true;
             }
-            else
-            {
-                key.DeleteValue(RunRegistryValueName, throwOnMissingValue: false);
-            }
+
+            using RegistryKey? openKey = Registry.CurrentUser.OpenSubKey(RunRegistryPath, writable: true);
+            if (openKey == null) return true;
+            openKey.DeleteValue(RunRegistryValueName, throwOnMissingValue: false);
+            return true;
         }
         catch (Exception ex)
         {
             Log.Warn(ex, "Failed to update Windows startup registry entry.");
+            return false;
         }
     }
 

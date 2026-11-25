@@ -2,6 +2,7 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Numerics;
@@ -93,7 +94,7 @@ namespace VRCX
 
                         break;
                     case ScreenshotSearchType.WorldName:
-                        if (metadata.World.Name == null)
+                        if (metadata.World?.Name == null)
                             continue;
 
                         if (metadata.World.Name.Contains(query, StringComparison.OrdinalIgnoreCase))
@@ -101,7 +102,7 @@ namespace VRCX
 
                         break;
                     case ScreenshotSearchType.WorldID:
-                        if (metadata.World.Id == query)
+                        if (metadata.World?.Id == query)
                             result.Add(metadata);
 
                         break;
@@ -119,16 +120,16 @@ namespace VRCX
         public static ScreenshotMetadata? GetScreenshotMetadata(string path, bool includeJSON = false)
         {
             // Early return if file doesn't exist, or isn't a PNG(Check both extension and file header)
-            if (!File.Exists(path) || !path.EndsWith(".png"))
+            if (!File.Exists(path) || !path.EndsWith(".png", StringComparison.OrdinalIgnoreCase))
                 return null;
 
             List<string> metadata = ReadTextMetadata(path);
             ScreenshotMetadata result = new ScreenshotMetadata();
+            bool gotMetadata = false;
+            bool gotVrchatMetadata = false;
 
             for (var i = 0; i < metadata.Count; i++)
             {
-                bool gotMetadata = false;
-                bool gotVrchatMetadata = false;
                 try
                 {
                     var metadataString = metadata[i];
@@ -149,8 +150,27 @@ namespace VRCX
                             vrcxMetadataResult.SourceFile = path;
                             if (gotVrchatMetadata)
                             {
-                                result.Players = vrcxMetadataResult.Players;
-                                result.World.InstanceId = vrcxMetadataResult.World.InstanceId;
+                                result.Players = vrcxMetadataResult.Players ?? result.Players;
+                                if (vrcxMetadataResult.World != null)
+                                {
+                                    result.World ??= new ScreenshotMetadata.WorldDetail();
+                                    if (!string.IsNullOrEmpty(vrcxMetadataResult.World.InstanceId))
+                                        result.World.InstanceId = vrcxMetadataResult.World.InstanceId;
+                                    if (string.IsNullOrEmpty(result.World.Id) && !string.IsNullOrEmpty(vrcxMetadataResult.World.Id))
+                                        result.World.Id = vrcxMetadataResult.World.Id;
+                                    if (string.IsNullOrEmpty(result.World.Name) && !string.IsNullOrEmpty(vrcxMetadataResult.World.Name))
+                                        result.World.Name = vrcxMetadataResult.World.Name;
+                                }
+                                if (vrcxMetadataResult.Author != null)
+                                {
+                                    result.Author ??= new ScreenshotMetadata.AuthorDetail();
+                                    if (string.IsNullOrEmpty(result.Author.Id) && !string.IsNullOrEmpty(vrcxMetadataResult.Author.Id))
+                                        result.Author.Id = vrcxMetadataResult.Author.Id;
+                                    if (string.IsNullOrEmpty(result.Author.DisplayName) && !string.IsNullOrEmpty(vrcxMetadataResult.Author.DisplayName))
+                                        result.Author.DisplayName = vrcxMetadataResult.Author.DisplayName;
+                                }
+                                if (string.IsNullOrEmpty(result.Note) && !string.IsNullOrEmpty(vrcxMetadataResult.Note))
+                                    result.Note = vrcxMetadataResult.Note;
                             }
                             else
                             {
@@ -231,21 +251,31 @@ namespace VRCX
 
         public static bool WriteVRCXMetadata(string text, string path)
         {
-            var pngFile = new PNGFile(path, true);
+            using var pngFile = new PNGFile(path, true);
+            PNGHelper.DeleteTextChunk("Description", pngFile);
             var chunk = PNGHelper.GenerateTextChunk("Description", text);
-            var status = pngFile.WriteChunk(chunk);
-            pngFile.Dispose();
-
-            return status;
+            return pngFile.WriteChunk(chunk);
         }
 
         public static ScreenshotMetadata ParseVRCImage(string xmlString)
         {
             var index = xmlString.IndexOf("<x:xmpmeta", StringComparison.Ordinal);
+            if (index < 0)
+                throw new FormatException("Missing <x:xmpmeta root element.");
+
             xmlString = xmlString.Substring(index);
-            var doc = new XmlDocument();
-            doc.LoadXml(xmlString);
-            var root = doc.DocumentElement;
+            var doc = new XmlDocument { XmlResolver = null };
+            var readerSettings = new XmlReaderSettings
+            {
+                DtdProcessing = DtdProcessing.Prohibit,
+                XmlResolver = null
+            };
+            using (var stringReader = new StringReader(xmlString))
+            using (var xmlReader = XmlReader.Create(stringReader, readerSettings))
+            {
+                doc.Load(xmlReader);
+            }
+            var root = doc.DocumentElement ?? throw new FormatException("Empty XMP root element.");
             var nsManager = new XmlNamespaceManager(doc.NameTable);
             nsManager.AddNamespace("x", "adobe:ns:meta/");
             nsManager.AddNamespace("rdf", "http://www.w3.org/1999/02/22-rdf-syntax-ns#");
@@ -331,10 +361,15 @@ namespace VRCX
             // lfs|cvr|1|author:047b30bd-089d-887c-8734-b0032df5d176,Hordini|world:2e73b387-c6d4-45e9-b998-0fd6aa122c1d,i+efec20004ef1cd8b-404003-93833f-1aee112a,Bono's Basement (Anime) (#816724)|pos:2.196716,0.01250899,-3.817466|players:5301af21-eb8d-7b36-3ef4-b623fa51c2c6,3.778407,0.01250887,-3.815876,DDAkebono;f9e5c36c-41b0-7031-1185-35b4034010c0,4.828233,0.01250893,-3.920135,Natsumi
 
             var lfsParts = metadataString.Split('|');
+            if (lfsParts.Length < 2)
+                return metadata;
             if (lfsParts[1] == "cvr")
                 lfsParts = lfsParts.Skip(1).ToArray();
+            if (lfsParts.Length < 2)
+                return metadata;
 
-            var version = int.Parse(lfsParts[1]);
+            if (!int.TryParse(lfsParts[1], NumberStyles.Integer, CultureInfo.InvariantCulture, out var version))
+                version = 0;
             var application = lfsParts[0];
             metadata.Application = application;
             metadata.Version = version;
@@ -345,22 +380,38 @@ namespace VRCX
             {
                 // ScreenshotManager format: https://github.com/DragonPlayerX/ScreenshotManager/blob/33950b98003e795d29c68ce5fe1d86e7e65c92ad/ScreenshotManager/Core/FileDataHandler.cs#L94
                 // screenshotmanager|0|author:usr_290c03d6-66cc-4f0e-b782-c07f5cfa8deb,VirtualTeacup|wrld_6caf5200-70e1-46c2-b043-e3c4abe69e0f,47213,The Great Pug
-                var author = lfsParts[2].Split(',');
+                if (lfsParts.Length > 2)
+                {
+                    var authorRaw = lfsParts[2].StartsWith("author:", StringComparison.Ordinal)
+                        ? lfsParts[2].Substring("author:".Length)
+                        : lfsParts[2];
+                    var author = authorRaw.Split(',', 2);
+                    metadata.Author.Id = author[0];
+                    if (author.Length > 1)
+                        metadata.Author.DisplayName = author[1];
+                }
 
-                metadata.Author.Id = author[0];
-                metadata.Author.DisplayName = author[1];
-
-                var world = lfsParts[3].Split(',');
-
-                metadata.World.Id = world[0];
-                metadata.World.Name = world[2];
-                metadata.World.InstanceId = string.Join(":", world[0], world[1]); // worldId:instanceId format, same as vrcx format, just minimal
+                if (lfsParts.Length > 3)
+                {
+                    var worldRaw = lfsParts[3].StartsWith("world:", StringComparison.Ordinal)
+                        ? lfsParts[3].Substring("world:".Length)
+                        : lfsParts[3];
+                    var world = worldRaw.Split(',', 3);
+                    metadata.World.Id = world[0];
+                    if (world.Length > 2)
+                        metadata.World.Name = world[2];
+                    metadata.World.InstanceId = world.Length > 1
+                        ? string.Join(":", world[0], world[1]) // worldId:instanceId format, same as vrcx format, just minimal
+                        : world[0];
+                }
                 return metadata;
             }
 
             for (var i = 2; i < lfsParts.Length; i++)
             {
-                var split = lfsParts[i].Split(':');
+                var split = lfsParts[i].Split(':', 2);
+                if (split.Length < 2)
+                    continue;
                 var key = split[0];
                 var value = split[1];
 
@@ -371,22 +422,49 @@ namespace VRCX
                 switch (key)
                 {
                     case "author":
-                        metadata.Author.Id = isCVR ? string.Empty : parts[0];
-                        metadata.Author.DisplayName = isCVR ? $"{parts[1]} ({parts[0]})" : parts[1];
+                        if (parts.Length >= 2)
+                        {
+                            var authorName = string.Join(",", parts.Skip(1));
+                            metadata.Author.Id = isCVR ? string.Empty : parts[0];
+                            metadata.Author.DisplayName = isCVR ? $"{authorName} ({parts[0]})" : authorName;
+                        }
                         break;
 
                     case "world":
-                        metadata.World.Id = isCVR || version == 1 ? string.Empty : parts[0];
-                        metadata.World.InstanceId = isCVR || version == 1 ? string.Empty : string.Join(":", parts[0], parts[1]); // worldId:instanceId format, same as vrcx format, just minimal
-                        metadata.World.Name = isCVR ? $"{parts[2]} ({parts[0]})" : (version == 1 ? value : parts[2]);
+                        if (isCVR)
+                        {
+                            metadata.World.Id = string.Empty;
+                            metadata.World.InstanceId = string.Empty;
+                            metadata.World.Name = parts.Length >= 3
+                                ? $"{string.Join(",", parts.Skip(2))} ({parts[0]})"
+                                : value;
+                        }
+                        else if (version == 1)
+                        {
+                            // LFS v1: world:wrld_xxx:47213,The Great Pug
+                            var v1World = value.Split(',', 2);
+                            var locParts = v1World[0].Split(':', 2);
+                            metadata.World.Id = locParts[0];
+                            metadata.World.InstanceId = v1World[0];
+                            metadata.World.Name = v1World.Length > 1 ? v1World[1] : value;
+                        }
+                        else if (parts.Length >= 3)
+                        {
+                            metadata.World.Id = parts[0];
+                            metadata.World.InstanceId = string.Join(":", parts[0], parts[1]); // worldId:instanceId format, same as vrcx format, just minimal
+                            metadata.World.Name = string.Join(",", parts.Skip(2));
+                        }
                         break;
 
                     case "pos":
-                        float.TryParse(parts[0], out float x);
-                        float.TryParse(parts[1], out float y);
-                        float.TryParse(parts[2], out float z);
+                        if (parts.Length >= 3)
+                        {
+                            float.TryParse(parts[0], NumberStyles.Float, CultureInfo.InvariantCulture, out float x);
+                            float.TryParse(parts[1], NumberStyles.Float, CultureInfo.InvariantCulture, out float y);
+                            float.TryParse(parts[2], NumberStyles.Float, CultureInfo.InvariantCulture, out float z);
 
-                        metadata.Pos = new Vector3(x, y, z);
+                            metadata.Pos = new Vector3(x, y, z);
+                        }
                         break;
 
                     // We don't use this, so don't parse it.
@@ -401,20 +479,36 @@ namespace VRCX
 
                         foreach (var player in players)
                         {
+                            if (string.IsNullOrWhiteSpace(player))
+                                continue;
                             var playerParts = player.Split(',');
 
-                            float.TryParse(playerParts[1], out float x2);
-                            float.TryParse(playerParts[2], out float y2);
-                            float.TryParse(playerParts[3], out float z2);
-
-                            var playerDetail = new ScreenshotMetadata.PlayerDetail
+                            if (playerParts.Length >= 5)
                             {
-                                Id = isCVR ? string.Empty : playerParts[0],
-                                DisplayName = isCVR ? $"{playerParts[4]} ({playerParts[0]})" : playerParts[4],
-                                Pos = new Vector3(x2, y2, z2)
-                            };
+                                float.TryParse(playerParts[1], NumberStyles.Float, CultureInfo.InvariantCulture, out float x2);
+                                float.TryParse(playerParts[2], NumberStyles.Float, CultureInfo.InvariantCulture, out float y2);
+                                float.TryParse(playerParts[3], NumberStyles.Float, CultureInfo.InvariantCulture, out float z2);
 
-                            playersArray.Add(playerDetail);
+                                var displayName = string.Join(",", playerParts.Skip(4));
+                                var playerDetail = new ScreenshotMetadata.PlayerDetail
+                                {
+                                    Id = isCVR ? string.Empty : playerParts[0],
+                                    DisplayName = isCVR ? $"{displayName} ({playerParts[0]})" : displayName,
+                                    Pos = new Vector3(x2, y2, z2)
+                                };
+
+                                playersArray.Add(playerDetail);
+                            }
+                            else if (playerParts.Length >= 2)
+                            {
+                                // LFS v1 format omits player 3D position: usr_xxx,DisplayName
+                                var displayName = string.Join(",", playerParts.Skip(1));
+                                playersArray.Add(new ScreenshotMetadata.PlayerDetail
+                                {
+                                    Id = isCVR ? string.Empty : playerParts[0],
+                                    DisplayName = isCVR ? $"{displayName} ({playerParts[0]})" : displayName
+                                });
+                            }
                         }
                         break;
                 }

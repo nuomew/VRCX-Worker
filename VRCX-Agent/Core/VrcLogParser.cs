@@ -17,7 +17,7 @@ public sealed class VrcLogParser
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
     private static readonly Regex JoiningWorldRegex = new(
-        @"^\[Behaviour\]\s+Joining\s+(wrld_[0-9a-f-]{36}:.+)$",
+        @"^\[Behaviour\]\s+Joining\s+((?:wrld|wld)_[A-Za-z0-9-]+:.+)$",
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
     private static readonly Regex EnteringRoomRegex = new(
@@ -29,15 +29,15 @@ public sealed class VrcLogParser
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
     private static readonly Regex PlayerJoinedRegex = new(
-        @"^\[Behaviour\]\s+OnPlayerJoined\s+(.+?)(?:\s+\((usr_[0-9a-f-]{36})\))?$",
+        @"^\[Behaviour\]\s+OnPlayerJoined\s+(.+?)(?:\s+\((usr_[A-Za-z0-9-]+)\))?$",
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
     private static readonly Regex PlayerLeftRegex = new(
-        @"^\[Behaviour\]\s+OnPlayerLeft\s+(.+?)(?:\s+\((usr_[0-9a-f-]{36})\))?$",
+        @"^\[Behaviour\]\s+OnPlayerLeft\s+(.+?)(?:\s+\((usr_[A-Za-z0-9-]+)\))?$",
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
     private static readonly Regex VideoPlayRegex = new(
-        @"^\[Video Playback\]\s+(?:Attempting to resolve URL|URL)\s+'(https?://[^']+)'",
+        @"^\[Video Playback\]\s+(?:Attempting to resolve URL|Resolving URL|URL)\s+'([a-zA-Z][a-zA-Z0-9+.-]*://[^']+)'",
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
     private static readonly Regex ScreenshotRegex = new(
@@ -45,11 +45,12 @@ public sealed class VrcLogParser
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
     private static readonly Regex PortalSpawnRegex = new(
-        @"^\[Behaviour\]\s+Instantiated a Portal",
+        @"^\[Behaviour\]\s+Instantiated a (?:\(Clone\b.*Portals/PortalInternalDynamic|Portal\b)",
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
     private readonly Dictionary<string, DateTimeOffset> _recentEventDedupe = new(StringComparer.Ordinal);
     private string _pendingWorldName = string.Empty;
+    private DateTimeOffset _pendingWorldNameAt = DateTimeOffset.MinValue;
     private string _currentLocation = string.Empty;
     private string _currentWorldId = string.Empty;
     private string _currentWorldName = string.Empty;
@@ -62,6 +63,8 @@ public sealed class VrcLogParser
     public string CurrentWorldId => _currentWorldId;
     public string CurrentWorldName => _currentWorldName;
     public int CurrentPlayerCount => _currentPlayers.Count;
+    public bool HasPendingLocation => _pendingJoiningEvent != null;
+    public DateTimeOffset PendingJoiningAt => _lastJoiningAt;
 
     /// <summary>
     /// Resets transient room and player state when switching to a newly created VRChat log file.
@@ -69,6 +72,7 @@ public sealed class VrcLogParser
     public void ResetSessionState()
     {
         _pendingWorldName = string.Empty;
+        _pendingWorldNameAt = DateTimeOffset.MinValue;
         _currentLocation = string.Empty;
         _currentWorldId = string.Empty;
         _currentWorldName = string.Empty;
@@ -162,10 +166,22 @@ public sealed class VrcLogParser
         DateTimeOffset eventTime = ParseVrcTimestamp(rawTs);
         string isoTs = eventTime.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ", CultureInfo.InvariantCulture);
 
-        // 0. OnLeftRoom -> clear current instance players when leaving/switching worlds (matches Dotnet/LogWatcher.cs)
+        // 0. OnLeftRoom -> clear current instance players, world state, buffered Entering Room name, and sever pending nameless Joining
         if (LeftRoomRegex.IsMatch(body))
         {
             _currentPlayers.Clear();
+            _pendingWorldName = string.Empty;
+            _pendingWorldNameAt = DateTimeOffset.MinValue;
+            _lastJoiningHadWorldName = true;
+            _currentLocation = string.Empty;
+            _currentWorldId = string.Empty;
+            _currentWorldName = string.Empty;
+            if (_pendingJoiningEvent != null)
+            {
+                GameLogEventItem flushedPending = _pendingJoiningEvent;
+                _pendingJoiningEvent = null;
+                return flushedPending;
+            }
             return null;
         }
 
@@ -177,13 +193,14 @@ public sealed class VrcLogParser
         if (enterMatch.Success)
         {
             string worldName = enterMatch.Groups[1].Value.Trim();
-            _currentWorldName = worldName;
             if (!_lastJoiningHadWorldName &&
                 !string.IsNullOrEmpty(_currentLocation) &&
                 Math.Abs((eventTime - _lastJoiningAt).TotalSeconds) <= 10)
             {
+                _currentWorldName = worldName;
                 _lastJoiningHadWorldName = true;
                 _pendingWorldName = string.Empty;
+                _pendingWorldNameAt = DateTimeOffset.MinValue;
                 _pendingJoiningEvent = null;
                 if (IsFloodDuplicate($"Location:{_currentLocation}:{worldName}", eventTime, TimeSpan.FromSeconds(5)))
                 {
@@ -199,7 +216,25 @@ public sealed class VrcLogParser
                 };
             }
 
-            _pendingWorldName = worldName;
+            // Ignore duplicate Entering Room lines for the already-joined current world within 10s so they
+            // do not leave stale _pendingWorldName behind for a subsequent nameless Joining event.
+            bool isDuplicateCurrentWorld = _lastJoiningHadWorldName &&
+                !string.IsNullOrEmpty(_currentLocation) &&
+                string.Equals(worldName, _currentWorldName, StringComparison.Ordinal) &&
+                Math.Abs((eventTime - _lastJoiningAt).TotalSeconds) <= 10;
+            if (!isDuplicateCurrentWorld)
+            {
+                _pendingWorldName = worldName;
+                _pendingWorldNameAt = eventTime;
+            }
+            // If an older Joining event timed out without an Entering Room line, emit it now before buffering the next world.
+            if (_pendingJoiningEvent != null)
+            {
+                GameLogEventItem timedOutPending = _pendingJoiningEvent;
+                _pendingJoiningEvent = null;
+                _lastJoiningHadWorldName = true;
+                return timedOutPending;
+            }
             return null;
         }
 
@@ -213,23 +248,29 @@ public sealed class VrcLogParser
                 return null;
             }
 
+            GameLogEventItem? supersededPending = _pendingJoiningEvent;
+            _pendingJoiningEvent = null;
+
             string worldId = ExtractWorldId(loc);
             _currentLocation = loc;
             _currentWorldId = worldId;
             _currentPlayers.Clear();
             _lastJoiningAt = eventTime;
 
-            if (!string.IsNullOrEmpty(_pendingWorldName))
+            bool hasFreshPendingWorldName = !string.IsNullOrEmpty(_pendingWorldName) &&
+                _pendingWorldNameAt != DateTimeOffset.MinValue &&
+                (eventTime - _pendingWorldNameAt).Duration() <= TimeSpan.FromSeconds(15);
+            if (hasFreshPendingWorldName)
             {
                 string worldName = _pendingWorldName;
                 _pendingWorldName = string.Empty;
+                _pendingWorldNameAt = DateTimeOffset.MinValue;
                 _currentWorldName = worldName;
                 _lastJoiningHadWorldName = true;
-                _pendingJoiningEvent = null;
 
                 if (IsFloodDuplicate($"Location:{loc}:{worldName}", eventTime, TimeSpan.FromSeconds(5)))
                 {
-                    return null;
+                    return supersededPending;
                 }
 
                 return new GameLogEventItem
@@ -242,8 +283,11 @@ public sealed class VrcLogParser
                 };
             }
 
-            // World name has not arrived yet (reverse-order log or world without Entering Room line);
-            // keep a pending fallback event so LogTailCollector flushes it if no Entering Room line follows.
+            // World name has not arrived yet (or buffered name was stale): clear stale world name and flush
+            // any superseded pending Joining event immediately so consecutive joins are never lost.
+            _pendingWorldName = string.Empty;
+            _pendingWorldNameAt = DateTimeOffset.MinValue;
+            _currentWorldName = string.Empty;
             _lastJoiningHadWorldName = false;
             _pendingJoiningEvent = new GameLogEventItem
             {
@@ -253,7 +297,7 @@ public sealed class VrcLogParser
                 WorldId = worldId,
                 WorldName = string.Empty
             };
-            return null;
+            return supersededPending;
         }
 
         // 3. OnPlayerJoined
@@ -351,9 +395,17 @@ public sealed class VrcLogParser
         }
 
         // 8. VRC Quit / OpenVR Init
-        if (body.Contains("VRCApplication: OnApplicationQuit", StringComparison.Ordinal))
+        if (body.Contains("VRCApplication: OnApplicationQuit", StringComparison.Ordinal) ||
+            body.Contains("VRCApplication: HandleApplicationQuit", StringComparison.Ordinal))
         {
+            // Keep any buffered _pendingJoiningEvent intact so LogTailCollector flushes it right before
+            // this quit event (matching OnLeftRoom semantics).
             _currentPlayers.Clear();
+            _currentLocation = string.Empty;
+            _currentWorldId = string.Empty;
+            _currentWorldName = string.Empty;
+            _pendingWorldName = string.Empty;
+            _pendingWorldNameAt = DateTimeOffset.MinValue;
             return new GameLogEventItem
             {
                 Type = "Event",
