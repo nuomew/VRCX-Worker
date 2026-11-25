@@ -16,7 +16,13 @@ function classifyThrottleableReadGet(options) {
     if (!options || typeof options !== 'object') return null;
     const method = String(options.method || 'GET').toUpperCase();
     if (method !== 'GET') return null;
-    if (options.uploadImage || options.uploadFilePUT || options.uploadImageLegacy || options.uploadPrintImage) {
+    if (
+        options.uploadImage ||
+        options.uploadFilePUT ||
+        options.uploadImageLegacy ||
+        options.uploadImagePrint ||
+        options.uploadPrintImage
+    ) {
         return null;
     }
     if (options.headers && (options.headers.Authorization || options.headers.authorization)) {
@@ -127,7 +133,8 @@ export function createWebApiBridge() {
     }
 
     /**
-     * Invalidates volatile lists and the mutated target URL while preserving stable entity/config caches.
+     * Invalidates volatile lists and mutated domain collections (favorites, friends including offline=true,
+     * notifications, prints) while preserving unrelated static/entity caches.
      *
      * @param {string} writeUrl
      */
@@ -139,8 +146,44 @@ export function createWebApiBridge() {
             clearReadCache();
             return;
         }
+        const isFavoriteWrite = writePath.startsWith('/api/1/favorites') || writePath.startsWith('/api/1/favorite/');
+        const isFriendWrite = writePath.includes('/friend');
+        const isNotificationWrite = writePath.includes('/notifications');
+        const isPrintWrite = writePath.startsWith('/api/1/prints');
+
         for (const [key, entry] of getCache.entries()) {
             if (entry.tier === 'volatile') {
+                getCache.delete(key);
+                continue;
+            }
+            let keyPath = '';
+            try {
+                keyPath = new URL(key).pathname;
+            } catch {
+                keyPath = key;
+            }
+            if (
+                isFavoriteWrite &&
+                (keyPath.startsWith('/api/1/favorites') ||
+                    keyPath.startsWith('/api/1/favorite/') ||
+                    keyPath.startsWith('/api/1/worlds/favorites') ||
+                    keyPath.startsWith('/api/1/avatars/favorites'))
+            ) {
+                getCache.delete(key);
+                continue;
+            }
+            if (isFriendWrite && keyPath.startsWith('/api/1/auth/user/friends')) {
+                getCache.delete(key);
+                continue;
+            }
+            if (
+                isNotificationWrite &&
+                (keyPath.startsWith('/api/1/notifications') || keyPath.startsWith('/api/1/auth/user/notifications'))
+            ) {
+                getCache.delete(key);
+                continue;
+            }
+            if (isPrintWrite && keyPath.startsWith('/api/1/prints')) {
                 getCache.delete(key);
                 continue;
             }
@@ -305,7 +348,14 @@ export function createWebApiBridge() {
             }
 
             const method = String(options?.method || 'GET').toUpperCase();
-            if (method !== 'GET') {
+            const isUpload = Boolean(
+                options?.uploadImage ||
+                options?.uploadFilePUT ||
+                options?.uploadImageLegacy ||
+                options?.uploadImagePrint ||
+                options?.uploadPrintImage
+            );
+            if (method !== 'GET' || isUpload) {
                 invalidateCacheForWrite(String(options?.url || ''));
             }
 

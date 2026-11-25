@@ -120,7 +120,7 @@ public sealed class RemoteCommandExecutor
             psi.ArgumentList.Add("--no-vr");
         }
 
-        Process? proc = Process.Start(psi);
+        using Process? proc = Process.Start(psi);
         return new CommandExecutionResult
         {
             CmdId = cmdId,
@@ -306,8 +306,16 @@ public sealed class RemoteCommandExecutor
             try
             {
                 // VRChat registers its exact launch.exe path under the vrchat:// URI protocol handler regardless of Steam drive.
-                string? rawCmd = Registry.ClassesRoot.OpenSubKey(@"VRChat\shell\open\command")?.GetValue(null) as string
-                    ?? Registry.CurrentUser.OpenSubKey(@"Software\Classes\VRChat\shell\open\command")?.GetValue(null) as string;
+                string? rawCmd;
+                using (RegistryKey? hkcrKey = Registry.ClassesRoot.OpenSubKey(@"VRChat\shell\open\command"))
+                {
+                    rawCmd = hkcrKey?.GetValue(null) as string;
+                }
+                if (rawCmd == null)
+                {
+                    using RegistryKey? hkcuKey = Registry.CurrentUser.OpenSubKey(@"Software\Classes\VRChat\shell\open\command");
+                    rawCmd = hkcuKey?.GetValue(null) as string;
+                }
                 string? fromProtocol = ExtractExecutablePathFromShellCommand(rawCmd);
                 if (!string.IsNullOrEmpty(fromProtocol) && File.Exists(fromProtocol))
                 {

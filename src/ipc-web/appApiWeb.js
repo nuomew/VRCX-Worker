@@ -124,6 +124,11 @@ const BLAKE2B_SIGMA = [
     [10, 2, 8, 4, 7, 6, 1, 5, 15, 11, 9, 14, 3, 12, 13, 0]
 ];
 
+/**
+ * @param {bigint} x
+ * @param {bigint} n
+ * @returns {bigint}
+ */
 function rotr64(x, n) {
     return ((x >> n) | ((x << (64n - n)) & MASK64)) & MASK64;
 }
@@ -139,11 +144,21 @@ function blake2b256(input) {
     const h = BLAKE2B_IV.slice();
     h[0] ^= 0x01010000n ^ BigInt(outlen);
 
-    const v = new Array(16);
-    const m = new Array(16);
+    /** @type {bigint[]} */
+    const v = new Array(16).fill(0n);
+    /** @type {bigint[]} */
+    const m = new Array(16).fill(0n);
     const block = new Uint8Array(128);
     const blockView = new DataView(block.buffer);
 
+    /**
+     * @param {number} a
+     * @param {number} b
+     * @param {number} c
+     * @param {number} d
+     * @param {bigint} x
+     * @param {bigint} y
+     */
     const mix = (a, b, c, d, x, y) => {
         v[a] = (v[a] + v[b] + x) & MASK64;
         v[d] = rotr64(v[d] ^ v[a], 32n);

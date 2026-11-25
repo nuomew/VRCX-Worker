@@ -172,7 +172,9 @@ describe('Phase 0 POC: Sharded D1 FTS5 + AgentHubDO Hibernation + VRChat Probe',
     });
 
     it('finds CJK (Chinese) 3-char substring via FTS5 trigram + B-tree index with rows_read < 100 and zero full-table scan', async () => {
-        const res = await exports.default.fetch('http://example.com/poc/search?q=' + encodeURIComponent('木之本') + '&explain=1');
+        const res = await exports.default.fetch(
+            'http://example.com/poc/search?q=' + encodeURIComponent('木之本') + '&explain=1'
+        );
         expect(res.status).toBe(200);
         const body = (await res.json()) as { ok: boolean; data: EntitySearchResult };
         expect(body.ok).toBe(true);
@@ -192,7 +194,9 @@ describe('Phase 0 POC: Sharded D1 FTS5 + AgentHubDO Hibernation + VRChat Probe',
     });
 
     it('finds Japanese world substring via FTS5 trigram + B-tree index with rows_read < 100', async () => {
-        const res = await exports.default.fetch('http://example.com/poc/search?q=' + encodeURIComponent('集会所') + '&explain=1');
+        const res = await exports.default.fetch(
+            'http://example.com/poc/search?q=' + encodeURIComponent('集会所') + '&explain=1'
+        );
         expect(res.status).toBe(200);
         const body = (await res.json()) as { ok: boolean; data: EntitySearchResult };
         expect(body.data.strategy).toBe('trigram_fts');
@@ -278,29 +282,46 @@ describe('Phase 0 POC: Sharded D1 FTS5 + AgentHubDO Hibernation + VRChat Probe',
         expect(statusJson.data.webClientsCount).toBeGreaterThanOrEqual(1);
         expect(statusJson.data.deviceStates['win-desktop-01']?.state.worldName).toBe('日本語集会所 JP Shrine');
 
-        // 5. Web dispatches remote command after DO woke from hibernation -> Agent receives -> returns result
-        const agentCmdPromise = waitForMessage(agentWs, (msg) => msg.includes('"cmd.dispatch"'));
+        // 5. Direct web WS cmd.dispatch is rejected (security boundary); validated HTTP /api/commands routes to Agent after DO wakeup -> Agent returns result to Web
+        const wsBlockPromise = waitForMessage(webWs, (msg) => msg.includes('"FORBIDDEN_WS_RELAY"'));
         webWs.send(
             JSON.stringify({
                 v: 1,
-                id: 'cmd-001',
+                id: 'cmd-bypass-001',
                 type: 'cmd.dispatch',
                 payload: {
                     targetDeviceId: 'win-desktop-01',
-                    action: 'launch_vrc',
-                    launchUrl: 'vrchat://launch?id=wrld_jp_hub_001:99999'
+                    action: 'launch_vrc'
                 }
             })
         );
+        const wsBlockReply = JSON.parse(await wsBlockPromise) as { type: string; payload: { code: string } };
+        expect(wsBlockReply.type).toBe('error');
+        expect(wsBlockReply.payload.code).toBe('FORBIDDEN_WS_RELAY');
+
+        const agentCmdPromise = waitForMessage(agentWs, (msg) => msg.includes('"cmd.dispatch"'));
+        const dispatchRes = await exports.default.fetch('http://example.com/api/commands', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                targetDeviceId: 'win-desktop-01',
+                action: 'launch_vrc',
+                params: {
+                    launchUrl: 'vrchat://launch?id=wrld_12345678-1234-1234-1234-1234567890ab:99999'
+                }
+            })
+        });
+        expect(dispatchRes.status).toBe(200);
+        const dispatchJson = (await dispatchRes.json()) as { ok: boolean; data: { cmdId: string } };
         const receivedCmd = JSON.parse(await agentCmdPromise) as { id: string; payload: { action: string } };
-        expect(receivedCmd.id).toBe('cmd-001');
+        expect(receivedCmd.id).toBe(dispatchJson.data.cmdId);
         expect(receivedCmd.payload.action).toBe('launch_vrc');
 
         const webResultPromise = waitForMessage(webWs, (msg) => msg.includes('"cmd.result"'));
         agentWs.send(
             JSON.stringify({
                 v: 1,
-                id: 'cmd-001',
+                id: dispatchJson.data.cmdId,
                 type: 'cmd.result',
                 payload: { status: 'succeeded' }
             })

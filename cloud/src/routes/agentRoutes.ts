@@ -8,7 +8,7 @@ import {
 } from '../auth/auth';
 import { encryptAesGcm, randomHex, sha256Hex } from '../crypto/vault';
 import type { Env } from '../env';
-import { accrueCloudUptime, getCloudSyncIntervalSeconds } from './coreData';
+import { accrueCloudUptime, clampQueryLimit, getCloudSyncIntervalSeconds } from './coreData';
 import { type GameLogIngestItem, ingestGameLogItems } from './eventsData';
 
 // Strict command allowlist (R.A.I.L.G.U.A.R.D.)
@@ -525,34 +525,47 @@ export async function handleAgentPublicRoutes(request: Request, env: Env, url: U
             );
         }
 
-        const pendingCommands = (
-            (pendingRes?.results ?? []) as Array<{
-                cmd_id: string;
-                action: string;
-                payload_json: string;
-                expires_at: string;
-            }>
-        ).map((row) => {
+        const candidateRows = (pendingRes?.results ?? []) as Array<{
+            cmd_id: string;
+            action: string;
+            payload_json: string;
+            expires_at: string;
+        }>;
+        const claimStartIndex = coreWrites.length;
+        for (const row of candidateRows) {
+            coreWrites.push(
+                env.DB_CORE.prepare(
+                    "UPDATE cloud_commands SET status = 'dispatched', target_device_id = ? WHERE cmd_id = ? AND status = 'pending' AND (target_device_id = '' OR target_device_id = ?)"
+                ).bind(auth.deviceId, row.cmd_id, auth.deviceId)
+            );
+        }
+
+        const writeResults = await env.DB_CORE.batch(coreWrites);
+        const pendingCommands: Array<{
+            cmdId: string;
+            action: string;
+            params: Record<string, unknown>;
+            expiresAt: string;
+        }> = [];
+        for (let i = 0; i < candidateRows.length; i++) {
+            const claimRes = writeResults[claimStartIndex + i];
+            if ((claimRes?.meta?.changes ?? 0) !== 1) {
+                continue;
+            }
+            const row = candidateRows[i]!;
             let params: Record<string, unknown> = {};
             try {
                 params = JSON.parse(row.payload_json || '{}') as Record<string, unknown>;
             } catch {
                 params = {};
             }
-            coreWrites.push(
-                env.DB_CORE.prepare(
-                    "UPDATE cloud_commands SET status = 'dispatched', target_device_id = ? WHERE cmd_id = ?"
-                ).bind(auth.deviceId, row.cmd_id)
-            );
-            return {
+            pendingCommands.push({
                 cmdId: row.cmd_id,
                 action: row.action,
                 params,
                 expiresAt: row.expires_at
-            };
-        });
-
-        await env.DB_CORE.batch(coreWrites);
+            });
+        }
 
         // Periodic HTTP sync persists live state into DB_CORE.cloud_device_states and GameLog into DB_GAMELOG
         // without waking AgentHubDO on every 60s tick (preserving Free-tier Durable Object quotas).
@@ -676,7 +689,7 @@ export async function handleAgentWebRoutes(request: Request, env: Env, url: URL)
     // Remote command allowlist dispatch + audit history
     if (url.pathname === '/api/commands') {
         if (request.method === 'GET') {
-            const limit = Math.min(Number(url.searchParams.get('limit') ?? '30'), 100);
+            const limit = clampQueryLimit(url.searchParams.get('limit'), 30, 100);
             const res = await env.DB_CORE.prepare('SELECT * FROM cloud_commands ORDER BY created_at DESC LIMIT ?')
                 .bind(limit)
                 .all();

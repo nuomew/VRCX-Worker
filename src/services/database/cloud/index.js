@@ -889,11 +889,22 @@ export function createCloudDatabase(dbVars) {
                 $isExpired: Boolean(r.expired)
             }));
         },
-        async lookupNotificationDatabase(search, filters, maxEntries = 100) {
+        async lookupNotificationDatabase(search, filters, vipList = [], maxEntries = 100) {
+            // Preserve compatibility if a caller passes a numeric 3rd argument (legacy maxEntries)
+            let resolvedVipList = vipList;
+            let resolvedMax = maxEntries;
+            if (typeof vipList === 'number') {
+                resolvedMax = vipList;
+                resolvedVipList = [];
+            }
+            const limit = Math.max(1, Number(resolvedMax) || 100);
+            const vipSet =
+                Array.isArray(resolvedVipList) && resolvedVipList.length > 0 ? new Set(resolvedVipList) : null;
             const all = await this.getNotifications();
             const q = String(search || '').toLowerCase();
             return all
                 .filter((n) => !filters?.length || filters.includes(n.type))
+                .filter((n) => !vipSet || (n.senderUserId && vipSet.has(n.senderUserId)))
                 .filter(
                     (n) =>
                         !q ||
@@ -902,9 +913,12 @@ export function createCloudDatabase(dbVars) {
                             .includes(q) ||
                         String(n.message || '')
                             .toLowerCase()
+                            .includes(q) ||
+                        String(n.details?.worldName || '')
+                            .toLowerCase()
                             .includes(q)
                 )
-                .slice(0, maxEntries);
+                .slice(0, limit);
         },
         async addNotificationToDatabase(entry) {
             queueNotificationWrite(1, entry);
@@ -1071,8 +1085,9 @@ export function createCloudDatabase(dbVars) {
             return res?.lastRowId ? { ...entry, rowId: res.lastRowId } : undefined;
         },
         async addGamelogJoinLeaveBulk(entries) {
-            if (!entries?.length) return;
+            if (!Array.isArray(entries) || entries.length === 0) return [];
             await cloudFetch('/api/gamelog', { method: 'POST', json: { items: entries } }).catch(() => {});
+            return entries;
         },
         async addGamelogPortalSpawnToDatabase(entry) {
             const res = await cloudFetch('/api/gamelog', {
@@ -1432,7 +1447,31 @@ export function createCloudDatabase(dbVars) {
                 });
         },
         async deleteGameLogInstance(input) {
-            await this.deleteGameLogInstanceByInstanceId(input);
+            const loc = typeof input === 'string' ? input : input?.location || '';
+            if (!loc) return;
+            if (typeof input === 'string') {
+                await this.deleteGameLogInstanceByInstanceId(input);
+                return;
+            }
+            const params = new URLSearchParams({
+                kind: 'user_instance',
+                location: loc
+            });
+            const userId = String(input?.id || input?.userId || '').trim();
+            const displayName = String(input?.displayName || '').trim();
+            if (userId) params.set('userId', userId);
+            if (displayName) params.set('displayName', displayName);
+            if (Array.isArray(input?.events) && input.events.length > 0) {
+                const eventIds = input.events
+                    .map((v) => Math.floor(Number(v)))
+                    .filter((n) => Number.isFinite(n) && n > 0);
+                if (eventIds.length > 0) {
+                    params.set('events', eventIds.join(','));
+                }
+            }
+            await cloudFetch(`/api/gamelog?${params.toString()}`, {
+                method: 'DELETE'
+            });
         },
         async deleteGameLogEntry(input) {
             if (input?.rowId && input?.type) {
@@ -1506,17 +1545,21 @@ export function createCloudDatabase(dbVars) {
             queueFeedWrite(entry);
             return { ...entry, rowId: Date.now() };
         },
-        async lookupFeedDatabase(filters, vipList, maxEntries = 100) {
+        async lookupFeedDatabase(filters, vipList, maxEntries = 100, dateFrom = '', dateTo = '') {
             const limit = Math.min(maxEntries || 100, 100);
             const hasFilters = Array.isArray(filters) && filters.length > 0;
             const hasVip = Array.isArray(vipList) && vipList.length > 0;
-            if (hasFilters || hasVip) {
+            const cleanDateFrom = String(dateFrom || '').trim();
+            const cleanDateTo = String(dateTo || '').trim();
+            if (hasFilters || hasVip || cleanDateFrom || cleanDateTo) {
                 const rows = await cloudFetch('/api/feed/query', {
                     method: 'POST',
                     json: {
                         types: hasFilters ? filters : [],
                         vipList: hasVip ? vipList : [],
-                        limit
+                        limit,
+                        dateFrom: cleanDateFrom || undefined,
+                        dateTo: cleanDateTo || undefined
                     }
                 }).catch(() => []);
                 return Array.isArray(rows) ? rows : [];
@@ -1524,15 +1567,23 @@ export function createCloudDatabase(dbVars) {
             const rows = await cloudFetch(`/api/feed?limit=${limit}`).catch(() => []);
             return Array.isArray(rows) ? rows : [];
         },
-        async searchFeedDatabase(search, filters, vipList, maxEntries = 50) {
+        async searchFeedDatabase(search, filters, vipList, maxEntries = 50, dateFrom = '', dateTo = '') {
             const q = String(search || '').trim();
-            if (!q) return this.lookupFeedDatabase(filters, vipList, maxEntries);
+            const cleanDateFrom = String(dateFrom || '').trim();
+            const cleanDateTo = String(dateTo || '').trim();
+            if (!q) return this.lookupFeedDatabase(filters, vipList, maxEntries, cleanDateFrom, cleanDateTo);
             const params = new URLSearchParams({
                 q,
                 limit: String(Math.min(maxEntries || 50, 100))
             });
             if (Array.isArray(filters) && filters.length > 0) {
                 params.set('types', filters.join(','));
+            }
+            if (cleanDateFrom) {
+                params.set('dateFrom', cleanDateFrom);
+            }
+            if (cleanDateTo) {
+                params.set('dateTo', cleanDateTo);
             }
             const rows = await cloudFetch(`/api/feed/search?${params.toString()}`).catch(() => []);
             const list = Array.isArray(rows) ? rows : [];
@@ -1569,6 +1620,12 @@ export function createCloudDatabase(dbVars) {
                 if (vipSet && (!r.userId || !vipSet.has(r.userId))) {
                     return false;
                 }
+                if (cleanDateFrom && String(r.created_at || '') < cleanDateFrom) {
+                    return false;
+                }
+                if (cleanDateTo && String(r.created_at || '') > cleanDateTo) {
+                    return false;
+                }
                 return true;
             });
         },
@@ -1595,7 +1652,10 @@ export function createCloudDatabase(dbVars) {
             ACTIVITY: 'activity',
             OVERLAP: 'overlap'
         },
-        async getActivitySourceSliceV2({ userId, isSelf, fromDays, toDays = 0 } = {}) {
+        /**
+         * @param {{ userId?: string; isSelf?: boolean; fromDays?: number; toDays?: number }} [params]
+         */
+        async getActivitySourceSliceV2({ userId = '', isSelf = false, fromDays = 30, toDays = 0 } = {}) {
             const nowMs = Date.now();
             const safeFromDays = Math.max(1, Number(fromDays) || 30);
             const fromDateIso = new Date(nowMs - safeFromDays * 86400_000).toISOString();
@@ -1604,7 +1664,10 @@ export function createCloudDatabase(dbVars) {
                 ? this.getCurrentUserLocationSliceV2(fromDateIso, toDateIso)
                 : this.getFriendPresenceSliceV2(userId, fromDateIso, toDateIso);
         },
-        async getActivitySourceAfterV2({ userId, isSelf, afterCreatedAt, inclusive = false } = {}) {
+        /**
+         * @param {{ userId?: string; isSelf?: boolean; afterCreatedAt?: string; inclusive?: boolean }} [params]
+         */
+        async getActivitySourceAfterV2({ userId = '', isSelf = false, afterCreatedAt = '', inclusive = false } = {}) {
             return isSelf
                 ? this.getCurrentUserLocationAfterV2(afterCreatedAt, inclusive)
                 : this.getFriendPresenceAfterV2(userId, afterCreatedAt);

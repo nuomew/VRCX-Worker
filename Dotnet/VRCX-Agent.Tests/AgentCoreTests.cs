@@ -1295,6 +1295,66 @@ public sealed class AgentCoreTests
         Assert.False(CommandValidator.IsAllowedVrcUrl("http://s3.us-west-2.amazonaws.com/bucket/file.png"));
     }
 
+    [Fact]
+    public async Task ScreenshotPipeline_ClassifiesPoisonPillAsPermanentFailureAndServerErrorAsTransient()
+    {
+        string tempDir = Path.Combine(Path.GetTempPath(), "vrcx-poison-test-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(tempDir);
+        string corruptPng = Path.Combine(tempDir, "corrupt.png");
+        string validPng = Path.Combine(tempDir, "valid.png");
+        try
+        {
+            await File.WriteAllBytesAsync(corruptPng, new byte[] { 0x00, 0x01, 0x02, 0x03, 0x04 });
+            using (var img = new SixLabors.ImageSharp.Image<SixLabors.ImageSharp.PixelFormats.Rgba32>(16, 16))
+            {
+                img.SaveAsPng(validPng);
+            }
+
+            var compressedCfg = new AgentConfig
+            {
+                CloudUrl = "https://vrcx.example.workers.dev",
+                SyncSecret = "secret",
+                AutoUploadScreenshots = true,
+                CompressScreenshots = true
+            };
+
+            // 1. Corrupt image fails ImageSharp decoding -> PermanentFailure (never blocks queue forever)
+            using (var httpOk = new HttpClient(new StubHttpHandler(_ => Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)))))
+            {
+                var pipeline = new ScreenshotPipeline(() => compressedCfg, httpOk);
+                ScreenshotUploadOutcome corruptOutcome = await pipeline.UploadQueuedTaskWithOutcomeAsync(
+                    new PendingScreenshotTask { LocalPath = corruptPng, TakenAtIso = "2026-11-24T15:00:00Z" },
+                    CancellationToken.None);
+                Assert.Equal(ScreenshotUploadOutcome.PermanentFailure, corruptOutcome);
+            }
+
+            // 2. HTTP 413 RequestEntityTooLarge -> PermanentFailure
+            using (var http413 = new HttpClient(new StubHttpHandler(_ => Task.FromResult(new HttpResponseMessage(HttpStatusCode.RequestEntityTooLarge)))))
+            {
+                var pipeline = new ScreenshotPipeline(() => compressedCfg, http413);
+                ScreenshotUploadOutcome tooLargeOutcome = await pipeline.UploadQueuedTaskWithOutcomeAsync(
+                    new PendingScreenshotTask { LocalPath = validPng, TakenAtIso = "2026-11-24T15:00:00Z" },
+                    CancellationToken.None);
+                Assert.Equal(ScreenshotUploadOutcome.PermanentFailure, tooLargeOutcome);
+            }
+
+            // 3. HTTP 503 ServiceUnavailable & 429 TooManyRequests -> TransientFailure (retryable)
+            foreach (HttpStatusCode retryableCode in new[] { HttpStatusCode.ServiceUnavailable, HttpStatusCode.TooManyRequests, HttpStatusCode.Unauthorized })
+            {
+                using var httpRetry = new HttpClient(new StubHttpHandler(_ => Task.FromResult(new HttpResponseMessage(retryableCode))));
+                var pipeline = new ScreenshotPipeline(() => compressedCfg, httpRetry);
+                ScreenshotUploadOutcome transientOutcome = await pipeline.UploadQueuedTaskWithOutcomeAsync(
+                    new PendingScreenshotTask { LocalPath = validPng, TakenAtIso = "2026-11-24T15:00:00Z" },
+                    CancellationToken.None);
+                Assert.Equal(ScreenshotUploadOutcome.TransientFailure, transientOutcome);
+            }
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir)) Directory.Delete(tempDir, recursive: true);
+        }
+    }
+
     private sealed class StubHttpHandler : HttpMessageHandler
     {
         private readonly Func<HttpRequestMessage, Task<HttpResponseMessage>> _responder;

@@ -1322,6 +1322,7 @@ export const useFriendStore = defineStore('Friend', () => {
         tryApplyFriendOrder,
         resetFriendLog,
         reindexSortedFriend,
+        runInSortedFriendsBatch,
         resetDerivedDebugCounters,
         getDerivedDebugCounters,
         initFriendLogHistoryTable,

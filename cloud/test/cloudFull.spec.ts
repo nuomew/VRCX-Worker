@@ -2388,4 +2388,337 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
         // ts3 already had explicit time=900000ms -> preserved as-is
         expect(secondAuditSelf?.time).toBe(900_000);
     });
+
+    it('covers Wave 2 fixes: uploadImagePrint, wrld_/grp_ by-location, location time patch, scoped user delete, feed dates, favorite merge, atomic command claim, clamped limits, and WS relay block', async () => {
+        // 1. uploadImagePrint builds multipart POST matching Dotnet/WebApi.cs and never hits GET cache
+        const capturedCalls: Array<{ url: string; method: string; hasImagePart: boolean; noteValue: string | null }> =
+            [];
+        const originalFetch = globalThis.fetch;
+        const fetchSpy = vi
+            .spyOn(globalThis, 'fetch')
+            .mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+                const targetUrl =
+                    typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+                if (targetUrl === 'https://api.vrchat.cloud/api/1/prints') {
+                    const body = init?.body;
+                    let hasImagePart = false;
+                    let noteValue: string | null = null;
+                    if (body instanceof FormData) {
+                        hasImagePart = body.has('image');
+                        const note = body.get('note');
+                        noteValue = typeof note === 'string' ? note : null;
+                    }
+                    capturedCalls.push({
+                        url: targetUrl,
+                        method: String(init?.method ?? 'GET').toUpperCase(),
+                        hasImagePart,
+                        noteValue
+                    });
+                    return new Response(JSON.stringify({ id: 'prnt_wave2_1' }), {
+                        status: 200,
+                        headers: { 'Content-Type': 'application/json' }
+                    });
+                }
+                return originalFetch(input, init);
+            });
+
+        try {
+            const printRes = await exports.default.fetch('http://example.com/api/vrc/execute', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    url: 'https://api.vrchat.cloud/api/1/prints',
+                    method: 'GET',
+                    uploadImagePrint: true,
+                    imageData: btoa('png-bytes'),
+                    postData: JSON.stringify({ note: 'Wave2Print' }),
+                    preferCloudDirect: true
+                })
+            });
+            expect(printRes.status).toBe(200);
+            expect(capturedCalls).toHaveLength(1);
+            expect(capturedCalls[0]).toEqual({
+                url: 'https://api.vrchat.cloud/api/1/prints',
+                method: 'POST',
+                hasImagePart: true,
+                noteValue: 'Wave2Print'
+            });
+        } finally {
+            fetchSpy.mockRestore();
+        }
+
+        // 2. GameLog: bare wrld_ / grp_ by-location (including PortalSpawn & VideoPlay), PATCH update_location_time without location, and scoped user_instance DELETE
+        const w2Loc = 'wrld_wave2_world:77777~group(grp_wave2_grp)';
+        const w2Ts = '2026-11-23T10:00:00.000Z';
+        const ingestRes = await exports.default.fetch('http://example.com/api/gamelog', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                items: [
+                    {
+                        type: 'Location',
+                        created_at: w2Ts,
+                        location: w2Loc,
+                        worldId: 'wrld_wave2_world',
+                        worldName: 'Wave2 World',
+                        time: 0,
+                        groupName: 'Wave2 Group'
+                    },
+                    {
+                        type: 'OnPlayerJoined',
+                        created_at: '2026-11-23T10:01:00.000Z',
+                        location: w2Loc,
+                        userId: 'usr_w2_a',
+                        displayName: 'Wave2Alice'
+                    },
+                    {
+                        type: 'OnPlayerJoined',
+                        created_at: '2026-11-23T10:02:00.000Z',
+                        location: w2Loc,
+                        userId: 'usr_w2_b',
+                        displayName: 'Wave2Bob'
+                    },
+                    {
+                        type: 'PortalSpawn',
+                        created_at: '2026-11-23T10:03:00.000Z',
+                        location: w2Loc,
+                        userId: 'usr_w2_a',
+                        displayName: 'Wave2Alice',
+                        instanceId: 'wrld_dest:1',
+                        worldName: 'Dest World'
+                    },
+                    {
+                        type: 'VideoPlay',
+                        created_at: '2026-11-23T10:04:00.000Z',
+                        location: w2Loc,
+                        userId: 'usr_w2_b',
+                        displayName: 'Wave2Bob',
+                        videoUrl: 'https://youtu.be/wave2vid',
+                        videoName: 'Wave2 Video',
+                        videoId: 'wave2vid'
+                    }
+                ]
+            })
+        });
+        expect(ingestRes.status).toBe(200);
+
+        // PATCH update_location_time omitting `location` must still update duration
+        const patchTimeRes = await exports.default.fetch('http://example.com/api/gamelog', {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                op: 'update_location_time',
+                created_at: w2Ts,
+                time: 456_000
+            })
+        });
+        expect(patchTimeRes.status).toBe(200);
+
+        // Bare world ID search via /api/gamelog/by-location returns Location, JoinLeave, PortalSpawn, and VideoPlay
+        const byWorldRes = await exports.default.fetch(
+            'http://example.com/api/gamelog/by-location?location=wrld_wave2_world'
+        );
+        expect(byWorldRes.status).toBe(200);
+        const byWorldJson = (await byWorldRes.json()) as {
+            ok: boolean;
+            data: Array<{ rowId: number; type: string; userId?: string; time?: number }>;
+        };
+        expect(byWorldJson.data.some((r) => r.type === 'Location' && r.time === 456_000)).toBe(true);
+        expect(byWorldJson.data.some((r) => r.type === 'OnPlayerJoined' && r.userId === 'usr_w2_a')).toBe(true);
+        expect(byWorldJson.data.some((r) => r.type === 'PortalSpawn')).toBe(true);
+        expect(byWorldJson.data.some((r) => r.type === 'VideoPlay')).toBe(true);
+
+        // Bare group ID search via /api/gamelog/by-location also matches group(...) instances
+        const byGroupRes = await exports.default.fetch(
+            'http://example.com/api/gamelog/by-location?location=grp_wave2_grp'
+        );
+        const byGroupJson = (await byGroupRes.json()) as { ok: boolean; data: Array<{ type: string }> };
+        expect(byGroupJson.data.some((r) => r.type === 'Location')).toBe(true);
+        expect(byGroupJson.data.some((r) => r.type === 'VideoPlay')).toBe(true);
+
+        // Scoped user_instance delete removes ONLY usr_w2_a's join_leave row, preserving Location and usr_w2_b
+        const aliceRow = byWorldJson.data.find((r) => r.type === 'OnPlayerJoined' && r.userId === 'usr_w2_a');
+        expect(aliceRow).toBeDefined();
+        const delScopedRes = await exports.default.fetch(
+            `http://example.com/api/gamelog?kind=user_instance&location=${encodeURIComponent(w2Loc)}&userId=usr_w2_a&displayName=Wave2Alice&events=${aliceRow!.rowId}`,
+            { method: 'DELETE' }
+        );
+        expect(delScopedRes.status).toBe(200);
+
+        const afterDelRes = await exports.default.fetch(
+            `http://example.com/api/gamelog/by-location?location=${encodeURIComponent(w2Loc)}`
+        );
+        const afterDelJson = (await afterDelRes.json()) as {
+            ok: boolean;
+            data: Array<{ type: string; userId?: string }>;
+        };
+        expect(afterDelJson.data.some((r) => r.type === 'Location')).toBe(true);
+        expect(afterDelJson.data.some((r) => r.type === 'OnPlayerJoined' && r.userId === 'usr_w2_b')).toBe(true);
+        expect(afterDelJson.data.some((r) => r.type === 'OnPlayerJoined' && r.userId === 'usr_w2_a')).toBe(false);
+
+        // 3. Feed dateFrom/dateTo filtering on both /api/feed/query and /api/feed/search
+        await exports.default.fetch('http://example.com/api/feed', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                items: [
+                    {
+                        type: 'GPS',
+                        created_at: '2026-10-01T00:00:00.000Z',
+                        userId: 'usr_date_tester',
+                        displayName: 'DateTester',
+                        location: 'wrld_old:1',
+                        worldName: 'Old World'
+                    },
+                    {
+                        type: 'GPS',
+                        created_at: '2026-10-15T12:00:00.000Z',
+                        userId: 'usr_date_tester',
+                        displayName: 'DateTester',
+                        location: 'wrld_mid:1',
+                        worldName: 'Mid World'
+                    },
+                    {
+                        type: 'GPS',
+                        created_at: '2026-10-28T00:00:00.000Z',
+                        userId: 'usr_date_tester',
+                        displayName: 'DateTester',
+                        location: 'wrld_new:1',
+                        worldName: 'New World'
+                    }
+                ]
+            })
+        });
+
+        const dateQueryRes = await exports.default.fetch('http://example.com/api/feed/query', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                types: ['GPS'],
+                vipList: ['usr_date_tester'],
+                dateFrom: '2026-10-10T00:00:00.000Z',
+                dateTo: '2026-10-20T00:00:00.000Z',
+                limit: 20
+            })
+        });
+        const dateQueryJson = (await dateQueryRes.json()) as { ok: boolean; data: Array<{ worldName: string }> };
+        expect(dateQueryJson.data).toHaveLength(1);
+        expect(dateQueryJson.data[0]?.worldName).toBe('Mid World');
+
+        const dateSearchRes = await exports.default.fetch(
+            'http://example.com/api/feed/search?q=DateTester&dateFrom=2026-10-10T00:00:00.000Z&dateTo=2026-10-20T00:00:00.000Z'
+        );
+        const dateSearchJson = (await dateSearchRes.json()) as { ok: boolean; data: Array<{ worldName: string }> };
+        expect(dateSearchJson.data).toHaveLength(1);
+        expect(dateSearchJson.data[0]?.worldName).toBe('Mid World');
+
+        // 4. Favorite group rename merge succeeds without UNIQUE constraint 500
+        await exports.default.fetch('http://example.com/api/favorites', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ kind: 'friend', targetId: 'usr_fav_dup', groupName: 'grp_src' })
+        });
+        await exports.default.fetch('http://example.com/api/favorites', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ kind: 'friend', targetId: 'usr_fav_only_src', groupName: 'grp_src' })
+        });
+        await exports.default.fetch('http://example.com/api/favorites', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ kind: 'friend', targetId: 'usr_fav_dup', groupName: 'grp_dst' })
+        });
+        const mergeRes = await exports.default.fetch('http://example.com/api/favorites', {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ kind: 'friend', oldGroupName: 'grp_src', newGroupName: 'grp_dst' })
+        });
+        expect(mergeRes.status).toBe(200);
+        const favAfterMerge = await env.DB_CORE.prepare(
+            "SELECT user_id, group_name FROM favorite_friend WHERE group_name IN ('grp_src', 'grp_dst') ORDER BY user_id"
+        ).all<{ user_id: string; group_name: string }>();
+        expect(favAfterMerge.results).toEqual([
+            { user_id: 'usr_fav_dup', group_name: 'grp_dst' },
+            { user_id: 'usr_fav_only_src', group_name: 'grp_dst' }
+        ]);
+
+        // 5. Atomic command claiming prevents two concurrent agents from claiming the same broadcast command
+        const key1Res = await exports.default.fetch('http://example.com/api/agent/sync-key', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ deviceName: 'Race-PC-1' })
+        });
+        const key2Res = await exports.default.fetch('http://example.com/api/agent/sync-key', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ deviceName: 'Race-PC-2' })
+        });
+        const syncKey1 = ((await key1Res.json()) as { data: { syncKey: string } }).data.syncKey;
+        const syncKey2 = ((await key2Res.json()) as { data: { syncKey: string } }).data.syncKey;
+
+        const cmdCreate = await exports.default.fetch('http://example.com/api/commands', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ action: 'sync_now', params: {} })
+        });
+        expect(cmdCreate.status).toBe(200);
+        const createdCmdId = ((await cmdCreate.json()) as { data: { cmdId: string } }).data.cmdId;
+
+        const [sync1, sync2] = await Promise.all([
+            exports.default.fetch('http://example.com/api/agent/sync', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${syncKey1}` },
+                body: JSON.stringify({ events: [] })
+            }),
+            exports.default.fetch('http://example.com/api/agent/sync', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${syncKey2}` },
+                body: JSON.stringify({ events: [] })
+            })
+        ]);
+        const s1Cmds = ((await sync1.json()) as { data: { pendingCommands: Array<{ cmdId: string }> } }).data
+            .pendingCommands;
+        const s2Cmds = ((await sync2.json()) as { data: { pendingCommands: Array<{ cmdId: string }> } }).data
+            .pendingCommands;
+        const claimedCount =
+            s1Cmds.filter((c) => c.cmdId === createdCmdId).length +
+            s2Cmds.filter((c) => c.cmdId === createdCmdId).length;
+        expect(claimedCount).toBe(1);
+
+        // 6. Clamped query limits reject negative/NaN values cleanly without unbounded scans
+        for (const badPath of [
+            '/api/avatar-history?limit=-1',
+            '/api/friend-log/history?limit=notanumber',
+            '/api/notifications?v=1&limit=-5',
+            '/api/commands?limit=-10'
+        ]) {
+            const res = await exports.default.fetch(`http://example.com${badPath}`);
+            expect(res.status).toBe(200);
+            const json = (await res.json()) as { ok: boolean; data: unknown[] };
+            expect(json.ok).toBe(true);
+            expect(Array.isArray(json.data)).toBe(true);
+        }
+
+        // 7. AgentHubDO blocks direct unvalidated web WS cmd.dispatch / rpc.request relay
+        const hub = env.AGENT_HUB.get(env.AGENT_HUB.idFromName('wave2-ws-guard-test'));
+        const wsRes = await hub.fetch('https://agent-hub.internal/ws/web', {
+            headers: { Upgrade: 'websocket' }
+        });
+        expect(wsRes.status).toBe(101);
+        const webSocket = wsRes.webSocket!;
+        webSocket.accept();
+        const errReply = await new Promise<Record<string, unknown>>((resolve, reject) => {
+            const timer = setTimeout(() => reject(new Error('No error reply from AgentHubDO')), 3000);
+            webSocket.addEventListener('message', (ev) => {
+                clearTimeout(timer);
+                resolve(JSON.parse(String(ev.data)) as Record<string, unknown>);
+            });
+            webSocket.send(
+                JSON.stringify({ v: 1, id: 'bypass-1', type: 'cmd.dispatch', payload: { action: 'quit_vrc' } })
+            );
+        });
+        expect(errReply.type).toBe('error');
+        expect((errReply.payload as Record<string, unknown>)?.code).toBe('FORBIDDEN_WS_RELAY');
+        webSocket.close(1000, 'done');
+    });
 });

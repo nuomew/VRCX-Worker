@@ -10,6 +10,13 @@ function safeJsonParse<T>(raw: string | null | undefined, fallback: T): T {
     }
 }
 
+export function clampQueryLimit(raw: string | null, fallback: number, max: number): number {
+    if (raw == null || raw.trim() === '') return fallback;
+    const n = Number(raw);
+    if (!Number.isFinite(n) || n <= 0) return fallback;
+    return Math.min(Math.floor(n), max);
+}
+
 export async function incrementCounter(db: D1Database, counterKey: string, delta: number): Promise<void> {
     if (!delta) return;
     const now = new Date().toISOString();
@@ -504,9 +511,15 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
                     { status: 400 }
                 );
             }
-            await env.DB_CORE.prepare(`UPDATE ${table} SET group_name = ? WHERE group_name = ?`)
-                .bind(body.newGroupName, body.oldGroupName)
-                .run();
+            if (body.oldGroupName !== body.newGroupName) {
+                await env.DB_CORE.batch([
+                    env.DB_CORE.prepare(`UPDATE OR IGNORE ${table} SET group_name = ? WHERE group_name = ?`).bind(
+                        body.newGroupName,
+                        body.oldGroupName
+                    ),
+                    env.DB_CORE.prepare(`DELETE FROM ${table} WHERE group_name = ?`).bind(body.oldGroupName)
+                ]);
+            }
             return Response.json({ ok: true });
         }
         if (request.method === 'DELETE') {
@@ -576,7 +589,7 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
 
     if (url.pathname === '/api/avatar-history') {
         if (request.method === 'GET') {
-            const limit = Math.min(Number(url.searchParams.get('limit') ?? '100'), 200);
+            const limit = clampQueryLimit(url.searchParams.get('limit'), 100, 200);
             const res = await env.DB_CORE.prepare(
                 'SELECT avatar_id, created_at, time FROM avatar_history ORDER BY created_at DESC LIMIT ?'
             )
@@ -714,7 +727,7 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
     if (url.pathname === '/api/friend-log/history') {
         if (request.method === 'GET') {
             const userId = url.searchParams.get('userId');
-            const limit = Math.min(Number(url.searchParams.get('limit') ?? '200'), 500);
+            const limit = clampQueryLimit(url.searchParams.get('limit'), 200, 500);
             const res = userId
                 ? await env.DB_CORE.prepare(
                       'SELECT * FROM friend_log_history WHERE user_id = ? ORDER BY id DESC LIMIT ?'
@@ -780,7 +793,7 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
     if (url.pathname === '/api/notifications') {
         if (request.method === 'GET') {
             const version = url.searchParams.get('v') === '2' ? 2 : 1;
-            const limit = Math.min(Number(url.searchParams.get('limit') ?? '100'), 200);
+            const limit = clampQueryLimit(url.searchParams.get('limit'), 100, 200);
             const table = version === 2 ? 'notifications_v2' : 'notifications';
             const res = await env.DB_CORE.prepare(`SELECT * FROM ${table} ORDER BY created_at DESC LIMIT ?`)
                 .bind(limit)

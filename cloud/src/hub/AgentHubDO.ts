@@ -18,6 +18,7 @@ interface HubEnvelope {
 }
 
 interface PendingRpc {
+    deviceId: string;
     resolve: (payload: Record<string, unknown>) => void;
     reject: (err: Error) => void;
     timer: ReturnType<typeof setTimeout>;
@@ -66,7 +67,11 @@ export class AgentHubDO extends DurableObject<Env> {
             const list = Array.isArray(body?.messages) ? body.messages : body?.type ? [body] : [];
             for (const msg of list) {
                 if (msg && typeof msg.type === 'string') {
-                    if (msg.type === 'agent.state' && typeof msg.payload?.deviceId === 'string' && msg.payload.deviceId) {
+                    if (
+                        msg.type === 'agent.state' &&
+                        typeof msg.payload?.deviceId === 'string' &&
+                        msg.payload.deviceId
+                    ) {
                         const { deviceId, ...statePayload } = msg.payload;
                         this.ctx.storage.sql.exec(
                             `INSERT INTO live_device_state (device_id, state_json, updated_at)
@@ -154,6 +159,8 @@ export class AgentHubDO extends DurableObject<Env> {
             );
         }
 
+        const agentAttachment = agentSocket.deserializeAttachment() as SocketAttachment | null;
+        const agentDeviceId = agentAttachment?.deviceId ?? 'default-win-agent';
         const payload = (await request.json()) as Record<string, unknown>;
         const reqId = crypto.randomUUID();
 
@@ -162,7 +169,7 @@ export class AgentHubDO extends DurableObject<Env> {
                 this.pendingRpcs.delete(reqId);
                 reject(new Error('Agent RPC timeout'));
             }, RPC_TIMEOUT_MS);
-            this.pendingRpcs.set(reqId, { resolve, reject, timer });
+            this.pendingRpcs.set(reqId, { deviceId: agentDeviceId, resolve, reject, timer });
         });
 
         try {
@@ -356,30 +363,21 @@ export class AgentHubDO extends DurableObject<Env> {
             return;
         }
 
-        // Messages from web clients routed to target or active agent
+        // Security boundary: direct web->agent WS forwarding would bypass Worker command allowlist,
+        // SSRF URL allowlist, and cloud_commands audit logging. Clients must use HTTP /api/commands & /api/vrc/execute.
         if (envelope.type === 'cmd.dispatch' || envelope.type === 'rpc.request') {
-            const targetDeviceId =
-                typeof envelope.payload?.targetDeviceId === 'string' ? envelope.payload.targetDeviceId : undefined;
-            const agentSocket = this.pickAgentSocket(targetDeviceId);
-
-            if (!agentSocket) {
-                ws.send(
-                    JSON.stringify({
-                        v: 1,
-                        id: envelope.id,
-                        type: 'cmd.result',
-                        ts: Date.now(),
-                        payload: { status: 'failed', code: 'AGENT_OFFLINE' }
-                    })
-                );
-                return;
-            }
-
-            try {
-                agentSocket.send(JSON.stringify({ ...envelope, ts: Date.now() }));
-            } catch {
-                // Socket cleanup handled on close/error.
-            }
+            ws.send(
+                JSON.stringify({
+                    v: 1,
+                    id: envelope.id,
+                    type: 'error',
+                    ts: Date.now(),
+                    payload: {
+                        code: 'FORBIDDEN_WS_RELAY',
+                        message: 'Direct WebSocket command/RPC relay is disabled; use validated HTTP API endpoints'
+                    }
+                })
+            );
         }
     }
 
@@ -392,6 +390,7 @@ export class AgentHubDO extends DurableObject<Env> {
         }
         if (attachment?.role === 'agent') {
             for (const [id, pending] of this.pendingRpcs.entries()) {
+                if (pending.deviceId !== attachment.deviceId) continue;
                 clearTimeout(pending.timer);
                 pending.reject(new Error('Agent disconnected during RPC'));
                 this.pendingRpcs.delete(id);

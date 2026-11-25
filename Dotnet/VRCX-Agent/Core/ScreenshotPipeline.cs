@@ -18,6 +18,13 @@ using SixLabors.ImageSharp.Processing;
 
 namespace VRCX.Agent.Core;
 
+public enum ScreenshotUploadOutcome
+{
+    Uploaded,
+    TransientFailure,
+    PermanentFailure
+}
+
 /// <summary>
 /// Processes new VRChat PNG screenshots locally:
 /// 1) Writes VRCX `Description` iTXt metadata into the local PNG reusing upstream `PNGFile` + `PNGHelper`.
@@ -287,25 +294,35 @@ public sealed class ScreenshotPipeline
 
     /// <summary>
     /// Uploads a queued screenshot strictly once during a scheduled sync cycle when AutoUploadScreenshots is enabled.
-    /// Deduplicates by local path, filename, and source-file SHA-256 across restarts and compression-mode switches.
+    /// Returns true when the screenshot was uploaded or already deduplicated.
     /// </summary>
     public async Task<bool> UploadQueuedTaskAsync(PendingScreenshotTask task, CancellationToken ct)
     {
+        ScreenshotUploadOutcome outcome = await UploadQueuedTaskWithOutcomeAsync(task, ct).ConfigureAwait(false);
+        return outcome == ScreenshotUploadOutcome.Uploaded;
+    }
+
+    /// <summary>
+    /// Uploads a queued screenshot and classifies failures as permanent (corrupt image / 4xx rejection)
+    /// vs transient (network / 5xx / 429 / temporary file lock) so callers can drop poison-pill entries.
+    /// </summary>
+    public async Task<ScreenshotUploadOutcome> UploadQueuedTaskWithOutcomeAsync(PendingScreenshotTask task, CancellationToken ct)
+    {
         if (string.IsNullOrWhiteSpace(task.LocalPath) || !File.Exists(task.LocalPath))
         {
-            return true;
+            return ScreenshotUploadOutcome.Uploaded;
         }
 
         AgentConfig cfg = _configProvider();
         if (!cfg.IsConfigured || !cfg.AutoUploadScreenshots)
         {
-            return true;
+            return ScreenshotUploadOutcome.Uploaded;
         }
 
         if (HasAlreadyUploaded(task.LocalPath))
         {
             Log.Debug("Skipping already-synced screenshot {Path}", task.LocalPath);
-            return true;
+            return ScreenshotUploadOutcome.Uploaded;
         }
 
         var meta = BuildMetaPayload(task, cfg.CompressScreenshots);
@@ -319,7 +336,7 @@ public sealed class ScreenshotPipeline
             {
                 MarkUploaded(task.LocalPath, screenshotId);
                 Log.Debug("Skipping already-synced screenshot content {Id} ({Path})", screenshotId, task.LocalPath);
-                return true;
+                return ScreenshotUploadOutcome.Uploaded;
             }
 
             byte[] payloadBytes;
@@ -357,18 +374,29 @@ public sealed class ScreenshotPipeline
             using HttpResponseMessage res = await _httpProvider().SendAsync(req, ct).ConfigureAwait(false);
             if (!res.IsSuccessStatusCode)
             {
+                int statusCode = (int)res.StatusCode;
                 string err = await res.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
-                Log.Warn("Screenshot upload failed ({Status}): {Error}", (int)res.StatusCode, err);
-                return false;
+                Log.Warn("Screenshot upload failed ({Status}): {Error}", statusCode, err);
+                // Non-retryable client rejections (400/413/415/422 etc.); keep 401/403/408/429 transient so auth/rate-limit recoveries work.
+                bool isPermanentClientError = statusCode >= 400 && statusCode < 500
+                    && statusCode != 401 && statusCode != 403 && statusCode != 408 && statusCode != 429;
+                return isPermanentClientError
+                    ? ScreenshotUploadOutcome.PermanentFailure
+                    : ScreenshotUploadOutcome.TransientFailure;
             }
 
             MarkUploaded(task.LocalPath, screenshotId);
-            return true;
+            return ScreenshotUploadOutcome.Uploaded;
+        }
+        catch (Exception ex) when (ex is ImageFormatException || ex is NotSupportedException)
+        {
+            Log.Warn(ex, "Permanent screenshot decode failure for {Path}; skipping poison-pill file", task.LocalPath);
+            return ScreenshotUploadOutcome.PermanentFailure;
         }
         catch (Exception ex)
         {
             Log.Warn(ex, "Screenshot upload failed for {Path}", task.LocalPath);
-            return false;
+            return ScreenshotUploadOutcome.TransientFailure;
         }
     }
 

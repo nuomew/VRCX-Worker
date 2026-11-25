@@ -38,6 +38,7 @@ interface WebApiExecutePayload {
     uploadImage?: boolean;
     uploadImageLegacy?: boolean;
     uploadFilePUT?: boolean;
+    uploadImagePrint?: boolean;
     uploadPrintImage?: boolean;
     postData?: string;
     imageData?: string;
@@ -317,7 +318,8 @@ function buildUpstreamRequestInit(payload: WebApiExecutePayload, cookieHeader: s
         return { method: 'PUT', headers, body: bytes as BodyInit };
     }
 
-    if ((payload.uploadImage || payload.uploadImageLegacy || payload.uploadPrintImage) && payload.imageData) {
+    const isPrintUpload = Boolean(payload.uploadImagePrint || payload.uploadPrintImage);
+    if ((payload.uploadImage || payload.uploadImageLegacy || isPrintUpload) && payload.imageData) {
         const form = new FormData();
         if (payload.postData) {
             if (payload.uploadImageLegacy) {
@@ -337,8 +339,8 @@ function buildUpstreamRequestInit(payload: WebApiExecutePayload, cookieHeader: s
         const blob = new Blob([imgBytes.buffer as ArrayBuffer], { type: 'image/png' });
         if (payload.uploadImageLegacy) {
             form.append('image', blob, 'image.png');
-        } else if (payload.uploadPrintImage) {
-            form.append('image', blob, 'print.png');
+        } else if (isPrintUpload) {
+            form.append('image', blob, 'image');
         } else {
             form.append('file', blob, 'blob');
         }
@@ -442,12 +444,16 @@ export async function handleVrcProxyRoutes(request: Request, env: Env, url: URL)
         }
 
         const method = (payload.method || 'GET').toUpperCase();
-        const isMutation = method !== 'GET';
         const hasAuthHeader = Boolean(payload.headers?.Authorization || payload.headers?.authorization);
         const isUpload = Boolean(
-            payload.uploadImage || payload.uploadImageLegacy || payload.uploadFilePUT || payload.uploadPrintImage
+            payload.uploadImage ||
+            payload.uploadImageLegacy ||
+            payload.uploadFilePUT ||
+            payload.uploadImagePrint ||
+            payload.uploadPrintImage
         );
-        const canUseServerCache = !isMutation && !isUpload && !hasAuthHeader && !payload.bypassCache;
+        const isMutation = method !== 'GET' || isUpload;
+        const canUseServerCache = !isMutation && !hasAuthHeader && !payload.bypassCache;
 
         let cacheMeta: ReturnType<typeof classifyVrcCacheUrl> = null;
         if (canUseServerCache) {

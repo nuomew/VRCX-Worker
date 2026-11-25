@@ -25,6 +25,7 @@ public sealed class TrayApplicationContext : ApplicationContext
 {
     private static readonly Logger Log = LogManager.GetCurrentClassLogger();
     private const int BatchUploadLimit = 50;
+    private const int MaxScreenshotRetries = 3;
 
     private readonly AgentConfigStore _configStore;
     private readonly HttpSyncClient _syncClient;
@@ -36,6 +37,9 @@ public sealed class TrayApplicationContext : ApplicationContext
     private readonly SyncScheduleGate _scheduleGate;
     private readonly Queue<PendingScreenshotTask> _pendingScreenshots = new();
     private readonly HashSet<string> _queuedScreenshotPaths = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> _inFlightCapturePaths = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> _permanentlyFailedScreenshotPaths = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, int> _screenshotFailureCounts = new(StringComparer.OrdinalIgnoreCase);
     private readonly SemaphoreSlim _syncLock = new(1, 1);
     private readonly SemaphoreSlim _updateCheckLock = new(1, 1);
     private readonly CancellationTokenSource _cts = new();
@@ -346,7 +350,9 @@ public sealed class TrayApplicationContext : ApplicationContext
             {
                 List<GameLogEventItem> batch = _logCollector.PeekBatch(BatchUploadLimit);
                 LogCursorState cursor = _logCollector.SnapshotCursor();
-                LiveAgentState? stateToSend = BuildStateIfChangedOrForced(force || batch.Count > 0 || round == 0);
+                LiveAgentState? stateToSend = BuildStateIfChangedOrForced(
+                    force || batch.Count > 0 || round == 0,
+                    out string? pendingStateSignature);
 
                 AgentSyncResponse response = await _syncClient.SyncOnceAsync(
                     cfg,
@@ -356,6 +362,10 @@ public sealed class TrayApplicationContext : ApplicationContext
                     ct).ConfigureAwait(false);
 
                 lastResponse = response;
+                if (pendingStateSignature != null)
+                {
+                    _lastSentStateSignature = pendingStateSignature;
+                }
 
                 if (batch.Count > 0)
                 {
@@ -465,22 +475,75 @@ public sealed class TrayApplicationContext : ApplicationContext
                 task = _pendingScreenshots.Peek();
             }
 
-            bool uploaded = await _screenshotPipeline.UploadQueuedTaskAsync(task, ct).ConfigureAwait(false);
-            if (!uploaded)
+            string normalizedPath = ScreenshotPipeline.NormalizeScreenshotPath(task.LocalPath);
+            ScreenshotUploadOutcome outcome = await _screenshotPipeline
+                .UploadQueuedTaskWithOutcomeAsync(task, ct)
+                .ConfigureAwait(false);
+
+            if (outcome == ScreenshotUploadOutcome.Uploaded)
             {
-                // Keep queued for the next scheduled sync tick
-                break;
+                lock (_pendingScreenshots)
+                {
+                    if (_pendingScreenshots.Count > 0 && ReferenceEquals(_pendingScreenshots.Peek(), task))
+                    {
+                        _pendingScreenshots.Dequeue();
+                    }
+                    _queuedScreenshotPaths.Remove(normalizedPath);
+                    _screenshotFailureCounts.Remove(normalizedPath);
+                }
+                attempts++;
+                continue;
             }
 
+            if (outcome == ScreenshotUploadOutcome.PermanentFailure)
+            {
+                Log.Warn("Dropping poison-pill screenshot {Path} after permanent failure so subsequent photos continue syncing.", task.LocalPath);
+                lock (_pendingScreenshots)
+                {
+                    if (_pendingScreenshots.Count > 0 && ReferenceEquals(_pendingScreenshots.Peek(), task))
+                    {
+                        _pendingScreenshots.Dequeue();
+                    }
+                    _queuedScreenshotPaths.Remove(normalizedPath);
+                    _screenshotFailureCounts.Remove(normalizedPath);
+                    _permanentlyFailedScreenshotPaths.Add(normalizedPath);
+                }
+                attempts++;
+                continue;
+            }
+
+            // Transient failure: retry on subsequent sync cycles, but cap consecutive failures to avoid infinite head-of-line blocking.
+            bool dropPoisonItem = false;
+            int failures;
             lock (_pendingScreenshots)
             {
-                if (_pendingScreenshots.Count > 0)
+                failures = _screenshotFailureCounts.TryGetValue(normalizedPath, out int existing) ? existing + 1 : 1;
+                if (failures >= MaxScreenshotRetries)
                 {
-                    PendingScreenshotTask done = _pendingScreenshots.Dequeue();
-                    _queuedScreenshotPaths.Remove(ScreenshotPipeline.NormalizeScreenshotPath(done.LocalPath));
+                    dropPoisonItem = true;
+                    if (_pendingScreenshots.Count > 0 && ReferenceEquals(_pendingScreenshots.Peek(), task))
+                    {
+                        _pendingScreenshots.Dequeue();
+                    }
+                    _queuedScreenshotPaths.Remove(normalizedPath);
+                    _screenshotFailureCounts.Remove(normalizedPath);
+                    _permanentlyFailedScreenshotPaths.Add(normalizedPath);
+                }
+                else
+                {
+                    _screenshotFailureCounts[normalizedPath] = failures;
                 }
             }
-            attempts++;
+
+            if (dropPoisonItem)
+            {
+                Log.Warn("Skipping screenshot {Path} after {Count} consecutive upload failures.", task.LocalPath, failures);
+                attempts++;
+                continue;
+            }
+
+            // Keep queued for the next scheduled sync tick
+            break;
         }
     }
 
@@ -509,6 +572,10 @@ public sealed class TrayApplicationContext : ApplicationContext
             {
                 if (_pendingScreenshots.Count >= 200) break;
                 string normalized = ScreenshotPipeline.NormalizeScreenshotPath(item.LocalPath);
+                if (_inFlightCapturePaths.Contains(normalized) || _permanentlyFailedScreenshotPaths.Contains(normalized))
+                {
+                    continue;
+                }
                 if (_queuedScreenshotPaths.Add(normalized))
                 {
                     _pendingScreenshots.Enqueue(item);
@@ -523,7 +590,7 @@ public sealed class TrayApplicationContext : ApplicationContext
         }
     }
 
-    private LiveAgentState? BuildStateIfChangedOrForced(bool allowHeartbeat)
+    private LiveAgentState? BuildStateIfChangedOrForced(bool allowHeartbeat, out string? pendingSignature)
     {
         bool vrcRunning = _processMonitor.IsVrcRunning;
         string currentLocation = _logCollector.Parser.CurrentLocation;
@@ -554,10 +621,11 @@ public sealed class TrayApplicationContext : ApplicationContext
         string sig = $"{state.VrcRunning}|{state.VrcStartedAt}|{state.SteamVrRunning}|{state.SteamVrStartedAt}|{state.CurrentLocation}|{state.CurrentWorldName}|{state.PlayerCount}|{playersSig}|{state.OfflineQueueCount}";
         if (sig != _lastSentStateSignature)
         {
-            _lastSentStateSignature = sig;
+            pendingSignature = sig;
             return state;
         }
         // Skip unchanged state on idle heartbeats to avoid waking AgentHubDO unnecessarily on Cloudflare Free tier.
+        pendingSignature = null;
         return allowHeartbeat && _lastSyncSuccessAt == DateTimeOffset.MinValue ? state : null;
     }
 
@@ -569,10 +637,14 @@ public sealed class TrayApplicationContext : ApplicationContext
         string normalizedPath = ScreenshotPipeline.NormalizeScreenshotPath(ev.LocalScreenshotPath);
         lock (_pendingScreenshots)
         {
-            if (_queuedScreenshotPaths.Contains(normalizedPath))
+            if (_queuedScreenshotPaths.Contains(normalizedPath)
+                || _inFlightCapturePaths.Contains(normalizedPath)
+                || _permanentlyFailedScreenshotPaths.Contains(normalizedPath))
             {
                 return;
             }
+            // Mark in-flight immediately so periodic historical scans cannot race ahead of local PNG metadata embedding.
+            _inFlightCapturePaths.Add(normalizedPath);
         }
 
         var task = new PendingScreenshotTask
@@ -588,17 +660,36 @@ public sealed class TrayApplicationContext : ApplicationContext
         // Only write local PNG metadata immediately; defer network upload until next Web-scheduled sync tick.
         _ = Task.Run(async () =>
         {
-            await _screenshotPipeline.EmbedLocalMetadataOnlyAsync(task, _cts.Token).ConfigureAwait(false);
-            if (_config.AutoUploadScreenshots && !_screenshotPipeline.HasAlreadyUploaded(task.LocalPath))
+            try
+            {
+                await _screenshotPipeline.EmbedLocalMetadataOnlyAsync(task, _cts.Token).ConfigureAwait(false);
+                if (_config.AutoUploadScreenshots && !_screenshotPipeline.HasAlreadyUploaded(task.LocalPath))
+                {
+                    bool enqueued = false;
+                    lock (_pendingScreenshots)
+                    {
+                        if (_pendingScreenshots.Count < 200 && _queuedScreenshotPaths.Add(normalizedPath))
+                        {
+                            _pendingScreenshots.Enqueue(task);
+                            enqueued = true;
+                        }
+                    }
+                    if (enqueued)
+                    {
+                        UpdateTrayStatus();
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.Warn(ex, "Live screenshot metadata processing failed for {Path}", task.LocalPath);
+            }
+            finally
             {
                 lock (_pendingScreenshots)
                 {
-                    if (_pendingScreenshots.Count < 200 && _queuedScreenshotPaths.Add(normalizedPath))
-                    {
-                        _pendingScreenshots.Enqueue(task);
-                    }
+                    _inFlightCapturePaths.Remove(normalizedPath);
                 }
-                UpdateTrayStatus();
             }
         });
     }

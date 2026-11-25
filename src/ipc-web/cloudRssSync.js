@@ -29,6 +29,7 @@ export function resetCloudRssSyncState() {
  *     webSyncIntervalSeconds?: number;
  *     onlineFriends?: Array<Record<string, any>>;
  *     recentFeeds?: Array<Record<string, any>>;
+ *     friendLogInserted?: number;
  *     notificationsV1?: Array<Record<string, any>>;
  *     notificationsV2?: Array<Record<string, any>>;
  * }} data
@@ -53,32 +54,41 @@ export function applyCloudRssSnapshot(data) {
     const onlineFriends = Array.isArray(data.onlineFriends) ? data.onlineFriends : [];
     const onlineIdSet = new Set();
 
-    friendStore.runInSortedFriendsBatch(() => {
+    const runBatch =
+        typeof friendStore.runInSortedFriendsBatch === 'function'
+            ? (fn) => friendStore.runInSortedFriendsBatch(fn)
+            : (fn) => fn();
+
+    runBatch(() => {
         for (const raw of onlineFriends) {
             if (!raw || typeof raw !== 'object' || !raw.id) continue;
             onlineIdSet.add(raw.id);
             const state = raw.platform === 'web' ? 'active' : raw.platform ? 'online' : 'offline';
-            applyUser({
-                ...raw,
-                state
-            });
+            applyUser(
+                /** @type {any} */ ({
+                    ...raw,
+                    state
+                })
+            );
         }
 
         // Transition friends that disappeared from the latest online snapshot cleanly to offline
         for (const [friendId, ctx] of friendStore.friends.entries()) {
             if (friendId === userStore.currentUser?.id) continue;
             if (!onlineIdSet.has(friendId) && ctx.state !== 'offline') {
-                applyUser({
-                    id: friendId,
-                    state: 'offline',
-                    platform: '',
-                    location: 'offline',
-                    worldId: 'offline',
-                    instanceId: 'offline',
-                    travelingToLocation: 'offline',
-                    travelingToWorld: 'offline',
-                    travelingToInstance: 'offline'
-                });
+                applyUser(
+                    /** @type {any} */ ({
+                        id: friendId,
+                        state: 'offline',
+                        platform: '',
+                        location: 'offline',
+                        worldId: 'offline',
+                        instanceId: 'offline',
+                        travelingToLocation: 'offline',
+                        travelingToWorld: 'offline',
+                        travelingToInstance: 'offline'
+                    })
+                );
             }
         }
     });

@@ -317,6 +317,7 @@ const GAMELOG_STATEMENTS: readonly string[] = [
         world_name TEXT NOT NULL DEFAULT '',
         UNIQUE (created_at, display_name)
     )`,
+    `CREATE INDEX IF NOT EXISTS idx_gamelog_portal_location ON gamelog_portal_spawn (location, id DESC)`,
     `CREATE TABLE IF NOT EXISTS gamelog_video_play (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         created_at TEXT NOT NULL,
@@ -483,7 +484,7 @@ export async function ensureSchemaReady(env: Env): Promise<void> {
     if (!initPromise) {
         initPromise = Promise.all([
             initCoreIfNeeded(env.DB_CORE),
-            initShardIfNeeded(env.DB_GAMELOG, 'idx_gamelog_video_location', GAMELOG_STATEMENTS, 'index'),
+            initShardIfNeeded(env.DB_GAMELOG, 'idx_gamelog_portal_location', GAMELOG_STATEMENTS, 'index'),
             initShardIfNeeded(env.DB_FEED, 'activity_sessions_v2', FEED_STATEMENTS, 'table'),
             initShardIfNeeded(getCacheDb(env), 'cloud_rss_snapshot', CACHE_STATEMENTS, 'table')
         ])

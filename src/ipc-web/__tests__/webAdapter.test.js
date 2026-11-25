@@ -999,4 +999,169 @@ describe('WEB cloud adapter (stateless)', () => {
         const totalSent = feedCalls.reduce((sum, c) => sum + JSON.parse(c[1].body).items.length, 0);
         expect(totalSent).toBe(65);
     });
+
+    it('covers Wave 2 frontend fixes: addGamelogJoinLeaveBulk array return, 4-arg VIP lookupNotificationDatabase, feed dateFrom/dateTo, scoped deleteGameLogInstance, uploadImagePrint bypass, and favorite/offline-friend cache invalidation', async () => {
+        const db = createCloudDatabase({ userPrefix: 'usr_me', maxTableSize: 500 });
+
+        // 1. addGamelogJoinLeaveBulk returns iterable array (never undefined)
+        const emptyBulk = await db.addGamelogJoinLeaveBulk([]);
+        expect(emptyBulk).toEqual([]);
+        fetchSpy.mockResolvedValueOnce(mockOk({ inserted: 2 }));
+        const bulkInput = [
+            { type: 'OnPlayerLeft', created_at: '2026-11-24T13:00:00.000Z', userId: 'usr_1', displayName: 'A' },
+            { type: 'OnPlayerLeft', created_at: '2026-11-24T13:00:01.000Z', userId: 'usr_2', displayName: 'B' }
+        ];
+        const persisted = await db.addGamelogJoinLeaveBulk(bulkInput);
+        expect(Array.isArray(persisted)).toBe(true);
+        expect(persisted).toHaveLength(2);
+
+        // 2. lookupNotificationDatabase accepts 4-arg (search, filters, vipList, maxEntries) and filters by VIP senderUserId
+        fetchSpy.mockResolvedValueOnce(
+            mockOk([
+                {
+                    id: 'not_vip',
+                    created_at: '2026-11-24T13:05:00.000Z',
+                    type: 'invite',
+                    sender_user_id: 'usr_vip_1',
+                    sender_username: 'VipFriend',
+                    world_name: 'Sakura Shrine'
+                },
+                {
+                    id: 'not_other',
+                    created_at: '2026-11-24T13:04:00.000Z',
+                    type: 'invite',
+                    sender_user_id: 'usr_other_1',
+                    sender_username: 'OtherFriend',
+                    world_name: 'Other World'
+                }
+            ])
+        );
+        const vipNotys = await db.lookupNotificationDatabase('', ['invite'], ['usr_vip_1'], 50);
+        expect(vipNotys).toHaveLength(1);
+        expect(vipNotys[0].id).toBe('not_vip');
+
+        // 3. searchFeedDatabase forwards dateFrom/dateTo for both empty-search and keyword-search queries
+        fetchSpy.mockResolvedValueOnce(mockOk([{ rowId: 1, type: 'GPS', created_at: '2026-11-15T00:00:00.000Z' }]));
+        const dateOnlyRows = await db.searchFeedDatabase(
+            '',
+            ['GPS'],
+            [],
+            50,
+            '2026-11-10T00:00:00.000Z',
+            '2026-11-20T00:00:00.000Z'
+        );
+        expect(dateOnlyRows).toHaveLength(1);
+        const dateQueryCall = fetchSpy.mock.calls.at(-1);
+        expect(dateQueryCall[0]).toBe('/api/feed/query');
+        expect(JSON.parse(dateQueryCall[1].body)).toMatchObject({
+            types: ['GPS'],
+            dateFrom: '2026-11-10T00:00:00.000Z',
+            dateTo: '2026-11-20T00:00:00.000Z'
+        });
+
+        fetchSpy.mockResolvedValueOnce(
+            mockOk([
+                { rowId: 1, type: 'GPS', created_at: '2026-11-15T00:00:00.000Z', userId: 'usr_1' },
+                { rowId: 2, type: 'GPS', created_at: '2026-11-25T00:00:00.000Z', userId: 'usr_1' }
+            ])
+        );
+        const dateSearchRows = await db.searchFeedDatabase(
+            'Alice',
+            ['GPS'],
+            [],
+            50,
+            '2026-11-10T00:00:00.000Z',
+            '2026-11-20T00:00:00.000Z'
+        );
+        expect(dateSearchRows).toHaveLength(1);
+        expect(fetchSpy.mock.calls.at(-1)[0]).toContain('dateFrom=2026-11-10T00%3A00%3A00.000Z');
+        expect(fetchSpy.mock.calls.at(-1)[0]).toContain('dateTo=2026-11-20T00%3A00%3A00.000Z');
+
+        // 4. deleteGameLogInstance sends scoped kind=user_instance (never wipes full room)
+        fetchSpy.mockResolvedValueOnce(mockOk({}));
+        await db.deleteGameLogInstance({
+            id: 'usr_target',
+            displayName: 'TargetUser',
+            location: 'wrld_1:100',
+            events: [10, 11]
+        });
+        const delUrl = fetchSpy.mock.calls.at(-1)[0];
+        expect(delUrl).toContain('kind=user_instance');
+        expect(delUrl).toContain('userId=usr_target');
+        expect(delUrl).toContain('displayName=TargetUser');
+        expect(delUrl).toContain('events=10%2C11');
+
+        // 5. webApiRemote: uploadImagePrint bypasses GET cache/batch, and favorite/friend writes evict favorites + static offline friends caches
+        cloudState.webSyncIntervalSeconds = 60;
+        const webApi = createWebApiBridge();
+        const favUrl = 'https://api.vrchat.cloud/api/1/favorites?n=100&offset=0';
+        const worldsFavUrl = 'https://api.vrchat.cloud/api/1/worlds/favorites?n=100';
+        const offlineFriendsUrl = 'https://api.vrchat.cloud/api/1/auth/user/friends?n=100&offset=0&offline=true';
+        const printsUrl = 'https://api.vrchat.cloud/api/1/prints/user/usr_me';
+
+        fetchSpy.mockResolvedValueOnce(
+            mockOk({
+                route: 'cloud_cache',
+                results: [
+                    { status: 200, data: '["fav1"]' },
+                    { status: 200, data: '["wfav1"]' },
+                    { status: 200, data: '["off1"]' },
+                    { status: 200, data: '["p1"]' }
+                ]
+            })
+        );
+        await Promise.all([
+            webApi.ExecuteJson(JSON.stringify({ url: favUrl, method: 'GET' })),
+            webApi.ExecuteJson(JSON.stringify({ url: worldsFavUrl, method: 'GET' })),
+            webApi.ExecuteJson(JSON.stringify({ url: offlineFriendsUrl, method: 'GET' })),
+            webApi.ExecuteJson(JSON.stringify({ url: printsUrl, method: 'GET' }))
+        ]);
+
+        // Deleting a favorite must evict both /api/1/favorites?... and /api/1/worlds/favorites
+        fetchSpy.mockResolvedValueOnce(mockOk({ status: 200, data: '{}' }));
+        await webApi.ExecuteJson(
+            JSON.stringify({ url: 'https://api.vrchat.cloud/api/1/favorites/fvrt_123', method: 'DELETE' })
+        );
+        fetchSpy.mockResolvedValueOnce(
+            mockOk({
+                route: 'cloud_direct',
+                results: [
+                    { status: 200, data: '["fav2"]' },
+                    { status: 200, data: '["wfav2"]' }
+                ]
+            })
+        );
+        const [favAfter, wFavAfter] = await Promise.all([
+            webApi.ExecuteJson(JSON.stringify({ url: favUrl, method: 'GET' })),
+            webApi.ExecuteJson(JSON.stringify({ url: worldsFavUrl, method: 'GET' }))
+        ]);
+        expect(JSON.parse(favAfter).message).toBe('["fav2"]');
+        expect(JSON.parse(wFavAfter).message).toBe('["wfav2"]');
+
+        // Unfriending must evict static offline=true friends cache
+        fetchSpy.mockResolvedValueOnce(mockOk({ status: 200, data: '{}' }));
+        await webApi.ExecuteJson(
+            JSON.stringify({ url: 'https://api.vrchat.cloud/api/1/auth/user/friends/usr_off1', method: 'DELETE' })
+        );
+        fetchSpy.mockResolvedValueOnce(mockOk({ status: 200, data: '["off2"]' }));
+        const offAfter = await webApi.ExecuteJson(JSON.stringify({ url: offlineFriendsUrl, method: 'GET' }));
+        expect(JSON.parse(offAfter).message).toBe('["off2"]');
+
+        // uploadImagePrint with default method='GET' must NOT batch or hit GET cache, and must evict /api/1/prints cache
+        fetchSpy.mockResolvedValueOnce(mockOk({ status: 200, data: '{"id":"prnt_new"}' }));
+        const uploadRes = await webApi.ExecuteJson(
+            JSON.stringify({
+                url: 'https://api.vrchat.cloud/api/1/prints',
+                method: 'GET',
+                uploadImagePrint: true,
+                imageData: 'abc'
+            })
+        );
+        expect(fetchSpy.mock.calls.at(-1)[0]).toBe('/api/vrc/execute');
+        expect(JSON.parse(uploadRes).message).toBe('{"id":"prnt_new"}');
+
+        fetchSpy.mockResolvedValueOnce(mockOk({ status: 200, data: '["p2"]' }));
+        const printsAfter = await webApi.ExecuteJson(JSON.stringify({ url: printsUrl, method: 'GET' }));
+        expect(JSON.parse(printsAfter).message).toBe('["p2"]');
+    });
 });
