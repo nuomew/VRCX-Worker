@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag (e.g. v1.10.7)'
+        description: 'Release tag (e.g. v1.10.8)'
         required: true
-        default: 'v1.10.7'
+        default: 'v1.10.8'
   push:
     tags:
       - 'v*'
@@ -35,7 +35,7 @@ jobs:
         run: |
           $tag = if ("${{ github.event_name }}" -eq "workflow_dispatch") { "${{ inputs.tag }}" } else { "${{ github.ref_name }}" }
           $ver = $tag.TrimStart('v', 'V')
-          if ($ver -notmatch '^\d+\.\d+\.\d+') { $ver = '1.10.7' }
+          if ($ver -notmatch '^\d+\.\d+\.\d+') { $ver = '1.10.8' }
           echo "tag=$tag" >> $env:GITHUB_OUTPUT
           echo "ver=$ver" >> $env:GITHUB_OUTPUT
 

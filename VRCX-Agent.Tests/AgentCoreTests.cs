@@ -1601,10 +1601,33 @@ public sealed class AgentCoreTests
     {
         // 1. P1-15: VMess WS+TLS sends exact custom SNI (different from connect IP and HTTP Host header)
         string uuid = "de305d54-75b4-431b-adb2-eb6b9e546014";
-        using var ecdsa = System.Security.Cryptography.ECDsa.Create(System.Security.Cryptography.ECCurve.NamedCurves.nistP256);
+        using var rsa = System.Security.Cryptography.RSA.Create(2048);
         var certReq = new System.Security.Cryptography.X509Certificates.CertificateRequest(
-            "CN=custom-sni.example", ecdsa, System.Security.Cryptography.HashAlgorithmName.SHA256);
-        using var selfSigned = certReq.CreateSelfSigned(DateTimeOffset.UtcNow.AddDays(-1), DateTimeOffset.UtcNow.AddDays(1));
+            "CN=custom-sni.example",
+            rsa,
+            System.Security.Cryptography.HashAlgorithmName.SHA256,
+            System.Security.Cryptography.RSASignaturePadding.Pkcs1);
+        certReq.CertificateExtensions.Add(new System.Security.Cryptography.X509Certificates.X509KeyUsageExtension(
+            System.Security.Cryptography.X509Certificates.X509KeyUsageFlags.DigitalSignature |
+            System.Security.Cryptography.X509Certificates.X509KeyUsageFlags.KeyEncipherment,
+            critical: false));
+        certReq.CertificateExtensions.Add(new System.Security.Cryptography.X509Certificates.X509EnhancedKeyUsageExtension(
+            new System.Security.Cryptography.OidCollection { new System.Security.Cryptography.Oid("1.3.6.1.5.5.7.3.1") },
+            critical: false));
+        var sanBuilder = new System.Security.Cryptography.X509Certificates.SubjectAlternativeNameBuilder();
+        sanBuilder.AddDnsName("custom-sni.example");
+        certReq.CertificateExtensions.Add(sanBuilder.Build());
+        using var ephemeralCert = certReq.CreateSelfSigned(DateTimeOffset.UtcNow.AddDays(-1), DateTimeOffset.UtcNow.AddDays(1));
+        // Windows SChannel rejects ephemeral CNG keys from CreateSelfSigned() in AuthenticateAsServerAsync;
+        // re-importing via PKCS#12 with UserKeySet materializes a SChannel-compatible private key.
+        var keyFlags = OperatingSystem.IsWindows()
+            ? System.Security.Cryptography.X509Certificates.X509KeyStorageFlags.UserKeySet |
+              System.Security.Cryptography.X509Certificates.X509KeyStorageFlags.Exportable
+            : System.Security.Cryptography.X509Certificates.X509KeyStorageFlags.DefaultKeySet;
+        using var selfSigned = System.Security.Cryptography.X509Certificates.X509CertificateLoader.LoadPkcs12(
+            ephemeralCert.Export(System.Security.Cryptography.X509Certificates.X509ContentType.Pfx),
+            password: null,
+            keyStorageFlags: keyFlags);
 
         using var wsListener = new System.Net.Sockets.TcpListener(IPAddress.Loopback, 0);
         wsListener.Start();
@@ -1624,7 +1647,11 @@ public sealed class AgentCoreTests
                     return selfSigned;
                 },
                 ClientCertificateRequired = false,
-                EnabledSslProtocols = System.Security.Authentication.SslProtocols.Tls12 | System.Security.Authentication.SslProtocols.Tls13
+                EnabledSslProtocols = System.Security.Authentication.SslProtocols.Tls12 | System.Security.Authentication.SslProtocols.Tls13,
+                ApplicationProtocols = new List<System.Net.Security.SslApplicationProtocol>
+                {
+                    System.Net.Security.SslApplicationProtocol.Http11
+                }
             });
             byte[] buf = new byte[4096];
             int total = 0;

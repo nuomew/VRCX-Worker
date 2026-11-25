@@ -297,7 +297,7 @@
                                     <span class="font-mono text-[11px] text-muted-foreground">{{ dev.device_id }}</span>
                                 </div>
                                 <div class="text-muted-foreground">
-                                    v{{ dev.agent_version || '1.10.7' }} ·
+                                    v{{ dev.agent_version || '1.10.8' }} ·
                                     {{
                                         t('cloud_hub.devices.last_sync', {
                                             time: dev.last_seen_at || t('cloud_hub.devices.never_synced')
