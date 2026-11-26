@@ -4123,6 +4123,7 @@
             "status_cancelled": "Cancelled",
             "status_failed": "Failed",
             "status_stopped_quota_limit": "Paused (Near 500 MB Cap)",
+            "status_paused_daily_quota": "Paused (Daily Write Quota)",
             "cancel_job_btn": "Cancel Sync",
             "cancelling": "Cancelling...",
             "job_stats": "Processed {processed} / {total} rows · Inserted {inserted} · Skipped duplicates {skipped}",
@@ -4187,7 +4188,13 @@
             "concurrency_option": "{count} threads",
             "concurrency_option_recommended": "{count} threads (Recommended)",
             "concurrency_saved_toast": "Cloud sync concurrency saved ({count} threads).",
-            "concurrency_badge": "{count} threads"
+            "concurrency_badge": "{count} threads",
+            "resume_sync_btn": "Resume Sync Selected",
+            "reset_cursors_btn": "Reset Checkpoints",
+            "resetting_cursors": "Resetting...",
+            "reset_cursors_toast": "Saved resume checkpoints cleared. Next sync will scan from the beginning.",
+            "cursor_checkpoint_badge": "Checkpoint · {count} synced",
+            "cursor_resume_hint": "Saved checkpoints detected — syncing will resume directly from the last confirmed row without re-uploading completed tables."
         }
     }
 }

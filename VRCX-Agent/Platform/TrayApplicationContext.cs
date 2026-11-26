@@ -628,7 +628,8 @@ public sealed class TrayApplicationContext : ApplicationContext
         string jobId,
         string accountPrefix,
         IReadOnlyList<string> categories,
-        int concurrency)
+        int concurrency,
+        IReadOnlyDictionary<string, LegacyTableCursor>? resumeCursors)
     {
         AgentConfig cfg = GetConfigSnapshot();
         string dbPath = DesktopLegacyMigrator.ResolveDesktopVrcxDatabasePath();
@@ -650,7 +651,7 @@ public sealed class TrayApplicationContext : ApplicationContext
             try
             {
                 var (completed, batches, message) = await DesktopLegacyMigrator
-                    .RunMigrationAsync(cfg, dbPath, jobId, accountPrefix, safeCategories, _syncClient, linkedCts.Token, safeConcurrency)
+                    .RunMigrationAsync(cfg, dbPath, jobId, accountPrefix, safeCategories, _syncClient, linkedCts.Token, safeConcurrency, resumeCursors)
                     .ConfigureAwait(false);
                 Log.Info("Desktop legacy migration {JobId} finished (completed={Completed}, batches={Batches}, threads={Threads}): {Msg}", jobId, completed, batches, safeConcurrency, message);
             }

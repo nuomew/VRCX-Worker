@@ -11,7 +11,7 @@ import {
     upsertEntityUsersBatch,
     upsertEntityWorldsBatch
 } from './coreData';
-import { getLegacyImportedStats } from './legacyMigration';
+import { decodeLegacyFeedChunkRows, getLegacyImportedStats } from './legacyMigration';
 
 const MAX_LIMIT = 100;
 
@@ -2624,6 +2624,54 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
                 const rid = Number(row.rowId ?? 0);
                 if (Number.isFinite(rid) && rid > 0) {
                     row.rowId = -rid;
+                }
+            }
+
+            // Also read compact archived chunks from legacy_feed_chunks (Plan A: >99% D1 write savings)
+            const chunkKinds: string[] = [];
+            if (wantGps) chunkKinds.push('gps');
+            if (wantOnline || wantOffline) chunkKinds.push('oo');
+            if (wantStatus) chunkKinds.push('status');
+            if (wantBio) chunkKinds.push('bio');
+            if (chunkKinds.length > 0) {
+                try {
+                    const kindPh = chunkKinds.map(() => '?').join(', ');
+                    const chunkConds: string[] = [`feed_kind IN (${kindPh})`];
+                    const chunkBinds: unknown[] = [...chunkKinds];
+                    if (cleanDateFrom) {
+                        chunkConds.push('max_created_at >= ?');
+                        chunkBinds.push(cleanDateFrom);
+                    }
+                    if (cleanDateTo) {
+                        chunkConds.push('min_created_at <= ?');
+                        chunkBinds.push(cleanDateTo);
+                    }
+                    const chunkLimit = hasVip ? 16 : Math.min(12, Math.max(4, Math.ceil(limit / 80) + 2));
+                    const chunkRes = await db
+                        .prepare(
+                            `SELECT id, feed_kind, payload_json
+                             FROM legacy_feed_chunks
+                             WHERE ${chunkConds.join(' AND ')}
+                             ORDER BY max_created_at DESC, id DESC
+                             LIMIT ?`
+                        )
+                        .bind(...chunkBinds, chunkLimit)
+                        .all<{ id: number; feed_kind: string; payload_json: string }>();
+                    const vipSet = hasVip ? new Set(vipIds) : null;
+                    for (const c of chunkRes.results ?? []) {
+                        const unpacked = decodeLegacyFeedChunkRows(c.id, c.feed_kind, c.payload_json);
+                        for (const entry of unpacked) {
+                            const entryType = String(entry.type ?? '');
+                            if (!useAll && !typeSet.has(entryType)) continue;
+                            if (vipSet && !vipSet.has(String(entry.userId ?? ''))) continue;
+                            const createdAt = String(entry.created_at ?? '');
+                            if (cleanDateFrom && createdAt < cleanDateFrom) continue;
+                            if (cleanDateTo && createdAt > cleanDateTo) continue;
+                            items.push(entry);
+                        }
+                    }
+                } catch {
+                    // Graceful fallback if legacy_feed_chunks has not been initialized yet
                 }
             }
         }

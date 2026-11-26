@@ -424,7 +424,8 @@ public sealed class HttpSyncClient
         bool categoryDone,
         bool allDone,
         string? errorMessage,
-        CancellationToken ct)
+        CancellationToken ct,
+        LegacyMigrationCursorUpdate? cursorUpdate = null)
     {
         if (!config.IsConfigured || !TryNormalizeCloudUrl(config.CloudUrl, out string normalizedBaseUrl))
         {
@@ -443,6 +444,10 @@ public sealed class HttpSyncClient
         if (!string.IsNullOrWhiteSpace(errorMessage))
         {
             payload["errorMessage"] = errorMessage;
+        }
+        if (cursorUpdate != null && !string.IsNullOrWhiteSpace(cursorUpdate.Table))
+        {
+            payload["cursorUpdate"] = cursorUpdate;
         }
 
         string jsonBody = JsonConvert.SerializeObject(payload);

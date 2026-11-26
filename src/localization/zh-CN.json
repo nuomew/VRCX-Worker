@@ -4121,6 +4121,7 @@
             "status_cancelled": "已取消",
             "status_failed": "失败",
             "status_stopped_quota_limit": "已触发 500 MB 保护暂停",
+            "status_paused_daily_quota": "已达今日 D1 写入配额（断点已保存）",
             "cancel_job_btn": "停止同步",
             "cancelling": "停止中...",
             "job_stats": "已处理 {processed} / {total} 条 · 新增入库 {inserted} 条 · 跳过重复 {skipped} 条",
@@ -4185,7 +4186,13 @@
             "concurrency_option": "{count} 线程",
             "concurrency_option_recommended": "{count} 线程（推荐）",
             "concurrency_saved_toast": "已保存云端同步并发线程数（{count} 线程）。",
-            "concurrency_badge": "{count} 线程"
+            "concurrency_badge": "{count} 线程",
+            "resume_sync_btn": "断点续传已选数据",
+            "reset_cursors_btn": "重置断点",
+            "resetting_cursors": "重置中...",
+            "reset_cursors_toast": "已清空续传断点，下次同步将从头重新扫描。",
+            "cursor_checkpoint_badge": "断点已存 · 已传 {count} 条",
+            "cursor_resume_hint": "检测到已保存的同步断点：本次将直接从上次已确认位置续传，自动跳过已完成的数据表。"
         }
     }
 }

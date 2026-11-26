@@ -88,6 +88,42 @@ public sealed class LegacyMigrationBatchResponse
     public string? Reason { get; set; }
 }
 
+public sealed class LegacyTableCursor
+{
+    [JsonProperty("createdAt")]
+    public string CreatedAt { get; set; } = string.Empty;
+
+    [JsonProperty("rowId")]
+    public long RowId { get; set; }
+
+    [JsonProperty("completed")]
+    public bool Completed { get; set; }
+
+    [JsonProperty("rowsDone")]
+    public long RowsDone { get; set; }
+
+    [JsonProperty("updatedAt", NullValueHandling = NullValueHandling.Ignore)]
+    public string? UpdatedAt { get; set; }
+}
+
+public sealed class LegacyMigrationCursorUpdate
+{
+    [JsonProperty("table")]
+    public string Table { get; set; } = string.Empty;
+
+    [JsonProperty("createdAt")]
+    public string CreatedAt { get; set; } = string.Empty;
+
+    [JsonProperty("rowId")]
+    public long RowId { get; set; }
+
+    [JsonProperty("completed")]
+    public bool Completed { get; set; }
+
+    [JsonProperty("rowsDone")]
+    public long RowsDone { get; set; }
+}
+
 /// <summary>
 /// Strictly read-only scanner and batched uploader for upstream original desktop VRCX (`%AppData%\VRCX\VRCX.sqlite3`).
 /// Never writes to or locks the desktop database, strips all credentials/cookies/proxies before upload,
@@ -123,6 +159,10 @@ public static class DesktopLegacyMigrator
 
     private static readonly Regex SafeAccountPrefixRegex = new(
         @"^[A-Za-z_][A-Za-z0-9_]{2,64}$",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+
+    private static readonly Regex SafeLogicalTableRegex = new(
+        @"^[a-z0-9_]{2,48}$",
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
     private static readonly Regex UserTableSuffixRegex = new(
@@ -168,6 +208,69 @@ public static class DesktopLegacyMigrator
     public static bool IsValidAccountPrefix(string? prefix)
     {
         return !string.IsNullOrWhiteSpace(prefix) && SafeAccountPrefixRegex.IsMatch(prefix.Trim());
+    }
+
+    public static bool IsValidLogicalTableName(string? tableName)
+    {
+        return !string.IsNullOrWhiteSpace(tableName) && SafeLogicalTableRegex.IsMatch(tableName.Trim());
+    }
+
+    public static Dictionary<string, LegacyTableCursor> ParseResumeCursors(object? raw)
+    {
+        var result = new Dictionary<string, LegacyTableCursor>(StringComparer.Ordinal);
+        if (raw == null) return result;
+
+        if (raw is IReadOnlyDictionary<string, LegacyTableCursor> typed)
+        {
+            foreach (var kv in typed)
+            {
+                string key = kv.Key?.Trim() ?? string.Empty;
+                if (!SafeLogicalTableRegex.IsMatch(key) || kv.Value == null) continue;
+                result[key] = new LegacyTableCursor
+                {
+                    CreatedAt = (kv.Value.CreatedAt ?? string.Empty).Trim(),
+                    RowId = Math.Max(0, kv.Value.RowId),
+                    Completed = kv.Value.Completed,
+                    RowsDone = Math.Max(0, kv.Value.RowsDone),
+                    UpdatedAt = kv.Value.UpdatedAt
+                };
+            }
+            return result;
+        }
+
+        JObject? obj = raw as JObject;
+        if (obj == null)
+        {
+            try
+            {
+                obj = JObject.FromObject(raw);
+            }
+            catch
+            {
+                return result;
+            }
+        }
+
+        foreach (JProperty prop in obj.Properties())
+        {
+            string key = prop.Name.Trim();
+            if (!SafeLogicalTableRegex.IsMatch(key) || prop.Value is not JObject cObj) continue;
+            string createdAt = (cObj["createdAt"]?.Value<string>() ?? string.Empty).Trim();
+            if (createdAt.Length > 64) createdAt = createdAt.Substring(0, 64);
+            long rowId = Math.Max(0, cObj["rowId"]?.Value<long?>() ?? 0);
+            bool completed = cObj["completed"]?.Value<bool?>() == true;
+            long rowsDone = Math.Max(0, cObj["rowsDone"]?.Value<long?>() ?? 0);
+            string? updatedAt = cObj["updatedAt"]?.Value<string>();
+            result[key] = new LegacyTableCursor
+            {
+                CreatedAt = createdAt,
+                RowId = rowId,
+                Completed = completed,
+                RowsDone = rowsDone,
+                UpdatedAt = updatedAt
+            };
+        }
+        return result;
     }
 
     public static bool IsSafeLegacyConfigKey(string? rawKey)
@@ -277,9 +380,15 @@ public static class DesktopLegacyMigrator
         return cols;
     }
 
-    private static long EstimateD1Bytes(long rowCount, long rawBytes)
+    private static long EstimateD1Bytes(long rowCount, long rawBytes, bool compactChunked = false)
     {
         if (rowCount <= 0) return 0;
+        if (compactChunked)
+        {
+            // Historical Feed rows are stored in compact JSON tuple chunks (~240 rows per 1 D1 row),
+            // eliminating per-row B-tree index & FTS5 dictionary amplification.
+            return Math.Max(4096L, (long)Math.Ceiling(rawBytes * 1.05));
+        }
         // Accounts for SQLite B-tree page overhead, secondary indexes, unique constraints, and FTS5 dictionary entries.
         return Math.Max(4096L, (long)Math.Ceiling(rawBytes * 1.45 + rowCount * 48.0));
     }
@@ -428,7 +537,7 @@ public static class DesktopLegacyMigrator
                         Key = categoryKey,
                         RowCount = totalRows,
                         RawBytes = totalRaw,
-                        EstimatedDbBytes = EstimateD1Bytes(totalRows, totalRaw),
+                        EstimatedDbBytes = EstimateD1Bytes(totalRows, totalRaw, compactChunked: categoryKey == "feed"),
                         Tables = matchedTables
                     });
                 }
@@ -547,6 +656,96 @@ public static class DesktopLegacyMigrator
         return false;
     }
 
+    private sealed class MigrationBatchWorkItem
+    {
+        public int Seq { get; init; }
+        public List<Dictionary<string, object?>> Items { get; init; } = new();
+        public string LastCreatedAt { get; init; } = string.Empty;
+        public long LastRowId { get; init; }
+        public int RowCount { get; init; }
+    }
+
+    /// <summary>
+    /// Tracks contiguous confirmed batch watermarks for a single logical table under concurrent uploads.
+    /// The safe cursor only advances across uninterrupted sequence numbers 0..k so an early stop or
+    /// failure can never skip unconfirmed batches when resuming later.
+    /// </summary>
+    private sealed class TableWatermarkTracker
+    {
+        private readonly object _gate = new();
+        private readonly string _logicalTable;
+        private readonly int _reportEveryBatches;
+        private readonly Dictionary<int, (string CreatedAt, long RowId, int RowCount)> _acked = new();
+        private int _nextExpectedSeq;
+        private string _safeCreatedAt;
+        private long _safeRowId;
+        private long _safeRowsDone;
+        private int _batchesSinceReport;
+        private bool _hasUnreportedProgress;
+
+        public TableWatermarkTracker(string logicalTable, LegacyTableCursor? initialCursor, int effectiveConcurrency)
+        {
+            _logicalTable = logicalTable;
+            _reportEveryBatches = Math.Max(1, effectiveConcurrency / 2);
+            _safeCreatedAt = initialCursor?.CreatedAt ?? string.Empty;
+            _safeRowId = initialCursor?.RowId ?? 0;
+            _safeRowsDone = initialCursor?.RowsDone ?? 0;
+        }
+
+        public void RecordAck(int seq, string lastCreatedAt, long lastRowId, int rowCount)
+        {
+            lock (_gate)
+            {
+                _acked[seq] = (lastCreatedAt, lastRowId, rowCount);
+                while (_acked.Remove(_nextExpectedSeq, out var meta))
+                {
+                    _safeCreatedAt = meta.CreatedAt;
+                    _safeRowId = meta.RowId;
+                    _safeRowsDone += meta.RowCount;
+                    _nextExpectedSeq++;
+                    _batchesSinceReport++;
+                    _hasUnreportedProgress = true;
+                }
+            }
+        }
+
+        public LegacyMigrationCursorUpdate? TryTakePiggybackUpdate(bool force = false)
+        {
+            lock (_gate)
+            {
+                if (!_hasUnreportedProgress) return null;
+                if (!force && _batchesSinceReport < _reportEveryBatches) return null;
+                _batchesSinceReport = 0;
+                _hasUnreportedProgress = false;
+                return new LegacyMigrationCursorUpdate
+                {
+                    Table = _logicalTable,
+                    CreatedAt = _safeCreatedAt,
+                    RowId = _safeRowId,
+                    Completed = false,
+                    RowsDone = _safeRowsDone
+                };
+            }
+        }
+
+        public LegacyMigrationCursorUpdate BuildCompletedUpdate()
+        {
+            lock (_gate)
+            {
+                _batchesSinceReport = 0;
+                _hasUnreportedProgress = false;
+                return new LegacyMigrationCursorUpdate
+                {
+                    Table = _logicalTable,
+                    CreatedAt = _safeCreatedAt,
+                    RowId = _safeRowId,
+                    Completed = true,
+                    RowsDone = _safeRowsDone
+                };
+            }
+        }
+    }
+
     private static async Task<LegacyMigrationBatchResponse> PostMigrationBatchWithRetryAsync(
         HttpSyncClient syncClient,
         AgentConfig config,
@@ -556,14 +755,15 @@ public static class DesktopLegacyMigrator
         bool categoryDone,
         bool allDone,
         string? errorMessage,
-        CancellationToken ct)
+        CancellationToken ct,
+        LegacyMigrationCursorUpdate? cursorUpdate = null)
     {
         for (int attempt = 0; ; attempt++)
         {
             try
             {
                 return await syncClient
-                    .PostMigrationBatchAsync(config, jobId, category, items, categoryDone, allDone, errorMessage, ct)
+                    .PostMigrationBatchAsync(config, jobId, category, items, categoryDone, allDone, errorMessage, ct, cursorUpdate)
                     .ConfigureAwait(false);
             }
             catch (Exception ex) when (attempt < MaxBatchRetryAttempts && IsTransientBatchError(ex, ct))
@@ -582,8 +782,9 @@ public static class DesktopLegacyMigrator
     }
 
     /// <summary>
-    /// Streams selected categories from the read-only desktop VRCX database in bounded batches
+    /// Streams selected categories from the read-only desktop VRCX database in bounded per-table batches
     /// into the dedicated cloud DB_LEGACY database, supporting cloud-configured concurrency,
+    /// deterministic table-level cursor resume checkpoints, contiguous watermark tracking,
     /// transient batch retries, cancellation, and server quota stop signals.
     /// </summary>
     public static async Task<(bool Completed, long UploadedBatches, string Message)> RunMigrationAsync(
@@ -594,7 +795,8 @@ public static class DesktopLegacyMigrator
         IReadOnlyList<string> categories,
         HttpSyncClient syncClient,
         CancellationToken ct,
-        int concurrency = 1)
+        int concurrency = 1,
+        IReadOnlyDictionary<string, LegacyTableCursor>? resumeCursors = null)
     {
         if (string.IsNullOrWhiteSpace(dbPath) || !File.Exists(dbPath))
         {
@@ -607,6 +809,8 @@ public static class DesktopLegacyMigrator
         string safePrefix = IsValidAccountPrefix(accountPrefix) ? accountPrefix.Trim() : string.Empty;
         int effectiveConcurrency = Math.Clamp(concurrency, MinConcurrency, MaxConcurrency);
         long batchesSent = 0;
+        string stopReason = "Stopped by server";
+        LegacyMigrationCursorUpdate? lastKnownSafeCursor = null;
 
         try
         {
@@ -618,322 +822,464 @@ public static class DesktopLegacyMigrator
                 ct.ThrowIfCancellationRequested();
                 if (!AllowedCategorySet.Contains(rawCategory)) continue;
 
-                var buffer = new List<Dictionary<string, object?>>(BatchRowsLimit);
-                int bufferBytes = 256;
-                int stoppedByServer = 0;
-                Exception? workerFailure = null;
-
-                using var categoryCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-                Channel<List<Dictionary<string, object?>>>? batchChannel = null;
-                Task[]? workerTasks = null;
-
-                if (effectiveConcurrency > 1)
+                async Task<bool> StreamTableAsync(
+                    string logicalTable,
+                    string physicalTable,
+                    bool orderByCreatedAtDesc,
+                    Func<SqliteDataReader, Dictionary<string, int>, Dictionary<string, object?>?> mapper)
                 {
-                    batchChannel = Channel.CreateBounded<List<Dictionary<string, object?>>>(
-                        new BoundedChannelOptions(effectiveConcurrency * 2)
-                        {
-                            SingleWriter = true,
-                            SingleReader = false,
-                            FullMode = BoundedChannelFullMode.Wait
-                        });
-                    workerTasks = new Task[effectiveConcurrency];
-                    for (int w = 0; w < effectiveConcurrency; w++)
+                    LegacyTableCursor? existingCursor = null;
+                    if (resumeCursors != null && resumeCursors.TryGetValue(logicalTable, out var foundCursor))
                     {
-                        workerTasks[w] = Task.Run(async () =>
+                        existingCursor = foundCursor;
+                        if (existingCursor.Completed)
                         {
-                            try
+                            return false;
+                        }
+                    }
+
+                    if (!tables.Contains(physicalTable)) return false;
+                    HashSet<string> cols = ListColumns(conn, physicalTable);
+                    if (cols.Count == 0) return false;
+
+                    bool useCreatedAtDesc = orderByCreatedAtDesc && cols.Contains("created_at");
+                    using var cmd = conn.CreateCommand();
+                    var whereClauses = new List<string>();
+                    if (useCreatedAtDesc)
+                    {
+                        if (existingCursor != null)
+                        {
+                            if (!string.IsNullOrEmpty(existingCursor.CreatedAt) && existingCursor.RowId > 0)
                             {
-                                await foreach (var batch in batchChannel.Reader.ReadAllAsync(categoryCts.Token).ConfigureAwait(false))
+                                whereClauses.Add("(COALESCE(created_at, '') < $cTs OR (COALESCE(created_at, '') = $cTs AND rowid < $cRid))");
+                                cmd.Parameters.AddWithValue("$cTs", existingCursor.CreatedAt);
+                                cmd.Parameters.AddWithValue("$cRid", existingCursor.RowId);
+                            }
+                            else if (!string.IsNullOrEmpty(existingCursor.CreatedAt))
+                            {
+                                whereClauses.Add("COALESCE(created_at, '') < $cTs");
+                                cmd.Parameters.AddWithValue("$cTs", existingCursor.CreatedAt);
+                            }
+                            else if (existingCursor.RowId > 0)
+                            {
+                                whereClauses.Add("rowid < $cRid");
+                                cmd.Parameters.AddWithValue("$cRid", existingCursor.RowId);
+                            }
+                        }
+                        string whereSql = whereClauses.Count > 0 ? "WHERE " + string.Join(" AND ", whereClauses) : string.Empty;
+                        cmd.CommandText = $"SELECT rowid AS __vrcx_rowid, * FROM \"{physicalTable}\" {whereSql} ORDER BY COALESCE(created_at, '') DESC, rowid DESC";
+                    }
+                    else
+                    {
+                        if (existingCursor != null && existingCursor.RowId > 0)
+                        {
+                            whereClauses.Add("rowid > $cRid");
+                            cmd.Parameters.AddWithValue("$cRid", existingCursor.RowId);
+                        }
+                        string whereSql = whereClauses.Count > 0 ? "WHERE " + string.Join(" AND ", whereClauses) : string.Empty;
+                        cmd.CommandText = $"SELECT rowid AS __vrcx_rowid, * FROM \"{physicalTable}\" {whereSql} ORDER BY rowid ASC";
+                    }
+
+                    var buffer = new List<Dictionary<string, object?>>(BatchRowsLimit);
+                    int bufferBytes = 256;
+                    string bufferLastCreatedAt = existingCursor?.CreatedAt ?? string.Empty;
+                    long bufferLastRowId = existingCursor?.RowId ?? 0;
+                    long singleThreadRowsDone = existingCursor?.RowsDone ?? 0;
+                    int nextBatchSeq = 0;
+
+                    int stoppedByServer = 0;
+                    Exception? workerFailure = null;
+                    TableWatermarkTracker? watermark = null;
+                    CancellationTokenSource? tableCts = null;
+                    Channel<MigrationBatchWorkItem>? batchChannel = null;
+                    Task[]? workerTasks = null;
+
+                    void EnsureConcurrentWorkersStarted()
+                    {
+                        if (batchChannel != null) return;
+                        watermark = new TableWatermarkTracker(logicalTable, existingCursor, effectiveConcurrency);
+                        tableCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                        batchChannel = Channel.CreateBounded<MigrationBatchWorkItem>(
+                            new BoundedChannelOptions(effectiveConcurrency * 2)
+                            {
+                                SingleWriter = true,
+                                SingleReader = false,
+                                FullMode = BoundedChannelFullMode.Wait
+                            });
+                        workerTasks = new Task[effectiveConcurrency];
+                        for (int w = 0; w < effectiveConcurrency; w++)
+                        {
+                            workerTasks[w] = Task.Run(async () =>
+                            {
+                                try
                                 {
-                                    if (Volatile.Read(ref stoppedByServer) != 0) break;
-                                    LegacyMigrationBatchResponse res = await PostMigrationBatchWithRetryAsync(
-                                        syncClient,
-                                        config,
-                                        jobId,
-                                        rawCategory,
-                                        batch,
-                                        categoryDone: false,
-                                        allDone: false,
-                                        errorMessage: null,
-                                        categoryCts.Token).ConfigureAwait(false);
-                                    Interlocked.Increment(ref batchesSent);
-                                    if (res.ShouldStop)
+                                    await foreach (MigrationBatchWorkItem work in batchChannel.Reader.ReadAllAsync(tableCts.Token).ConfigureAwait(false))
                                     {
-                                        Interlocked.Exchange(ref stoppedByServer, 1);
-                                        try { categoryCts.Cancel(); } catch { /* ignore */ }
-                                        break;
+                                        if (Volatile.Read(ref stoppedByServer) != 0) break;
+                                        LegacyMigrationCursorUpdate? piggyback = watermark.TryTakePiggybackUpdate(force: false);
+                                        LegacyMigrationBatchResponse res = await PostMigrationBatchWithRetryAsync(
+                                            syncClient,
+                                            config,
+                                            jobId,
+                                            rawCategory,
+                                            work.Items,
+                                            categoryDone: false,
+                                            allDone: false,
+                                            errorMessage: null,
+                                            tableCts.Token,
+                                            cursorUpdate: piggyback).ConfigureAwait(false);
+                                        Interlocked.Increment(ref batchesSent);
+                                        if (res.ShouldStop)
+                                        {
+                                            if (!string.IsNullOrWhiteSpace(res.Reason))
+                                            {
+                                                stopReason = res.Reason!;
+                                            }
+                                            Interlocked.Exchange(ref stoppedByServer, 1);
+                                            try { tableCts.Cancel(); } catch { /* ignore */ }
+                                            break;
+                                        }
+                                        watermark.RecordAck(work.Seq, work.LastCreatedAt, work.LastRowId, work.RowCount);
                                     }
                                 }
-                            }
-                            catch (OperationCanceledException) when (Volatile.Read(ref stoppedByServer) != 0 || ct.IsCancellationRequested)
-                            {
-                                // Normal halt on server stop signal or external cancellation
-                            }
-                            catch (Exception ex)
-                            {
-                                Interlocked.CompareExchange(ref workerFailure, ex, null);
-                                try { categoryCts.Cancel(); } catch { /* ignore */ }
-                            }
-                        }, CancellationToken.None);
+                                catch (OperationCanceledException) when (Volatile.Read(ref stoppedByServer) != 0 || ct.IsCancellationRequested)
+                                {
+                                    // Normal halt on server stop signal or external cancellation
+                                }
+                                catch (Exception ex)
+                                {
+                                    Interlocked.CompareExchange(ref workerFailure, ex, null);
+                                    try { tableCts.Cancel(); } catch { /* ignore */ }
+                                }
+                            }, CancellationToken.None);
+                        }
                     }
-                }
 
-                async Task<bool> FlushBufferAsync(bool categoryDone)
-                {
-                    if (effectiveConcurrency <= 1)
+                    async Task DrainWorkersAsync(bool cancelInFlight)
                     {
-                        if (buffer.Count == 0 && !categoryDone) return false;
-                        var batchToSend = new List<Dictionary<string, object?>>(buffer);
+                        if (batchChannel != null && workerTasks != null)
+                        {
+                            batchChannel.Writer.TryComplete();
+                            if (cancelInFlight && tableCts != null)
+                            {
+                                try { tableCts.Cancel(); } catch { /* ignore */ }
+                            }
+                            await Task.WhenAll(workerTasks).ConfigureAwait(false);
+                        }
+                        if (watermark != null)
+                        {
+                            LegacyMigrationCursorUpdate? pending = watermark.TryTakePiggybackUpdate(force: true);
+                            if (pending != null)
+                            {
+                                lastKnownSafeCursor = pending;
+                            }
+                        }
+                        tableCts?.Dispose();
+                        tableCts = null;
+                    }
+
+                    async Task<bool> FlushBatchAsync(bool isFinalTableBatch)
+                    {
+                        if (buffer.Count == 0) return false;
+                        var itemsToSend = new List<Dictionary<string, object?>>(buffer);
+                        string lastTs = bufferLastCreatedAt;
+                        long lastRid = bufferLastRowId;
+                        int count = itemsToSend.Count;
                         buffer.Clear();
                         bufferBytes = 256;
 
+                        // Use concurrent channel only when concurrency > 1 and the table spans multiple batches.
+                        if (effectiveConcurrency > 1 && (!isFinalTableBatch || batchChannel != null))
+                        {
+                            EnsureConcurrentWorkersStarted();
+                            var work = new MigrationBatchWorkItem
+                            {
+                                Seq = nextBatchSeq++,
+                                Items = itemsToSend,
+                                LastCreatedAt = lastTs,
+                                LastRowId = lastRid,
+                                RowCount = count
+                            };
+                            try
+                            {
+                                await batchChannel!.Writer.WriteAsync(work, tableCts!.Token).ConfigureAwait(false);
+                            }
+                            catch (OperationCanceledException) when (Volatile.Read(ref stoppedByServer) != 0 || workerFailure != null)
+                            {
+                                return true;
+                            }
+                            return Volatile.Read(ref stoppedByServer) != 0 || workerFailure != null;
+                        }
+
+                        // Single-threaded mode (or single-batch small table): attach exact cursor directly to this batch.
+                        singleThreadRowsDone += count;
+                        var cursorUpdate = new LegacyMigrationCursorUpdate
+                        {
+                            Table = logicalTable,
+                            CreatedAt = lastTs,
+                            RowId = lastRid,
+                            Completed = isFinalTableBatch,
+                            RowsDone = singleThreadRowsDone
+                        };
                         LegacyMigrationBatchResponse res = await PostMigrationBatchWithRetryAsync(
                             syncClient,
                             config,
                             jobId,
                             rawCategory,
-                            batchToSend,
-                            categoryDone,
+                            itemsToSend,
+                            categoryDone: false,
                             allDone: false,
                             errorMessage: null,
-                            ct).ConfigureAwait(false);
+                            ct,
+                            cursorUpdate: cursorUpdate).ConfigureAwait(false);
                         Interlocked.Increment(ref batchesSent);
                         if (res.ShouldStop)
                         {
+                            if (!string.IsNullOrWhiteSpace(res.Reason))
+                            {
+                                stopReason = res.Reason!;
+                            }
                             Interlocked.Exchange(ref stoppedByServer, 1);
                             return true;
                         }
                         return false;
                     }
 
-                    // Concurrent mode: push data batches to bounded worker channel; send categoryDone only after all workers drain.
-                    if (buffer.Count > 0)
+                    bool anyValidRowSent = false;
+                    try
                     {
-                        var batchToSend = new List<Dictionary<string, object?>>(buffer);
-                        buffer.Clear();
-                        bufferBytes = 256;
-                        try
+                        using SqliteDataReader reader = cmd.ExecuteReader();
+                        Dictionary<string, int> ord = BuildOrdinalMap(reader);
+                        while (reader.Read())
                         {
-                            await batchChannel!.Writer.WriteAsync(batchToSend, categoryCts.Token).ConfigureAwait(false);
+                            ct.ThrowIfCancellationRequested();
+                            Dictionary<string, object?>? mapped = mapper(reader, ord);
+                            if (mapped == null) continue;
+
+                            long rowId = GetColLong(reader, ord, "__vrcx_rowid");
+                            string rowCreatedAt = useCreatedAtDesc ? GetColStr(reader, ord, "created_at") : string.Empty;
+
+                            int itemBytes = Encoding.UTF8.GetByteCount(JsonConvert.SerializeObject(mapped)) + 2;
+                            if (itemBytes > MaxBatchPayloadBytes)
+                            {
+                                ClampOversizedStringFields(mapped, MaxSingleFieldChars);
+                                itemBytes = Encoding.UTF8.GetByteCount(JsonConvert.SerializeObject(mapped)) + 2;
+                                if (itemBytes > MaxBatchPayloadBytes)
+                                {
+                                    ClampOversizedStringFields(mapped, 4096);
+                                    itemBytes = Encoding.UTF8.GetByteCount(JsonConvert.SerializeObject(mapped)) + 2;
+                                }
+                            }
+
+                            if (buffer.Count >= BatchRowsLimit || (buffer.Count > 0 && bufferBytes + itemBytes > MaxBatchPayloadBytes))
+                            {
+                                anyValidRowSent = true;
+                                if (await FlushBatchAsync(isFinalTableBatch: false).ConfigureAwait(false))
+                                {
+                                    await DrainWorkersAsync(cancelInFlight: true).ConfigureAwait(false);
+                                    if (workerFailure != null && Volatile.Read(ref stoppedByServer) == 0)
+                                    {
+                                        throw workerFailure;
+                                    }
+                                    return true;
+                                }
+                            }
+
+                            buffer.Add(mapped);
+                            bufferBytes += itemBytes;
+                            bufferLastRowId = rowId;
+                            bufferLastCreatedAt = rowCreatedAt;
                         }
-                        catch (OperationCanceledException) when (Volatile.Read(ref stoppedByServer) != 0 || workerFailure != null)
+
+                        if (buffer.Count > 0)
                         {
-                            return true;
+                            anyValidRowSent = true;
+                            if (await FlushBatchAsync(isFinalTableBatch: true).ConfigureAwait(false))
+                            {
+                                await DrainWorkersAsync(cancelInFlight: true).ConfigureAwait(false);
+                                if (workerFailure != null && Volatile.Read(ref stoppedByServer) == 0)
+                                {
+                                    throw workerFailure;
+                                }
+                                return true;
+                            }
                         }
-                    }
 
-                    if (!categoryDone)
-                    {
-                        return Volatile.Read(ref stoppedByServer) != 0 || workerFailure != null;
-                    }
-
-                    batchChannel!.Writer.TryComplete();
-                    await Task.WhenAll(workerTasks!).ConfigureAwait(false);
-                    if (workerFailure != null)
-                    {
-                        throw workerFailure;
-                    }
-                    ct.ThrowIfCancellationRequested();
-                    if (Volatile.Read(ref stoppedByServer) != 0)
-                    {
-                        return true;
-                    }
-
-                    LegacyMigrationBatchResponse doneRes = await PostMigrationBatchWithRetryAsync(
-                        syncClient,
-                        config,
-                        jobId,
-                        rawCategory,
-                        Array.Empty<Dictionary<string, object?>>(),
-                        categoryDone: true,
-                        allDone: false,
-                        errorMessage: null,
-                        ct).ConfigureAwait(false);
-                    if (doneRes.ShouldStop)
-                    {
-                        Interlocked.Exchange(ref stoppedByServer, 1);
-                        return true;
-                    }
-                    return false;
-                }
-
-                async Task DrainWorkersOnEarlyExitAsync()
-                {
-                    if (batchChannel != null && workerTasks != null)
-                    {
-                        batchChannel.Writer.TryComplete();
-                        try { categoryCts.Cancel(); } catch { /* ignore */ }
-                        await Task.WhenAll(workerTasks).ConfigureAwait(false);
-                        if (workerFailure != null && Volatile.Read(ref stoppedByServer) == 0)
+                        if (batchChannel != null)
                         {
-                            throw workerFailure;
-                        }
-                    }
-                }
+                            await DrainWorkersAsync(cancelInFlight: false).ConfigureAwait(false);
+                            if (workerFailure != null && Volatile.Read(ref stoppedByServer) == 0)
+                            {
+                                throw workerFailure;
+                            }
+                            ct.ThrowIfCancellationRequested();
+                            if (Volatile.Read(ref stoppedByServer) != 0)
+                            {
+                                return true;
+                            }
 
-                async Task<bool> EnqueueItemAsync(Dictionary<string, object?> item)
-                {
-                    if (Volatile.Read(ref stoppedByServer) != 0 || workerFailure != null)
-                    {
-                        return true;
-                    }
-                    int itemBytes = Encoding.UTF8.GetByteCount(JsonConvert.SerializeObject(item)) + 2;
-                    if (itemBytes > MaxBatchPayloadBytes)
-                    {
-                        ClampOversizedStringFields(item, MaxSingleFieldChars);
-                        itemBytes = Encoding.UTF8.GetByteCount(JsonConvert.SerializeObject(item)) + 2;
-                        if (itemBytes > MaxBatchPayloadBytes)
+                            // All concurrent workers for this table drained cleanly; seal table cursor as completed.
+                            LegacyMigrationBatchResponse sealRes = await PostMigrationBatchWithRetryAsync(
+                                syncClient,
+                                config,
+                                jobId,
+                                rawCategory,
+                                Array.Empty<Dictionary<string, object?>>(),
+                                categoryDone: false,
+                                allDone: false,
+                                errorMessage: null,
+                                ct,
+                                cursorUpdate: watermark!.BuildCompletedUpdate()).ConfigureAwait(false);
+                            if (sealRes.ShouldStop)
+                            {
+                                if (!string.IsNullOrWhiteSpace(sealRes.Reason))
+                                {
+                                    stopReason = sealRes.Reason!;
+                                }
+                                return true;
+                            }
+                        }
+                        else if (!anyValidRowSent && existingCursor != null && !existingCursor.Completed)
                         {
-                            ClampOversizedStringFields(item, 4096);
-                            itemBytes = Encoding.UTF8.GetByteCount(JsonConvert.SerializeObject(item)) + 2;
+                            // Resumed right at the end of a previously unfinished table; mark it completed.
+                            LegacyMigrationBatchResponse sealRes = await PostMigrationBatchWithRetryAsync(
+                                syncClient,
+                                config,
+                                jobId,
+                                rawCategory,
+                                Array.Empty<Dictionary<string, object?>>(),
+                                categoryDone: false,
+                                allDone: false,
+                                errorMessage: null,
+                                ct,
+                                cursorUpdate: new LegacyMigrationCursorUpdate
+                                {
+                                    Table = logicalTable,
+                                    CreatedAt = existingCursor.CreatedAt,
+                                    RowId = existingCursor.RowId,
+                                    Completed = true,
+                                    RowsDone = existingCursor.RowsDone
+                                }).ConfigureAwait(false);
+                            if (sealRes.ShouldStop)
+                            {
+                                if (!string.IsNullOrWhiteSpace(sealRes.Reason))
+                                {
+                                    stopReason = sealRes.Reason!;
+                                }
+                                return true;
+                            }
                         }
+
+                        return false;
                     }
-                    if (buffer.Count >= BatchRowsLimit || (buffer.Count > 0 && bufferBytes + itemBytes > MaxBatchPayloadBytes))
+                    catch
                     {
-                        if (await FlushBufferAsync(categoryDone: false).ConfigureAwait(false))
-                        {
-                            return true;
-                        }
+                        await DrainWorkersAsync(cancelInFlight: true).ConfigureAwait(false);
+                        throw;
                     }
-                    buffer.Add(item);
-                    bufferBytes += itemBytes;
-                    return false;
-                }
-
-                async Task<bool> StreamTableAsync(
-                    string tableName,
-                    string orderByClause,
-                    Func<SqliteDataReader, Dictionary<string, int>, Dictionary<string, object?>?> mapper)
-                {
-                    if (!tables.Contains(tableName)) return false;
-                    HashSet<string> cols = ListColumns(conn, tableName);
-                    if (cols.Count == 0) return false;
-
-                    string safeOrderBy = !string.IsNullOrEmpty(orderByClause) &&
-                        orderByClause.Contains("created_at", StringComparison.OrdinalIgnoreCase) &&
-                        !cols.Contains("created_at")
-                        ? string.Empty
-                        : orderByClause;
-
-                    using var cmd = conn.CreateCommand();
-                    cmd.CommandText = $"SELECT * FROM \"{tableName}\" {safeOrderBy}";
-                    using SqliteDataReader reader = cmd.ExecuteReader();
-                    Dictionary<string, int> ord = BuildOrdinalMap(reader);
-                    while (reader.Read())
-                    {
-                        ct.ThrowIfCancellationRequested();
-                        Dictionary<string, object?>? mapped = mapper(reader, ord);
-                        if (mapped == null) continue;
-                        if (await EnqueueItemAsync(mapped).ConfigureAwait(false))
-                        {
-                            await DrainWorkersOnEarlyExitAsync().ConfigureAwait(false);
-                            return true;
-                        }
-                    }
-                    return false;
                 }
 
                 if (rawCategory == "memos_notes")
                 {
-                    if (await StreamTableAsync("memos", "", (r, o) => new()
+                    if (await StreamTableAsync("memos", "memos", false, (r, o) => new()
                     {
                         ["kind"] = "memo",
                         ["userId"] = GetColStr(r, o, "user_id"),
                         ["editedAt"] = GetColStr(r, o, "edited_at"),
                         ["memo"] = GetColStr(r, o, "memo")
-                    }).ConfigureAwait(false)) return (false, batchesSent, "Stopped by server");
+                    }).ConfigureAwait(false)) return (false, Volatile.Read(ref batchesSent), stopReason);
 
-                    if (await StreamTableAsync("world_memos", "", (r, o) => new()
+                    if (await StreamTableAsync("world_memos", "world_memos", false, (r, o) => new()
                     {
                         ["kind"] = "world_memo",
                         ["worldId"] = GetColStr(r, o, "world_id"),
                         ["editedAt"] = GetColStr(r, o, "edited_at"),
                         ["memo"] = GetColStr(r, o, "memo")
-                    }).ConfigureAwait(false)) return (false, batchesSent, "Stopped by server");
+                    }).ConfigureAwait(false)) return (false, Volatile.Read(ref batchesSent), stopReason);
 
-                    if (await StreamTableAsync("avatar_memos", "", (r, o) => new()
+                    if (await StreamTableAsync("avatar_memos", "avatar_memos", false, (r, o) => new()
                     {
                         ["kind"] = "avatar_memo",
                         ["avatarId"] = GetColStr(r, o, "avatar_id"),
                         ["editedAt"] = GetColStr(r, o, "edited_at"),
                         ["memo"] = GetColStr(r, o, "memo")
-                    }).ConfigureAwait(false)) return (false, batchesSent, "Stopped by server");
+                    }).ConfigureAwait(false)) return (false, Volatile.Read(ref batchesSent), stopReason);
 
                     if (!string.IsNullOrEmpty(safePrefix))
                     {
-                        if (await StreamTableAsync($"{safePrefix}_notes", "", (r, o) => new()
+                        if (await StreamTableAsync("notes", $"{safePrefix}_notes", false, (r, o) => new()
                         {
                             ["kind"] = "note",
                             ["userId"] = GetColStr(r, o, "user_id"),
                             ["displayName"] = GetColStr(r, o, "display_name"),
                             ["note"] = GetColStr(r, o, "note"),
                             ["createdAt"] = GetColStr(r, o, "created_at")
-                        }).ConfigureAwait(false)) return (false, batchesSent, "Stopped by server");
+                        }).ConfigureAwait(false)) return (false, Volatile.Read(ref batchesSent), stopReason);
                     }
                 }
                 else if (rawCategory == "favorites")
                 {
-                    if (await StreamTableAsync("favorite_friend", "", (r, o) => new()
+                    if (await StreamTableAsync("favorite_friend", "favorite_friend", false, (r, o) => new()
                     {
                         ["kind"] = "favorite_friend",
                         ["createdAt"] = GetColStr(r, o, "created_at"),
                         ["userId"] = GetColStr(r, o, "user_id"),
                         ["groupName"] = GetColStr(r, o, "group_name")
-                    }).ConfigureAwait(false)) return (false, batchesSent, "Stopped by server");
+                    }).ConfigureAwait(false)) return (false, Volatile.Read(ref batchesSent), stopReason);
 
-                    if (await StreamTableAsync("favorite_world", "", (r, o) => new()
+                    if (await StreamTableAsync("favorite_world", "favorite_world", false, (r, o) => new()
                     {
                         ["kind"] = "favorite_world",
                         ["createdAt"] = GetColStr(r, o, "created_at"),
                         ["worldId"] = GetColStr(r, o, "world_id"),
                         ["groupName"] = GetColStr(r, o, "group_name")
-                    }).ConfigureAwait(false)) return (false, batchesSent, "Stopped by server");
+                    }).ConfigureAwait(false)) return (false, Volatile.Read(ref batchesSent), stopReason);
 
-                    if (await StreamTableAsync("favorite_avatar", "", (r, o) => new()
+                    if (await StreamTableAsync("favorite_avatar", "favorite_avatar", false, (r, o) => new()
                     {
                         ["kind"] = "favorite_avatar",
                         ["createdAt"] = GetColStr(r, o, "created_at"),
                         ["avatarId"] = GetColStr(r, o, "avatar_id"),
                         ["groupName"] = GetColStr(r, o, "group_name")
-                    }).ConfigureAwait(false)) return (false, batchesSent, "Stopped by server");
+                    }).ConfigureAwait(false)) return (false, Volatile.Read(ref batchesSent), stopReason);
 
-                    if (await StreamTableAsync("favorite_print", "", (r, o) => new()
+                    if (await StreamTableAsync("favorite_print", "favorite_print", false, (r, o) => new()
                     {
                         ["kind"] = "favorite_print",
                         ["printId"] = GetColStr(r, o, "print_id"),
                         ["createdAt"] = GetColStr(r, o, "created_at")
-                    }).ConfigureAwait(false)) return (false, batchesSent, "Stopped by server");
+                    }).ConfigureAwait(false)) return (false, Volatile.Read(ref batchesSent), stopReason);
 
-                    if (await StreamTableAsync("avatar_tags", "", (r, o) => new()
+                    if (await StreamTableAsync("avatar_tags", "avatar_tags", false, (r, o) => new()
                     {
                         ["kind"] = "avatar_tag",
                         ["avatarId"] = GetColStr(r, o, "avatar_id"),
                         ["tag"] = GetColStr(r, o, "tag"),
                         ["color"] = o.TryGetValue("color", out int ci) && !r.IsDBNull(ci) ? Convert.ToString(r.GetValue(ci)) : null
-                    }).ConfigureAwait(false)) return (false, batchesSent, "Stopped by server");
+                    }).ConfigureAwait(false)) return (false, Volatile.Read(ref batchesSent), stopReason);
                 }
                 else if (rawCategory == "avatar_history" && !string.IsNullOrEmpty(safePrefix))
                 {
-                    if (await StreamTableAsync($"{safePrefix}_avatar_history", "ORDER BY created_at DESC", (r, o) => new()
+                    if (await StreamTableAsync("avatar_history", $"{safePrefix}_avatar_history", true, (r, o) => new()
                     {
                         ["kind"] = "avatar_history",
                         ["avatarId"] = GetColStr(r, o, "avatar_id"),
                         ["createdAt"] = GetColStr(r, o, "created_at"),
                         ["time"] = GetColLong(r, o, "time")
-                    }).ConfigureAwait(false)) return (false, batchesSent, "Stopped by server");
+                    }).ConfigureAwait(false)) return (false, Volatile.Read(ref batchesSent), stopReason);
                 }
                 else if (rawCategory == "friend_log" && !string.IsNullOrEmpty(safePrefix))
                 {
-                    if (await StreamTableAsync($"{safePrefix}_friend_log_current", "", (r, o) => new()
+                    if (await StreamTableAsync("friend_log_current", $"{safePrefix}_friend_log_current", false, (r, o) => new()
                     {
                         ["kind"] = "friend_log_current",
                         ["userId"] = GetColStr(r, o, "user_id"),
                         ["displayName"] = GetColStr(r, o, "display_name"),
                         ["trustLevel"] = GetColStr(r, o, "trust_level"),
                         ["friendNumber"] = GetColLong(r, o, "friend_number")
-                    }).ConfigureAwait(false)) return (false, batchesSent, "Stopped by server");
+                    }).ConfigureAwait(false)) return (false, Volatile.Read(ref batchesSent), stopReason);
 
-                    if (await StreamTableAsync($"{safePrefix}_friend_log_history", "ORDER BY created_at DESC", (r, o) => new()
+                    if (await StreamTableAsync("friend_log_history", $"{safePrefix}_friend_log_history", true, (r, o) => new()
                     {
                         ["kind"] = "friend_log_history",
                         ["createdAt"] = GetColStr(r, o, "created_at"),
@@ -944,11 +1290,11 @@ public static class DesktopLegacyMigrator
                         ["trustLevel"] = GetColStr(r, o, "trust_level"),
                         ["previousTrustLevel"] = GetColStr(r, o, "previous_trust_level"),
                         ["friendNumber"] = GetColLong(r, o, "friend_number")
-                    }).ConfigureAwait(false)) return (false, batchesSent, "Stopped by server");
+                    }).ConfigureAwait(false)) return (false, Volatile.Read(ref batchesSent), stopReason);
                 }
                 else if (rawCategory == "notifications" && !string.IsNullOrEmpty(safePrefix))
                 {
-                    if (await StreamTableAsync($"{safePrefix}_notifications", "ORDER BY created_at DESC", (r, o) => new()
+                    if (await StreamTableAsync("notifications", $"{safePrefix}_notifications", true, (r, o) => new()
                     {
                         ["kind"] = "notification_v1",
                         ["id"] = GetColStr(r, o, "id"),
@@ -965,9 +1311,9 @@ public static class DesktopLegacyMigrator
                         ["requestMessage"] = GetColStr(r, o, "request_message"),
                         ["responseMessage"] = GetColStr(r, o, "response_message"),
                         ["expired"] = GetColLong(r, o, "expired") != 0
-                    }).ConfigureAwait(false)) return (false, batchesSent, "Stopped by server");
+                    }).ConfigureAwait(false)) return (false, Volatile.Read(ref batchesSent), stopReason);
 
-                    if (await StreamTableAsync($"{safePrefix}_notifications_v2", "ORDER BY created_at DESC", (r, o) => new()
+                    if (await StreamTableAsync("notifications_v2", $"{safePrefix}_notifications_v2", true, (r, o) => new()
                     {
                         ["kind"] = "notification_v2",
                         ["id"] = GetColStr(r, o, "id"),
@@ -986,11 +1332,11 @@ public static class DesktopLegacyMigrator
                         ["data"] = GetColStr(r, o, "data"),
                         ["responses"] = GetColStr(r, o, "responses"),
                         ["details"] = GetColStr(r, o, "details")
-                    }).ConfigureAwait(false)) return (false, batchesSent, "Stopped by server");
+                    }).ConfigureAwait(false)) return (false, Volatile.Read(ref batchesSent), stopReason);
                 }
                 else if (rawCategory == "moderation_profiles" && !string.IsNullOrEmpty(safePrefix))
                 {
-                    if (await StreamTableAsync($"{safePrefix}_moderation", "", (r, o) => new()
+                    if (await StreamTableAsync("moderation", $"{safePrefix}_moderation", false, (r, o) => new()
                     {
                         ["kind"] = "moderation",
                         ["userId"] = GetColStr(r, o, "user_id"),
@@ -998,21 +1344,21 @@ public static class DesktopLegacyMigrator
                         ["displayName"] = GetColStr(r, o, "display_name"),
                         ["block"] = GetColLong(r, o, "block") != 0,
                         ["mute"] = GetColLong(r, o, "mute") != 0
-                    }).ConfigureAwait(false)) return (false, batchesSent, "Stopped by server");
+                    }).ConfigureAwait(false)) return (false, Volatile.Read(ref batchesSent), stopReason);
 
-                    if (await StreamTableAsync($"{safePrefix}_user_profile", "", (r, o) => new()
+                    if (await StreamTableAsync("user_profile", $"{safePrefix}_user_profile", false, (r, o) => new()
                     {
                         ["kind"] = "user_profile",
                         ["userId"] = GetColStr(r, o, "user_id"),
                         ["bio"] = GetColStr(r, o, "bio"),
                         ["bioLinks"] = GetColStr(r, o, "bio_links"),
                         ["updatedAt"] = GetColStr(r, o, "updated_at")
-                    }).ConfigureAwait(false)) return (false, batchesSent, "Stopped by server");
+                    }).ConfigureAwait(false)) return (false, Volatile.Read(ref batchesSent), stopReason);
                 }
                 else if (rawCategory == "gamelog")
                 {
                     // Stream newest historical rows first so recent history always migrates first even on multi-year DBs.
-                    if (await StreamTableAsync("gamelog_location", "ORDER BY created_at DESC", (r, o) => new()
+                    if (await StreamTableAsync("gamelog_location", "gamelog_location", true, (r, o) => new()
                     {
                         ["type"] = "Location",
                         ["created_at"] = GetColStr(r, o, "created_at"),
@@ -1021,9 +1367,9 @@ public static class DesktopLegacyMigrator
                         ["worldName"] = GetColStr(r, o, "world_name"),
                         ["time"] = GetColLong(r, o, "time"),
                         ["groupName"] = GetColStr(r, o, "group_name")
-                    }).ConfigureAwait(false)) return (false, batchesSent, "Stopped by server");
+                    }).ConfigureAwait(false)) return (false, Volatile.Read(ref batchesSent), stopReason);
 
-                    if (await StreamTableAsync("gamelog_join_leave", "ORDER BY created_at DESC", (r, o) => new()
+                    if (await StreamTableAsync("gamelog_join_leave", "gamelog_join_leave", true, (r, o) => new()
                     {
                         ["type"] = GetColStr(r, o, "type"),
                         ["created_at"] = GetColStr(r, o, "created_at"),
@@ -1031,9 +1377,9 @@ public static class DesktopLegacyMigrator
                         ["location"] = GetColStr(r, o, "location"),
                         ["userId"] = GetColStr(r, o, "user_id"),
                         ["time"] = GetColLong(r, o, "time")
-                    }).ConfigureAwait(false)) return (false, batchesSent, "Stopped by server");
+                    }).ConfigureAwait(false)) return (false, Volatile.Read(ref batchesSent), stopReason);
 
-                    if (await StreamTableAsync("gamelog_portal_spawn", "ORDER BY created_at DESC", (r, o) => new()
+                    if (await StreamTableAsync("gamelog_portal_spawn", "gamelog_portal_spawn", true, (r, o) => new()
                     {
                         ["type"] = "PortalSpawn",
                         ["created_at"] = GetColStr(r, o, "created_at"),
@@ -1042,9 +1388,9 @@ public static class DesktopLegacyMigrator
                         ["userId"] = GetColStr(r, o, "user_id"),
                         ["instanceId"] = GetColStr(r, o, "instance_id"),
                         ["worldName"] = GetColStr(r, o, "world_name")
-                    }).ConfigureAwait(false)) return (false, batchesSent, "Stopped by server");
+                    }).ConfigureAwait(false)) return (false, Volatile.Read(ref batchesSent), stopReason);
 
-                    if (await StreamTableAsync("gamelog_video_play", "ORDER BY created_at DESC", (r, o) => new()
+                    if (await StreamTableAsync("gamelog_video_play", "gamelog_video_play", true, (r, o) => new()
                     {
                         ["type"] = "VideoPlay",
                         ["created_at"] = GetColStr(r, o, "created_at"),
@@ -1054,16 +1400,16 @@ public static class DesktopLegacyMigrator
                         ["location"] = GetColStr(r, o, "location"),
                         ["displayName"] = GetColStr(r, o, "display_name"),
                         ["userId"] = GetColStr(r, o, "user_id")
-                    }).ConfigureAwait(false)) return (false, batchesSent, "Stopped by server");
+                    }).ConfigureAwait(false)) return (false, Volatile.Read(ref batchesSent), stopReason);
 
-                    if (await StreamTableAsync("gamelog_event", "ORDER BY created_at DESC", (r, o) => new()
+                    if (await StreamTableAsync("gamelog_event", "gamelog_event", true, (r, o) => new()
                     {
                         ["type"] = "Event",
                         ["created_at"] = GetColStr(r, o, "created_at"),
                         ["data"] = GetColStr(r, o, "data")
-                    }).ConfigureAwait(false)) return (false, batchesSent, "Stopped by server");
+                    }).ConfigureAwait(false)) return (false, Volatile.Read(ref batchesSent), stopReason);
 
-                    if (await StreamTableAsync("gamelog_external", "ORDER BY created_at DESC", (r, o) => new()
+                    if (await StreamTableAsync("gamelog_external", "gamelog_external", true, (r, o) => new()
                     {
                         ["type"] = "External",
                         ["created_at"] = GetColStr(r, o, "created_at"),
@@ -1071,11 +1417,11 @@ public static class DesktopLegacyMigrator
                         ["displayName"] = GetColStr(r, o, "display_name"),
                         ["userId"] = GetColStr(r, o, "user_id"),
                         ["location"] = GetColStr(r, o, "location")
-                    }).ConfigureAwait(false)) return (false, batchesSent, "Stopped by server");
+                    }).ConfigureAwait(false)) return (false, Volatile.Read(ref batchesSent), stopReason);
                 }
                 else if (rawCategory == "feed" && !string.IsNullOrEmpty(safePrefix))
                 {
-                    if (await StreamTableAsync($"{safePrefix}_feed_gps", "ORDER BY created_at DESC", (r, o) => new()
+                    if (await StreamTableAsync("feed_gps", $"{safePrefix}_feed_gps", true, (r, o) => new()
                     {
                         ["type"] = "GPS",
                         ["created_at"] = GetColStr(r, o, "created_at"),
@@ -1086,9 +1432,9 @@ public static class DesktopLegacyMigrator
                         ["previousLocation"] = GetColStr(r, o, "previous_location"),
                         ["time"] = GetColLong(r, o, "time"),
                         ["groupName"] = GetColStr(r, o, "group_name")
-                    }).ConfigureAwait(false)) return (false, batchesSent, "Stopped by server");
+                    }).ConfigureAwait(false)) return (false, Volatile.Read(ref batchesSent), stopReason);
 
-                    if (await StreamTableAsync($"{safePrefix}_feed_online_offline", "ORDER BY created_at DESC", (r, o) => new()
+                    if (await StreamTableAsync("feed_online_offline", $"{safePrefix}_feed_online_offline", true, (r, o) => new()
                     {
                         ["type"] = GetColStr(r, o, "type"),
                         ["created_at"] = GetColStr(r, o, "created_at"),
@@ -1098,9 +1444,9 @@ public static class DesktopLegacyMigrator
                         ["worldName"] = GetColStr(r, o, "world_name"),
                         ["time"] = GetColLong(r, o, "time"),
                         ["groupName"] = GetColStr(r, o, "group_name")
-                    }).ConfigureAwait(false)) return (false, batchesSent, "Stopped by server");
+                    }).ConfigureAwait(false)) return (false, Volatile.Read(ref batchesSent), stopReason);
 
-                    if (await StreamTableAsync($"{safePrefix}_feed_status", "ORDER BY created_at DESC", (r, o) => new()
+                    if (await StreamTableAsync("feed_status", $"{safePrefix}_feed_status", true, (r, o) => new()
                     {
                         ["type"] = "Status",
                         ["created_at"] = GetColStr(r, o, "created_at"),
@@ -1110,9 +1456,9 @@ public static class DesktopLegacyMigrator
                         ["statusDescription"] = GetColStr(r, o, "status_description"),
                         ["previousStatus"] = GetColStr(r, o, "previous_status"),
                         ["previousStatusDescription"] = GetColStr(r, o, "previous_status_description")
-                    }).ConfigureAwait(false)) return (false, batchesSent, "Stopped by server");
+                    }).ConfigureAwait(false)) return (false, Volatile.Read(ref batchesSent), stopReason);
 
-                    if (await StreamTableAsync($"{safePrefix}_feed_bio", "ORDER BY created_at DESC", (r, o) => new()
+                    if (await StreamTableAsync("feed_bio", $"{safePrefix}_feed_bio", true, (r, o) => new()
                     {
                         ["type"] = "Bio",
                         ["created_at"] = GetColStr(r, o, "created_at"),
@@ -1122,11 +1468,11 @@ public static class DesktopLegacyMigrator
                         ["previousBio"] = GetColStr(r, o, "previous_bio"),
                         ["bioLinks"] = GetColStr(r, o, "bio_links"),
                         ["previousBioLinks"] = GetColStr(r, o, "previous_bio_links")
-                    }).ConfigureAwait(false)) return (false, batchesSent, "Stopped by server");
+                    }).ConfigureAwait(false)) return (false, Volatile.Read(ref batchesSent), stopReason);
                 }
                 else if (rawCategory == "settings")
                 {
-                    if (await StreamTableAsync("configs", "", (r, o) =>
+                    if (await StreamTableAsync("configs", "configs", false, (r, o) =>
                     {
                         string key = GetColStr(r, o, "key");
                         if (!IsSafeLegacyConfigKey(key)) return null;
@@ -1136,12 +1482,27 @@ public static class DesktopLegacyMigrator
                             ["key"] = key,
                             ["value"] = GetColStr(r, o, "value")
                         };
-                    }).ConfigureAwait(false)) return (false, batchesSent, "Stopped by server");
+                    }).ConfigureAwait(false)) return (false, Volatile.Read(ref batchesSent), stopReason);
                 }
 
-                if (await FlushBufferAsync(categoryDone: true).ConfigureAwait(false) || Volatile.Read(ref stoppedByServer) != 0)
+                // Mark category done after all tables in this category have finished and sealed their cursors.
+                LegacyMigrationBatchResponse catDoneRes = await PostMigrationBatchWithRetryAsync(
+                    syncClient,
+                    config,
+                    jobId,
+                    rawCategory,
+                    Array.Empty<Dictionary<string, object?>>(),
+                    categoryDone: true,
+                    allDone: false,
+                    errorMessage: null,
+                    ct).ConfigureAwait(false);
+                if (catDoneRes.ShouldStop)
                 {
-                    return (false, Volatile.Read(ref batchesSent), "Stopped by server");
+                    if (!string.IsNullOrWhiteSpace(catDoneRes.Reason))
+                    {
+                        stopReason = catDoneRes.Reason!;
+                    }
+                    return (false, Volatile.Read(ref batchesSent), stopReason);
                 }
             }
 
@@ -1168,7 +1529,16 @@ public static class DesktopLegacyMigrator
             try
             {
                 await syncClient
-                    .PostMigrationBatchAsync(config, jobId, string.Empty, Array.Empty<Dictionary<string, object?>>(), false, true, ex.Message, CancellationToken.None)
+                    .PostMigrationBatchAsync(
+                        config,
+                        jobId,
+                        string.Empty,
+                        Array.Empty<Dictionary<string, object?>>(),
+                        false,
+                        true,
+                        ex.Message,
+                        CancellationToken.None,
+                        cursorUpdate: lastKnownSafeCursor)
                     .ConfigureAwait(false);
             }
             catch

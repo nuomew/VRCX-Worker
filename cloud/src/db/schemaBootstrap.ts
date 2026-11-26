@@ -743,7 +743,17 @@ const LEGACY_STATEMENTS: readonly string[] = [
         UNIQUE (created_at, user_id, bio)
     )`,
     `CREATE INDEX IF NOT EXISTS idx_legacy_feed_bio_user_id ON feed_bio (user_id, id DESC)`,
-    `CREATE INDEX IF NOT EXISTS idx_legacy_feed_bio_created ON feed_bio (created_at DESC)`
+    `CREATE INDEX IF NOT EXISTS idx_legacy_feed_bio_created ON feed_bio (created_at DESC)`,
+    `CREATE TABLE IF NOT EXISTS legacy_feed_chunks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chunk_key TEXT NOT NULL UNIQUE,
+        feed_kind TEXT NOT NULL,
+        min_created_at TEXT NOT NULL,
+        max_created_at TEXT NOT NULL,
+        row_count INTEGER NOT NULL DEFAULT 0,
+        payload_json TEXT NOT NULL
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_legacy_feed_chunks_kind_max ON legacy_feed_chunks (feed_kind, max_created_at DESC)`
 ];
 
 const CHAT_STATEMENTS: readonly string[] = [
@@ -867,7 +877,7 @@ export async function ensureSchemaReady(env: Env): Promise<void> {
             initShardIfNeeded(getChatDb(env), 'cloud_chat_config', CHAT_STATEMENTS, 'table')
         ];
         if (env.DB_LEGACY) {
-            tasks.push(initShardIfNeeded(env.DB_LEGACY, 'idx_legacy_feed_bio_created', LEGACY_STATEMENTS, 'index'));
+            tasks.push(initShardIfNeeded(env.DB_LEGACY, 'idx_legacy_feed_chunks_kind_max', LEGACY_STATEMENTS, 'index'));
         }
         initPromise = Promise.all(tasks)
             .then(() => {

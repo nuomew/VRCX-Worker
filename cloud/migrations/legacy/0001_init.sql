@@ -355,3 +355,16 @@ CREATE TABLE IF NOT EXISTS feed_bio (
 );
 CREATE INDEX IF NOT EXISTS idx_legacy_feed_bio_user_id ON feed_bio (user_id, id DESC);
 CREATE INDEX IF NOT EXISTS idx_legacy_feed_bio_created ON feed_bio (created_at DESC);
+
+-- Compact chunked archive for migrated historical Feed rows (~240 rows per chunk row,
+-- cutting Cloudflare D1 rows_written by >99% while staying transparent to queries and exports).
+CREATE TABLE IF NOT EXISTS legacy_feed_chunks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chunk_key TEXT NOT NULL UNIQUE,
+    feed_kind TEXT NOT NULL,
+    min_created_at TEXT NOT NULL,
+    max_created_at TEXT NOT NULL,
+    row_count INTEGER NOT NULL DEFAULT 0,
+    payload_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_legacy_feed_chunks_kind_max ON legacy_feed_chunks (feed_kind, max_created_at DESC);

@@ -8353,4 +8353,335 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
             ]);
         }
     });
+
+    it('packs legacy feed batches into compact legacy_feed_chunks with transparent query/export and supports table-level resume cursors', async () => {
+        expect(env.DB_LEGACY).toBeDefined();
+        const guardedEnv: Env = { ...env, AGENT_SYNC_KEY: 'mig-chunk-cursor-test-key' };
+        const deviceId = 'win-mig-chunk-cursor-1';
+        const accountPrefix = 'usr11112222333344445555666677779999';
+
+        try {
+            // Register device online so /api/migration/start can dispatch desktop_migrate
+            const regRes = await worker.fetch(
+                new Request('http://example.com/api/agent/sync', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        Authorization: 'Bearer mig-chunk-cursor-test-key',
+                        'X-Device-Id': deviceId,
+                        'X-Device-Name': 'ChunkTestPC'
+                    },
+                    body: JSON.stringify({ events: [] })
+                }),
+                guardedEnv
+            );
+            expect(regRes.status).toBe(200);
+
+            // Start a migration job for memos_notes + feed
+            const startRes = await worker.fetch(
+                new Request('http://example.com/api/migration/start', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+                    body: JSON.stringify({
+                        deviceId,
+                        accountPrefix,
+                        categories: ['memos_notes', 'feed'],
+                        concurrency: 4
+                    })
+                }),
+                guardedEnv
+            );
+            expect(startRes.status).toBe(200);
+            const startJson = (await startRes.json()) as { data: { job: { jobId: string } } };
+            const jobId = startJson.data.job.jobId;
+
+            // Upload mixed historical Feed batch + partial feed_gps cursor checkpoint
+            const feedItems = [
+                {
+                    type: 'GPS',
+                    created_at: '2025-05-10T10:00:00.000Z',
+                    userId: 'usr_chunk_alice',
+                    displayName: 'ChunkAlice',
+                    location: 'wrld_chunk_1:100',
+                    worldName: 'Chunk Shrine',
+                    previousLocation: '',
+                    time: 1200,
+                    groupName: ''
+                },
+                {
+                    type: 'GPS',
+                    created_at: '2025-05-09T09:00:00.000Z',
+                    userId: 'usr_chunk_bob',
+                    displayName: 'ChunkBob',
+                    location: 'wrld_chunk_2:200',
+                    worldName: 'Chunk Plaza',
+                    previousLocation: 'wrld_chunk_1:100',
+                    time: 600,
+                    groupName: 'ChunkGrp'
+                },
+                {
+                    type: 'Online',
+                    created_at: '2025-05-08T08:00:00.000Z',
+                    userId: 'usr_chunk_alice',
+                    displayName: 'ChunkAlice',
+                    location: 'wrld_chunk_1:100',
+                    worldName: 'Chunk Shrine',
+                    time: 0,
+                    groupName: ''
+                },
+                {
+                    type: 'Status',
+                    created_at: '2025-05-07T07:00:00.000Z',
+                    userId: 'usr_chunk_alice',
+                    displayName: 'ChunkAlice',
+                    status: 'join me',
+                    statusDescription: 'Hanging out',
+                    previousStatus: 'active',
+                    previousStatusDescription: ''
+                },
+                {
+                    type: 'Bio',
+                    created_at: '2025-05-06T06:00:00.000Z',
+                    userId: 'usr_chunk_alice',
+                    displayName: 'ChunkAlice',
+                    bio: 'Chunk bio new',
+                    previousBio: 'Chunk bio old',
+                    bioLinks: JSON.stringify(['https://example.com/a']),
+                    previousBioLinks: '[]'
+                }
+            ];
+
+            const batchRes = await worker.fetch(
+                new Request('http://example.com/api/agent/migration/batch', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        Authorization: 'Bearer mig-chunk-cursor-test-key',
+                        'X-Device-Id': deviceId
+                    },
+                    body: JSON.stringify({
+                        jobId,
+                        category: 'feed',
+                        items: feedItems,
+                        categoryDone: false,
+                        allDone: false,
+                        cursorUpdate: {
+                            table: 'feed_gps',
+                            createdAt: '2025-05-09T09:00:00.000Z',
+                            rowId: 500,
+                            completed: false,
+                            rowsDone: 2
+                        }
+                    })
+                }),
+                guardedEnv
+            );
+            expect(batchRes.status).toBe(200);
+            const batchJson = (await batchRes.json()) as { data: { inserted: number; skipped: number } };
+            expect(batchJson.data.inserted).toBe(5);
+            expect(batchJson.data.skipped).toBe(0);
+
+            // Re-uploading the exact same Feed batch is idempotent via deterministic chunk_key
+            const dupBatchRes = await worker.fetch(
+                new Request('http://example.com/api/agent/migration/batch', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        Authorization: 'Bearer mig-chunk-cursor-test-key',
+                        'X-Device-Id': deviceId
+                    },
+                    body: JSON.stringify({
+                        jobId,
+                        category: 'feed',
+                        items: feedItems,
+                        categoryDone: false,
+                        allDone: false
+                    })
+                }),
+                guardedEnv
+            );
+            expect(dupBatchRes.status).toBe(200);
+            const dupBatchJson = (await dupBatchRes.json()) as { data: { inserted: number; skipped: number } };
+            expect(dupBatchJson.data.inserted).toBe(0);
+            expect(dupBatchJson.data.skipped).toBe(5);
+
+            // Verify Plan A storage: legacy single-row feed_gps has 0 rows; legacy_feed_chunks stores 4 compact chunks (gps=2, oo=1, status=1, bio=1)
+            const singleRowGps = await env.DB_LEGACY!.prepare('SELECT COUNT(*) AS cnt FROM feed_gps').first<{ cnt: number }>();
+            expect(singleRowGps?.cnt ?? 0).toBe(0);
+            const chunkRows = await env.DB_LEGACY!.prepare(
+                'SELECT feed_kind, row_count FROM legacy_feed_chunks ORDER BY feed_kind ASC'
+            ).all<{ feed_kind: string; row_count: number }>();
+            expect(chunkRows.results).toEqual([
+                { feed_kind: 'bio', row_count: 1 },
+                { feed_kind: 'gps', row_count: 2 },
+                { feed_kind: 'oo', row_count: 1 },
+                { feed_kind: 'status', row_count: 1 }
+            ]);
+
+            // Mark memos completed and finish job
+            const memoBatchRes = await worker.fetch(
+                new Request('http://example.com/api/agent/migration/batch', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        Authorization: 'Bearer mig-chunk-cursor-test-key',
+                        'X-Device-Id': deviceId
+                    },
+                    body: JSON.stringify({
+                        jobId,
+                        category: 'memos_notes',
+                        items: [{ kind: 'memo', userId: 'usr_chunk_alice', editedAt: '2025-05-01T00:00:00Z', memo: 'Nice friend' }],
+                        categoryDone: true,
+                        allDone: true,
+                        cursorUpdate: {
+                            table: 'memos',
+                            createdAt: '',
+                            rowId: 1,
+                            completed: true,
+                            rowsDone: 1
+                        }
+                    })
+                }),
+                guardedEnv
+            );
+            expect(memoBatchRes.status).toBe(200);
+
+            // Transparent Feed read: /api/feed/query unpacks legacy_feed_chunks seamlessly with filters
+            const queryRes = await worker.fetch(
+                new Request('http://example.com/api/feed/query', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+                    body: JSON.stringify({
+                        types: ['GPS', 'Online', 'Status', 'Bio'],
+                        vipList: ['usr_chunk_alice', 'usr_chunk_bob'],
+                        dateFrom: '2025-05-01T00:00:00.000Z',
+                        dateTo: '2025-05-15T00:00:00.000Z',
+                        limit: 20
+                    })
+                }),
+                guardedEnv
+            );
+            expect(queryRes.status).toBe(200);
+            const queryJson = (await queryRes.json()) as {
+                data: Array<{ type: string; userId: string; worldName?: string; bioLinks?: string[] }>;
+            };
+            expect(queryJson.data).toHaveLength(5);
+            expect(queryJson.data.some((r) => r.type === 'GPS' && r.worldName === 'Chunk Shrine')).toBe(true);
+            expect(queryJson.data.some((r) => r.type === 'Bio' && Array.isArray(r.bioLinks) && r.bioLinks[0] === 'https://example.com/a')).toBe(true);
+
+            // Transparent Cloud Export: summary counts & paginated legacy export unpack legacy_feed_chunks to upstream SQLite columns
+            const expSummaryRes = await worker.fetch(
+                new Request('http://example.com/api/migration/export?scope=summary&includeLegacy=1'),
+                guardedEnv
+            );
+            expect(expSummaryRes.status).toBe(200);
+            const expSummaryJson = (await expSummaryRes.json()) as {
+                data: { tables: Array<{ name: string; legacyCount: number }> };
+            };
+            expect(expSummaryJson.data.tables.find((t) => t.name === 'feed_gps')?.legacyCount).toBe(2);
+            expect(expSummaryJson.data.tables.find((t) => t.name === 'feed_bio')?.legacyCount).toBe(1);
+
+            const expPageRes = await worker.fetch(
+                new Request('http://example.com/api/migration/export?table=feed_gps&source=legacy&afterRowId=0&limit=50'),
+                guardedEnv
+            );
+            expect(expPageRes.status).toBe(200);
+            const expPageJson = (await expPageRes.json()) as {
+                data: { rows: Array<{ user_id: string; world_name: string }>; hasMore: boolean };
+            };
+            expect(expPageJson.data.rows).toHaveLength(2);
+            expect(expPageJson.data.rows.some((r) => r.user_id === 'usr_chunk_alice' && r.world_name === 'Chunk Shrine')).toBe(true);
+
+            // Verify persisted table-level cursors in /api/migration/state & forwarded into next /api/migration/start command
+            const stateRes = await worker.fetch(new Request('http://example.com/api/migration/state'), guardedEnv);
+            expect(stateRes.status).toBe(200);
+            const stateJson = (await stateRes.json()) as {
+                data: { cursors: Record<string, Record<string, { rowId: number; completed: boolean; rowsDone: number }>> };
+            };
+            expect(stateJson.data.cursors[accountPrefix]?.feed_gps).toMatchObject({
+                rowId: 500,
+                completed: false,
+                rowsDone: 2
+            });
+            expect(stateJson.data.cursors[accountPrefix]?.memos).toMatchObject({
+                completed: true,
+                rowsDone: 1
+            });
+
+            // Starting a resume job dispatches persisted cursors inside desktop_migrate params
+            const resumeStartRes = await worker.fetch(
+                new Request('http://example.com/api/migration/start', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+                    body: JSON.stringify({
+                        deviceId,
+                        accountPrefix,
+                        categories: ['feed'],
+                        resume: true
+                    })
+                }),
+                guardedEnv
+            );
+            expect(resumeStartRes.status).toBe(200);
+            const resumeStartJson = (await resumeStartRes.json()) as { data: { cmdId: string } };
+            const pullCmdRes = await worker.fetch(
+                new Request('http://example.com/api/agent/sync', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        Authorization: 'Bearer mig-chunk-cursor-test-key',
+                        'X-Device-Id': deviceId
+                    },
+                    body: JSON.stringify({ events: [] })
+                }),
+                guardedEnv
+            );
+            expect(pullCmdRes.status).toBe(200);
+            const pullCmdJson = (await pullCmdRes.json()) as {
+                data: {
+                    pendingCommands: Array<{
+                        cmdId: string;
+                        action: string;
+                        params?: { cursors?: Record<string, { rowId: number; completed: boolean }> };
+                    }>;
+                };
+            };
+            const dispatchedCmd = pullCmdJson.data.pendingCommands.find((c) => c.cmdId === resumeStartJson.data.cmdId);
+            expect(dispatchedCmd?.action).toBe('desktop_migrate');
+            expect(dispatchedCmd?.params?.cursors?.feed_gps?.rowId).toBe(500);
+            expect(dispatchedCmd?.params?.cursors?.memos).toBeUndefined(); // not in selected categories
+
+            // DELETE /api/migration/cursors clears saved checkpoints for this account
+            const clearCursorsRes = await worker.fetch(
+                new Request(`http://example.com/api/migration/cursors?accountPrefix=${encodeURIComponent(accountPrefix)}`, {
+                    method: 'DELETE',
+                    headers: { Origin: 'http://example.com' }
+                }),
+                guardedEnv
+            );
+            expect(clearCursorsRes.status).toBe(200);
+            const afterClearState = await worker.fetch(new Request('http://example.com/api/migration/state'), guardedEnv);
+            const afterClearJson = (await afterClearState.json()) as {
+                data: { cursors: Record<string, unknown> };
+            };
+            expect(afterClearJson.data.cursors[accountPrefix]).toBeUndefined();
+
+            // DELETE /api/migration/data removes legacy_feed_chunks cleanly
+            const delDataRes = await worker.fetch(
+                new Request('http://example.com/api/migration/data', {
+                    method: 'DELETE',
+                    headers: { Origin: 'http://example.com' }
+                }),
+                guardedEnv
+            );
+            expect(delDataRes.status).toBe(200);
+            const remainingChunks = await env.DB_LEGACY!.prepare('SELECT COUNT(*) AS cnt FROM legacy_feed_chunks').first<{ cnt: number }>();
+            expect(remainingChunks?.cnt ?? 0).toBe(0);
+        } finally {
+            await env.DB_CORE.batch([
+                env.DB_CORE.prepare('DELETE FROM cloud_devices WHERE device_id = ?').bind(deviceId),
+                env.DB_CORE.prepare('DELETE FROM cloud_commands WHERE device_id = ?').bind(deviceId)
+            ]).catch(() => {});
+        }
+    });
 });

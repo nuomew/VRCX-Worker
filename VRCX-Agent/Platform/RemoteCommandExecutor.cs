@@ -22,7 +22,7 @@ public sealed class RemoteCommandExecutor
     private readonly Func<AgentConfig> _configProvider;
     private readonly Func<CancellationToken, Task> _syncNowCallback;
     private readonly Func<CancellationToken, Task<string>>? _desktopScanCallback;
-    private readonly Func<string, string, IReadOnlyList<string>, int, Task<string>>? _desktopMigrateCallback;
+    private readonly Func<string, string, IReadOnlyList<string>, int, IReadOnlyDictionary<string, LegacyTableCursor>?, Task<string>>? _desktopMigrateCallback;
     private readonly Func<string, string>? _desktopMigrateCancelCallback;
     private readonly Func<CloudOscRuntimeConfig>? _oscRuntimeConfigProvider;
 
@@ -30,7 +30,7 @@ public sealed class RemoteCommandExecutor
         Func<AgentConfig> configProvider,
         Func<CancellationToken, Task> syncNowCallback,
         Func<CancellationToken, Task<string>>? desktopScanCallback = null,
-        Func<string, string, IReadOnlyList<string>, int, Task<string>>? desktopMigrateCallback = null,
+        Func<string, string, IReadOnlyList<string>, int, IReadOnlyDictionary<string, LegacyTableCursor>?, Task<string>>? desktopMigrateCallback = null,
         Func<string, string>? desktopMigrateCancelCallback = null,
         Func<CloudOscRuntimeConfig>? oscRuntimeConfigProvider = null)
     {
@@ -415,7 +415,12 @@ public sealed class RemoteCommandExecutor
         {
             concurrency = parsedConcurrency;
         }
-        string msg = await _desktopMigrateCallback(jobId, accountPrefix, categories, concurrency).ConfigureAwait(false);
+        IReadOnlyDictionary<string, LegacyTableCursor>? resumeCursors = null;
+        if (parameters.TryGetValue("cursors", out var rawCursors) && rawCursors != null)
+        {
+            resumeCursors = DesktopLegacyMigrator.ParseResumeCursors(rawCursors);
+        }
+        string msg = await _desktopMigrateCallback(jobId, accountPrefix, categories, concurrency, resumeCursors).ConfigureAwait(false);
         return new CommandExecutionResult
         {
             CmdId = cmdId,

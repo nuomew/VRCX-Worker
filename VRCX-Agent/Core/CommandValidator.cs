@@ -158,6 +158,44 @@ public static class CommandValidator
                     return (false, $"desktop_migrate concurrency must be an integer between {DesktopLegacyMigrator.MinConcurrency} and {DesktopLegacyMigrator.MaxConcurrency}.");
                 }
             }
+            if (parameters.TryGetValue("cursors", out var rawCursors) && rawCursors != null)
+            {
+                if (rawCursors is Newtonsoft.Json.Linq.JObject jCursors)
+                {
+                    foreach (var prop in jCursors.Properties())
+                    {
+                        if (!DesktopLegacyMigrator.IsValidLogicalTableName(prop.Name) || prop.Value is not Newtonsoft.Json.Linq.JObject)
+                        {
+                            return (false, "desktop_migrate cursors contains an invalid table name or entry.");
+                        }
+                    }
+                }
+                else if (rawCursors is IDictionary<string, object?> dictCursors)
+                {
+                    foreach (var kv in dictCursors)
+                    {
+                        if (!DesktopLegacyMigrator.IsValidLogicalTableName(kv.Key) ||
+                            (kv.Value is not IDictionary<string, object?> && kv.Value is not Newtonsoft.Json.Linq.JObject && kv.Value is not LegacyTableCursor))
+                        {
+                            return (false, "desktop_migrate cursors contains an invalid table name or entry.");
+                        }
+                    }
+                }
+                else if (rawCursors is IReadOnlyDictionary<string, LegacyTableCursor> typedCursors)
+                {
+                    foreach (var kv in typedCursors)
+                    {
+                        if (!DesktopLegacyMigrator.IsValidLogicalTableName(kv.Key) || kv.Value == null)
+                        {
+                            return (false, "desktop_migrate cursors contains an invalid table name or entry.");
+                        }
+                    }
+                }
+                else
+                {
+                    return (false, "desktop_migrate cursors must be an object map.");
+                }
+            }
         }
         else if (action == "desktop_migrate_cancel")
         {

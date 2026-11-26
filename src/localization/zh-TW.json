@@ -3786,6 +3786,7 @@
             "status_cancelled": "已取消",
             "status_failed": "失敗",
             "status_stopped_quota_limit": "已觸發 500 MB 保護暫停",
+            "status_paused_daily_quota": "已達今日 D1 寫入配額（斷點已儲存）",
             "cancel_job_btn": "停止同步",
             "cancelling": "停止中...",
             "job_stats": "已處理 {processed} / {total} 筆 · 新增匯入 {inserted} 筆 · 略過重複 {skipped} 筆",
@@ -3850,7 +3851,13 @@
             "concurrency_option": "{count} 執行緒",
             "concurrency_option_recommended": "{count} 執行緒（推薦）",
             "concurrency_saved_toast": "已儲存雲端同步並發執行緒數（{count} 執行緒）。",
-            "concurrency_badge": "{count} 執行緒"
+            "concurrency_badge": "{count} 執行緒",
+            "resume_sync_btn": "斷點續傳已選資料",
+            "reset_cursors_btn": "重設斷點",
+            "resetting_cursors": "重設中...",
+            "reset_cursors_toast": "已清除續傳斷點，下次同步將從頭重新掃描。",
+            "cursor_checkpoint_badge": "斷點已存 · 已傳 {count} 筆",
+            "cursor_resume_hint": "偵測到已儲存的同步斷點：本次將直接從上次已確認位置續傳，自動略過已完成的資料表。"
         }
     }
 }

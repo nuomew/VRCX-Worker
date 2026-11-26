@@ -161,7 +161,16 @@ const CLEANUP_TABLES: readonly CleanupTableSpec[] = [
     }
 ];
 
-const LEGACY_CLEANUP_TABLES: readonly CleanupTableSpec[] = CLEANUP_TABLES.filter((t) => Boolean(t.legacyCategory));
+const LEGACY_CLEANUP_TABLES: readonly CleanupTableSpec[] = [
+    ...CLEANUP_TABLES.filter((t) => Boolean(t.legacyCategory)),
+    {
+        shard: 'feed',
+        table: 'legacy_feed_chunks',
+        whereSql: 'max_created_at < ?',
+        cutoffKind: 'iso',
+        legacyCategory: 'feed'
+    }
+];
 
 function isPlainObject(val: unknown): val is Record<string, unknown> {
     return Boolean(val) && typeof val === 'object' && !Array.isArray(val);

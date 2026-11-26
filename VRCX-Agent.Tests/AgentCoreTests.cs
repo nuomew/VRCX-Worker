@@ -2700,8 +2700,16 @@ INSERT INTO {acctPrefix}_friend_log_history (created_at, type, user_id, display_
                 CancellationToken.None);
 
             Assert.True(completed);
-            Assert.Equal(2, batchesSent); // memos_notes + settings (+ final allDone signal)
-            Assert.Equal(3, uploadedPayloads.Count);
+            Assert.Equal(3, batchesSent); // memos + notes + configs (1 per logical table with table-level cursorUpdate)
+            Assert.Contains(uploadedPayloads, p =>
+                p["cursorUpdate"]?["table"]?.Value<string>() == "memos" &&
+                p["cursorUpdate"]?["completed"]?.Value<bool>() == true);
+            Assert.Contains(uploadedPayloads, p =>
+                p["cursorUpdate"]?["table"]?.Value<string>() == "notes" &&
+                p["cursorUpdate"]?["completed"]?.Value<bool>() == true);
+            Assert.Contains(uploadedPayloads, p =>
+                p["cursorUpdate"]?["table"]?.Value<string>() == "configs" &&
+                p["cursorUpdate"]?["completed"]?.Value<bool>() == true);
             string allSentJson = string.Join("\n", uploadedPayloads.Select(p => p.ToString(Formatting.None)));
             Assert.Contains("Old desktop memo", allSentJson);
             Assert.Contains("Met in JP shrine", allSentJson);
@@ -2871,6 +2879,92 @@ INSERT INTO {acctPrefix}_friend_log_history (created_at, type, user_id, display_
                 CancellationToken.None);
             Assert.False(completedStop);
             Assert.Equal(1, stopCalls);
+
+            // 9. Table-level cursor resume skips completed tables, resumes feed_gps strictly past (createdAt, rowId), and seals completed watermark
+            Assert.True(CommandValidator.ValidateRemoteCommand("desktop_migrate", new Dictionary<string, object?>
+            {
+                ["jobId"] = "mig_resume_005",
+                ["categories"] = new[] { "memos_notes", "feed" },
+                ["cursors"] = new Dictionary<string, object?>
+                {
+                    ["memos"] = new Dictionary<string, object?> { ["completed"] = true, ["rowId"] = 1, ["rowsDone"] = 1 },
+                    ["feed_gps"] = new Dictionary<string, object?> { ["createdAt"] = "2024-04-01T05:00Z", ["rowId"] = 300, ["completed"] = false, ["rowsDone"] = 301 }
+                }
+            }).Ok);
+            Assert.False(CommandValidator.ValidateRemoteCommand("desktop_migrate", new Dictionary<string, object?>
+            {
+                ["jobId"] = "mig_resume_bad",
+                ["categories"] = new[] { "feed" },
+                ["cursors"] = new Dictionary<string, object?> { ["bad;DROP TABLE"] = new Dictionary<string, object?>() }
+            }).Ok);
+
+            // Look up the exact 250th newest row in feed_gps as our resume checkpoint
+            string resumeTs = string.Empty;
+            long resumeRowId = 0;
+            using (var connCur = new SqliteConnection($"Data Source={dbPath};Mode=ReadOnly;Pooling=False"))
+            {
+                connCur.Open();
+                using var curCmd = connCur.CreateCommand();
+                curCmd.CommandText = $"SELECT rowid, created_at FROM \"{acctPrefix}_feed_gps\" ORDER BY COALESCE(created_at, '') DESC, rowid DESC LIMIT 1 OFFSET 249";
+                using var rCur = curCmd.ExecuteReader();
+                Assert.True(rCur.Read());
+                resumeRowId = rCur.GetInt64(0);
+                resumeTs = rCur.GetString(1);
+            }
+
+            var resumePayloads = new System.Collections.Concurrent.ConcurrentBag<JObject>();
+            var resumedFeedItems = new System.Collections.Concurrent.ConcurrentBag<string>();
+            using var resumeHttp = new HttpClient(new StubHttpHandler(async req =>
+            {
+                string body = req.Content != null ? await req.Content.ReadAsStringAsync() : "{}";
+                JObject jo = JObject.Parse(body);
+                resumePayloads.Add(jo);
+                if (jo["category"]?.Value<string>() == "feed" && jo["items"] is JArray arr)
+                {
+                    foreach (JToken item in arr)
+                    {
+                        resumedFeedItems.Add(item["created_at"]?.Value<string>() ?? string.Empty);
+                    }
+                }
+                return new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent(
+                        "{\"ok\":true,\"data\":{\"inserted\":1,\"skipped\":0,\"legacyDbBytes\":65536,\"shouldStop\":false}}",
+                        Encoding.UTF8,
+                        "application/json")
+                };
+            }));
+
+            var resumeCursors = new Dictionary<string, LegacyTableCursor>
+            {
+                ["memos"] = new LegacyTableCursor { Completed = true, RowId = 1, RowsDone = 1 },
+                ["feed_gps"] = new LegacyTableCursor { CreatedAt = resumeTs, RowId = resumeRowId, Completed = false, RowsDone = 250 }
+            };
+
+            var (completedResume, _, _) = await DesktopLegacyMigrator.RunMigrationAsync(
+                cfg,
+                dbPath,
+                "mig_resume_005",
+                acctPrefix,
+                new[] { "memos_notes", "feed" },
+                new HttpSyncClient(resumeHttp),
+                CancellationToken.None,
+                concurrency: 4,
+                resumeCursors: resumeCursors);
+
+            Assert.True(completedResume);
+            string resumeAllJson = string.Join("\n", resumePayloads.Select(p => p.ToString(Formatting.None)));
+            // Completed `memos` table must be skipped; unfinished `notes` still uploads
+            Assert.DoesNotContain("Old desktop memo", resumeAllJson);
+            Assert.Contains("Met in JP shrine", resumeAllJson);
+            // Total feed_gps rows = 601; resuming after the 250th newest row must upload strictly the remaining 351 rows
+            Assert.Equal(351, resumedFeedItems.Count);
+            Assert.DoesNotContain("2025-01-05T08:00:00Z", resumedFeedItems);
+            // Final feed_gps cursorUpdate seals completed=true with accumulated rowsDone = 601
+            Assert.Contains(resumePayloads, p =>
+                p["cursorUpdate"]?["table"]?.Value<string>() == "feed_gps" &&
+                p["cursorUpdate"]?["completed"]?.Value<bool>() == true &&
+                p["cursorUpdate"]?["rowsDone"]?.Value<long>() == 601);
         }
         finally
         {

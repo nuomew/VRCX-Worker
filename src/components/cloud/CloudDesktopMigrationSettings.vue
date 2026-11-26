@@ -212,7 +212,16 @@
                     {{ t('cloud_hub.migration.current_category', { name: categoryLabel(job.currentCategory) }) }}
                 </span>
             </div>
-            <p v-if="job.errorMessage" class="text-[11px] text-destructive">{{ job.errorMessage }}</p>
+            <p
+                v-if="job.errorMessage"
+                class="text-[11px]"
+                :class="
+                    job.status === 'paused_daily_quota'
+                        ? 'text-amber-600 dark:text-amber-400'
+                        : 'text-destructive'
+                ">
+                {{ job.errorMessage }}
+            </p>
         </div>
 
         <!-- Desktop Inventory & Manual Category Selection (ALL OFF BY DEFAULT) -->
@@ -263,12 +272,25 @@
                     <span class="text-[11px] text-muted-foreground">
                         {{ t('cloud_hub.migration.default_off_hint') }}
                     </span>
-                    <div class="flex items-center gap-2">
+                    <div class="flex flex-wrap items-center gap-2">
                         <Button size="sm" variant="outline" class="h-7 px-2.5 text-[11px]" @click="selectLightweightCategories">
                             {{ t('cloud_hub.migration.select_lightweight_btn') }}
                         </Button>
                         <Button size="sm" variant="outline" class="h-7 px-2.5 text-[11px]" @click="resetSelectionsToOff">
                             {{ t('cloud_hub.migration.clear_selection_btn') }}
+                        </Button>
+                        <Button
+                            v-if="hasAnySavedCursor"
+                            size="sm"
+                            variant="outline"
+                            class="h-7 px-2.5 text-[11px]"
+                            :disabled="isJobActive || resettingCursors"
+                            @click="resetSavedCursors">
+                            {{
+                                resettingCursors
+                                    ? t('cloud_hub.migration.resetting_cursors')
+                                    : t('cloud_hub.migration.reset_cursors_btn')
+                            }}
                         </Button>
                     </div>
                 </div>
@@ -298,6 +320,15 @@
                                         v-if="importedStats[item.key] > 0"
                                         class="rounded bg-primary/15 px-1.5 py-0.5 text-[10px] font-medium text-primary">
                                         {{ t('cloud_hub.migration.already_imported_badge', { count: importedStats[item.key].toLocaleString() }) }}
+                                    </span>
+                                    <span
+                                        v-if="categoryCursorInfo(item.key).hasPartial"
+                                        class="rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium text-amber-600 dark:text-amber-400">
+                                        {{
+                                            t('cloud_hub.migration.cursor_checkpoint_badge', {
+                                                count: categoryCursorInfo(item.key).rowsDone.toLocaleString()
+                                            })
+                                        }}
                                     </span>
                                     <span
                                         v-if="wouldExceedLimit(item)"
@@ -366,10 +397,15 @@
                             {{
                                 startingJob
                                     ? t('cloud_hub.migration.starting_btn')
-                                    : t('cloud_hub.migration.start_sync_btn')
+                                    : hasSelectedResumeCursor
+                                      ? t('cloud_hub.migration.resume_sync_btn')
+                                      : t('cloud_hub.migration.start_sync_btn')
                             }}
                         </Button>
                     </div>
+                    <p v-if="hasSelectedResumeCursor && !projectedExceedsLimit" class="text-[11px] text-muted-foreground">
+                        {{ t('cloud_hub.migration.cursor_resume_hint') }}
+                    </p>
                     <p v-if="projectedExceedsLimit" class="text-[11px] text-destructive">
                         {{ t('cloud_hub.migration.quota_exceeded_warning') }}
                     </p>
@@ -412,6 +448,24 @@
         'feed'
     ];
     const LIGHTWEIGHT_CATEGORIES = ['memos_notes', 'favorites', 'avatar_history', 'friend_log', 'moderation_profiles'];
+    const CATEGORY_LOGICAL_TABLES = {
+        memos_notes: ['memos', 'world_memos', 'avatar_memos', 'notes'],
+        favorites: ['favorite_friend', 'favorite_world', 'favorite_avatar', 'favorite_print', 'avatar_tags'],
+        avatar_history: ['avatar_history'],
+        friend_log: ['friend_log_current', 'friend_log_history'],
+        notifications: ['notifications', 'notifications_v2'],
+        moderation_profiles: ['moderation', 'user_profile'],
+        gamelog: [
+            'gamelog_location',
+            'gamelog_join_leave',
+            'gamelog_portal_spawn',
+            'gamelog_video_play',
+            'gamelog_event',
+            'gamelog_external'
+        ],
+        feed: ['feed_gps', 'feed_online_offline', 'feed_status', 'feed_bio'],
+        settings: ['configs']
+    };
     const CONCURRENCY_OPTIONS = [1, 2, 3, 4, 6, 8];
     const WARN_LIMIT_BYTES = 400 * 1024 * 1024;
 
@@ -422,6 +476,7 @@
     const startingJob = ref(false);
     const cancellingJob = ref(false);
     const clearingData = ref(false);
+    const resettingCursors = ref(false);
     const savingConcurrency = ref(false);
     const showClearConfirm = ref(false);
     const actionError = ref('');
@@ -436,6 +491,7 @@
     const selectedDeviceId = ref('');
     const inventory = ref(null);
     const job = ref(null);
+    const savedCursors = ref({});
     const importedStats = reactive({
         memos_notes: 0,
         favorites: 0,
@@ -461,6 +517,37 @@
     const totalImportedRows = computed(() =>
         Object.values(importedStats).reduce((sum, n) => sum + (Number.isFinite(Number(n)) ? Number(n) : 0), 0)
     );
+    const activeCursorScopeKey = computed(() => selectedAccountPrefix.value || '_shared');
+    const activeScopeCursors = computed(() => {
+        const scopeMap = savedCursors.value?.[activeCursorScopeKey.value];
+        return scopeMap && typeof scopeMap === 'object' ? scopeMap : {};
+    });
+    const hasAnySavedCursor = computed(() => Object.keys(activeScopeCursors.value).length > 0);
+
+    function categoryCursorInfo(categoryKey) {
+        const tables = CATEGORY_LOGICAL_TABLES[categoryKey] || [];
+        const scopeMap = activeScopeCursors.value;
+        let savedCount = 0;
+        let completedCount = 0;
+        let rowsDone = 0;
+        let hasUnfinishedTable = false;
+        for (const tbl of tables) {
+            const cur = scopeMap[tbl];
+            if (!cur || typeof cur !== 'object') continue;
+            savedCount++;
+            rowsDone += Math.max(0, Number(cur.rowsDone || 0));
+            if (cur.completed === true) {
+                completedCount++;
+            } else if (cur.rowsDone > 0 || cur.rowId > 0 || cur.createdAt) {
+                hasUnfinishedTable = true;
+            }
+        }
+        return {
+            hasAny: savedCount > 0,
+            hasPartial: hasUnfinishedTable || (completedCount > 0 && completedCount < tables.length),
+            rowsDone
+        };
+    }
 
     const mergedCategoryList = computed(() => {
         if (!inventory.value?.dbFound) return [];
@@ -494,6 +581,9 @@
         mergedCategoryList.value
             .filter((item) => item.rowCount > 0 && selectedCategories[item.key])
             .map((item) => item.key)
+    );
+    const hasSelectedResumeCursor = computed(() =>
+        selectedCategoryKeys.value.some((key) => categoryCursorInfo(key).hasAny)
     );
     const selectedTotalRows = computed(() =>
         mergedCategoryList.value
@@ -540,6 +630,7 @@
     const jobStatusBadgeClass = computed(() => {
         const s = job.value?.status;
         if (s === 'completed') return 'border-status-online/40 bg-status-online/10 text-foreground';
+        if (s === 'paused_daily_quota') return 'border-amber-500/40 bg-amber-500/10 text-amber-600 dark:text-amber-400';
         if (s === 'failed' || s === 'stopped_quota_limit') return 'border-destructive/40 bg-destructive/10 text-destructive';
         if (s === 'queued' || s === 'running') return 'border-primary/40 bg-primary/10 text-primary';
         return 'border-border bg-muted/50 text-muted-foreground';
@@ -659,6 +750,7 @@
             for (const key of CATEGORY_ORDER) {
                 importedStats[key] = Number(nextStats[key] || 0);
             }
+            savedCursors.value = data?.cursors && typeof data.cursors === 'object' ? data.cursors : {};
 
             const prevStatus = job.value?.status;
             job.value = data?.job || null;
@@ -736,7 +828,8 @@
                     deviceId: selectedDeviceId.value || inventory.value?.deviceId || undefined,
                     accountPrefix: selectedAccountPrefix.value || '',
                     categories: selectedCategoryKeys.value,
-                    concurrency: migrationConcurrency.value
+                    concurrency: migrationConcurrency.value,
+                    resume: true
                 }
             });
             job.value = res?.job || null;
@@ -764,6 +857,24 @@
         } finally {
             cancellingJob.value = false;
             ensurePolling();
+        }
+    }
+
+    async function resetSavedCursors() {
+        if (resettingCursors.value || isJobActive.value) return;
+        resettingCursors.value = true;
+        actionError.value = '';
+        try {
+            const qs = selectedAccountPrefix.value
+                ? `?accountPrefix=${encodeURIComponent(selectedAccountPrefix.value)}`
+                : '';
+            await cloudFetch(`/api/migration/cursors${qs}`, { method: 'DELETE' });
+            toast.success(t('cloud_hub.migration.reset_cursors_toast'));
+            await loadMigrationState({ silent: true });
+        } catch (err) {
+            actionError.value = err?.message || String(err);
+        } finally {
+            resettingCursors.value = false;
         }
     }
 
