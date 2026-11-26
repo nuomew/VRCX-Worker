@@ -245,41 +245,10 @@ describe('UserDialogInfoTab.vue', () => {
             expect(wrapper.find('spinner-stub').exists()).toBe(true);
         });
 
-        test('hides empty local-log stat rows in Web mode while keeping online duration and any populated cloud/migrated stats', () => {
+        test('keeps VRCX info card and all stat rows visible in Web mode with em-dash placeholders when empty and real values when populated', () => {
             vi.stubGlobal('WEB', true);
             try {
                 const emptyLocalWrapper = mountComponent({
-                    userDialog: {
-                        lastSeen: '',
-                        dateFriended: '',
-                        timeSpent: 0,
-                        joinCount: 0
-                    }
-                });
-                const cardHtml = emptyLocalWrapper.find('[data-vrcx-info-card]').html();
-                expect(emptyLocalWrapper.find('[data-vrcx-info-card]').exists()).toBe(true);
-                expect(cardHtml).toContain('dialog.user.info.online_for');
-                expect(cardHtml).not.toContain('dialog.user.info.last_seen');
-                expect(cardHtml).not.toContain('dialog.user.info.friended');
-                expect(cardHtml).not.toContain('dialog.user.info.time_together');
-                expect(cardHtml).not.toContain('dialog.user.info.join_count');
-
-                const populatedWrapper = mountComponent({
-                    userDialog: {
-                        lastSeen: '2026-11-26T10:00:00.000Z',
-                        dateFriended: '2026-10-01T10:00:00.000Z',
-                        timeSpent: 7200000,
-                        joinCount: 4
-                    }
-                });
-                const populatedHtml = populatedWrapper.find('[data-vrcx-info-card]').html();
-                expect(populatedHtml).toContain('dialog.user.info.online_for');
-                expect(populatedHtml).toContain('dialog.user.info.last_seen');
-                expect(populatedHtml).toContain('dialog.user.info.friended');
-                expect(populatedHtml).toContain('dialog.user.info.time_together');
-                expect(populatedHtml).toContain('dialog.user.info.join_count');
-
-                const allEmptyWrapper = mountComponent({
                     userDialog: {
                         ref: {
                             id: 'usr_target',
@@ -299,7 +268,31 @@ describe('UserDialogInfoTab.vue', () => {
                         joinCount: 0
                     }
                 });
-                expect(allEmptyWrapper.find('[data-vrcx-info-card]').exists()).toBe(false);
+                const card = emptyLocalWrapper.find('[data-vrcx-info-card]');
+                expect(card.exists()).toBe(true);
+                const cardHtml = card.html();
+                expect(cardHtml).toContain('dialog.user.info.offline_for');
+                expect(cardHtml).toContain('dialog.user.info.last_seen');
+                expect(cardHtml).toContain('dialog.user.info.friended');
+                expect(cardHtml).toContain('dialog.user.info.time_together');
+                expect(cardHtml).toContain('dialog.user.info.join_count');
+                expect(cardHtml).toContain('—');
+
+                const populatedWrapper = mountComponent({
+                    userDialog: {
+                        lastSeen: '2026-11-26T10:00:00.000Z',
+                        dateFriended: '2026-10-01T10:00:00.000Z',
+                        timeSpent: 7200000,
+                        joinCount: 4
+                    }
+                });
+                const populatedHtml = populatedWrapper.find('[data-vrcx-info-card]').html();
+                expect(populatedHtml).toContain('dialog.user.info.online_for');
+                expect(populatedHtml).toContain('dialog.user.info.last_seen');
+                expect(populatedHtml).toContain('dialog.user.info.friended');
+                expect(populatedHtml).toContain('dialog.user.info.time_together');
+                expect(populatedHtml).toContain('dialog.user.info.join_count');
+                expect(populatedHtml).toContain('>4<');
             } finally {
                 vi.unstubAllGlobals();
             }

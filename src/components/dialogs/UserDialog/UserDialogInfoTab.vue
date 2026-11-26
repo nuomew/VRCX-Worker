@@ -229,7 +229,7 @@
             </div>
 
             <div class="flex flex-col gap-2.5">
-                <div v-if="showVrcxInfoCard" class="rounded-xl bg-(--profile-card) p-3" data-vrcx-info-card>
+                <div class="rounded-xl bg-(--profile-card) p-3" data-vrcx-info-card>
                     <div class="flex items-center justify-between mb-2 pb-2 border-b border-muted-foreground/20">
                         <span
                             class="text-[10px] font-bold uppercase tracking-wide"
@@ -245,7 +245,6 @@
                     </div>
                     <div class="flex flex-col gap-1.5">
                         <TooltipWrapper
-                            v-if="showOnlineForRow"
                             side="right"
                             :content="formatDateFilter(userOnlineForTimestamp(userDialog), 'long')"
                             :disabled="!userOnlineForTimestamp(userDialog)">
@@ -268,7 +267,6 @@
 
                         <template v-if="currentUser.id !== userDialog.id">
                             <TooltipWrapper
-                                v-if="showLastSeenRow"
                                 side="right"
                                 :disabled="!userDialog.lastSeen"
                                 :content="formatDateFilter(userDialog.lastSeen, 'long')">
@@ -281,10 +279,7 @@
                                     }}</span>
                                 </div>
                             </TooltipWrapper>
-                            <TooltipWrapper
-                                v-if="showDateFriendedRow"
-                                side="right"
-                                :disabled="userDialog.dateFriendedInfo.length === 0">
+                            <TooltipWrapper side="right" :disabled="userDialog.dateFriendedInfo.length === 0">
                                 <template #content>
                                     <template v-if="userDialog.dateFriendedInfo.length === 1">
                                         {{ formatDateFilter(userDialog.dateFriended, 'long') }}
@@ -310,7 +305,6 @@
                                 </div>
                             </TooltipWrapper>
                             <TooltipWrapper
-                                v-if="showTimeSpentRow"
                                 side="right"
                                 :content="timeToText(userDialog.timeSpent, true)"
                                 :disabled="!userDialog.timeSpent">
@@ -323,10 +317,7 @@
                                     }}</span>
                                 </div>
                             </TooltipWrapper>
-                            <TooltipWrapper
-                                v-if="showJoinCountRow"
-                                side="right"
-                                :content="t('dialog.user.info.open_previous_instance')">
+                            <TooltipWrapper side="right" :content="t('dialog.user.info.open_previous_instance')">
                                 <div
                                     class="flex justify-between items-start gap-2 text-xs cursor-pointer hover:text-foreground"
                                     @click="showPreviousInstancesListDialog(userDialog.ref)">
@@ -340,10 +331,7 @@
                             </TooltipWrapper>
                         </template>
                         <template v-else>
-                            <TooltipWrapper
-                                v-if="showTimeSpentRow"
-                                side="right"
-                                :content="t('dialog.user.info.open_previous_instance')">
+                            <TooltipWrapper side="right" :content="t('dialog.user.info.open_previous_instance')">
                                 <div
                                     class="flex justify-between items-start gap-2 text-xs cursor-pointer hover:text-foreground"
                                     @click="showPreviousInstancesListDialog(userDialog.ref)">
@@ -474,7 +462,7 @@
     import { Copy, Info, Languages, Pencil, Trash2, User } from 'lucide-vue-next';
     import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar';
     import IconFrame from '@/components/IconFrame.vue';
-    import { computed, ref, watch } from 'vue';
+    import { ref, watch } from 'vue';
     import { Button } from '@/components/ui/button';
     import { Spinner } from '@/components/ui/spinner';
     import { storeToRefs } from 'pinia';
@@ -526,28 +514,6 @@
 
     const { lastLocation } = storeToRefs(useLocationStore());
     const { userImage, userStatusClass } = useUserDisplay();
-
-    // In stateless Web mode, hide local-log/history rows that currently have no data instead of showing empty dashes,
-    // while displaying any row as soon as online presence, companion logs, or migrated DB_LEGACY history provides it.
-    const isWebMode = typeof WEB !== 'undefined' && WEB;
-    const showOnlineForRow = computed(() => !isWebMode || Boolean(userOnlineForTimestamp(userDialog.value)));
-    const showLastSeenRow = computed(() => !isWebMode || Boolean(userDialog.value.lastSeen));
-    const showDateFriendedRow = computed(() => !isWebMode || Boolean(userDialog.value.dateFriended));
-    const showTimeSpentRow = computed(() => !isWebMode || Number(userDialog.value.timeSpent) > 0);
-    const showJoinCountRow = computed(() => !isWebMode || Number(userDialog.value.joinCount) > 0);
-    const showVrcxInfoCard = computed(() => {
-        if (!isWebMode) return true;
-        if (showOnlineForRow.value) return true;
-        if (currentUser.value.id !== userDialog.value.id) {
-            return (
-                showLastSeenRow.value ||
-                showDateFriendedRow.value ||
-                showTimeSpentRow.value ||
-                showJoinCountRow.value
-            );
-        }
-        return showTimeSpentRow.value;
-    });
 
     const bioCache = ref({
         userId: null,
