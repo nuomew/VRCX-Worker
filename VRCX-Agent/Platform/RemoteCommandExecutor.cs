@@ -21,13 +21,22 @@ public sealed class RemoteCommandExecutor
 
     private readonly Func<AgentConfig> _configProvider;
     private readonly Func<CancellationToken, Task> _syncNowCallback;
+    private readonly Func<CancellationToken, Task<string>>? _desktopScanCallback;
+    private readonly Func<string, string, IReadOnlyList<string>, Task<string>>? _desktopMigrateCallback;
+    private readonly Func<string, string>? _desktopMigrateCancelCallback;
 
     public RemoteCommandExecutor(
         Func<AgentConfig> configProvider,
-        Func<CancellationToken, Task> syncNowCallback)
+        Func<CancellationToken, Task> syncNowCallback,
+        Func<CancellationToken, Task<string>>? desktopScanCallback = null,
+        Func<string, string, IReadOnlyList<string>, Task<string>>? desktopMigrateCallback = null,
+        Func<string, string>? desktopMigrateCancelCallback = null)
     {
         _configProvider = configProvider;
         _syncNowCallback = syncNowCallback;
+        _desktopScanCallback = desktopScanCallback;
+        _desktopMigrateCallback = desktopMigrateCallback;
+        _desktopMigrateCancelCallback = desktopMigrateCancelCallback;
     }
 
     public async Task<CommandExecutionResult> ExecuteAsync(
@@ -58,6 +67,9 @@ public sealed class RemoteCommandExecutor
                 "send_vr_notify" => await SendVrNotificationAsync(cmdId, parameters, ct).ConfigureAwait(false),
                 "discord_update" => UpdateDiscordPresence(cmdId, parameters),
                 "sync_now" => await TriggerSyncNowAsync(cmdId, ct).ConfigureAwait(false),
+                "desktop_scan" => await TriggerDesktopScanAsync(cmdId, ct).ConfigureAwait(false),
+                "desktop_migrate" => await TriggerDesktopMigrateAsync(cmdId, parameters).ConfigureAwait(false),
+                "desktop_migrate_cancel" => TriggerDesktopMigrateCancel(cmdId, parameters),
                 _ => new CommandExecutionResult { CmdId = cmdId, Status = "failed", Message = "Unsupported action" }
             };
         }
@@ -287,6 +299,57 @@ public sealed class RemoteCommandExecutor
             CmdId = cmdId,
             Status = "succeeded",
             Message = "Forced GameLog and live state sync completed"
+        };
+    }
+
+    private async Task<CommandExecutionResult> TriggerDesktopScanAsync(string cmdId, CancellationToken ct)
+    {
+        if (_desktopScanCallback == null)
+        {
+            return new CommandExecutionResult { CmdId = cmdId, Status = "failed", Message = "Desktop scan handler unavailable" };
+        }
+        string msg = await _desktopScanCallback(ct).ConfigureAwait(false);
+        return new CommandExecutionResult
+        {
+            CmdId = cmdId,
+            Status = "succeeded",
+            Message = msg
+        };
+    }
+
+    private async Task<CommandExecutionResult> TriggerDesktopMigrateAsync(string cmdId, Dictionary<string, object?> parameters)
+    {
+        if (_desktopMigrateCallback == null)
+        {
+            return new CommandExecutionResult { CmdId = cmdId, Status = "failed", Message = "Desktop migration handler unavailable" };
+        }
+        string jobId = GetString(parameters, "jobId").Trim();
+        string accountPrefix = GetString(parameters, "accountPrefix").Trim();
+        List<string> categories = parameters.TryGetValue("categories", out var rawCats)
+            ? CommandValidator.ExtractStringList(rawCats)
+            : new List<string>();
+        string msg = await _desktopMigrateCallback(jobId, accountPrefix, categories).ConfigureAwait(false);
+        return new CommandExecutionResult
+        {
+            CmdId = cmdId,
+            Status = "succeeded",
+            Message = msg
+        };
+    }
+
+    private CommandExecutionResult TriggerDesktopMigrateCancel(string cmdId, Dictionary<string, object?> parameters)
+    {
+        if (_desktopMigrateCancelCallback == null)
+        {
+            return new CommandExecutionResult { CmdId = cmdId, Status = "failed", Message = "Desktop migration cancel handler unavailable" };
+        }
+        string jobId = GetString(parameters, "jobId").Trim();
+        string msg = _desktopMigrateCancelCallback(jobId);
+        return new CommandExecutionResult
+        {
+            CmdId = cmdId,
+            Status = "succeeded",
+            Message = msg
         };
     }
 

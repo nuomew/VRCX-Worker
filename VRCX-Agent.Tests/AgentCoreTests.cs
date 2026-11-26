@@ -1,12 +1,15 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Net;
 using System.Net.Http;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using Microsoft.Data.Sqlite;
 using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 using SixLabors.ImageSharp;
 using SixLabors.ImageSharp.PixelFormats;
 using VRCX.Agent.Core;
@@ -2566,6 +2569,178 @@ public sealed class AgentCoreTests
         Assert.NotNull(goodRes);
         Assert.Equal(1, httpCalls);
         Assert.Equal("https://vrcx.example.workers.dev/api/agent/sync", sentUri?.AbsoluteUri);
+    }
+
+    [Fact]
+    public async Task DesktopLegacyMigrator_ScansReadOnlyFiltersSecretsAndStreamsSelectedCategories()
+    {
+        // 1. CommandValidator allows valid migration actions and rejects invalid categories/prefixes/jobIds
+        Assert.True(CommandValidator.ValidateRemoteCommand("desktop_scan", null).Ok);
+        Assert.True(CommandValidator.ValidateRemoteCommand("desktop_migrate", new Dictionary<string, object?>
+        {
+            ["jobId"] = "mig_1234abcd",
+            ["accountPrefix"] = "usr11112222333344445555666677778888",
+            ["categories"] = new[] { "memos_notes", "gamelog", "settings" }
+        }).Ok);
+        Assert.True(CommandValidator.ValidateRemoteCommand("desktop_migrate_cancel", new Dictionary<string, object?>
+        {
+            ["jobId"] = "mig_1234abcd"
+        }).Ok);
+        Assert.False(CommandValidator.ValidateRemoteCommand("desktop_migrate", new Dictionary<string, object?>
+        {
+            ["jobId"] = "mig_1234abcd",
+            ["categories"] = Array.Empty<string>()
+        }).Ok);
+        Assert.False(CommandValidator.ValidateRemoteCommand("desktop_migrate", new Dictionary<string, object?>
+        {
+            ["jobId"] = "mig_1234abcd",
+            ["categories"] = new[] { "drop_table_evil" }
+        }).Ok);
+        Assert.False(CommandValidator.ValidateRemoteCommand("desktop_migrate", new Dictionary<string, object?>
+        {
+            ["jobId"] = "mig_1234abcd",
+            ["accountPrefix"] = "../evil;DROP TABLE",
+            ["categories"] = new[] { "gamelog" }
+        }).Ok);
+
+        string tempRoot = Path.Combine(Path.GetTempPath(), "vrcx_legacy_mig_test_" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(tempRoot);
+        try
+        {
+            string appDataDir = Path.Combine(tempRoot, "AppDataVrcx");
+            string customDbDir = Path.Combine(tempRoot, "CustomStorage");
+            Directory.CreateDirectory(appDataDir);
+            Directory.CreateDirectory(customDbDir);
+            string dbPath = Path.Combine(customDbDir, "VRCX.sqlite3");
+
+            // Write VRCX.json pointing VRCX_DatabaseLocation to customDbDir\VRCX.sqlite3
+            File.WriteAllText(
+                Path.Combine(appDataDir, "VRCX.json"),
+                JsonConvert.SerializeObject(new { VRCX_DatabaseLocation = dbPath }),
+                Encoding.UTF8);
+
+            // Create a realistic upstream desktop VRCX SQLite database
+            const string acctPrefix = "usr11112222333344445555666677778888";
+            using (var conn = new SqliteConnection($"Data Source={dbPath};Pooling=False"))
+            {
+                conn.Open();
+                using var cmd = conn.CreateCommand();
+                cmd.CommandText = $@"
+CREATE TABLE memos (user_id TEXT PRIMARY KEY, edited_at TEXT, memo TEXT);
+CREATE TABLE favorite_friend (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT, user_id TEXT, group_name TEXT);
+CREATE TABLE gamelog_location (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT, location TEXT, world_id TEXT, world_name TEXT, time INTEGER, group_name TEXT);
+CREATE TABLE configs (key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE {acctPrefix}_notes (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT, display_name TEXT, note TEXT, created_at TEXT);
+CREATE TABLE {acctPrefix}_feed_gps (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT, user_id TEXT, display_name TEXT, location TEXT, world_name TEXT, previous_location TEXT, time INTEGER, group_name TEXT);
+CREATE TABLE {acctPrefix}_friend_log_history (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT, type TEXT, user_id TEXT, display_name TEXT, previous_display_name TEXT, trust_level TEXT, previous_trust_level TEXT, friend_number INTEGER);
+INSERT INTO memos VALUES ('usr_friend_1', '2025-01-01T00:00:00Z', 'Old desktop memo');
+INSERT INTO favorite_friend (created_at, user_id, group_name) VALUES ('2025-01-02T00:00:00Z', 'usr_friend_1', 'Besties');
+INSERT INTO gamelog_location (created_at, location, world_id, world_name, time, group_name) VALUES ('2025-01-03T10:00:00Z', 'wrld_old1:100', 'wrld_old1', '桜の集会所', 3600, '');
+INSERT INTO configs VALUES ('VRCX_themeMode', 'midnight');
+INSERT INTO configs VALUES ('VRCX_savedCredentials', 'SECRET_PASS_MUST_NEVER_LEAVE');
+INSERT INTO configs VALUES ('VRCX_proxy', 'http://127.0.0.1:7890');
+INSERT INTO configs VALUES ('VRCX_authToken', 'authcookie_secret_xyz');
+INSERT INTO {acctPrefix}_notes (user_id, display_name, note, created_at) VALUES ('usr_friend_1', 'Sakura', 'Met in JP shrine', '2025-01-04T00:00:00Z');
+INSERT INTO {acctPrefix}_feed_gps (created_at, user_id, display_name, location, world_name, previous_location, time, group_name) VALUES ('2025-01-05T08:00:00Z', 'usr_friend_1', 'Sakura', 'wrld_old1:100', '桜の集会所', '', 1200, '');
+INSERT INTO {acctPrefix}_friend_log_history (created_at, type, user_id, display_name, previous_display_name, trust_level, previous_trust_level, friend_number) VALUES ('2025-01-06T09:00:00Z', 'Friend', 'usr_friend_1', 'Sakura', '', 'Trusted User', '', 12);
+";
+                cmd.ExecuteNonQuery();
+            }
+
+            // 2. ResolveDesktopVrcxDatabasePath honors VRCX.json custom path
+            Assert.Equal(dbPath, DesktopLegacyMigrator.ResolveDesktopVrcxDatabasePath(appDataDir));
+
+            // 3. Read-only scan discovers shared tables, account prefix label, filters secrets in settings, and estimates DB bytes
+            LegacyDesktopInventoryReport inv = DesktopLegacyMigrator.ScanDatabase(dbPath, "Win-Desktop");
+            Assert.True(inv.DbFound);
+            Assert.Equal("VRCX.sqlite3", inv.DbFileName);
+            Assert.True(inv.DbFileBytes > 0);
+
+            LegacyCategoryInventory? settingsCat = inv.SharedCategories.FirstOrDefault(c => c.Key == "settings");
+            Assert.NotNull(settingsCat);
+            Assert.Equal(1, settingsCat!.RowCount); // Only VRCX_themeMode survives secret/proxy filter
+            Assert.True(settingsCat.EstimatedDbBytes >= 4096);
+
+            LegacyAccountInventory acc = Assert.Single(inv.Accounts);
+            Assert.Equal(acctPrefix, acc.Prefix);
+            Assert.Equal("usr_11112222-3333-4444-5555-666677778888", acc.Label);
+            Assert.Equal(1, acc.Categories.First(c => c.Key == "memos_notes").RowCount);
+            Assert.Equal(1, acc.Categories.First(c => c.Key == "feed").RowCount);
+            Assert.Equal(1, acc.Categories.First(c => c.Key == "friend_log").RowCount);
+
+            // 4. RunMigrationAsync streams ONLY selected categories and never leaks sensitive config keys
+            var uploadedPayloads = new List<JObject>();
+            using var stubHttp = new HttpClient(new StubHttpHandler(async req =>
+            {
+                string body = req.Content != null ? await req.Content.ReadAsStringAsync() : "{}";
+                uploadedPayloads.Add(JObject.Parse(body));
+                return new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent(
+                        "{\"ok\":true,\"data\":{\"inserted\":1,\"skipped\":0,\"legacyDbBytes\":65536,\"shouldStop\":false}}",
+                        Encoding.UTF8,
+                        "application/json")
+                };
+            }));
+            var syncClient = new HttpSyncClient(stubHttp);
+            var cfg = new AgentConfig
+            {
+                CloudUrl = "https://vrcx.example.workers.dev",
+                SyncSecret = "vrcx_sync_test_key",
+                DeviceId = "dev_legacy_test"
+            };
+
+            var (completed, batchesSent, _) = await DesktopLegacyMigrator.RunMigrationAsync(
+                cfg,
+                dbPath,
+                "mig_run_001",
+                acctPrefix,
+                new[] { "memos_notes", "settings" },
+                syncClient,
+                CancellationToken.None);
+
+            Assert.True(completed);
+            Assert.Equal(2, batchesSent); // memos_notes + settings (+ final allDone signal)
+            Assert.Equal(3, uploadedPayloads.Count);
+            string allSentJson = string.Join("\n", uploadedPayloads.Select(p => p.ToString(Formatting.None)));
+            Assert.Contains("Old desktop memo", allSentJson);
+            Assert.Contains("Met in JP shrine", allSentJson);
+            Assert.Contains("VRCX_themeMode", allSentJson);
+            // Unselected categories and sensitive configs must NEVER leave the PC
+            Assert.DoesNotContain("Besties", allSentJson);
+            Assert.DoesNotContain("桜の集会所", allSentJson);
+            Assert.DoesNotContain("SECRET_PASS_MUST_NEVER_LEAVE", allSentJson);
+            Assert.DoesNotContain("authcookie_secret_xyz", allSentJson);
+            Assert.DoesNotContain("127.0.0.1:7890", allSentJson);
+
+            // 5. Server shouldStop=true halts migration immediately without sending remaining categories
+            int stopCalls = 0;
+            using var stopHttp = new HttpClient(new StubHttpHandler(_ =>
+            {
+                stopCalls++;
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent(
+                        "{\"ok\":true,\"data\":{\"inserted\":0,\"skipped\":1,\"legacyDbBytes\":504000000,\"shouldStop\":true,\"reason\":\"LEGACY_DB_QUOTA_NEAR_LIMIT\"}}",
+                        Encoding.UTF8,
+                        "application/json")
+                });
+            }));
+            var (completedStop, _, _) = await DesktopLegacyMigrator.RunMigrationAsync(
+                cfg,
+                dbPath,
+                "mig_stop_002",
+                acctPrefix,
+                new[] { "memos_notes", "gamelog", "feed" },
+                new HttpSyncClient(stopHttp),
+                CancellationToken.None);
+            Assert.False(completedStop);
+            Assert.Equal(1, stopCalls);
+        }
+        finally
+        {
+            if (Directory.Exists(tempRoot)) Directory.Delete(tempRoot, recursive: true);
+        }
     }
 
     private sealed class StubHttpHandler : HttpMessageHandler

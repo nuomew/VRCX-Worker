@@ -5739,4 +5739,325 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
             ]);
         }
     });
+
+    it('isolates legacy desktop VRCX migration in dedicated DB_LEGACY, enforces opt-in + secret stripping, and merges reads transparently', async () => {
+        try {
+            // 1. /health and /api/admin/quota expose dedicated DB_LEGACY
+            const healthRes = await exports.default.fetch('http://example.com/health');
+            expect(healthRes.status).toBe(200);
+            const healthJson = (await healthRes.json()) as { ok: boolean; data: { legacyDbDedicated: boolean } };
+            expect(healthJson.data.legacyDbDedicated).toBe(true);
+
+            const quotaRes = await exports.default.fetch('http://example.com/api/admin/quota');
+            expect(quotaRes.status).toBe(200);
+            const quotaJson = (await quotaRes.json()) as {
+                ok: boolean;
+                data: {
+                    legacyDbDedicated: boolean;
+                    freeSingleDbLimitBytes: number;
+                    databases: { legacy: { bytes: number; percentOfFreeLimit: number } };
+                };
+            };
+            expect(quotaJson.data.legacyDbDedicated).toBe(true);
+            expect(quotaJson.data.freeSingleDbLimitBytes).toBe(500 * 1024 * 1024);
+            expect(quotaJson.data.databases.legacy.bytes).toBeGreaterThanOrEqual(0);
+
+            // 2. Register an Agent sync key, trigger desktop_scan, and confirm Agent receives the command + posts inventory
+            const keyRes = await exports.default.fetch('http://example.com/api/agent/sync-key', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+                body: JSON.stringify({ deviceName: 'Legacy-Migration-PC' })
+            });
+            expect(keyRes.status).toBe(200);
+            const { syncKey, deviceId } = ((await keyRes.json()) as { data: { syncKey: string; deviceId: string } }).data;
+            const agentHeaders = {
+                Authorization: `Bearer ${syncKey}`,
+                'Content-Type': 'application/json'
+            };
+
+            const scanRes = await exports.default.fetch('http://example.com/api/migration/scan', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+                body: JSON.stringify({ deviceId })
+            });
+            expect(scanRes.status).toBe(200);
+
+            const pollScanRes = await exports.default.fetch('http://example.com/api/agent/sync', {
+                method: 'POST',
+                headers: agentHeaders,
+                body: JSON.stringify({ deviceId, agentVersion: '1.11.0', events: [] })
+            });
+            expect(pollScanRes.status).toBe(200);
+            const pollScanJson = (await pollScanRes.json()) as {
+                data: { pendingCommands: Array<{ action: string }> };
+            };
+            expect(pollScanJson.data.pendingCommands.some((c) => c.action === 'desktop_scan')).toBe(true);
+
+            const invRes = await exports.default.fetch('http://example.com/api/agent/migration/inventory', {
+                method: 'POST',
+                headers: agentHeaders,
+                body: JSON.stringify({
+                    deviceName: 'Legacy-Migration-PC',
+                    dbFound: true,
+                    dbFileName: 'VRCX.sqlite3',
+                    dbFileBytes: 12_345_678,
+                    sharedCategories: [
+                        { key: 'memos_notes', rowCount: 2, rawBytes: 256, estimatedDbBytes: 4096, tables: ['memos'] },
+                        { key: 'gamelog', rowCount: 2, rawBytes: 512, estimatedDbBytes: 4096, tables: ['gamelog_location'] },
+                        { key: 'settings', rowCount: 2, rawBytes: 128, estimatedDbBytes: 4096, tables: ['configs'] }
+                    ],
+                    accounts: [
+                        {
+                            prefix: 'usr11112222333344445555666677778888',
+                            label: 'usr_11112222-3333-4444-5555-666677778888',
+                            categories: [
+                                { key: 'feed', rowCount: 1, rawBytes: 200, estimatedDbBytes: 4096, tables: ['usr11112222333344445555666677778888_feed_gps'] }
+                            ]
+                        }
+                    ]
+                })
+            });
+            expect(invRes.status).toBe(200);
+
+            // 3. Starting with empty categories is rejected (opt-in strictly enforced)
+            const emptyStartRes = await exports.default.fetch('http://example.com/api/migration/start', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+                body: JSON.stringify({ deviceId, categories: [] })
+            });
+            expect(emptyStartRes.status).toBe(400);
+
+            // Seed an active DB_CORE memo & theme setting to verify active DB_CORE precedence over DB_LEGACY
+            const seedMemoRes = await exports.default.fetch('http://example.com/api/memos', {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+                body: JSON.stringify({
+                    kind: 'user',
+                    id: 'usr_override',
+                    memo: 'New Cloud Memo',
+                    editedAt: '2026-11-26T00:00:00Z'
+                })
+            });
+            expect(seedMemoRes.status).toBe(200);
+            const seedCfgRes = await exports.default.fetch('http://example.com/api/config/bundle', {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+                body: JSON.stringify({
+                    bundleKey: 'vrcx_config',
+                    patch: { 'config:vrcx_thememode': 'dark' }
+                })
+            });
+            expect(seedCfgRes.status).toBe(200);
+
+            // 4. Start migration for selected categories and ingest batches into isolated DB_LEGACY
+            const selectedCategories = [
+                'memos_notes',
+                'favorites',
+                'avatar_history',
+                'friend_log',
+                'notifications',
+                'moderation_profiles',
+                'gamelog',
+                'feed',
+                'settings'
+            ];
+            const startRes = await exports.default.fetch('http://example.com/api/migration/start', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+                body: JSON.stringify({
+                    deviceId,
+                    accountPrefix: 'usr11112222333344445555666677778888',
+                    categories: selectedCategories
+                })
+            });
+            expect(startRes.status).toBe(200);
+            const startJson = (await startRes.json()) as { data: { job: { jobId: string } } };
+            const jobId = startJson.data.job.jobId;
+
+            const postBatch = async (category: string, items: unknown[], categoryDone = true, allDone = false) => {
+                const res = await exports.default.fetch('http://example.com/api/agent/migration/batch', {
+                    method: 'POST',
+                    headers: agentHeaders,
+                    body: JSON.stringify({ jobId, category, items, categoryDone, allDone })
+                });
+                expect(res.status).toBe(200);
+                return (await res.json()) as { ok: boolean; data: { inserted: number; skipped: number; shouldStop: boolean } };
+            };
+
+            const bMemos = await postBatch('memos_notes', [
+                { kind: 'memo', userId: 'usr_override', editedAt: '2024-01-01T00:00:00Z', memo: 'Old Desktop Memo' },
+                { kind: 'memo', userId: 'usr_legacy_only', editedAt: '2024-01-02T00:00:00Z', memo: 'Only Legacy Memo' },
+                { kind: 'note', userId: 'usr_legacy_only', displayName: 'LegacyPal', note: 'Old note text', createdAt: '2024-01-02T00:00:00Z' }
+            ]);
+            expect(bMemos.data.inserted).toBe(3);
+
+            // Idempotent replay produces 0 duplicate inserts
+            const bMemosReplay = await postBatch('memos_notes', [
+                { kind: 'memo', userId: 'usr_legacy_only', editedAt: '2024-01-02T00:00:00Z', memo: 'Only Legacy Memo' }
+            ]);
+            expect(bMemosReplay.data.inserted).toBe(0);
+
+            await postBatch('favorites', [
+                { kind: 'favorite_friend', createdAt: '2024-02-01T00:00:00Z', userId: 'usr_legacy_only', groupName: 'LegacyBesties' }
+            ]);
+            await postBatch('avatar_history', [
+                { kind: 'avatar_history', avatarId: 'avtr_legacy_1', createdAt: '2024-02-02T00:00:00Z', time: 1800 }
+            ]);
+            await postBatch('friend_log', [
+                {
+                    kind: 'friend_log_history',
+                    createdAt: '2024-02-03T00:00:00Z',
+                    type: 'Friend',
+                    userId: 'usr_legacy_only',
+                    displayName: 'LegacyPal',
+                    trustLevel: 'Trusted User',
+                    friendNumber: 7
+                }
+            ]);
+            await postBatch('notifications', [
+                {
+                    kind: 'notification_v1',
+                    id: 'not_legacy_1',
+                    createdAt: '2024-02-04T00:00:00Z',
+                    type: 'invite',
+                    senderUserId: 'usr_legacy_only',
+                    senderUsername: 'LegacyPal',
+                    message: 'Old invite'
+                }
+            ]);
+            await postBatch('moderation_profiles', [
+                { kind: 'moderation', userId: 'usr_mod_legacy', updatedAt: '2024-02-05T00:00:00Z', displayName: 'BlockedOld', block: true, mute: false },
+                { kind: 'user_profile', userId: 'usr_legacy_only', bio: 'Old bio', bioLinks: '[]', updatedAt: '2024-02-05T00:00:00Z' }
+            ]);
+            await postBatch('gamelog', [
+                {
+                    type: 'Location',
+                    created_at: '2024-03-01T10:00:00Z',
+                    location: 'wrld_legacy_shrine:100',
+                    worldId: 'wrld_legacy_shrine',
+                    worldName: '古都の桜神社',
+                    time: 2400
+                },
+                {
+                    type: 'OnPlayerJoined',
+                    created_at: '2024-03-01T10:01:00Z',
+                    displayName: '古参フレンド',
+                    location: 'wrld_legacy_shrine:100',
+                    userId: 'usr_legacy_only',
+                    time: 0
+                }
+            ]);
+            await postBatch('feed', [
+                {
+                    type: 'GPS',
+                    created_at: '2024-03-01T10:05:00Z',
+                    userId: 'usr_legacy_only',
+                    displayName: 'LegacyPal',
+                    location: 'wrld_legacy_shrine:100',
+                    worldName: '古都の桜神社',
+                    previousLocation: '',
+                    time: 900
+                }
+            ]);
+            const bSettings = await postBatch(
+                'settings',
+                [
+                    { kind: 'config', key: 'VRCX_themeMode', value: 'light' },
+                    { kind: 'config', key: 'VRCX_fontSize', value: '15' },
+                    { kind: 'config', key: 'VRCX_savedCredentials', value: 'LEAK_SECRET_SHOULD_STRIP' }
+                ],
+                true,
+                false
+            );
+            expect(bSettings.data.inserted).toBe(2); // savedCredentials stripped by cloud defense-in-depth
+
+            // 5. Verify strict database isolation: active DB_GAMELOG & DB_FEED contain zero legacy shrine rows
+            const activeGamelogRow = await env.DB_GAMELOG.prepare(
+                "SELECT id FROM gamelog_location WHERE world_id = 'wrld_legacy_shrine'"
+            ).first();
+            expect(activeGamelogRow).toBeNull();
+            const activeFeedRow = await env.DB_FEED.prepare(
+                "SELECT id FROM feed_gps WHERE user_id = 'usr_legacy_only'"
+            ).first();
+            expect(activeFeedRow).toBeNull();
+
+            // 6. Verify transparent merged reads across /api/bootstrap, gamelog, FTS search, feed, friend-log, notifications, avatar-history
+            const bootRes = await exports.default.fetch('http://example.com/api/bootstrap');
+            expect(bootRes.status).toBe(200);
+            const bootJson = (await bootRes.json()) as {
+                data: {
+                    configs: Record<string, string>;
+                    memos: Array<{ user_id: string; memo: string }>;
+                    notes: Array<{ user_id: string; note: string }>;
+                    favoriteFriends: Array<{ user_id: string; group_name: string }>;
+                    moderations: Array<{ user_id: string }>;
+                    userProfiles: Array<{ user_id: string; bio: string }>;
+                };
+            };
+            expect(bootJson.data.memos.find((m) => m.user_id === 'usr_override')?.memo).toBe('New Cloud Memo');
+            expect(bootJson.data.memos.find((m) => m.user_id === 'usr_legacy_only')?.memo).toBe('Only Legacy Memo');
+            expect(bootJson.data.notes.some((n) => n.user_id === 'usr_legacy_only' && n.note === 'Old note text')).toBe(true);
+            expect(bootJson.data.favoriteFriends.some((f) => f.user_id === 'usr_legacy_only' && f.group_name === 'LegacyBesties')).toBe(true);
+            expect(bootJson.data.moderations.some((m) => m.user_id === 'usr_mod_legacy')).toBe(true);
+            expect(bootJson.data.userProfiles.some((p) => p.user_id === 'usr_legacy_only' && p.bio === 'Old bio')).toBe(true);
+            expect(bootJson.data.configs['config:vrcx_thememode']).toBe('dark'); // active DB_CORE wins
+            expect(bootJson.data.configs['config:vrcx_fontsize']).toBe('15'); // legacy fills missing key
+            expect(JSON.stringify(bootJson)).not.toContain('LEAK_SECRET_SHOULD_STRIP');
+
+            const avtrRes = await exports.default.fetch('http://example.com/api/avatar-history?limit=50');
+            expect(JSON.stringify(await avtrRes.json())).toContain('avtr_legacy_1');
+
+            const flRes = await exports.default.fetch('http://example.com/api/friend-log/history?limit=50');
+            expect(JSON.stringify(await flRes.json())).toContain('LegacyPal');
+
+            const notyRes = await exports.default.fetch('http://example.com/api/notifications?v=1&limit=50');
+            expect(JSON.stringify(await notyRes.json())).toContain('not_legacy_1');
+
+            const glSearchRes = await exports.default.fetch(
+                `http://example.com/api/gamelog/search?q=${encodeURIComponent('桜神社')}&limit=20`
+            );
+            expect(glSearchRes.status).toBe(200);
+            const glSearchJson = (await glSearchRes.json()) as {
+                data: { locationRows: Array<{ world_id: string; world_name: string }> };
+            };
+            expect(glSearchJson.data.locationRows.some((r) => r.world_id === 'wrld_legacy_shrine')).toBe(true);
+
+            const feedRes = await exports.default.fetch('http://example.com/api/feed?limit=100');
+            const feedJson = (await feedRes.json()) as { data: Array<{ userId?: string; worldName?: string }> };
+            expect(feedJson.data.some((f) => f.userId === 'usr_legacy_only' && f.worldName === '古都の桜神社')).toBe(true);
+
+            // 7. Cancel running job -> subsequent batch receives shouldStop=true
+            const cancelRes = await exports.default.fetch('http://example.com/api/migration/cancel', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' }
+            });
+            expect(cancelRes.status).toBe(200);
+            const afterCancel = await postBatch('settings', [{ kind: 'config', key: 'VRCX_other', value: '1' }], false, false);
+            expect(afterCancel.data.shouldStop).toBe(true);
+
+            // 8. DELETE /api/migration/data wipes DB_LEGACY cleanly while leaving active DB_CORE untouched
+            const clearRes = await exports.default.fetch('http://example.com/api/migration/data', {
+                method: 'DELETE',
+                headers: { Origin: 'http://example.com' }
+            });
+            expect(clearRes.status).toBe(200);
+
+            const stateAfterClearRes = await exports.default.fetch('http://example.com/api/migration/state');
+            const stateAfterClear = (await stateAfterClearRes.json()) as {
+                data: { importedStats: Record<string, number> };
+            };
+            expect(Object.values(stateAfterClear.data.importedStats).every((n) => n === 0)).toBe(true);
+
+            const bootAfterClear = (await (await exports.default.fetch('http://example.com/api/bootstrap')).json()) as {
+                data: { memos: Array<{ user_id: string; memo: string }> };
+            };
+            expect(bootAfterClear.data.memos.find((m) => m.user_id === 'usr_override')?.memo).toBe('New Cloud Memo');
+            expect(bootAfterClear.data.memos.some((m) => m.user_id === 'usr_legacy_only')).toBe(false);
+        } finally {
+            await exports.default.fetch('http://example.com/api/migration/data', {
+                method: 'DELETE',
+                headers: { Origin: 'http://example.com' }
+            });
+        }
+    });
 });

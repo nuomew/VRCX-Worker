@@ -11,6 +11,9 @@
                 <template #security>
                     <SecurityTab v-if="isWeb" />
                 </template>
+                <template #desktop_migration>
+                    <DesktopMigrationTab v-if="isWeb" />
+                </template>
                 <template #interface>
                     <InterfaceTab />
                 </template>
@@ -52,13 +55,19 @@
     import VrTab from './components/Tabs/VrTab.vue';
 
     const SecurityTab = defineAsyncComponent(() => import('./components/Tabs/SecurityTab.vue'));
+    const DesktopMigrationTab = defineAsyncComponent(() => import('./components/Tabs/DesktopMigrationTab.vue'));
 
     const { t } = useI18n();
     const isWeb = typeof WEB !== 'undefined' && WEB;
     const settingsTabs = computed(() => {
         const tabs = [
             { value: 'system', label: t('view.settings.category.system') },
-            ...(isWeb ? [{ value: 'security', label: t('cloud_hub.two_factor.tab_label') }] : []),
+            ...(isWeb
+                ? [
+                      { value: 'security', label: t('cloud_hub.two_factor.tab_label') },
+                      { value: 'desktop_migration', label: t('cloud_hub.migration.tab_label') }
+                  ]
+                : []),
             { value: 'interface', label: t('view.settings.category.interface') },
             { value: 'social', label: t('view.settings.category.social') },
             { value: 'notifications', label: t('view.settings.category.notifications') },

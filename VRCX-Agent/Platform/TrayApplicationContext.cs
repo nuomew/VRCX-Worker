@@ -43,7 +43,10 @@ public sealed class TrayApplicationContext : ApplicationContext
     private readonly SemaphoreSlim _syncLock = new(1, 1);
     private readonly SemaphoreSlim _updateCheckLock = new(1, 1);
     private readonly object _configLock = new();
+    private readonly object _migrationLock = new();
     private readonly CancellationTokenSource _cts = new();
+    private CancellationTokenSource? _activeMigrationCts;
+    private string _activeMigrationJobId = string.Empty;
 
     private readonly NotifyIcon _trayIcon;
     private readonly Icon _trayIconAsset;
@@ -130,7 +133,12 @@ public sealed class TrayApplicationContext : ApplicationContext
         _logCollector = new LogTailCollector(_configStore.DataDirectory);
         _screenshotPipeline = new ScreenshotPipeline(GetConfigSnapshot, () => _screenshotHttp, _configStore.DataDirectory);
         _processMonitor = new LocalProcessMonitor();
-        _commandExecutor = new RemoteCommandExecutor(GetConfigSnapshot, ct => RunSyncCycleAsync(force: true, ct));
+        _commandExecutor = new RemoteCommandExecutor(
+            GetConfigSnapshot,
+            ct => RunSyncCycleAsync(force: true, ct),
+            RunDesktopLegacyScanAsync,
+            StartDesktopLegacyMigrationAsync,
+            CancelDesktopLegacyMigration);
 
         VRCX.Discord.Instance.Init();
 
@@ -561,6 +569,83 @@ public sealed class TrayApplicationContext : ApplicationContext
                 _ = Task.Run(() => RunSyncCycleAsync(force: true, ct));
             }
         }
+    }
+
+    private async Task<string> RunDesktopLegacyScanAsync(CancellationToken ct)
+    {
+        AgentConfig cfg = GetConfigSnapshot();
+        string dbPath = DesktopLegacyMigrator.ResolveDesktopVrcxDatabasePath();
+        LegacyDesktopInventoryReport report = await Task
+            .Run(() => DesktopLegacyMigrator.ScanDatabase(dbPath, cfg.DeviceName), ct)
+            .ConfigureAwait(false);
+        await _syncClient.PostMigrationInventoryAsync(cfg, report, ct).ConfigureAwait(false);
+        if (!report.DbFound)
+        {
+            return "No local desktop VRCX.sqlite3 database found";
+        }
+        int totalAccounts = report.Accounts.Count;
+        long totalRows = report.SharedCategories.Sum(c => c.RowCount) +
+                         report.Accounts.Sum(a => a.Categories.Sum(c => c.RowCount));
+        return $"Scanned {report.DbFileName} ({totalAccounts} account(s), {totalRows} rows)";
+    }
+
+    private Task<string> StartDesktopLegacyMigrationAsync(string jobId, string accountPrefix, IReadOnlyList<string> categories)
+    {
+        AgentConfig cfg = GetConfigSnapshot();
+        string dbPath = DesktopLegacyMigrator.ResolveDesktopVrcxDatabasePath();
+        List<string> safeCategories = categories.Where(DesktopLegacyMigrator.AllowedCategorySet.Contains).Distinct(StringComparer.Ordinal).ToList();
+
+        CancellationTokenSource linkedCts;
+        lock (_migrationLock)
+        {
+            try { _activeMigrationCts?.Cancel(); } catch { /* ignore */ }
+            try { _activeMigrationCts?.Dispose(); } catch { /* ignore */ }
+            linkedCts = CancellationTokenSource.CreateLinkedTokenSource(_shutdownToken);
+            _activeMigrationCts = linkedCts;
+            _activeMigrationJobId = jobId;
+        }
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                var (completed, batches, message) = await DesktopLegacyMigrator
+                    .RunMigrationAsync(cfg, dbPath, jobId, accountPrefix, safeCategories, _syncClient, linkedCts.Token)
+                    .ConfigureAwait(false);
+                Log.Info("Desktop legacy migration {JobId} finished (completed={Completed}, batches={Batches}): {Msg}", jobId, completed, batches, message);
+            }
+            catch (Exception ex)
+            {
+                Log.Warn(ex, "Unexpected error in desktop legacy migration background worker for {JobId}.", jobId);
+            }
+            finally
+            {
+                lock (_migrationLock)
+                {
+                    if (_activeMigrationJobId == jobId && ReferenceEquals(_activeMigrationCts, linkedCts))
+                    {
+                        _activeMigrationCts = null;
+                        _activeMigrationJobId = string.Empty;
+                    }
+                }
+                try { linkedCts.Dispose(); } catch { /* ignore */ }
+            }
+        });
+
+        return Task.FromResult($"Started desktop legacy migration job {jobId} ({safeCategories.Count} categories)");
+    }
+
+    private string CancelDesktopLegacyMigration(string jobId)
+    {
+        lock (_migrationLock)
+        {
+            if (_activeMigrationCts != null && (string.IsNullOrEmpty(jobId) || _activeMigrationJobId == jobId))
+            {
+                try { _activeMigrationCts.Cancel(); } catch { /* ignore */ }
+                return $"Cancelled active migration job {_activeMigrationJobId}";
+            }
+        }
+        return "No matching active migration job";
     }
 
     private void HandleCheckUpdateAction()
@@ -1863,6 +1948,13 @@ public sealed class TrayApplicationContext : ApplicationContext
         _isExiting = true;
 
         try { _cts.Cancel(); } catch { /* ignore */ }
+        lock (_migrationLock)
+        {
+            try { _activeMigrationCts?.Cancel(); } catch { /* ignore */ }
+            try { _activeMigrationCts?.Dispose(); } catch { /* ignore */ }
+            _activeMigrationCts = null;
+            _activeMigrationJobId = string.Empty;
+        }
         // Close any open modal dialog cleanly BEFORE disposing tray icon / menu controls to prevent ObjectDisposedException.
         try
         {

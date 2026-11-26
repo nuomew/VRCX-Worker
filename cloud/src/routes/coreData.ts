@@ -1,5 +1,25 @@
+import { getLegacyDb } from '../db/schemaBootstrap';
 import type { Env } from '../env';
 import { markWebClientActive } from '../sync/backgroundFeedSync';
+import { getLegacyImportedStats, isSafeLegacyConfigKey } from './legacyMigration';
+
+function mergePrimaryAndLegacy<T>(primary: T[], legacy: T[], keyFn: (row: T) => string): T[] {
+    if (legacy.length === 0) return primary;
+    const seen = new Set<string>();
+    const out: T[] = [];
+    for (const row of primary) {
+        const k = keyFn(row);
+        if (k) seen.add(k);
+        out.push(row);
+    }
+    for (const row of legacy) {
+        const k = keyFn(row);
+        if (k && seen.has(k)) continue;
+        if (k) seen.add(k);
+        out.push(row);
+    }
+    return out;
+}
 
 function safeJsonParse<T>(raw: string | null | undefined, fallback: T): T {
     if (!raw) return fallback;
@@ -388,6 +408,128 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
 
         const vrcxConfigs = bundles.vrcx_config ?? {};
         sanitizeConfigBundleMap(vrcxConfigs);
+
+        // Transparently merge migrated desktop VRCX data stored in the dedicated DB_LEGACY shard
+        // (active cloud DB_CORE rows always take precedence; 0 extra D1 reads when DB_LEGACY is empty).
+        let memos = (batchRes[1]?.results ?? []) as Array<Record<string, unknown>>;
+        let worldMemos = (batchRes[2]?.results ?? []) as Array<Record<string, unknown>>;
+        let avatarMemos = (batchRes[3]?.results ?? []) as Array<Record<string, unknown>>;
+        let notes = (batchRes[4]?.results ?? []) as Array<Record<string, unknown>>;
+        let favoriteFriends = (batchRes[5]?.results ?? []) as Array<Record<string, unknown>>;
+        let favoriteWorlds = (batchRes[6]?.results ?? []) as Array<Record<string, unknown>>;
+        let favoriteAvatars = (batchRes[7]?.results ?? []) as Array<Record<string, unknown>>;
+        let favoritePrints = (batchRes[8]?.results ?? []) as Array<Record<string, unknown>>;
+        let avatarTags = (batchRes[9]?.results ?? []) as Array<Record<string, unknown>>;
+        let moderations = (batchRes[10]?.results ?? []) as Array<Record<string, unknown>>;
+        let userProfiles = (batchRes[11]?.results ?? []) as Array<Record<string, unknown>>;
+
+        const legacyDb = getLegacyDb(env);
+        const legacyStats = legacyDb ? await getLegacyImportedStats(env) : null;
+        if (legacyDb && legacyStats) {
+            const legacyStmts: Array<{ slot: string; stmt: D1PreparedStatement }> = [];
+            if (legacyStats.memos_notes > 0) {
+                legacyStmts.push(
+                    { slot: 'memos', stmt: legacyDb.prepare('SELECT user_id, edited_at, memo FROM memos') },
+                    { slot: 'worldMemos', stmt: legacyDb.prepare('SELECT world_id, edited_at, memo FROM world_memos') },
+                    { slot: 'avatarMemos', stmt: legacyDb.prepare('SELECT avatar_id, edited_at, memo FROM avatar_memos') },
+                    { slot: 'notes', stmt: legacyDb.prepare('SELECT user_id, display_name, note, created_at FROM notes') }
+                );
+            }
+            if (legacyStats.favorites > 0) {
+                legacyStmts.push(
+                    {
+                        slot: 'favoriteFriends',
+                        stmt: legacyDb.prepare('SELECT -id AS id, created_at, user_id, group_name FROM favorite_friend')
+                    },
+                    {
+                        slot: 'favoriteWorlds',
+                        stmt: legacyDb.prepare('SELECT -id AS id, created_at, world_id, group_name FROM favorite_world')
+                    },
+                    {
+                        slot: 'favoriteAvatars',
+                        stmt: legacyDb.prepare('SELECT -id AS id, created_at, avatar_id, group_name FROM favorite_avatar')
+                    },
+                    {
+                        slot: 'favoritePrints',
+                        stmt: legacyDb.prepare('SELECT -id AS id, print_id, created_at FROM favorite_print')
+                    },
+                    { slot: 'avatarTags', stmt: legacyDb.prepare('SELECT avatar_id, tag, color FROM avatar_tags') }
+                );
+            }
+            if (legacyStats.moderation_profiles > 0) {
+                legacyStmts.push(
+                    {
+                        slot: 'moderations',
+                        stmt: legacyDb.prepare('SELECT user_id, updated_at, display_name, block, mute FROM moderation')
+                    },
+                    {
+                        slot: 'userProfiles',
+                        stmt: legacyDb.prepare('SELECT user_id, bio, bio_links, updated_at FROM user_profile')
+                    }
+                );
+            }
+            if (legacyStats.settings > 0) {
+                legacyStmts.push({
+                    slot: 'configs',
+                    stmt: legacyDb.prepare('SELECT config_key, config_value FROM legacy_configs LIMIT 500')
+                });
+            }
+            if (legacyStmts.length > 0) {
+                const legacyRes = await legacyDb.batch(legacyStmts.map((s) => s.stmt));
+                for (let i = 0; i < legacyStmts.length; i++) {
+                    const slot = legacyStmts[i]!.slot;
+                    const rows = (legacyRes[i]?.results ?? []) as Array<Record<string, unknown>>;
+                    if (slot === 'memos') {
+                        memos = mergePrimaryAndLegacy(memos, rows, (r) => String(r.user_id ?? ''));
+                    } else if (slot === 'worldMemos') {
+                        worldMemos = mergePrimaryAndLegacy(worldMemos, rows, (r) => String(r.world_id ?? ''));
+                    } else if (slot === 'avatarMemos') {
+                        avatarMemos = mergePrimaryAndLegacy(avatarMemos, rows, (r) => String(r.avatar_id ?? ''));
+                    } else if (slot === 'notes') {
+                        notes = mergePrimaryAndLegacy(notes, rows, (r) => String(r.user_id ?? ''));
+                    } else if (slot === 'favoriteFriends') {
+                        favoriteFriends = mergePrimaryAndLegacy(
+                            favoriteFriends,
+                            rows,
+                            (r) => `${String(r.user_id ?? '')}|${String(r.group_name ?? '')}`
+                        );
+                    } else if (slot === 'favoriteWorlds') {
+                        favoriteWorlds = mergePrimaryAndLegacy(
+                            favoriteWorlds,
+                            rows,
+                            (r) => `${String(r.world_id ?? '')}|${String(r.group_name ?? '')}`
+                        );
+                    } else if (slot === 'favoriteAvatars') {
+                        favoriteAvatars = mergePrimaryAndLegacy(
+                            favoriteAvatars,
+                            rows,
+                            (r) => `${String(r.avatar_id ?? '')}|${String(r.group_name ?? '')}`
+                        );
+                    } else if (slot === 'favoritePrints') {
+                        favoritePrints = mergePrimaryAndLegacy(favoritePrints, rows, (r) => String(r.print_id ?? ''));
+                    } else if (slot === 'avatarTags') {
+                        avatarTags = mergePrimaryAndLegacy(
+                            avatarTags,
+                            rows,
+                            (r) => `${String(r.avatar_id ?? '')}|${String(r.tag ?? '')}`
+                        );
+                    } else if (slot === 'moderations') {
+                        moderations = mergePrimaryAndLegacy(moderations, rows, (r) => String(r.user_id ?? ''));
+                    } else if (slot === 'userProfiles') {
+                        userProfiles = mergePrimaryAndLegacy(userProfiles, rows, (r) => String(r.user_id ?? ''));
+                    } else if (slot === 'configs') {
+                        for (const r of rows) {
+                            const k = typeof r.config_key === 'string' ? r.config_key : '';
+                            const v = typeof r.config_value === 'string' ? r.config_value : '';
+                            if (k && isSafeLegacyConfigKey(k) && !Object.prototype.hasOwnProperty.call(vrcxConfigs, k)) {
+                                vrcxConfigs[k] = v;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         const syncIntervalSeconds = parseCloudSyncIntervalSeconds(vrcxConfigs['cloud:syncIntervalSeconds']);
         const webSyncIntervalSeconds = parseWebSyncIntervalSeconds(vrcxConfigs['cloud:webSyncIntervalSeconds']);
         const nowIso = new Date().toISOString();
@@ -448,17 +590,17 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
                 syncIntervalSeconds,
                 webSyncIntervalSeconds,
                 totalUptimeSeconds,
-                memos: batchRes[1]?.results ?? [],
-                worldMemos: batchRes[2]?.results ?? [],
-                avatarMemos: batchRes[3]?.results ?? [],
-                notes: batchRes[4]?.results ?? [],
-                favoriteFriends: batchRes[5]?.results ?? [],
-                favoriteWorlds: batchRes[6]?.results ?? [],
-                favoriteAvatars: batchRes[7]?.results ?? [],
-                favoritePrints: batchRes[8]?.results ?? [],
-                avatarTags: batchRes[9]?.results ?? [],
-                moderations: batchRes[10]?.results ?? [],
-                userProfiles: batchRes[11]?.results ?? [],
+                memos,
+                worldMemos,
+                avatarMemos,
+                notes,
+                favoriteFriends,
+                favoriteWorlds,
+                favoriteAvatars,
+                favoritePrints,
+                avatarTags,
+                moderations,
+                userProfiles,
                 statsCounters: counters,
                 agentStatus: {
                     ...rawHub,
@@ -798,12 +940,31 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
     if (url.pathname === '/api/avatar-history') {
         if (request.method === 'GET') {
             const limit = clampQueryLimit(url.searchParams.get('limit'), 100, 200);
-            const res = await env.DB_CORE.prepare(
-                'SELECT avatar_id, created_at, time FROM avatar_history ORDER BY created_at DESC LIMIT ?'
+            const legacyDb = getLegacyDb(env);
+            const legacyStats = legacyDb ? await getLegacyImportedStats(env) : null;
+            const [res, legacyRes] = await Promise.all([
+                env.DB_CORE.prepare(
+                    'SELECT avatar_id, created_at, time FROM avatar_history ORDER BY created_at DESC LIMIT ?'
+                )
+                    .bind(limit)
+                    .all<Record<string, unknown>>(),
+                legacyDb && (legacyStats?.avatar_history ?? 0) > 0
+                    ? legacyDb
+                          .prepare(
+                              'SELECT avatar_id, created_at, time FROM avatar_history ORDER BY created_at DESC LIMIT ?'
+                          )
+                          .bind(limit)
+                          .all<Record<string, unknown>>()
+                    : Promise.resolve(null)
+            ]);
+            const merged = mergePrimaryAndLegacy(
+                res.results ?? [],
+                legacyRes?.results ?? [],
+                (r) => String(r.avatar_id ?? '')
             )
-                .bind(limit)
-                .all();
-            return Response.json({ ok: true, data: res.results ?? [] });
+                .sort((a, b) => String(b.created_at ?? '').localeCompare(String(a.created_at ?? '')))
+                .slice(0, limit);
+            return Response.json({ ok: true, data: merged });
         }
         if (request.method === 'POST') {
             const body = await parseJsonObject(request);
@@ -972,16 +1133,41 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
         if (request.method === 'GET') {
             const userId = url.searchParams.get('userId');
             const limit = clampQueryLimit(url.searchParams.get('limit'), 200, 500);
-            const res = userId
-                ? await env.DB_CORE.prepare(
-                      'SELECT * FROM friend_log_history WHERE user_id = ? ORDER BY id DESC LIMIT ?'
-                  )
-                      .bind(userId, limit)
-                      .all()
-                : await env.DB_CORE.prepare('SELECT * FROM friend_log_history ORDER BY id DESC LIMIT ?')
-                      .bind(limit)
-                      .all();
-            return Response.json({ ok: true, data: res.results ?? [] });
+            const legacyDb = getLegacyDb(env);
+            const legacyStats = legacyDb ? await getLegacyImportedStats(env) : null;
+            const [res, legacyRes] = await Promise.all([
+                userId
+                    ? env.DB_CORE.prepare('SELECT * FROM friend_log_history WHERE user_id = ? ORDER BY id DESC LIMIT ?')
+                          .bind(userId, limit)
+                          .all<Record<string, unknown>>()
+                    : env.DB_CORE.prepare('SELECT * FROM friend_log_history ORDER BY id DESC LIMIT ?')
+                          .bind(limit)
+                          .all<Record<string, unknown>>(),
+                legacyDb && (legacyStats?.friend_log ?? 0) > 0
+                    ? userId
+                        ? legacyDb
+                              .prepare(
+                                  'SELECT -id AS id, created_at, type, user_id, display_name, previous_display_name, trust_level, previous_trust_level, friend_number FROM friend_log_history WHERE user_id = ? ORDER BY created_at DESC, id DESC LIMIT ?'
+                              )
+                              .bind(userId, limit)
+                              .all<Record<string, unknown>>()
+                        : legacyDb
+                              .prepare(
+                                  'SELECT -id AS id, created_at, type, user_id, display_name, previous_display_name, trust_level, previous_trust_level, friend_number FROM friend_log_history ORDER BY created_at DESC, id DESC LIMIT ?'
+                              )
+                              .bind(limit)
+                              .all<Record<string, unknown>>()
+                    : Promise.resolve(null)
+            ]);
+            const merged = mergePrimaryAndLegacy(
+                res.results ?? [],
+                legacyRes?.results ?? [],
+                (r) =>
+                    `${String(r.created_at ?? '')}|${String(r.type ?? '')}|${String(r.user_id ?? '')}|${String(r.display_name ?? '')}`
+            )
+                .sort((a, b) => String(b.created_at ?? '').localeCompare(String(a.created_at ?? '')))
+                .slice(0, limit);
+            return Response.json({ ok: true, data: merged });
         }
         if (request.method === 'POST') {
             const body = await parseJsonObject(request);
@@ -1073,10 +1259,27 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
             const version = url.searchParams.get('v') === '2' ? 2 : 1;
             const limit = clampQueryLimit(url.searchParams.get('limit'), 100, 200);
             const table = version === 2 ? 'notifications_v2' : 'notifications';
-            const res = await env.DB_CORE.prepare(`SELECT * FROM ${table} ORDER BY created_at DESC LIMIT ?`)
-                .bind(limit)
-                .all();
-            return Response.json({ ok: true, data: res.results ?? [] });
+            const legacyDb = getLegacyDb(env);
+            const legacyStats = legacyDb ? await getLegacyImportedStats(env) : null;
+            const [res, legacyRes] = await Promise.all([
+                env.DB_CORE.prepare(`SELECT * FROM ${table} ORDER BY created_at DESC LIMIT ?`)
+                    .bind(limit)
+                    .all<Record<string, unknown>>(),
+                legacyDb && (legacyStats?.notifications ?? 0) > 0
+                    ? legacyDb
+                          .prepare(`SELECT * FROM ${table} ORDER BY created_at DESC LIMIT ?`)
+                          .bind(limit)
+                          .all<Record<string, unknown>>()
+                    : Promise.resolve(null)
+            ]);
+            const merged = mergePrimaryAndLegacy(
+                res.results ?? [],
+                legacyRes?.results ?? [],
+                (r) => String(r.id ?? '')
+            )
+                .sort((a, b) => String(b.created_at ?? '').localeCompare(String(a.created_at ?? '')))
+                .slice(0, limit);
+            return Response.json({ ok: true, data: merged });
         }
         if (request.method === 'POST') {
             const body = await parseJsonObject(request);
@@ -1341,11 +1544,12 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
     }
 
     if (url.pathname === '/api/admin/quota' && request.method === 'GET') {
-        const [coreProbe, gameProbe, feedProbe, cacheProbe, countersRes, devicesRes] = await Promise.all([
+        const [coreProbe, gameProbe, feedProbe, cacheProbe, legacyProbe, countersRes, devicesRes] = await Promise.all([
             env.DB_CORE.prepare('SELECT 1 AS ok').all(),
             env.DB_GAMELOG.prepare('SELECT 1 AS ok').all(),
             env.DB_FEED.prepare('SELECT 1 AS ok').all(),
             env.DB_CACHE ? env.DB_CACHE.prepare('SELECT 1 AS ok').all() : Promise.resolve(null),
+            env.DB_LEGACY ? env.DB_LEGACY.prepare('SELECT 1 AS ok').all() : Promise.resolve(null),
             env.DB_CORE.prepare('SELECT counter_key, row_count, updated_at FROM stats_counters').all(),
             env.DB_CORE.prepare('SELECT COUNT(*) AS cnt FROM cloud_devices').first<{ cnt: number }>()
         ]);
@@ -1354,12 +1558,17 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
         const sizeGame = gameProbe.meta?.size_after ?? 0;
         const sizeFeed = feedProbe.meta?.size_after ?? 0;
         const sizeCache = cacheProbe?.meta?.size_after ?? 0;
+        const sizeLegacy = legacyProbe?.meta?.size_after ?? 0;
 
         return Response.json({
             ok: true,
             data: {
                 healthy: Boolean(
-                    coreProbe.success && gameProbe.success && feedProbe.success && (!cacheProbe || cacheProbe.success)
+                    coreProbe.success &&
+                        gameProbe.success &&
+                        feedProbe.success &&
+                        (!cacheProbe || cacheProbe.success) &&
+                        (!legacyProbe || legacyProbe.success)
                 ),
                 freeSingleDbLimitBytes: freeDbCapBytes,
                 databases: {
@@ -1382,11 +1591,20 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
                                   percentOfFreeLimit: Number(((sizeCache / freeDbCapBytes) * 100).toFixed(2))
                               }
                           }
+                        : {}),
+                    ...(env.DB_LEGACY
+                        ? {
+                              legacy: {
+                                  bytes: sizeLegacy,
+                                  percentOfFreeLimit: Number(((sizeLegacy / freeDbCapBytes) * 100).toFixed(2))
+                              }
+                          }
                         : {})
                 },
                 pairedDevicesCount: devicesRes?.cnt ?? 0,
                 r2Enabled: Boolean(env.R2_MEDIA),
                 cacheDbDedicated: Boolean(env.DB_CACHE),
+                legacyDbDedicated: Boolean(env.DB_LEGACY),
                 counters: countersRes.results ?? []
             }
         });

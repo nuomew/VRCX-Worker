@@ -5,6 +5,7 @@ import { AgentHubDO } from './hub/AgentHubDO';
 import { handleAgentPublicRoutes, handleAgentWebRoutes } from './routes/agentRoutes';
 import { handleCoreDataRoutes } from './routes/coreData';
 import { handleEventsDataRoutes } from './routes/eventsData';
+import { handleLegacyMigrationAgentRoutes, handleLegacyMigrationWebRoutes } from './routes/legacyMigration';
 import { handleVrcProxyRoutes } from './routes/vrcProxy';
 import { searchGameLogByEntity } from './search/entityFts';
 import {
@@ -101,6 +102,7 @@ export default {
                         schemaReady: true,
                         r2Enabled: Boolean(env.R2_MEDIA),
                         cacheDbDedicated: Boolean(env.DB_CACHE),
+                        legacyDbDedicated: Boolean(env.DB_LEGACY),
                         timestamp: new Date().toISOString()
                     }
                 });
@@ -123,6 +125,10 @@ export default {
             const agentPublicResp = await handleAgentPublicRoutes(request, env, url);
             if (agentPublicResp) {
                 return agentPublicResp;
+            }
+            const legacyAgentResp = await handleLegacyMigrationAgentRoutes(request, env, url);
+            if (legacyAgentResp) {
+                return legacyAgentResp;
             }
 
             // 4. Windows Agent WebSocket upgrade (Device Bearer auth)
@@ -217,6 +223,9 @@ export default {
 
             const agentWebResp = await handleAgentWebRoutes(request, env, url);
             if (agentWebResp) return agentWebResp;
+
+            const legacyWebResp = await handleLegacyMigrationWebRoutes(request, env, url);
+            if (legacyWebResp) return legacyWebResp;
 
             return Response.json(
                 { ok: false, error: { code: 'NOT_FOUND', message: 'Route not found' } },

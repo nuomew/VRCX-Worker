@@ -26,8 +26,25 @@ const ALLOWED_ACTIONS = new Set([
     'clear_cache',
     'send_vr_notify',
     'discord_update',
-    'sync_now'
+    'sync_now',
+    'desktop_scan',
+    'desktop_migrate',
+    'desktop_migrate_cancel'
 ]);
+
+const MIGRATION_CATEGORY_ALLOWLIST = new Set([
+    'memos_notes',
+    'favorites',
+    'avatar_history',
+    'friend_log',
+    'notifications',
+    'moderation_profiles',
+    'gamelog',
+    'feed',
+    'settings'
+]);
+const MIGRATION_ACCOUNT_PREFIX_RE = /^[A-Za-z_][A-Za-z0-9_]{2,64}$/;
+const MIGRATION_JOB_ID_RE = /^[A-Za-z0-9_-]{4,64}$/;
 
 const VRC_INSTANCE_ID_RE = /^wrld_[0-9a-f-]{36}:[A-Za-z0-9_~()\-]+$/;
 const VRC_SHORT_NAME_RE = /^[A-Za-z0-9_-]{1,64}$/;
@@ -37,7 +54,7 @@ const MAX_AGENT_JSON_BYTES = 262_144; // 256 KiB ceiling for gamelog/sync JSON
 const MAX_CMD_RESULT_BYTES = 65_536; // 64 KiB ceiling for command result reports
 const MAX_CMD_RESULT_JSON_CHARS = 32_768;
 
-class PayloadTooLargeError extends Error {}
+export class PayloadTooLargeError extends Error {}
 
 async function readRequestBytesBounded(request: Request, maxBytes: number, message: string): Promise<Uint8Array> {
     const declaredLen = Number(request.headers.get('Content-Length') ?? '0');
@@ -83,7 +100,7 @@ async function readRequestBytesBounded(request: Request, maxBytes: number, messa
     return bytes;
 }
 
-async function readRequestTextBounded(request: Request, maxBytes: number, message: string): Promise<string> {
+export async function readRequestTextBounded(request: Request, maxBytes: number, message: string): Promise<string> {
     const bytes = await readRequestBytesBounded(request, maxBytes, message);
     return new TextDecoder().decode(bytes);
 }
@@ -168,8 +185,152 @@ export function validateCommand(
                 }
             }
         }
+    } else if (action === 'desktop_migrate') {
+        const jobId = typeof params.jobId === 'string' ? params.jobId.trim() : '';
+        if (!MIGRATION_JOB_ID_RE.test(jobId)) {
+            return { ok: false, message: 'desktop_migrate requires a valid jobId' };
+        }
+        if (params.accountPrefix !== undefined) {
+            if (typeof params.accountPrefix !== 'string') {
+                return { ok: false, message: 'desktop_migrate accountPrefix must be a string' };
+            }
+            const prefix = params.accountPrefix.trim();
+            if (prefix && !MIGRATION_ACCOUNT_PREFIX_RE.test(prefix)) {
+                return { ok: false, message: 'desktop_migrate accountPrefix is invalid' };
+            }
+        }
+        if (!Array.isArray(params.categories) || params.categories.length === 0) {
+            return { ok: false, message: 'desktop_migrate requires at least one allowed category' };
+        }
+        for (const cat of params.categories) {
+            if (typeof cat !== 'string' || !MIGRATION_CATEGORY_ALLOWLIST.has(cat)) {
+                return { ok: false, message: `Unsupported desktop_migrate category "${String(cat)}"` };
+            }
+        }
+    } else if (action === 'desktop_migrate_cancel') {
+        const jobId = typeof params.jobId === 'string' ? params.jobId.trim() : '';
+        if (!MIGRATION_JOB_ID_RE.test(jobId)) {
+            return { ok: false, message: 'desktop_migrate_cancel requires a valid jobId' };
+        }
     }
     return { ok: true };
+}
+
+export async function dispatchAgentCommandInternal(
+    env: Env,
+    opts: {
+        action: string;
+        params: Record<string, unknown>;
+        targetDeviceId?: string;
+        ttlSec?: number;
+        requireOnline?: boolean;
+    }
+): Promise<
+    | { ok: true; cmdId: string; deliveryStatus: 'dispatched' | 'queued'; deviceId?: string; expiresAt: string }
+    | { ok: false; status: number; code: string; message: string }
+> {
+    const targetDeviceId = (opts.targetDeviceId ?? '').trim();
+    const requireOnline = opts.requireOnline === true;
+    const check = validateCommand(opts.action, opts.params);
+    if (!check.ok) {
+        return { ok: false, status: 400, code: 'COMMAND_REJECTED', message: check.message };
+    }
+
+    const cmdId = `cmd_${randomHex(8)}`;
+    const rawTtlSec = typeof opts.ttlSec === 'number' && Number.isFinite(opts.ttlSec) ? opts.ttlSec : 600;
+    const ttlMs = Math.min(Math.max(rawTtlSec * 1000, 30_000), 1_800_000);
+    const now = Date.now();
+    const createdAt = new Date(now).toISOString();
+    const expiresAt = new Date(now + ttlMs).toISOString();
+    const pruneBeforeIso = new Date(now - 24 * 3600_000).toISOString();
+
+    await env.DB_CORE.batch([
+        env.DB_CORE.prepare(
+            `INSERT INTO cloud_commands (cmd_id, target_device_id, action, payload_json, status, result_json, created_at, expires_at, finished_at)
+             VALUES (?, ?, ?, ?, 'dispatching', '{}', ?, ?, '')`
+        ).bind(cmdId, targetDeviceId, opts.action, JSON.stringify(opts.params), createdAt, expiresAt),
+        env.DB_CORE.prepare('DELETE FROM cloud_commands WHERE expires_at < ?').bind(pruneBeforeIso)
+    ]);
+
+    const hub = env.AGENT_HUB.get(env.AGENT_HUB.idFromName('primary'));
+    let dispatchRes: Response | null = null;
+    try {
+        dispatchRes = await hub.fetch(
+            new Request('https://agent-hub.internal/dispatch-command', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    cmdId,
+                    targetDeviceId: targetDeviceId || undefined,
+                    action: opts.action,
+                    params: opts.params,
+                    expiresAt
+                })
+            })
+        );
+    } catch {
+        dispatchRes = null;
+    }
+
+    if (!dispatchRes || !dispatchRes.ok) {
+        await dispatchRes?.body?.cancel().catch(() => {});
+        const [syncIntervalSeconds, devRes] = await Promise.all([
+            getCloudSyncIntervalSeconds(env).catch(() => 60),
+            targetDeviceId
+                ? env.DB_CORE.prepare('SELECT device_id, last_seen_at FROM cloud_devices WHERE device_id = ? LIMIT 1')
+                      .bind(targetDeviceId)
+                      .all<{ device_id: string; last_seen_at: string }>()
+                : env.DB_CORE.prepare('SELECT device_id, last_seen_at FROM cloud_devices ORDER BY last_seen_at DESC LIMIT 20').all<{
+                      device_id: string;
+                      last_seen_at: string;
+                  }>()
+        ]);
+        const devRows = devRes.results ?? [];
+        const { httpAgentsOnline } = resolveRecentHttpAgents(devRows, now, getAgentOnlineWindowMs(syncIntervalSeconds));
+        const hasRegisteredTarget = devRows.length > 0;
+        const hasOnlineHttpTarget = targetDeviceId ? httpAgentsOnline.includes(targetDeviceId) : httpAgentsOnline.length > 0;
+        if (!hasRegisteredTarget || (requireOnline && !hasOnlineHttpTarget)) {
+            await env.DB_CORE.prepare("DELETE FROM cloud_commands WHERE cmd_id = ? AND status = 'dispatching'")
+                .bind(cmdId)
+                .run()
+                .catch(() => {});
+            return {
+                ok: false,
+                status: 503,
+                code: 'AGENT_OFFLINE',
+                message: !hasRegisteredTarget
+                    ? 'No paired Windows companion agent is registered'
+                    : 'No Windows companion agent is currently online'
+            };
+        }
+
+        await env.DB_CORE.prepare("UPDATE cloud_commands SET status = 'pending' WHERE cmd_id = ? AND status = 'dispatching'")
+            .bind(cmdId)
+            .run();
+        return {
+            ok: true,
+            cmdId,
+            deliveryStatus: 'queued',
+            deviceId: targetDeviceId || devRows[0]?.device_id,
+            expiresAt
+        };
+    }
+
+    const dispatchData = (await dispatchRes.json()) as { data?: { deviceId?: string } };
+    const resolvedDeviceId = dispatchData.data?.deviceId ?? targetDeviceId;
+    await env.DB_CORE.prepare(
+        "UPDATE cloud_commands SET status = 'dispatched', target_device_id = ? WHERE cmd_id = ? AND status IN ('pending', 'dispatching')"
+    )
+        .bind(resolvedDeviceId, cmdId)
+        .run();
+
+    return {
+        ok: true,
+        cmdId,
+        deliveryStatus: 'dispatched',
+        deviceId: resolvedDeviceId,
+        expiresAt
+    };
 }
 
 /**

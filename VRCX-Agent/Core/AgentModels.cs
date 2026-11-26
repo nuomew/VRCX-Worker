@@ -12,7 +12,7 @@ namespace VRCX.Agent.Core;
 /// </summary>
 public static class AgentMetadata
 {
-    public const string FallbackVersion = "1.10.8";
+    public const string FallbackVersion = "1.11.0";
 
     public static string Version { get; } = ResolveAssemblyVersion();
 

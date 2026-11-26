@@ -1,3 +1,4 @@
+import { getLegacyDb } from '../db/schemaBootstrap';
 import type { Env } from '../env';
 import { buildSafeTrigramMatch, escapeSqlLikePattern, searchGameLogByEntity } from '../search/entityFts';
 import {
@@ -10,6 +11,7 @@ import {
     upsertEntityUsersBatch,
     upsertEntityWorldsBatch
 } from './coreData';
+import { getLegacyImportedStats } from './legacyMigration';
 
 const MAX_LIMIT = 100;
 
@@ -695,10 +697,12 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
         return Response.json({ ok: true, data: out });
     }
 
-    const runFilteredGameLogQuery = async (
+    const runFilteredGameLogQueryOnDb = async (
+        db: D1Database,
         limit: number,
         types: string[],
-        vipList: string[]
+        vipList: string[],
+        negateRowIds = false
     ): Promise<Array<Record<string, unknown>>> => {
         const typeSet = new Set(types.filter(Boolean));
         const hasTypeFilter = typeSet.size > 0;
@@ -732,9 +736,7 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
 
         if (wantLocation) {
             slotIndex.loc = stmts.length;
-            stmts.push(
-                env.DB_GAMELOG.prepare('SELECT * FROM gamelog_location ORDER BY created_at DESC LIMIT ?').bind(perTable)
-            );
+            stmts.push(db.prepare('SELECT * FROM gamelog_location ORDER BY created_at DESC LIMIT ?').bind(perTable));
         }
         if (wantJl) {
             slotIndex.jl = stmts.length;
@@ -752,9 +754,7 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
             const whereSql = conds.length > 0 ? `WHERE ${conds.join(' AND ')}` : '';
             const jlOrder = hasVip ? 'ORDER BY id DESC' : 'ORDER BY created_at DESC';
             stmts.push(
-                env.DB_GAMELOG.prepare(
-                    `SELECT * FROM gamelog_join_leave ${whereSql} ${jlOrder} LIMIT ?`
-                ).bind(...binds, perTable)
+                db.prepare(`SELECT * FROM gamelog_join_leave ${whereSql} ${jlOrder} LIMIT ?`).bind(...binds, perTable)
             );
         }
         if (wantPortal) {
@@ -762,9 +762,9 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
             const whereSql = hasVip ? `WHERE user_id IN (${vipPh})` : '';
             const portalOrder = hasVip ? 'ORDER BY id DESC' : 'ORDER BY created_at DESC';
             stmts.push(
-                env.DB_GAMELOG.prepare(
-                    `SELECT * FROM gamelog_portal_spawn ${whereSql} ${portalOrder} LIMIT ?`
-                ).bind(...(hasVip ? cleanVips : []), perTable)
+                db
+                    .prepare(`SELECT * FROM gamelog_portal_spawn ${whereSql} ${portalOrder} LIMIT ?`)
+                    .bind(...(hasVip ? cleanVips : []), perTable)
             );
         }
         if (wantVideo) {
@@ -772,30 +772,28 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
             const whereSql = hasVip ? `WHERE user_id IN (${vipPh})` : '';
             const videoOrder = hasVip ? 'ORDER BY id DESC' : 'ORDER BY created_at DESC';
             stmts.push(
-                env.DB_GAMELOG.prepare(
-                    `SELECT * FROM gamelog_video_play ${whereSql} ${videoOrder} LIMIT ?`
-                ).bind(...(hasVip ? cleanVips : []), perTable)
+                db
+                    .prepare(`SELECT * FROM gamelog_video_play ${whereSql} ${videoOrder} LIMIT ?`)
+                    .bind(...(hasVip ? cleanVips : []), perTable)
             );
         }
         if (wantEvent) {
             slotIndex.ev = stmts.length;
-            stmts.push(
-                env.DB_GAMELOG.prepare('SELECT * FROM gamelog_event ORDER BY created_at DESC LIMIT ?').bind(perTable)
-            );
+            stmts.push(db.prepare('SELECT * FROM gamelog_event ORDER BY created_at DESC LIMIT ?').bind(perTable));
         }
         if (wantExternal) {
             slotIndex.ext = stmts.length;
             const whereSql = hasVip ? `WHERE user_id IN (${vipPh})` : '';
             const extOrder = hasVip ? 'ORDER BY id DESC' : 'ORDER BY created_at DESC';
             stmts.push(
-                env.DB_GAMELOG.prepare(
-                    `SELECT * FROM gamelog_external ${whereSql} ${extOrder} LIMIT ?`
-                ).bind(...(hasVip ? cleanVips : []), perTable)
+                db
+                    .prepare(`SELECT * FROM gamelog_external ${whereSql} ${extOrder} LIMIT ?`)
+                    .bind(...(hasVip ? cleanVips : []), perTable)
             );
         }
 
         if (stmts.length === 0) return [];
-        const rawResults = (await env.DB_GAMELOG.batch(stmts)) as D1Result<Record<string, unknown>>[];
+        const rawResults = (await db.batch(stmts)) as D1Result<Record<string, unknown>>[];
         const emptyRes = { results: [] } as unknown as D1Result<Record<string, unknown>>;
         const ordered: D1Result<Record<string, unknown>>[] = [
             slotIndex.loc >= 0 ? rawResults[slotIndex.loc]! : emptyRes,
@@ -805,7 +803,60 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
             slotIndex.ev >= 0 ? rawResults[slotIndex.ev]! : emptyRes,
             slotIndex.ext >= 0 ? rawResults[slotIndex.ext]! : emptyRes
         ];
-        return normalizeGameLogRows(ordered).slice(0, limit);
+        const normalized = normalizeGameLogRows(ordered);
+        if (negateRowIds) {
+            for (const row of normalized) {
+                const rid = Number(row.rowId ?? 0);
+                if (Number.isFinite(rid) && rid > 0) {
+                    row.rowId = -rid;
+                }
+            }
+        }
+        return normalized.slice(0, limit);
+    };
+
+    const gamelogDedupKey = (r: Record<string, unknown>): string => {
+        const type = String(r.type ?? '');
+        const created = String(r.created_at ?? '');
+        if (type === 'Location') return `Location|${created}|${String(r.location ?? '')}`;
+        if (type === 'OnPlayerJoined' || type === 'OnPlayerLeft') {
+            return `${type}|${created}|${String(r.displayName ?? '')}`;
+        }
+        if (type === 'PortalSpawn') return `PortalSpawn|${created}|${String(r.displayName ?? '')}`;
+        if (type === 'VideoPlay') return `VideoPlay|${created}|${String(r.videoUrl ?? '')}`;
+        if (type === 'Event') return `Event|${created}|${String(r.data ?? '')}`;
+        if (type === 'External') return `External|${created}|${String(r.message ?? '')}`;
+        return `${type}|${created}|${String(r.rowId ?? '')}`;
+    };
+
+    const runFilteredGameLogQuery = async (
+        limit: number,
+        types: string[],
+        vipList: string[]
+    ): Promise<Array<Record<string, unknown>>> => {
+        const legacyDb = getLegacyDb(env);
+        const legacyStats = legacyDb ? await getLegacyImportedStats(env) : null;
+        if (!legacyDb || (legacyStats?.gamelog ?? 0) <= 0) {
+            return runFilteredGameLogQueryOnDb(env.DB_GAMELOG, limit, types, vipList, false);
+        }
+        const [primaryRows, legacyRows] = await Promise.all([
+            runFilteredGameLogQueryOnDb(env.DB_GAMELOG, limit, types, vipList, false),
+            runFilteredGameLogQueryOnDb(legacyDb, limit, types, vipList, true)
+        ]);
+        const seen = new Set<string>();
+        const merged: Array<Record<string, unknown>> = [];
+        for (const r of primaryRows) {
+            seen.add(gamelogDedupKey(r));
+            merged.push(r);
+        }
+        for (const r of legacyRows) {
+            const k = gamelogDedupKey(r);
+            if (seen.has(k)) continue;
+            seen.add(k);
+            merged.push(r);
+        }
+        merged.sort((a, b) => String(b.created_at ?? '').localeCompare(String(a.created_at ?? '')));
+        return merged.slice(0, limit);
     };
 
     if (url.pathname === '/api/gamelog/query' && request.method === 'POST') {
@@ -1069,12 +1120,78 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
         const limit = clampLimit(url.searchParams.get('limit'), 50);
         const explain = url.searchParams.get('explain') === '1';
         const excludeUserId = (url.searchParams.get('excludeUserId') ?? '').trim();
-        const result = await searchGameLogByEntity(env, q, {
-            limit,
-            includeExplain: explain,
-            excludeUserId,
-            includeOtherTypes: true
-        });
+        const legacyDb = getLegacyDb(env);
+        const legacyStats = legacyDb && !explain ? await getLegacyImportedStats(env) : null;
+        const [result, legacyResult] = await Promise.all([
+            searchGameLogByEntity(env, q, {
+                limit,
+                includeExplain: explain,
+                excludeUserId,
+                includeOtherTypes: true
+            }),
+            legacyDb && (legacyStats?.gamelog ?? 0) > 0
+                ? searchGameLogByEntity(
+                      { ...env, DB_CORE: legacyDb, DB_GAMELOG: legacyDb },
+                      q,
+                      {
+                          limit,
+                          includeExplain: false,
+                          excludeUserId,
+                          includeOtherTypes: true
+                      }
+                  )
+                : Promise.resolve(null)
+        ]);
+        if (legacyResult) {
+            const mergeRows = <T extends { id: number; created_at: string }>(
+                primary: T[] | undefined,
+                legacy: T[] | undefined,
+                keyFn: (r: T) => string
+            ): T[] => {
+                const seen = new Set<string>();
+                const out: T[] = [];
+                for (const r of primary ?? []) {
+                    seen.add(keyFn(r));
+                    out.push(r);
+                }
+                for (const r of legacy ?? []) {
+                    const k = keyFn(r);
+                    if (seen.has(k)) continue;
+                    seen.add(k);
+                    out.push({ ...r, id: r.id > 0 ? -r.id : r.id });
+                }
+                out.sort((a, b) => String(b.created_at ?? '').localeCompare(String(a.created_at ?? '')));
+                return out.slice(0, limit);
+            };
+            result.matchedUserIds = Array.from(new Set([...result.matchedUserIds, ...legacyResult.matchedUserIds]));
+            result.matchedWorldIds = Array.from(new Set([...result.matchedWorldIds, ...legacyResult.matchedWorldIds]));
+            result.joinLeaveRows = mergeRows(
+                result.joinLeaveRows,
+                legacyResult.joinLeaveRows,
+                (r) => `${r.created_at}|${r.type}|${r.display_name}`
+            );
+            result.locationRows = mergeRows(
+                result.locationRows,
+                legacyResult.locationRows,
+                (r) => `${r.created_at}|${r.location}`
+            );
+            result.videoPlayRows = mergeRows(
+                result.videoPlayRows,
+                legacyResult.videoPlayRows,
+                (r) => `${r.created_at}|${r.video_url}`
+            );
+            result.eventRows = mergeRows(result.eventRows, legacyResult.eventRows, (r) => `${r.created_at}|${r.data}`);
+            result.portalSpawnRows = mergeRows(
+                result.portalSpawnRows,
+                legacyResult.portalSpawnRows,
+                (r) => `${r.created_at}|${r.display_name}`
+            );
+            result.externalRows = mergeRows(
+                result.externalRows,
+                legacyResult.externalRows,
+                (r) => `${r.created_at}|${r.message}`
+            );
+        }
         return Response.json({ ok: true, data: result });
     }
 
@@ -2236,12 +2353,14 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
         previousBioLinks: safeJsonParse<string[]>(r.previous_bio_links, [])
     });
 
-    const runFilteredFeedQuery = async (
+    const runFilteredFeedQueryOnDb = async (
+        db: D1Database,
         limit: number,
         rawTypes: string[],
         rawVipList: string[],
         dateFrom = '',
-        dateTo = ''
+        dateTo = '',
+        negateRowIds = false
     ): Promise<Array<Record<string, unknown>>> => {
         const requestedTypes = rawTypes.map((t) => String(t || '').trim()).filter(Boolean);
         const typeSet = new Set(requestedTypes.filter((t) => FEED_ALLOWED_TYPES.has(t)));
@@ -2256,7 +2375,7 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
         const cleanDateFrom = dateFrom.trim();
         const cleanDateTo = dateTo.trim();
         const hasDateBound = Boolean(cleanDateFrom || cleanDateTo);
-        const orderClause = hasDateBound ? 'ORDER BY created_at DESC, id DESC' : 'ORDER BY id DESC';
+        const orderClause = hasDateBound || negateRowIds ? 'ORDER BY created_at DESC, id DESC' : 'ORDER BY id DESC';
 
         const buildTableQuery = (table: string, extraCond?: { clause: string; bind: unknown }): D1PreparedStatement => {
             const conds: string[] = [];
@@ -2278,10 +2397,7 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
                 binds.push(cleanDateTo);
             }
             const whereClause = conds.length > 0 ? `WHERE ${conds.join(' AND ')}` : '';
-            return env.DB_FEED.prepare(`SELECT * FROM ${table} ${whereClause} ${orderClause} LIMIT ?`).bind(
-                ...binds,
-                perTable
-            );
+            return db.prepare(`SELECT * FROM ${table} ${whereClause} ${orderClause} LIMIT ?`).bind(...binds, perTable);
         };
 
         const wantGps = useAll || typeSet.has('GPS');
@@ -2321,7 +2437,7 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
             kinds.push('bio');
         }
 
-        const results = await env.DB_FEED.batch(stmts);
+        const results = await db.batch(stmts);
         const items: Array<Record<string, unknown>> = [];
         for (let i = 0; i < kinds.length; i++) {
             const rows = (results[i]?.results ?? []) as Array<Record<string, unknown>>;
@@ -2337,8 +2453,60 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
             }
         }
 
+        if (negateRowIds) {
+            for (const row of items) {
+                const rid = Number(row.rowId ?? 0);
+                if (Number.isFinite(rid) && rid > 0) {
+                    row.rowId = -rid;
+                }
+            }
+        }
+
         items.sort((a, b) => String(b.created_at ?? '').localeCompare(String(a.created_at ?? '')));
         return items.slice(0, limit);
+    };
+
+    const feedDedupKey = (r: Record<string, unknown>): string => {
+        const type = String(r.type ?? '');
+        const created = String(r.created_at ?? '');
+        const uid = String(r.userId ?? '');
+        if (type === 'GPS') return `GPS|${created}|${uid}|${String(r.location ?? '')}`;
+        if (type === 'Online' || type === 'Offline') return `${type}|${created}|${uid}`;
+        if (type === 'Status') return `Status|${created}|${uid}|${String(r.status ?? '')}|${String(r.statusDescription ?? '')}`;
+        if (type === 'Bio') return `Bio|${created}|${uid}|${String(r.bio ?? '')}`;
+        return `${type}|${created}|${uid}|${String(r.rowId ?? '')}`;
+    };
+
+    const runFilteredFeedQuery = async (
+        limit: number,
+        rawTypes: string[],
+        rawVipList: string[],
+        dateFrom = '',
+        dateTo = ''
+    ): Promise<Array<Record<string, unknown>>> => {
+        const legacyDb = getLegacyDb(env);
+        const legacyStats = legacyDb ? await getLegacyImportedStats(env) : null;
+        if (!legacyDb || (legacyStats?.feed ?? 0) <= 0) {
+            return runFilteredFeedQueryOnDb(env.DB_FEED, limit, rawTypes, rawVipList, dateFrom, dateTo, false);
+        }
+        const [primaryRows, legacyRows] = await Promise.all([
+            runFilteredFeedQueryOnDb(env.DB_FEED, limit, rawTypes, rawVipList, dateFrom, dateTo, false),
+            runFilteredFeedQueryOnDb(legacyDb, limit, rawTypes, rawVipList, dateFrom, dateTo, true)
+        ]);
+        const seen = new Set<string>();
+        const merged: Array<Record<string, unknown>> = [];
+        for (const r of primaryRows) {
+            seen.add(feedDedupKey(r));
+            merged.push(r);
+        }
+        for (const r of legacyRows) {
+            const k = feedDedupKey(r);
+            if (seen.has(k)) continue;
+            seen.add(k);
+            merged.push(r);
+        }
+        merged.sort((a, b) => String(b.created_at ?? '').localeCompare(String(a.created_at ?? '')));
+        return merged.slice(0, limit);
     };
 
     if (url.pathname === '/api/feed') {

@@ -2632,5 +2632,11 @@ describe('WEB cloud adapter (stateless)', () => {
         const enUnlockKeys = Object.keys(enJson.default.cloud_hub.unlock).sort();
         expect(Object.keys(zhCnJson.default.cloud_hub.unlock).sort()).toEqual(enUnlockKeys);
         expect(Object.keys(zhTwJson.default.cloud_hub.unlock).sort()).toEqual(enUnlockKeys);
+
+        // 4. Trilingual i18n parity check across en / zh-CN / zh-TW for cloud_hub.migration
+        const enMigKeys = Object.keys(enJson.default.cloud_hub.migration).sort();
+        expect(enMigKeys.length).toBeGreaterThanOrEqual(70);
+        expect(Object.keys(zhCnJson.default.cloud_hub.migration).sort()).toEqual(enMigKeys);
+        expect(Object.keys(zhTwJson.default.cloud_hub.migration).sort()).toEqual(enMigKeys);
     });
 });

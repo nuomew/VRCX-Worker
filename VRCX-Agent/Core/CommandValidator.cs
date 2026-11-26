@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Text.RegularExpressions;
 
 namespace VRCX.Agent.Core;
@@ -17,8 +18,15 @@ public static class CommandValidator
         "clear_cache",
         "send_vr_notify",
         "discord_update",
-        "sync_now"
+        "sync_now",
+        "desktop_scan",
+        "desktop_migrate",
+        "desktop_migrate_cancel"
     };
+
+    private static readonly Regex MigrationJobIdRegex = new(
+        @"^[A-Za-z0-9_-]{4,64}$",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
     private static readonly Regex VrcInstanceIdRegex = new(
         @"^wrld_[0-9a-f-]{36}:[A-Za-z0-9_~()\-]+$",
@@ -112,8 +120,76 @@ public static class CommandValidator
                 }
             }
         }
+        else if (action == "desktop_migrate")
+        {
+            string jobId = parameters != null && parameters.TryGetValue("jobId", out var rawJobId) && rawJobId is string jStr
+                ? jStr.Trim()
+                : string.Empty;
+            if (!MigrationJobIdRegex.IsMatch(jobId))
+            {
+                return (false, "desktop_migrate requires a valid jobId.");
+            }
+            if (parameters != null && parameters.TryGetValue("accountPrefix", out var rawPrefix) && rawPrefix != null)
+            {
+                if (rawPrefix is not string prefixStr)
+                {
+                    return (false, "desktop_migrate accountPrefix must be a string.");
+                }
+                if (!string.IsNullOrWhiteSpace(prefixStr) && !DesktopLegacyMigrator.IsValidAccountPrefix(prefixStr))
+                {
+                    return (false, "desktop_migrate accountPrefix is invalid.");
+                }
+            }
+            if (parameters == null || !parameters.TryGetValue("categories", out var rawCats) || rawCats == null)
+            {
+                return (false, "desktop_migrate requires categories.");
+            }
+            var catList = ExtractStringList(rawCats);
+            if (catList.Count == 0 || catList.Any(c => !DesktopLegacyMigrator.AllowedCategorySet.Contains(c)))
+            {
+                return (false, "desktop_migrate contains unsupported or empty categories.");
+            }
+        }
+        else if (action == "desktop_migrate_cancel")
+        {
+            string jobId = parameters != null && parameters.TryGetValue("jobId", out var rawJobId) && rawJobId is string jStr
+                ? jStr.Trim()
+                : string.Empty;
+            if (!MigrationJobIdRegex.IsMatch(jobId))
+            {
+                return (false, "desktop_migrate_cancel requires a valid jobId.");
+            }
+        }
 
         return (true, string.Empty);
+    }
+
+    public static List<string> ExtractStringList(object? raw)
+    {
+        var list = new List<string>();
+        if (raw is Newtonsoft.Json.Linq.JArray jArr)
+        {
+            foreach (var token in jArr)
+            {
+                if (token.Type == Newtonsoft.Json.Linq.JTokenType.String)
+                {
+                    string val = token.ToObject<string>()?.Trim() ?? string.Empty;
+                    if (!string.IsNullOrEmpty(val)) list.Add(val);
+                }
+            }
+            return list;
+        }
+        if (raw is IEnumerable<object?> enumerable && raw is not string)
+        {
+            foreach (object? item in enumerable)
+            {
+                if (item is string s && !string.IsNullOrWhiteSpace(s))
+                {
+                    list.Add(s.Trim());
+                }
+            }
+        }
+        return list;
     }
 
     public static bool IsValidCacheItemId(string? itemId)

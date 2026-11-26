@@ -34,6 +34,11 @@
             "binding": "DB_CACHE",
             "database_name": "vrcx-cache",
             "migrations_dir": "cloud/migrations/cache"
+        },
+        {
+            "binding": "DB_LEGACY",
+            "database_name": "vrcx-legacy",
+            "migrations_dir": "cloud/migrations/legacy"
         }
     ],
     "durable_objects": {

@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Net.Http;
 using System.Text;
 using System.Threading;
@@ -322,6 +323,95 @@ public sealed class HttpSyncClient
 
         using HttpResponseMessage res = await _httpProvider().SendAsync(req, ct).ConfigureAwait(false);
         return res.IsSuccessStatusCode;
+    }
+
+    /// <summary>
+    /// Uploads the read-only desktop VRCX database inventory (categories, row counts, estimated D1 footprint)
+    /// to `POST /api/agent/migration/inventory`.
+    /// </summary>
+    public async Task<bool> PostMigrationInventoryAsync(
+        AgentConfig config,
+        LegacyDesktopInventoryReport report,
+        CancellationToken ct)
+    {
+        if (!config.IsConfigured || !TryNormalizeCloudUrl(config.CloudUrl, out string normalizedBaseUrl))
+        {
+            throw new InvalidOperationException("Cloud URL is not configured.");
+        }
+
+        string endpoint = normalizedBaseUrl + "/api/agent/migration/inventory";
+        string jsonBody = JsonConvert.SerializeObject(report);
+        using var req = new HttpRequestMessage(HttpMethod.Post, endpoint)
+        {
+            Content = new StringContent(jsonBody, Encoding.UTF8, "application/json")
+        };
+        HmacSigner.ApplySyncAuthHeaders(req, config);
+
+        using HttpResponseMessage res = await _httpProvider().SendAsync(req, ct).ConfigureAwait(false);
+        string raw = await res.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+        if (!res.IsSuccessStatusCode)
+        {
+            string errDetail = ExtractErrorMessage(raw, $"HTTP {(int)res.StatusCode}");
+            throw new HttpRequestException($"Inventory upload rejected ({(int)res.StatusCode}): {errDetail}", null, res.StatusCode);
+        }
+        return true;
+    }
+
+    /// <summary>
+    /// Uploads one bounded batch of legacy desktop VRCX records to the isolated cloud DB_LEGACY database
+    /// via `POST /api/agent/migration/batch`.
+    /// </summary>
+    public async Task<LegacyMigrationBatchResponse> PostMigrationBatchAsync(
+        AgentConfig config,
+        string jobId,
+        string category,
+        IReadOnlyList<Dictionary<string, object?>> items,
+        bool categoryDone,
+        bool allDone,
+        string? errorMessage,
+        CancellationToken ct)
+    {
+        if (!config.IsConfigured || !TryNormalizeCloudUrl(config.CloudUrl, out string normalizedBaseUrl))
+        {
+            throw new InvalidOperationException("Cloud URL is not configured.");
+        }
+
+        string endpoint = normalizedBaseUrl + "/api/agent/migration/batch";
+        var payload = new Dictionary<string, object?>
+        {
+            ["jobId"] = jobId,
+            ["category"] = category,
+            ["items"] = items,
+            ["categoryDone"] = categoryDone,
+            ["allDone"] = allDone
+        };
+        if (!string.IsNullOrWhiteSpace(errorMessage))
+        {
+            payload["errorMessage"] = errorMessage;
+        }
+
+        string jsonBody = JsonConvert.SerializeObject(payload);
+        using var req = new HttpRequestMessage(HttpMethod.Post, endpoint)
+        {
+            Content = new StringContent(jsonBody, Encoding.UTF8, "application/json")
+        };
+        HmacSigner.ApplySyncAuthHeaders(req, config);
+
+        using HttpResponseMessage res = await _httpProvider().SendAsync(req, ct).ConfigureAwait(false);
+        string raw = await res.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+        if (!res.IsSuccessStatusCode)
+        {
+            string errDetail = ExtractErrorMessage(raw, $"HTTP {(int)res.StatusCode}");
+            throw new HttpRequestException($"Migration batch rejected ({(int)res.StatusCode}): {errDetail}", null, res.StatusCode);
+        }
+
+        JObject root = JObject.Parse(raw);
+        if (root["ok"]?.Value<bool>() != true)
+        {
+            string errDetail = root["error"]?["message"]?.Value<string>() ?? "Migration batch failed";
+            throw new HttpRequestException(errDetail);
+        }
+        return root["data"]?.ToObject<LegacyMigrationBatchResponse>() ?? new LegacyMigrationBatchResponse();
     }
 
     private static string ExtractErrorMessage(string raw, string fallback)
