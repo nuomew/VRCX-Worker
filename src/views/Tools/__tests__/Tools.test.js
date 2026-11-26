@@ -139,4 +139,18 @@ describe('Tools.vue', () => {
 
         expect(setString).toHaveBeenCalledWith('VRCX_toolsCategoryCollapsed', expect.stringContaining('"image":false'));
     });
+
+    test('renders avatar category and navigates to avatar search tool', async () => {
+        const wrapper = mount(Tools);
+        await flushPromises();
+
+        const avatarCategoryHeader = findCategoryHeaderByTitle(wrapper, 'view.tools.avatar.header');
+        expect(avatarCategoryHeader).toBeTruthy();
+
+        const avatarSearchItem = findToolItemByTitle(wrapper, 'view.tools.avatar.search');
+        expect(avatarSearchItem).toBeTruthy();
+
+        await avatarSearchItem.trigger('click');
+        expect(push).toHaveBeenCalledWith({ name: 'avatar-search' });
+    });
 });

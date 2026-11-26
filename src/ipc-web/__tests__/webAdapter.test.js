@@ -46,6 +46,14 @@ import {
     exportCloudDataToZip,
     normalizeExportUserPrefix
 } from '../cloudDataExport.js';
+import {
+    AVTRDB_V2_SEARCH_ENDPOINT,
+    extractAvatarId,
+    extractUserId,
+    matchesPublicAvatarFilters,
+    normalizePublicAvatar,
+    searchPublicAvatars
+} from '../publicAvatarSearch.js';
 
 function mockOk(data, status = 200) {
     return new Response(JSON.stringify({ ok: true, data }), {
@@ -2839,5 +2847,167 @@ describe('WEB cloud adapter (stateless)', () => {
         expect(enStorageKeys.length).toBeGreaterThanOrEqual(42);
         expect(Object.keys(zhCnJson.default.cloud_hub.storage).sort()).toEqual(enStorageKeys);
         expect(Object.keys(zhTwJson.default.cloud_hub.storage).sort()).toEqual(enStorageKeys);
+    });
+
+    it('searches public avatars by ID, author name/ID, avatar name and platform with official lookup, private filtering, proxy fallback, and trilingual parity', async () => {
+        const sampleAvatarId = 'avtr_11112222-3333-4444-5555-666677778888';
+        const sampleUserId = 'usr_aaaa1111-2222-3333-4444-555566667777';
+
+        // 1. Canonical ID extraction from raw IDs and VRChat URLs
+        expect(extractAvatarId(`https://vrchat.com/home/avatar/${sampleAvatarId.toUpperCase()}?foo=1`)).toBe(
+            sampleAvatarId
+        );
+        expect(extractAvatarId('not-an-avatar-id')).toBe('');
+        expect(extractUserId(`https://vrchat.com/home/user/${sampleUserId.toUpperCase()}`)).toBe(sampleUserId);
+        expect(extractUserId('author-name')).toBe('');
+
+        // 2. Normalization enforces public-only and parses unityPackages + avtrDB payloads
+        expect(normalizePublicAvatar({ id: sampleAvatarId, releaseStatus: 'private', name: 'Secret' })).toBeNull();
+        const normalizedOfficial = normalizePublicAvatar(
+            {
+                id: sampleAvatarId,
+                name: 'Runya Sample',
+                authorId: sampleUserId,
+                authorName: 'Naffna',
+                releaseStatus: 'public',
+                thumbnailImageUrl: 'https://api.vrchat.cloud/thumb.png',
+                unityPackages: [
+                    { platform: 'standalonewindows', performanceRating: 'Good' },
+                    { platform: 'android', performanceRating: 'Medium' },
+                    { platform: 'standalonewindows', variant: 'impostor' }
+                ]
+            },
+            'vrchat'
+        );
+        expect(normalizedOfficial).toMatchObject({
+            id: sampleAvatarId,
+            name: 'Runya Sample',
+            authorId: sampleUserId,
+            authorName: 'Naffna',
+            releaseStatus: 'public',
+            compatibility: ['pc', 'android'],
+            performance: {
+                pcRating: 'Good',
+                androidRating: 'Medium',
+                iosRating: null,
+                hasImpostor: true
+            }
+        });
+        expect(
+            matchesPublicAvatarFilters(normalizedOfficial, {
+                searchType: 'author',
+                query: 'naff',
+                platform: 'android'
+            })
+        ).toBe(true);
+        expect(
+            matchesPublicAvatarFilters(normalizedOfficial, {
+                searchType: 'author',
+                query: 'naff',
+                platform: 'ios'
+            })
+        ).toBe(false);
+
+        // 3. Invalid ID under searchType="id" short-circuits with invalidAvatarId flag
+        const invalidRes = await searchPublicAvatars({
+            query: 'invalid-keyword',
+            searchType: 'id',
+            fetchImpl: vi.fn(),
+            executeFallback: vi.fn(),
+            getOfficialAvatar: vi.fn()
+        });
+        expect(invalidRes.invalidAvatarId).toBe(true);
+        expect(invalidRes.avatars).toEqual([]);
+
+        // 4. Exact avatar ID queries VRChat official API first; private avatars trigger privateNotice
+        const officialPrivateSpy = vi.fn().mockResolvedValue({
+            json: { id: sampleAvatarId, name: 'Private One', releaseStatus: 'private' }
+        });
+        const directFetchUnused = vi.fn();
+        const privateRes = await searchPublicAvatars({
+            query: sampleAvatarId,
+            searchType: 'id',
+            fetchImpl: directFetchUnused,
+            executeFallback: vi.fn(),
+            getOfficialAvatar: officialPrivateSpy
+        });
+        expect(privateRes.privateNotice).toBe(true);
+        expect(privateRes.avatars).toEqual([]);
+        expect(directFetchUnused).not.toHaveBeenCalled();
+
+        // 5. Exact public avatar ID via VRChat URL returns normalized official avatar immediately
+        const officialPublicSpy = vi.fn().mockResolvedValue({
+            json: {
+                id: sampleAvatarId,
+                name: 'Runya Official',
+                authorId: sampleUserId,
+                authorName: 'Naffna',
+                releaseStatus: 'public',
+                unityPackages: [{ platform: 'standalonewindows', performanceRating: 'Excellent' }]
+            }
+        });
+        const officialRes = await searchPublicAvatars({
+            query: `https://vrchat.com/home/avatar/${sampleAvatarId}`,
+            searchType: 'all',
+            fetchImpl: directFetchUnused,
+            executeFallback: vi.fn(),
+            getOfficialAvatar: officialPublicSpy
+        });
+        expect(officialRes.source).toBe('vrchat');
+        expect(officialRes.avatars).toHaveLength(1);
+        expect(officialRes.avatars[0].name).toBe('Runya Official');
+
+        // 6. Keyword / author search tries direct browser fetch first and transparently falls back to Worker proxy
+        const failingDirectFetch = vi.fn().mockRejectedValue(new TypeError('Failed to fetch'));
+        const proxyFallback = vi.fn().mockResolvedValue({
+            status: 200,
+            data: JSON.stringify({
+                avatars: [
+                    {
+                        vrc_id: 'avtr_aaaaaaaa-0000-0000-0000-000000000001',
+                        name: 'Neko Maid',
+                        author: { name: 'Naffna', vrc_id: sampleUserId },
+                        compatibility: ['pc', 'android'],
+                        image_url: 'https://thumb.avtrdb.com/a1.webp',
+                        performance: { pc_rating: 'Poor', android_rating: 'VeryPoor', has_impostor: true }
+                    },
+                    {
+                        vrc_id: 'avtr_aaaaaaaa-0000-0000-0000-000000000002',
+                        name: 'Other Author Avatar',
+                        author: { name: 'SomeoneElse', vrc_id: 'usr_bbbb1111-2222-3333-4444-555566667777' },
+                        compatibility: ['pc'],
+                        image_url: 'https://thumb.avtrdb.com/a2.webp'
+                    }
+                ],
+                has_more: false
+            })
+        });
+        const authorSearchRes = await searchPublicAvatars({
+            query: 'Naffna',
+            searchType: 'author',
+            platform: 'android',
+            fetchImpl: failingDirectFetch,
+            executeFallback: proxyFallback
+        });
+        expect(failingDirectFetch).toHaveBeenCalledTimes(1);
+        expect(failingDirectFetch.mock.calls[0][0]).toContain(`${AVTRDB_V2_SEARCH_ENDPOINT}?query=Naffna`);
+        expect(proxyFallback).toHaveBeenCalledTimes(1);
+        expect(authorSearchRes.avatars).toHaveLength(1);
+        expect(authorSearchRes.avatars[0]).toMatchObject({
+            id: 'avtr_aaaaaaaa-0000-0000-0000-000000000001',
+            authorName: 'Naffna',
+            releaseStatus: 'public'
+        });
+
+        // 7. Trilingual parity for all view.tools.avatar.* keys
+        const [enJson, zhCnJson, zhTwJson] = await Promise.all([
+            import('../../localization/en.json'),
+            import('../../localization/zh-CN.json'),
+            import('../../localization/zh-TW.json')
+        ]);
+        const enAvatarKeys = Object.keys(enJson.default.view.tools.avatar).sort();
+        expect(enAvatarKeys).toHaveLength(28);
+        expect(Object.keys(zhCnJson.default.view.tools.avatar).sort()).toEqual(enAvatarKeys);
+        expect(Object.keys(zhTwJson.default.view.tools.avatar).sort()).toEqual(enAvatarKeys);
     });
 });

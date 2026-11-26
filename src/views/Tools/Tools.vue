@@ -117,6 +117,7 @@
         .filter((category) => category.tools.length > 0);
 
     const categoryCollapsed = ref({
+        avatar: false,
         group: false,
         image: false,
         shortcuts: false,

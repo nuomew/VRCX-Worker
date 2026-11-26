@@ -1,5 +1,6 @@
 const toolCategories = [
     { key: 'image', labelKey: 'view.tools.pictures.header' },
+    { key: 'avatar', labelKey: 'view.tools.avatar.header' },
     { key: 'shortcuts', labelKey: 'view.tools.shortcuts.header' },
     { key: 'group', labelKey: 'view.tools.group.header' },
     { key: 'system', labelKey: 'view.tools.system_tools.header' },
@@ -28,6 +29,16 @@ const toolDefinitions = [
         descriptionKey: 'view.tools.pictures.gallery_description',
         navEligible: true,
         action: { type: 'route', routeName: 'gallery' }
+    },
+    {
+        key: 'avatar-search',
+        category: 'avatar',
+        iconKey: 'user-search',
+        navIcon: 'ri-user-search-line',
+        titleKey: 'view.tools.avatar.search',
+        descriptionKey: 'view.tools.avatar.search_description',
+        navEligible: true,
+        action: { type: 'route', routeName: 'avatar-search' }
     },
     {
         key: 'vrc-photos',
