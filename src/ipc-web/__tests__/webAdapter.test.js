@@ -4,6 +4,7 @@ import {
     fitPatchForKeepalive,
     flushStorageNow,
     loadBootstrap,
+    resetBootstrapCache,
     saveCloudSyncIntervalSeconds,
     saveWebSyncIntervalSeconds,
     scheduleConfigPatch,
@@ -2559,7 +2560,9 @@ describe('WEB cloud adapter (stateless)', () => {
         expect(clamp2faTrustSeconds(MAX_CLOUD_2FA_TRUST_SECONDS + 999999)).toBe(MAX_CLOUD_2FA_TRUST_SECONDS);
         expect(clamp2faTrustSeconds('not-a-number', 3600)).toBe(3600);
 
-        // 2. Unverified browser when 2FA gate is enabled stays unauthenticated and does not call /api/bootstrap
+        // 2. Unverified browser when 2FA gate is enabled stays unauthenticated, does not call /api/bootstrap,
+        //    and seeds allowlisted theme/locale preferences into bootstrapCache.configs while keeping loaded=false
+        resetBootstrapCache();
         fetchSpy.mockResolvedValueOnce(
             mockOk({
                 authenticated: false,
@@ -2572,7 +2575,12 @@ describe('WEB cloud adapter (stateless)', () => {
                 defaultTrustSeconds: 259200,
                 maxTrustDays: 30,
                 trustExpiresAt: '',
-                subject: ''
+                subject: '',
+                uiPreferences: {
+                    themeMode: 'midnight',
+                    themeColor: 'blue',
+                    appLanguage: 'zh-CN'
+                }
             })
         );
         const ok = await refreshCloudAuthAndBootstrap();
@@ -2584,7 +2592,29 @@ describe('WEB cloud adapter (stateless)', () => {
         expect(cloudState.requiresTotp).toBe(true);
         expect(cloudState.default2faTrustSeconds).toBe(259200);
         expect(cloudState.max2faTrustDays).toBe(30);
+        expect(cloudState.uiPreferences).toEqual({
+            themeMode: 'midnight',
+            themeColor: 'blue',
+            appLanguage: 'zh-CN'
+        });
+        expect(bootstrapCache.loaded).toBe(false);
+        expect(bootstrapCache.configs['config:vrcx_thememode']).toBe('midnight');
+        expect(bootstrapCache.configs['config:vrcx_themecolor']).toBe('blue');
+        expect(bootstrapCache.configs['config:vrcx_applanguage']).toBe('zh-CN');
         expect(fetchSpy).toHaveBeenCalledTimes(1);
+
+        // Changing theme while authenticated flushes immediately (0ms debounce) instead of waiting 8s
+        cloudState.authenticated = true;
+        bootstrapCache.loaded = true;
+        fetchSpy.mockResolvedValueOnce(mockOk({ ok: true }));
+        scheduleConfigPatch('config:vrcx_thememode', 'dark');
+        await vi.advanceTimersByTimeAsync(10);
+        expect(fetchSpy).toHaveBeenCalledTimes(2);
+        expect(fetchSpy.mock.calls[1][0]).toBe('/api/config/bundle');
+        expect(JSON.parse(fetchSpy.mock.calls[1][1].body)).toEqual({
+            bundleKey: 'vrcx_config',
+            patch: { 'config:vrcx_thememode': 'dark' }
+        });
 
         // 3. Trilingual i18n parity check across en / zh-CN / zh-TW for cloud_hub.two_factor & unlock
         const [enJson, zhCnJson, zhTwJson] = await Promise.all([

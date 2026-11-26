@@ -79,16 +79,16 @@
                     </label>
                     <select
                         v-model="trustPresetSelection"
-                        class="w-full rounded-md border border-input bg-background px-3 py-2 text-xs text-foreground">
-                        <option value="0">{{ t('cloud_hub.two_factor.trust_session') }}</option>
-                        <option value="3600">{{ t('cloud_hub.two_factor.trust_1h') }}</option>
-                        <option value="43200">{{ t('cloud_hub.two_factor.trust_12h') }}</option>
-                        <option value="86400">{{ t('cloud_hub.two_factor.trust_1d') }}</option>
-                        <option value="259200">{{ t('cloud_hub.two_factor.trust_3d') }}</option>
-                        <option value="604800">{{ t('cloud_hub.two_factor.trust_7d') }}</option>
-                        <option value="1209600">{{ t('cloud_hub.two_factor.trust_14d') }}</option>
-                        <option value="2592000">{{ t('cloud_hub.two_factor.trust_30d') }}</option>
-                        <option value="custom">{{ t('cloud_hub.two_factor.trust_custom') }}</option>
+                        class="w-full rounded-md border border-input bg-background px-3 py-2 text-xs text-foreground dark:[color-scheme:dark]">
+                        <option class="bg-card text-foreground" value="0">{{ t('cloud_hub.two_factor.trust_session') }}</option>
+                        <option class="bg-card text-foreground" value="3600">{{ t('cloud_hub.two_factor.trust_1h') }}</option>
+                        <option class="bg-card text-foreground" value="43200">{{ t('cloud_hub.two_factor.trust_12h') }}</option>
+                        <option class="bg-card text-foreground" value="86400">{{ t('cloud_hub.two_factor.trust_1d') }}</option>
+                        <option class="bg-card text-foreground" value="259200">{{ t('cloud_hub.two_factor.trust_3d') }}</option>
+                        <option class="bg-card text-foreground" value="604800">{{ t('cloud_hub.two_factor.trust_7d') }}</option>
+                        <option class="bg-card text-foreground" value="1209600">{{ t('cloud_hub.two_factor.trust_14d') }}</option>
+                        <option class="bg-card text-foreground" value="2592000">{{ t('cloud_hub.two_factor.trust_30d') }}</option>
+                        <option class="bg-card text-foreground" value="custom">{{ t('cloud_hub.two_factor.trust_custom') }}</option>
                     </select>
                     <div v-if="trustPresetSelection === 'custom'" class="flex items-center gap-2">
                         <input
@@ -493,10 +493,45 @@
         MAX_CLOUD_2FA_TRUST_DAYS
     } from '../../ipc-web/cloudState';
     import { links } from '../../shared/constants/link';
+    import { applyThemeColor, changeAppThemeStyle, changeHtmlLangAttribute } from '../../shared/utils/base/ui';
+    import { loadLocalizedStrings } from '../../plugins/i18n';
 
-    const { t } = useI18n();
+    const { t, locale } = useI18n();
     const isWeb = typeof WEB !== 'undefined' && WEB;
     const cloudOriginUrl = typeof window !== 'undefined' ? window.location.origin : '';
+
+    // Keep the unlock/2FA gate synced to server-configured appearance both on first mount
+    // (before async appearanceSettings hydration completes) and if `/api/auth/me` succeeds on retry.
+    watch(
+        () => [
+            cloudState.uiPreferences.themeMode,
+            cloudState.uiPreferences.themeColor,
+            cloudState.uiPreferences.appLanguage
+        ],
+        async ([themeMode, themeColor, appLanguage]) => {
+            if (!isWeb || cloudState.authenticated || typeof document === 'undefined') return;
+            if (themeMode) {
+                const expectedDataTheme =
+                    themeMode === 'system'
+                        ? window.matchMedia?.('(prefers-color-scheme: dark)').matches
+                            ? 'dark'
+                            : 'light'
+                        : themeMode;
+                if (document.documentElement.getAttribute('data-theme') !== expectedDataTheme) {
+                    changeAppThemeStyle(themeMode);
+                }
+            }
+            if (themeColor && document.documentElement.getAttribute('data-theme-color') !== themeColor) {
+                await applyThemeColor(themeColor, { persist: false });
+            }
+            if (appLanguage && locale.value !== appLanguage) {
+                await loadLocalizedStrings(appLanguage);
+                locale.value = appLanguage;
+                changeHtmlLangAttribute(appLanguage);
+            }
+        },
+        { immediate: true }
+    );
 
     const passcode = ref('');
     const totpCode = ref('');

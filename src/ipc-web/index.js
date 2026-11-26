@@ -8,9 +8,33 @@ import {
     createSqliteNoopShim,
     createVrcxStorageBridge
 } from './appApiWeb.js';
-import { loadBootstrap } from './bootstrapCache.js';
-import { clamp2faTrustSeconds, cloudState, MAX_CLOUD_2FA_TRUST_DAYS } from './cloudState.js';
+import { bootstrapCache, loadBootstrap } from './bootstrapCache.js';
+import {
+    clamp2faTrustSeconds,
+    cloudState,
+    MAX_CLOUD_2FA_TRUST_DAYS,
+    normalizePublicUiPreferences
+} from './cloudState.js';
 import { createWebApiBridge } from './webApiRemote.js';
+
+/**
+ * Seeds allowlisted theme/locale keys into in-memory `bootstrapCache.configs` while unauthenticated
+ * so `initUi()` and `appearanceSettingsStore` render the 2FA/Passcode unlock screen in the configured
+ * theme and language without loading `/api/bootstrap` or setting `bootstrapCache.loaded = true`.
+ *
+ * @param {{ themeMode: string; themeColor: string; appLanguage: string }} prefs
+ */
+function seedPreAuthUiConfigs(prefs) {
+    if (prefs.themeMode) {
+        bootstrapCache.configs['config:vrcx_thememode'] = prefs.themeMode;
+    }
+    if (prefs.themeColor) {
+        bootstrapCache.configs['config:vrcx_themecolor'] = prefs.themeColor;
+    }
+    if (prefs.appLanguage) {
+        bootstrapCache.configs['config:vrcx_applanguage'] = prefs.appLanguage;
+    }
+}
 
 /**
  * Checks `/api/auth/me` and hydrates bootstrap data when authenticated.
@@ -37,12 +61,18 @@ export async function refreshCloudAuthAndBootstrap() {
         cloudState.subject = authInfo.subject || '';
         cloudState.r2Enabled = Boolean(authInfo.r2Enabled);
         cloudState.cloudFallbackAllowed = authInfo.cloudFallbackAllowed !== false;
+        const uiPreferences = normalizePublicUiPreferences(authInfo.uiPreferences);
+        cloudState.uiPreferences.themeMode = uiPreferences.themeMode;
+        cloudState.uiPreferences.themeColor = uiPreferences.themeColor;
+        cloudState.uiPreferences.appLanguage = uiPreferences.appLanguage;
 
         if (cloudState.authenticated) {
             await loadBootstrap();
             if (cloudState.wsAgentsOnline.length > 0) {
                 connectCloudHubWs();
             }
+        } else {
+            seedPreAuthUiConfigs(uiPreferences);
         }
         return true;
     } catch (err) {

@@ -5511,7 +5511,26 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
             // Extract enabled browser cookie
             const browser1Cookie = enableCookieHeader.split(';')[0]!;
 
-            // 4. Browser without cookie (fresh browser or cleared browser cache/cookies) is blocked!
+            // 4. Browser without cookie (fresh browser or cleared browser cache/cookies) is blocked,
+            //    yet `/api/auth/me` still returns strict allowlisted UI theme/locale preferences without leaking other configs.
+            await exports.default.fetch('http://example.com/api/config/bundle', {
+                method: 'PUT',
+                headers: {
+                    'Content-Type': 'application/json',
+                    Origin: 'http://example.com',
+                    Cookie: browser1Cookie
+                },
+                body: JSON.stringify({
+                    bundleKey: 'vrcx_config',
+                    patch: {
+                        'config:vrcx_thememode': 'midnight',
+                        'config:vrcx_themecolor': 'violet',
+                        'config:vrcx_applanguage': 'zh-CN',
+                        'config:vrcx_translationapikey': 'sk-secret-must-not-leak'
+                    }
+                })
+            });
+
             const unauthMeRes = await exports.default.fetch('http://example.com/api/auth/me');
             expect(unauthMeRes.status).toBe(200);
             const unauthMe = (await unauthMeRes.json()) as {
@@ -5521,6 +5540,11 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
                     totpGateEnabled: boolean;
                     requiresTotp: boolean;
                     totpVerified: boolean;
+                    uiPreferences: {
+                        themeMode: string;
+                        themeColor: string;
+                        appLanguage: string;
+                    };
                 };
             };
             expect(unauthMe.data.authenticated).toBe(false);
@@ -5528,6 +5552,39 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
             expect(unauthMe.data.totpGateEnabled).toBe(true);
             expect(unauthMe.data.requiresTotp).toBe(true);
             expect(unauthMe.data.totpVerified).toBe(false);
+            expect(unauthMe.data.uiPreferences).toEqual({
+                themeMode: 'midnight',
+                themeColor: 'violet',
+                appLanguage: 'zh-CN'
+            });
+            expect(JSON.stringify(unauthMe)).not.toContain('sk-secret-must-not-leak');
+
+            // Invalid/injected theme or locale values stored in config bundle must be stripped to empty strings
+            await exports.default.fetch('http://example.com/api/config/bundle', {
+                method: 'PUT',
+                headers: {
+                    'Content-Type': 'application/json',
+                    Origin: 'http://example.com',
+                    Cookie: browser1Cookie
+                },
+                body: JSON.stringify({
+                    bundleKey: 'vrcx_config',
+                    patch: {
+                        'config:vrcx_thememode': 'javascript:alert(1)',
+                        'config:vrcx_themecolor': '../evil',
+                        'config:vrcx_applanguage': 'en/../../etc/passwd'
+                    }
+                })
+            });
+            const sanitizedMeRes = await exports.default.fetch('http://example.com/api/auth/me');
+            const sanitizedMe = (await sanitizedMeRes.json()) as {
+                data: { uiPreferences: { themeMode: string; themeColor: string; appLanguage: string } };
+            };
+            expect(sanitizedMe.data.uiPreferences).toEqual({
+                themeMode: '',
+                themeColor: '',
+                appLanguage: ''
+            });
 
             const blockedBootstrap = await exports.default.fetch('http://example.com/api/bootstrap');
             expect(blockedBootstrap.status).toBe(401);

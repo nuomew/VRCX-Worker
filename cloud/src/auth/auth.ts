@@ -23,6 +23,58 @@ const STATE_KEY_REVOKED_SESSIONS = 'revoked_sessions';
 const STATE_KEY_CLOUD_TOTP = 'cloud_totp_config';
 const STATE_KEY_CLOUD_TOTP_PENDING = 'cloud_totp_pending';
 const MAX_REVOKED_SESSIONS = 50;
+const ALLOWED_PUBLIC_THEME_MODES = new Set(['system', 'light', 'dark', 'midnight']);
+const ALLOWED_PUBLIC_THEME_COLORS = new Set([
+    'default',
+    'blue',
+    'green',
+    'orange',
+    'red',
+    'rose',
+    'violet',
+    'yellow'
+]);
+const PUBLIC_APP_LANGUAGE_RE = /^[a-z]{2,3}(?:-[A-Za-z0-9]{2,4})?$/;
+
+export interface PublicUiPreferences {
+    themeMode: string;
+    themeColor: string;
+    appLanguage: string;
+}
+
+/**
+ * Reads only strict allowlisted UI appearance preferences (theme mode, theme accent color, locale)
+ * from `vrcx_config` so the pre-auth 2FA/Passcode unlock screen matches the user's configured theme
+ * without exposing any other config keys or sensitive data.
+ */
+async function loadPublicUiPreferences(env: Env): Promise<PublicUiPreferences> {
+    const empty: PublicUiPreferences = { themeMode: '', themeColor: '', appLanguage: '' };
+    if (!env.DB_CORE) return empty;
+    try {
+        const row = await env.DB_CORE.prepare(
+            "SELECT payload_json FROM config_bundles WHERE bundle_key = 'vrcx_config' LIMIT 1"
+        ).first<{ payload_json?: string }>();
+        if (!row?.payload_json) return empty;
+        const parsed = JSON.parse(row.payload_json) as Record<string, unknown>;
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return empty;
+
+        const rawThemeMode = parsed['config:vrcx_thememode'] ?? parsed['vrcx_thememode'];
+        const rawThemeColor = parsed['config:vrcx_themecolor'] ?? parsed['vrcx_themecolor'];
+        const rawAppLanguage = parsed['config:vrcx_applanguage'] ?? parsed['vrcx_applanguage'];
+
+        const normalizedMode = typeof rawThemeMode === 'string' ? rawThemeMode.trim().toLowerCase() : '';
+        const normalizedColor = typeof rawThemeColor === 'string' ? rawThemeColor.trim().toLowerCase() : '';
+        const normalizedLang = typeof rawAppLanguage === 'string' ? rawAppLanguage.trim() : '';
+
+        return {
+            themeMode: ALLOWED_PUBLIC_THEME_MODES.has(normalizedMode) ? normalizedMode : '',
+            themeColor: ALLOWED_PUBLIC_THEME_COLORS.has(normalizedColor) ? normalizedColor : '',
+            appLanguage: PUBLIC_APP_LANGUAGE_RE.test(normalizedLang) ? normalizedLang : ''
+        };
+    } catch {
+        return empty;
+    }
+}
 
 export const MAX_2FA_TRUST_DAYS = 30;
 export const MAX_2FA_TRUST_SECONDS = MAX_2FA_TRUST_DAYS * 24 * 60 * 60; // 2,592,000s (30 days hard cap)
@@ -990,7 +1042,10 @@ export async function clearAuthRateLimit(env: Env, bucketKey: string): Promise<v
 
 export async function handleAuthRoutes(request: Request, env: Env, url: URL): Promise<Response | null> {
     if (url.pathname === '/api/auth/me' && request.method === 'GET') {
-        const result = await authenticateWeb(request, env);
+        const [result, uiPreferences] = await Promise.all([
+            authenticateWeb(request, env),
+            loadPublicUiPreferences(env)
+        ]);
         return Response.json(
             {
                 ok: true,
@@ -1007,7 +1062,8 @@ export async function handleAuthRoutes(request: Request, env: Env, url: URL): Pr
                     trustExpiresAt: result.trustExpiresAt,
                     subject: result.subject,
                     r2Enabled: Boolean(env.R2_MEDIA),
-                    cloudFallbackAllowed: env.VRC_ALLOW_CLOUD_FALLBACK !== 'false'
+                    cloudFallbackAllowed: env.VRC_ALLOW_CLOUD_FALLBACK !== 'false',
+                    uiPreferences
                 }
             },
             { headers: { 'Cache-Control': 'no-store' } }

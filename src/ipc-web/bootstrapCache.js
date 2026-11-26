@@ -174,7 +174,16 @@ export async function loadBootstrap() {
 const BUNDLE_FLUSH_DELAY_MS = 8000;
 const BUNDLE_RETRY_BASE_MS = 15000;
 const BUNDLE_MAX_RETRIES = 3;
-const IMMEDIATE_CONFIG_KEYS = new Set(['config:vrcx_translationapiendpoint', 'vrcx_translationapiendpoint']);
+const IMMEDIATE_CONFIG_KEYS = new Set([
+    'config:vrcx_translationapiendpoint',
+    'vrcx_translationapiendpoint',
+    'config:vrcx_thememode',
+    'vrcx_thememode',
+    'config:vrcx_themecolor',
+    'vrcx_themecolor',
+    'config:vrcx_applanguage',
+    'vrcx_applanguage'
+]);
 
 /**
  * Resets in-memory bootstrap state and cancels any pending config/storage flushes

@@ -10,6 +10,31 @@ export const MAX_CLOUD_2FA_TRUST_SECONDS = MAX_CLOUD_2FA_TRUST_DAYS * 24 * 60 * 
 export const DEFAULT_CLOUD_2FA_TRUST_SECONDS = 7 * 24 * 60 * 60;
 export const CLOUD_2FA_TRUST_PRESETS = Object.freeze([0, 3600, 43200, 86400, 259200, 604800, 1209600, 2592000]);
 
+const ALLOWED_UI_THEME_MODES = new Set(['system', 'light', 'dark', 'midnight']);
+const ALLOWED_UI_THEME_COLORS = new Set(['default', 'blue', 'green', 'orange', 'red', 'rose', 'violet', 'yellow']);
+const ALLOWED_UI_LANGUAGE_RE = /^[a-z]{2,3}(?:-[A-Za-z0-9]{2,4})?$/;
+
+/**
+ * Sanitizes pre-auth UI preferences returned by `/api/auth/me` against strict allowlists.
+ *
+ * @param {unknown} raw
+ * @returns {{ themeMode: string; themeColor: string; appLanguage: string }}
+ */
+export function normalizePublicUiPreferences(raw) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+        return { themeMode: '', themeColor: '', appLanguage: '' };
+    }
+    const obj = /** @type {Record<string, unknown>} */ (raw);
+    const themeMode = typeof obj.themeMode === 'string' ? obj.themeMode.trim().toLowerCase() : '';
+    const themeColor = typeof obj.themeColor === 'string' ? obj.themeColor.trim().toLowerCase() : '';
+    const appLanguage = typeof obj.appLanguage === 'string' ? obj.appLanguage.trim() : '';
+    return {
+        themeMode: ALLOWED_UI_THEME_MODES.has(themeMode) ? themeMode : '',
+        themeColor: ALLOWED_UI_THEME_COLORS.has(themeColor) ? themeColor : '',
+        appLanguage: ALLOWED_UI_LANGUAGE_RE.test(appLanguage) ? appLanguage : ''
+    };
+}
+
 /**
  * Clamps a 2FA browser-trust duration in seconds into [0, 30 days] (0 = current browser session only).
  *
@@ -96,6 +121,12 @@ export const cloudState = reactive({
     totalUptimeBaseSeconds: 0,
     /** Local epoch ms when `totalUptimeBaseSeconds` was last synced from server (0 before bootstrap). */
     totalUptimeSyncedAt: 0,
+    /** Allowlisted appearance preferences hydrated before full auth so unlock/2FA gates honor configured theme & locale. */
+    uiPreferences: {
+        themeMode: '',
+        themeColor: '',
+        appLanguage: ''
+    },
     hubDialogOpen: false
 });
 
