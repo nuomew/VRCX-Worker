@@ -465,6 +465,22 @@ describe('ChatTranslator.vue', () => {
                     }
                 }
             });
+            fn({
+                type: 'chat.message',
+                payload: {
+                    message: {
+                        id: 'peer_msg_1',
+                        direction: 'peer_incoming',
+                        senderName: 'Alice',
+                        sourceText: 'Hi from another player',
+                        translatedText: '',
+                        sentText: 'Hi from another player',
+                        oscPort: 9000,
+                        status: 'synced',
+                        createdAt: '2026-11-26T10:02:30.000Z'
+                    }
+                }
+            });
         }
         for (const fn of mocks.cmdListeners) {
             fn({
@@ -477,7 +493,15 @@ describe('ChatTranslator.vue', () => {
         expect(wrapper.text()).toContain('view.tools.chat_translator.agent_realtime');
         expect(wrapper.text()).toContain('view.tools.chat_translator.dedicated_db_badge');
         expect(wrapper.text()).toContain('实时游戏打字消息');
+        expect(wrapper.text()).toContain('Hi from another player');
         expect(wrapper.text()).toContain('view.tools.chat_translator.status_sent');
+
+        // Self messages (web_to_vrc & desktop_sync) align right; peer_incoming aligns left
+        const rightRows = wrapper.findAll('[data-msg-side="right"]');
+        const leftRows = wrapper.findAll('[data-msg-side="left"]');
+        expect(rightRows.some((el) => el.text().includes('Hello world'))).toBe(true);
+        expect(rightRows.some((el) => el.text().includes('实时游戏打字消息'))).toBe(true);
+        expect(leftRows.some((el) => el.text().includes('Hi from another player'))).toBe(true);
 
         // Clicking Cloud OSC Settings opens modal dialog (not inline expansion) and toggling relay saves to PUT /api/chat/config
         expect(wrapper.find('.mock-osc-dialog').exists()).toBe(false);

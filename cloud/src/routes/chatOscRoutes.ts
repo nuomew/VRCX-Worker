@@ -25,7 +25,7 @@ const MAX_STORED_CHAT_MESSAGES = 500;
 const CHAT_WEB_ACTIVE_TTL_MS = 90_000;
 const CHAT_WEB_ACTIVE_STATE_KEY = 'chat_web_active';
 const CHAT_CONFIG_KEY = 'default';
-const VALID_DIRECTIONS = new Set(['web_to_vrc', 'desktop_sync']);
+const VALID_DIRECTIONS = new Set(['web_to_vrc', 'desktop_sync', 'peer_incoming']);
 const VALID_DISPLAY_MODES = new Set([
     'translated_only',
     'translated_and_source',

@@ -247,15 +247,26 @@
                 </div>
             </div>
 
-            <!-- Message Bubbles -->
+            <!-- Message Bubbles (self messages on the right, peer messages on the left) -->
             <div
                 v-for="msg in messages"
                 :key="msg.id"
-                class="group flex flex-col gap-1"
-                :class="msg.direction === 'web_to_vrc' ? 'items-end' : 'items-start'">
+                :data-msg-side="isSelfMessage(msg) ? 'right' : 'left'"
+                class="group flex w-full flex-col gap-1"
+                :class="isSelfMessage(msg) ? 'items-end' : 'items-start'">
+                <div
+                    v-if="!isSelfMessage(msg) && msg.senderName"
+                    class="px-1 text-[11px] font-medium text-muted-foreground">
+                    {{ msg.senderName }}
+                </div>
+
                 <div
                     class="flex items-end gap-1.5 max-w-[88%] sm:max-w-[76%]"
-                    :class="msg.direction === 'web_to_vrc' ? 'flex-row' : 'flex-row-reverse'">
+                    :class="
+                        isSelfMessage(msg)
+                            ? 'ml-auto flex-row justify-end'
+                            : 'mr-auto flex-row-reverse justify-start'
+                    ">
                     <!-- Floating Compact Action Pill (appears on hover/focus on desktop) -->
                     <div
                         class="shrink-0 inline-flex items-center gap-0.5 rounded-full border border-border/70 bg-background/95 p-0.5 shadow-xs transition-opacity duration-150 sm:opacity-0 sm:group-hover:opacity-100 sm:group-focus-within:opacity-100">
@@ -337,7 +348,7 @@
                 <!-- Compact Subtle Meta Footer (outside bubble) -->
                 <div
                     class="flex items-center gap-1.5 px-1 text-[11px] text-muted-foreground/80 select-none"
-                    :class="msg.direction === 'web_to_vrc' ? 'flex-row-reverse' : 'flex-row'"
+                    :class="isSelfMessage(msg) ? 'ml-auto flex-row-reverse' : 'mr-auto flex-row'"
                     :title="formatMessageMetaTooltip(msg)">
                     <span
                         class="inline-flex items-center gap-1 font-medium"
@@ -1008,7 +1019,14 @@
 
     async function maybeAutoTranslateDesktopMessage(msg) {
         if (!prefs.translateEnabled || !prefs.autoTranslateDesktop || !isTranslationConfigured.value) return;
-        if (!msg || msg.direction !== 'desktop_sync' || msg.translatedText || !msg.sourceText) return;
+        if (
+            !msg ||
+            (msg.direction !== 'desktop_sync' && msg.direction !== 'peer_incoming') ||
+            msg.translatedText ||
+            !msg.sourceText
+        ) {
+            return;
+        }
         if (autoTranslatedIds.has(msg.id) || translatingIds.has(msg.id)) return;
         autoTranslatedIds.add(msg.id);
         await translateExistingMessage(msg, { silent: true });
@@ -1326,13 +1344,18 @@
         return primary !== msg.translatedText && !primary.includes(msg.translatedText);
     }
 
+    function isSelfMessage(msg) {
+        return msg?.direction !== 'peer_incoming';
+    }
+
     function bubbleContainerClass(msg) {
+        const self = isSelfMessage(msg);
         if (msg?.status === 'failed') {
-            return msg.direction === 'web_to_vrc'
+            return self
                 ? 'rounded-2xl rounded-br-sm border-destructive/45 bg-destructive/10'
                 : 'rounded-2xl rounded-bl-sm border-destructive/45 bg-destructive/10';
         }
-        if (msg?.direction === 'web_to_vrc') {
+        if (self) {
             return 'rounded-2xl rounded-br-sm border-primary/25 bg-primary/12 dark:bg-primary/15';
         }
         return 'rounded-2xl rounded-bl-sm border-border/80 bg-card';

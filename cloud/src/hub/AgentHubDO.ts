@@ -724,10 +724,12 @@ export class AgentHubDO extends DurableObject<Env> {
                         ? new Date(Date.parse(safePayload.createdAt)).toISOString()
                         : new Date().toISOString();
 
+                const direction =
+                    safePayload.direction === 'peer_incoming' ? 'peer_incoming' : 'desktop_sync';
                 const dto = {
                     id: msgId,
                     deviceId: attachment.deviceId,
-                    direction: 'desktop_sync',
+                    direction,
                     sourceText: text,
                     translatedText: '',
                     sentText: text,
@@ -760,11 +762,12 @@ export class AgentHubDO extends DurableObject<Env> {
                                 .prepare(
                                     `INSERT OR IGNORE INTO cloud_chat_messages
                                      (id, device_id, direction, source_text, translated_text, sent_text, source_lang, target_lang, display_mode, osc_address, osc_port, immediate, play_sfx, status, cmd_id, error_message, created_at)
-                                     VALUES (?, ?, 'desktop_sync', ?, '', ?, 'auto', '', 'source_only', '/chatbox/input', ?, ?, ?, 'synced', '', '', ?)`
+                                     VALUES (?, ?, ?, ?, '', ?, 'auto', '', 'source_only', '/chatbox/input', ?, ?, ?, 'synced', '', '', ?)`
                                 )
                                 .bind(
                                     msgId,
                                     attachment.deviceId,
+                                    direction,
                                     text,
                                     text,
                                     oscPort,
