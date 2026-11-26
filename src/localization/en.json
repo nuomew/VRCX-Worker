@@ -3835,7 +3835,7 @@
         },
         "migration": {
             "tab_label": "Desktop Migration",
-            "section_title": "Original Desktop VRCX Data Migration",
+            "section_title": "Desktop VRCX Migration",
             "title": "Import Legacy Desktop VRCX Data",
             "fetch_desktop_btn": "Fetch from Desktop",
             "scanning_btn": "Requesting...",

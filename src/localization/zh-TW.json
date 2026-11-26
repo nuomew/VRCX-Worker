@@ -3498,7 +3498,7 @@
         },
         "migration": {
             "tab_label": "桌面遷移",
-            "section_title": "原版桌面 VRCX 舊資料遷移",
+            "section_title": "桌面 VRCX 遷移",
             "title": "拉取原版桌面 VRCX 歷史資料",
             "fetch_desktop_btn": "從桌面取得",
             "scanning_btn": "請求中...",

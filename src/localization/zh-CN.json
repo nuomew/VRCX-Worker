@@ -3833,7 +3833,7 @@
         },
         "migration": {
             "tab_label": "桌面迁移",
-            "section_title": "原版桌面 VRCX 老数据迁移",
+            "section_title": "桌面 VRCX 迁移",
             "title": "拉取原版桌面 VRCX 历史数据",
             "fetch_desktop_btn": "从桌面获取",
             "scanning_btn": "请求中...",
