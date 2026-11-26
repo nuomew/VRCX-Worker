@@ -4,6 +4,7 @@ import type { Env } from './env';
 import { AgentHubDO } from './hub/AgentHubDO';
 import { handleAgentPublicRoutes, handleAgentWebRoutes } from './routes/agentRoutes';
 import { handleCoreDataRoutes } from './routes/coreData';
+import { handleDbCleanupRoutes } from './routes/dbCleanup';
 import { handleEventsDataRoutes } from './routes/eventsData';
 import { handleLegacyMigrationAgentRoutes, handleLegacyMigrationWebRoutes } from './routes/legacyMigration';
 import { handleVrcProxyRoutes } from './routes/vrcProxy';
@@ -226,6 +227,9 @@ export default {
 
             const legacyWebResp = await handleLegacyMigrationWebRoutes(request, env, url);
             if (legacyWebResp) return legacyWebResp;
+
+            const cleanupResp = await handleDbCleanupRoutes(request, env, url);
+            if (cleanupResp) return cleanupResp;
 
             return Response.json(
                 { ok: false, error: { code: 'NOT_FOUND', message: 'Route not found' } },

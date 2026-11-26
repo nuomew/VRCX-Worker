@@ -468,6 +468,211 @@
                         </div>
                     </div>
 
+                    <!-- Database Age-Based Cleanup (Direct Delete or Backup to R2 + Delete) -->
+                    <div class="rounded-lg border border-border bg-background/50 p-4 space-y-3">
+                        <div class="flex flex-wrap items-center justify-between gap-2">
+                            <div class="font-medium text-foreground">{{ t('cloud_hub.quota.cleanup_heading') }}</div>
+                            <button
+                                type="button"
+                                class="rounded-md border border-border px-2.5 py-1 text-[11px] hover:bg-accent disabled:opacity-50"
+                                :disabled="loadingCleanupPreview || cleaningDb"
+                                @click="loadCleanupPreview">
+                                {{
+                                    loadingCleanupPreview
+                                        ? t('cloud_hub.quota.cleanup_loading')
+                                        : t('cloud_hub.quota.cleanup_refresh')
+                                }}
+                            </button>
+                        </div>
+
+                        <div class="flex flex-wrap items-center gap-2.5">
+                            <label class="text-[11px] font-medium text-muted-foreground">
+                                {{ t('cloud_hub.quota.cleanup_months_label') }}
+                            </label>
+                            <select
+                                v-model="cleanupMonthsPreset"
+                                :disabled="cleaningDb"
+                                class="rounded-md border border-input bg-background px-2.5 py-1 text-xs text-foreground dark:[color-scheme:dark]">
+                                <option class="bg-card text-foreground" value="1">
+                                    {{ t('cloud_hub.quota.cleanup_months_opt', { months: 1 }) }}
+                                </option>
+                                <option class="bg-card text-foreground" value="3">
+                                    {{ t('cloud_hub.quota.cleanup_months_opt', { months: 3 }) }}
+                                </option>
+                                <option class="bg-card text-foreground" value="6">
+                                    {{ t('cloud_hub.quota.cleanup_months_opt', { months: 6 }) }}
+                                </option>
+                                <option class="bg-card text-foreground" value="12">
+                                    {{ t('cloud_hub.quota.cleanup_months_opt', { months: 12 }) }}
+                                </option>
+                                <option class="bg-card text-foreground" value="24">
+                                    {{ t('cloud_hub.quota.cleanup_months_opt', { months: 24 }) }}
+                                </option>
+                                <option class="bg-card text-foreground" value="custom">
+                                    {{ t('cloud_hub.quota.cleanup_months_custom') }}
+                                </option>
+                            </select>
+                            <div v-if="cleanupMonthsPreset === 'custom'" class="flex items-center gap-1.5">
+                                <input
+                                    v-model.number="cleanupCustomMonths"
+                                    type="number"
+                                    min="1"
+                                    max="120"
+                                    step="1"
+                                    :disabled="cleaningDb"
+                                    class="w-20 rounded-md border border-input bg-background px-2 py-1 font-mono text-xs text-foreground" />
+                                <span class="text-[11px] text-muted-foreground">
+                                    {{ t('cloud_hub.quota.cleanup_months_unit') }}
+                                </span>
+                            </div>
+                            <label
+                                v-if="quotaInfo?.legacyDbDedicated"
+                                class="inline-flex items-center gap-1.5 text-[11px] text-foreground select-none cursor-pointer">
+                                <input
+                                    v-model="cleanupIncludeLegacy"
+                                    type="checkbox"
+                                    class="rounded border-input"
+                                    :disabled="cleaningDb" />
+                                <span>{{ t('cloud_hub.quota.cleanup_include_legacy') }}</span>
+                            </label>
+                        </div>
+
+                        <div
+                            v-if="cleanupPreview"
+                            class="rounded-md border border-border/70 bg-muted/30 px-3 py-2 text-[11px] space-y-1">
+                            <div class="flex flex-wrap items-center justify-between gap-2">
+                                <span class="text-muted-foreground">
+                                    {{
+                                        t('cloud_hub.quota.cleanup_cutoff_label', {
+                                            date: cleanupPreview.cutoffIso.slice(0, 10)
+                                        })
+                                    }}
+                                </span>
+                                <span class="font-mono font-medium text-foreground">
+                                    {{
+                                        cleanupPreview.totalRows > 0
+                                            ? t('cloud_hub.quota.cleanup_preview_count', {
+                                                  rows: cleanupPreview.totalRows.toLocaleString()
+                                              })
+                                            : t('cloud_hub.quota.cleanup_nothing_to_clean')
+                                    }}
+                                </span>
+                            </div>
+                            <div
+                                v-if="cleanupPreview.totalRows > 0"
+                                class="flex flex-wrap gap-x-3 gap-y-0.5 font-mono text-[11px] text-muted-foreground">
+                                <span v-if="cleanupPreview.shards.gamelog > 0">
+                                    DB_GAMELOG: {{ cleanupPreview.shards.gamelog.toLocaleString() }}
+                                </span>
+                                <span v-if="cleanupPreview.shards.feed > 0">
+                                    DB_FEED: {{ cleanupPreview.shards.feed.toLocaleString() }}
+                                </span>
+                                <span v-if="cleanupPreview.shards.core > 0">
+                                    DB_CORE: {{ cleanupPreview.shards.core.toLocaleString() }}
+                                </span>
+                                <span v-if="cleanupPreview.shards.legacy > 0">
+                                    DB_LEGACY: {{ cleanupPreview.shards.legacy.toLocaleString() }}
+                                </span>
+                            </div>
+                        </div>
+
+                        <div class="flex flex-wrap items-center gap-2">
+                            <button
+                                type="button"
+                                class="rounded-md border border-destructive/40 px-3 py-1.5 font-medium text-destructive hover:bg-destructive/10 disabled:opacity-50"
+                                :disabled="cleaningDb || !cleanupPreview || cleanupPreview.totalRows === 0"
+                                @click="requestCleanupConfirm('delete')">
+                                {{ t('cloud_hub.quota.cleanup_direct_btn') }}
+                            </button>
+                            <button
+                                type="button"
+                                class="rounded-md bg-primary px-3 py-1.5 font-medium text-primary-foreground hover:opacity-90 disabled:opacity-50"
+                                :disabled="
+                                    cleaningDb ||
+                                    !quotaInfo?.r2Enabled ||
+                                    !cleanupPreview ||
+                                    cleanupPreview.totalRows === 0
+                                "
+                                @click="requestCleanupConfirm('backup_and_delete')">
+                                {{ t('cloud_hub.quota.cleanup_backup_r2_btn') }}
+                            </button>
+                            <span v-if="quotaInfo && !quotaInfo.r2Enabled" class="text-[11px] text-muted-foreground">
+                                {{ t('cloud_hub.quota.cleanup_r2_unbound') }}
+                            </span>
+                        </div>
+
+                        <div
+                            v-if="pendingCleanupMode"
+                            class="rounded-md border border-destructive/40 bg-destructive/5 p-3 space-y-2">
+                            <div class="text-[11px] font-medium text-foreground">
+                                {{
+                                    pendingCleanupMode === 'backup_and_delete'
+                                        ? t('cloud_hub.quota.cleanup_confirm_backup_desc', {
+                                              months: resolvedCleanupMonths,
+                                              rows: (cleanupPreview?.totalRows ?? 0).toLocaleString()
+                                          })
+                                        : t('cloud_hub.quota.cleanup_confirm_direct_desc', {
+                                              months: resolvedCleanupMonths,
+                                              rows: (cleanupPreview?.totalRows ?? 0).toLocaleString()
+                                          })
+                                }}
+                            </div>
+                            <div class="flex flex-wrap items-center gap-2">
+                                <button
+                                    type="button"
+                                    class="rounded-md px-3 py-1 text-[11px] font-medium text-white disabled:opacity-50"
+                                    :class="
+                                        pendingCleanupMode === 'backup_and_delete'
+                                            ? 'bg-primary text-primary-foreground'
+                                            : 'bg-destructive'
+                                    "
+                                    :disabled="cleaningDb"
+                                    @click="executeCleanup">
+                                    {{
+                                        cleaningDb
+                                            ? t('cloud_hub.quota.cleanup_running')
+                                            : t('cloud_hub.quota.cleanup_confirm_btn')
+                                    }}
+                                </button>
+                                <button
+                                    type="button"
+                                    class="rounded-md border border-border px-3 py-1 text-[11px] hover:bg-accent disabled:opacity-50"
+                                    :disabled="cleaningDb"
+                                    @click="pendingCleanupMode = ''">
+                                    {{ t('cloud_hub.quota.cleanup_cancel_btn') }}
+                                </button>
+                            </div>
+                        </div>
+
+                        <p v-if="cleanupNotice" class="text-[11px] text-primary">{{ cleanupNotice }}</p>
+                        <p v-if="cleanupError" class="text-[11px] text-destructive">{{ cleanupError }}</p>
+
+                        <div v-if="quotaInfo?.r2Enabled && cleanupBackups.length > 0" class="space-y-1.5 pt-1">
+                            <div class="text-[11px] font-medium text-muted-foreground">
+                                {{ t('cloud_hub.quota.cleanup_r2_backups_heading', { count: cleanupBackups.length }) }}
+                            </div>
+                            <div
+                                v-for="item in cleanupBackups"
+                                :key="item.key"
+                                class="flex flex-wrap items-center justify-between gap-2 rounded border border-border px-2.5 py-1.5 text-[11px]">
+                                <div class="min-w-0 truncate">
+                                    <span class="font-mono text-foreground">{{ item.fileName }}</span>
+                                    <span class="ml-2 text-muted-foreground">
+                                        {{ formatBytes(item.bytes) }}
+                                        <template v-if="item.totalRows > 0">
+                                            · {{ item.totalRows.toLocaleString() }}
+                                        </template>
+                                    </span>
+                                </div>
+                                <a
+                                    :href="`/api/admin/cleanup/backups/download?key=${encodeURIComponent(item.key)}`"
+                                    class="shrink-0 rounded border border-border px-2 py-0.5 font-medium text-foreground hover:bg-accent">
+                                    {{ t('cloud_hub.quota.cleanup_download_backup') }}
+                                </a>
+                            </div>
+                        </div>
+                    </div>
+
                     <div class="rounded-lg border border-border bg-background/50 p-4 space-y-2">
                         <div class="flex items-center justify-between">
                             <div>
@@ -655,6 +860,25 @@
     const commandHistory = ref([]);
     const quotaInfo = ref(null);
     const wafProbeResult = ref('');
+    const cleanupMonthsPreset = ref('6');
+    const cleanupCustomMonths = ref(6);
+    const cleanupIncludeLegacy = ref(false);
+    const cleanupPreview = ref(null);
+    const loadingCleanupPreview = ref(false);
+    const pendingCleanupMode = ref('');
+    const cleaningDb = ref(false);
+    const cleanupNotice = ref('');
+    const cleanupError = ref('');
+    const cleanupBackups = ref([]);
+
+    const resolvedCleanupMonths = computed(() => {
+        const raw =
+            cleanupMonthsPreset.value === 'custom'
+                ? Number(cleanupCustomMonths.value)
+                : Number(cleanupMonthsPreset.value);
+        if (!Number.isFinite(raw)) return 6;
+        return Math.min(Math.max(Math.floor(raw), 1), 120);
+    });
 
     watch(
         () => cloudState.syncIntervalSeconds,
@@ -903,6 +1127,103 @@
         quotaInfo.value = await cloudFetch('/api/admin/quota').catch(() => null);
     }
 
+    async function loadCleanupPreview() {
+        loadingCleanupPreview.value = true;
+        cleanupError.value = '';
+        try {
+            const months = resolvedCleanupMonths.value;
+            const inc = cleanupIncludeLegacy.value ? '1' : '0';
+            cleanupPreview.value = await cloudFetch(
+                `/api/admin/cleanup/preview?months=${months}&includeLegacy=${inc}`
+            );
+        } catch (err) {
+            cleanupError.value = err?.message || String(err);
+        } finally {
+            loadingCleanupPreview.value = false;
+        }
+    }
+
+    async function loadCleanupBackups() {
+        try {
+            const data = await cloudFetch('/api/admin/cleanup/backups');
+            cleanupBackups.value = Array.isArray(data?.backups) ? data.backups : [];
+        } catch {
+            cleanupBackups.value = [];
+        }
+    }
+
+    function requestCleanupConfirm(mode) {
+        cleanupNotice.value = '';
+        cleanupError.value = '';
+        pendingCleanupMode.value = mode;
+    }
+
+    async function executeCleanup() {
+        const mode = pendingCleanupMode.value;
+        if (!mode || cleaningDb.value) return;
+        cleaningDb.value = true;
+        cleanupError.value = '';
+        cleanupNotice.value = '';
+        try {
+            const months = resolvedCleanupMonths.value;
+            const includeLegacy = cleanupIncludeLegacy.value;
+            let totalDeleted = 0;
+            let totalBackedUp = 0;
+            let backupCount = 0;
+            let lastFileName = '';
+            let truncated = false;
+
+            for (let round = 0; round < 20; round++) {
+                const res = await cloudFetch('/api/admin/cleanup', {
+                    method: 'POST',
+                    json: { months, mode, includeLegacy }
+                });
+                totalDeleted += Number(res?.deletedRows || 0);
+                totalBackedUp += Number(res?.backedUpRows || 0);
+                if (res?.backupFileName) {
+                    backupCount++;
+                    lastFileName = res.backupFileName;
+                }
+                if (!res?.hasMore) break;
+                if (round === 19) truncated = true;
+            }
+
+            pendingCleanupMode.value = '';
+            if (mode === 'backup_and_delete') {
+                cleanupNotice.value =
+                    backupCount > 1
+                        ? t('cloud_hub.quota.cleanup_done_backup_multi', {
+                              rows: totalDeleted.toLocaleString(),
+                              files: backupCount
+                          })
+                        : t('cloud_hub.quota.cleanup_done_backup', {
+                              rows: totalDeleted.toLocaleString(),
+                              file: lastFileName || `${totalBackedUp}`
+                          });
+                if (truncated) {
+                    cleanupNotice.value += ` ${t('cloud_hub.quota.cleanup_more_remaining')}`;
+                }
+            } else {
+                cleanupNotice.value = t('cloud_hub.quota.cleanup_done_direct', {
+                    rows: totalDeleted.toLocaleString()
+                });
+            }
+
+            await Promise.all([loadQuota(), loadCleanupPreview(), loadCleanupBackups()]);
+        } catch (err) {
+            cleanupError.value = err?.message || String(err);
+        } finally {
+            cleaningDb.value = false;
+        }
+    }
+
+    watch([cleanupMonthsPreset, cleanupCustomMonths, cleanupIncludeLegacy], () => {
+        pendingCleanupMode.value = '';
+        if (cloudState.hubDialogOpen && activeTab.value === 'quota') {
+            loadCleanupPreview();
+        }
+    });
+
     async function runWafProbe() {
         wafProbeResult.value = t('cloud_hub.quota.probing');
         try {
@@ -917,7 +1238,11 @@
         activeTab.value = id;
         if (id === 'devices' || id === 'synced_devices') loadDevices();
         else if (id === 'commands') loadCommands();
-        else if (id === 'quota') loadQuota();
+        else if (id === 'quota') {
+            loadQuota();
+            loadCleanupPreview();
+            loadCleanupBackups();
+        }
     }
 
     function stopPresenceTick() {
@@ -944,6 +1269,9 @@
                 createdDeviceName.value = '';
                 deviceActionError.value = '';
                 copiedField.value = '';
+                pendingCleanupMode.value = '';
+                cleanupError.value = '';
+                cleanupNotice.value = '';
             }
         }
     );

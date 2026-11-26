@@ -2828,5 +2828,11 @@ describe('WEB cloud adapter (stateless)', () => {
         expect(enExportKeys.length).toBeGreaterThanOrEqual(13);
         expect(exportKeys(zhCnJson)).toEqual(enExportKeys);
         expect(exportKeys(zhTwJson)).toEqual(enExportKeys);
+
+        // 5. Trilingual parity for all cloud_hub.quota keys (including age-based DB cleanup & R2 backup)
+        const enQuotaKeys = Object.keys(enJson.default.cloud_hub.quota).sort();
+        expect(enQuotaKeys.length).toBeGreaterThanOrEqual(30);
+        expect(Object.keys(zhCnJson.default.cloud_hub.quota).sort()).toEqual(enQuotaKeys);
+        expect(Object.keys(zhTwJson.default.cloud_hub.quota).sort()).toEqual(enQuotaKeys);
     });
 });

@@ -5,6 +5,7 @@ import { generateTotpCode, hmacSha256Hex, sha256Hex, sign2faTrustCookie, verifyP
 import type { Env } from '../src/env';
 import worker from '../src/index';
 import { incrementCounter } from '../src/routes/coreData';
+import { computeMonthsCutoff } from '../src/routes/dbCleanup';
 import { mergeSetCookies } from '../src/routes/vrcProxy';
 import {
     classifyVrcCacheUrl,
@@ -6634,6 +6635,263 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
                 legacyDb!.prepare("DELETE FROM memos WHERE user_id IN ('usr_export_overlap', 'usr_export_legacy_only')"),
                 legacyDb!.prepare("DELETE FROM legacy_configs WHERE config_key IN ('config:vrcx_fontsize', 'config:vrcx_password')")
             ]);
+        }
+    });
+
+    it('supports age-based database cleanup (direct delete & backup-to-R2-then-delete) while preserving recent rows and permanent assets', async () => {
+        const legacyDb = env.DB_LEGACY!;
+        const createdBackupKeys: string[] = [];
+
+        // 1. Month-cutoff clamping handles end-of-month & leap years cleanly
+        expect(computeMonthsCutoff(1, new Date('2026-03-31T12:00:00.000Z')).cutoffIso).toBe('2026-02-28T12:00:00.000Z');
+        expect(computeMonthsCutoff(1, new Date('2024-03-31T12:00:00.000Z')).cutoffIso).toBe('2024-02-29T12:00:00.000Z');
+
+        const oldIso = new Date(Date.now() - 540 * 86_400_000).toISOString(); // ~18 months ago
+        const recentIso = new Date(Date.now() - 86_400_000).toISOString(); // 1 day ago
+        const oldMs = Date.parse(oldIso);
+        const recentMs = Date.parse(recentIso);
+
+        try {
+            // Seed old & recent rows across DB_GAMELOG, DB_FEED, DB_CORE, DB_LEGACY + a permanent memo dated 18 months ago
+            await env.DB_CORE.batch([
+                env.DB_CORE.prepare('INSERT OR REPLACE INTO memos (user_id, edited_at, memo) VALUES (?, ?, ?)').bind(
+                    'usr_cleanup_keep_memo',
+                    oldIso,
+                    'Permanent memo must survive cleanup'
+                ),
+                env.DB_CORE.prepare(
+                    'INSERT OR REPLACE INTO notifications (id, created_at, type, sender_user_id, sender_username, message) VALUES (?, ?, ?, ?, ?, ?)'
+                ).bind('not_clean_old', oldIso, 'invite', 'usr_c1', 'OldPal', 'Old invite'),
+                env.DB_CORE.prepare(
+                    'INSERT OR REPLACE INTO notifications (id, created_at, type, sender_user_id, sender_username, message) VALUES (?, ?, ?, ?, ?, ?)'
+                ).bind('not_clean_new', recentIso, 'invite', 'usr_c2', 'NewPal', 'Recent invite'),
+                env.DB_CORE.prepare(
+                    'INSERT INTO friend_log_history (created_at, type, user_id, display_name) VALUES (?, ?, ?, ?)'
+                ).bind(oldIso, 'Friend', 'usr_c1', 'OldPal')
+            ]);
+            await env.DB_GAMELOG.batch([
+                env.DB_GAMELOG.prepare(
+                    'INSERT OR IGNORE INTO gamelog_location (created_at, location, world_id, world_name, time, group_name) VALUES (?, ?, ?, ?, ?, ?)'
+                ).bind(oldIso, 'wrld_clean_old:1', 'wrld_clean_old', 'Old Shrine', 1200, ''),
+                env.DB_GAMELOG.prepare(
+                    'INSERT OR IGNORE INTO gamelog_location (created_at, location, world_id, world_name, time, group_name) VALUES (?, ?, ?, ?, ?, ?)'
+                ).bind(recentIso, 'wrld_clean_new:2', 'wrld_clean_new', 'New Cafe', 600, '')
+            ]);
+            await env.DB_FEED.batch([
+                env.DB_FEED.prepare(
+                    'INSERT OR IGNORE INTO feed_gps (created_at, user_id, display_name, location, world_name, previous_location, time, group_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+                ).bind(oldIso, 'usr_c1', 'OldPal', 'wrld_clean_old:1', 'Old Shrine', '', 600, ''),
+                env.DB_FEED.prepare(
+                    'INSERT OR IGNORE INTO feed_gps (created_at, user_id, display_name, location, world_name, previous_location, time, group_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+                ).bind(recentIso, 'usr_c2', 'NewPal', 'wrld_clean_new:2', 'New Cafe', '', 300, ''),
+                env.DB_FEED.prepare(
+                    'INSERT INTO activity_sessions_v2 (user_id, start_at, end_at, is_open_tail, source_revision) VALUES (?, ?, ?, 0, ?)'
+                ).bind('usr_clean_act', oldMs - 3600_000, oldMs, 'rev_old'),
+                env.DB_FEED.prepare(
+                    'INSERT INTO activity_sessions_v2 (user_id, start_at, end_at, is_open_tail, source_revision) VALUES (?, ?, ?, 0, ?)'
+                ).bind('usr_clean_act', recentMs - 3600_000, recentMs, 'rev_new')
+            ]);
+            await legacyDb
+                .prepare(
+                    'INSERT OR IGNORE INTO gamelog_location (created_at, location, world_id, world_name, time, group_name) VALUES (?, ?, ?, ?, ?, ?)'
+                )
+                .bind(oldIso, 'wrld_legacy_clean_old:1', 'wrld_legacy_clean_old', 'Legacy Old World', 900, '')
+                .run();
+
+            // 2. Reject invalid months and preview matched old rows cleanly
+            expect((await exports.default.fetch('http://example.com/api/admin/cleanup/preview?months=0')).status).toBe(400);
+            expect((await exports.default.fetch('http://example.com/api/admin/cleanup/preview?months=999')).status).toBe(
+                400
+            );
+
+            const previewRes = await exports.default.fetch(
+                'http://example.com/api/admin/cleanup/preview?months=6&includeLegacy=1'
+            );
+            expect(previewRes.status).toBe(200);
+            const previewJson = (await previewRes.json()) as {
+                ok: boolean;
+                data: {
+                    r2Enabled: boolean;
+                    totalRows: number;
+                    shards: { core: number; gamelog: number; feed: number; legacy: number };
+                };
+            };
+            expect(previewJson.ok).toBe(true);
+            expect(previewJson.data.r2Enabled).toBe(true);
+            expect(previewJson.data.shards.core).toBeGreaterThanOrEqual(2);
+            expect(previewJson.data.shards.gamelog).toBeGreaterThanOrEqual(1);
+            expect(previewJson.data.shards.feed).toBeGreaterThanOrEqual(2);
+            expect(previewJson.data.shards.legacy).toBeGreaterThanOrEqual(1);
+
+            // 3. When R2_MEDIA is not bound, backup_and_delete MUST fail closed (503) and delete ZERO rows
+            const unboundRes = await worker.fetch(
+                new Request('http://example.com/api/admin/cleanup', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+                    body: JSON.stringify({ months: 6, mode: 'backup_and_delete', includeLegacy: true })
+                }),
+                { ...env, R2_MEDIA: undefined } as unknown as Env
+            );
+            expect(unboundRes.status).toBe(503);
+            const stillPresent = await env.DB_GAMELOG.prepare(
+                "SELECT COUNT(*) AS cnt FROM gamelog_location WHERE world_id = 'wrld_clean_old'"
+            ).first<{ cnt: number }>();
+            expect(stillPresent?.cnt).toBe(1);
+
+            // 4. Backup to R2 & Delete: archives gzipped JSON to R2 first, then deletes old rows only
+            const backupDelRes = await exports.default.fetch('http://example.com/api/admin/cleanup', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+                body: JSON.stringify({ months: 6, mode: 'backup_and_delete', includeLegacy: true })
+            });
+            expect(backupDelRes.status).toBe(200);
+            const backupDelJson = (await backupDelRes.json()) as {
+                ok: boolean;
+                data: {
+                    deletedRows: number;
+                    backedUpRows: number;
+                    backupKey: string;
+                    backupFileName: string;
+                    backupBytes: number;
+                };
+            };
+            expect(backupDelJson.data.deletedRows).toBeGreaterThanOrEqual(6);
+            expect(backupDelJson.data.backedUpRows).toBeGreaterThanOrEqual(6);
+            expect(backupDelJson.data.backupKey.startsWith('backups/db-cleanup/')).toBe(true);
+            expect(backupDelJson.data.backupBytes).toBeGreaterThan(20);
+            createdBackupKeys.push(backupDelJson.data.backupKey);
+
+            // Verify R2 backup listing and secure download + gzip payload integrity
+            const listRes = await exports.default.fetch('http://example.com/api/admin/cleanup/backups');
+            expect(listRes.status).toBe(200);
+            const listJson = (await listRes.json()) as {
+                data: { backups: Array<{ key: string; totalRows: number }> };
+            };
+            expect(listJson.data.backups.some((b) => b.key === backupDelJson.data.backupKey)).toBe(true);
+
+            // Reject traversal / non-backup R2 key downloads
+            expect(
+                (
+                    await exports.default.fetch(
+                        'http://example.com/api/admin/cleanup/backups/download?key=screenshots/other.webp'
+                    )
+                ).status
+            ).toBe(400);
+
+            const dlRes = await exports.default.fetch(
+                `http://example.com/api/admin/cleanup/backups/download?key=${encodeURIComponent(backupDelJson.data.backupKey)}`
+            );
+            expect(dlRes.status).toBe(200);
+            expect(dlRes.headers.get('Content-Type')).toBe('application/gzip');
+            const gunzippedText = await new Response(
+                dlRes.body!.pipeThrough(new DecompressionStream('gzip'))
+            ).text();
+            const parsedBackup = JSON.parse(gunzippedText) as {
+                format: string;
+                active: Record<string, Array<Record<string, unknown>>>;
+                legacy: Record<string, Array<Record<string, unknown>>>;
+            };
+            expect(parsedBackup.format).toBe('vrcx-worker-db-cleanup-backup-v1');
+            expect(parsedBackup.active.gamelog_location?.some((r) => r.world_id === 'wrld_clean_old')).toBe(true);
+            expect(parsedBackup.active.feed_gps?.some((r) => r.user_id === 'usr_c1')).toBe(true);
+            expect(parsedBackup.active.notifications?.some((r) => r.id === 'not_clean_old')).toBe(true);
+            expect(parsedBackup.legacy.gamelog_location?.some((r) => r.world_id === 'wrld_legacy_clean_old')).toBe(true);
+
+            // Confirm old rows deleted while recent rows AND permanent memos are untouched
+            expect(
+                (
+                    await env.DB_GAMELOG.prepare(
+                        "SELECT COUNT(*) AS cnt FROM gamelog_location WHERE world_id = 'wrld_clean_old'"
+                    ).first<{ cnt: number }>()
+                )?.cnt
+            ).toBe(0);
+            expect(
+                (
+                    await env.DB_GAMELOG.prepare(
+                        "SELECT COUNT(*) AS cnt FROM gamelog_location WHERE world_id = 'wrld_clean_new'"
+                    ).first<{ cnt: number }>()
+                )?.cnt
+            ).toBe(1);
+            expect(
+                (
+                    await env.DB_CORE.prepare(
+                        "SELECT memo FROM memos WHERE user_id = 'usr_cleanup_keep_memo'"
+                    ).first<{ memo: string }>()
+                )?.memo
+            ).toBe('Permanent memo must survive cleanup');
+            expect(
+                (
+                    await env.DB_CORE.prepare("SELECT COUNT(*) AS cnt FROM notifications WHERE id = 'not_clean_new'").first<{
+                        cnt: number;
+                    }>()
+                )?.cnt
+            ).toBe(1);
+            expect(
+                (
+                    await legacyDb
+                        .prepare("SELECT COUNT(*) AS cnt FROM gamelog_location WHERE world_id = 'wrld_legacy_clean_old'")
+                        .first<{ cnt: number }>()
+                )?.cnt
+            ).toBe(0);
+
+            // 5. Direct Delete mode: deletes old active rows without writing to R2 and leaves DB_LEGACY untouched when includeLegacy=false
+            await env.DB_GAMELOG.prepare(
+                'INSERT OR IGNORE INTO gamelog_location (created_at, location, world_id, world_name, time, group_name) VALUES (?, ?, ?, ?, ?, ?)'
+            )
+                .bind(oldIso, 'wrld_direct_old:1', 'wrld_direct_old', 'Direct Old World', 300, '')
+                .run();
+            await legacyDb
+                .prepare(
+                    'INSERT OR IGNORE INTO gamelog_location (created_at, location, world_id, world_name, time, group_name) VALUES (?, ?, ?, ?, ?, ?)'
+                )
+                .bind(oldIso, 'wrld_legacy_keep:1', 'wrld_legacy_keep', 'Legacy Untouched', 300, '')
+                .run();
+
+            const directRes = await exports.default.fetch('http://example.com/api/admin/cleanup', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+                body: JSON.stringify({ months: 6, mode: 'delete', includeLegacy: false })
+            });
+            expect(directRes.status).toBe(200);
+            const directJson = (await directRes.json()) as {
+                data: { deletedRows: number; backedUpRows: number; backupKey: string };
+            };
+            expect(directJson.data.deletedRows).toBeGreaterThanOrEqual(1);
+            expect(directJson.data.backedUpRows).toBe(0);
+            expect(directJson.data.backupKey).toBe('');
+            expect(
+                (
+                    await env.DB_GAMELOG.prepare(
+                        "SELECT COUNT(*) AS cnt FROM gamelog_location WHERE world_id = 'wrld_direct_old'"
+                    ).first<{ cnt: number }>()
+                )?.cnt
+            ).toBe(0);
+            expect(
+                (
+                    await legacyDb
+                        .prepare("SELECT COUNT(*) AS cnt FROM gamelog_location WHERE world_id = 'wrld_legacy_keep'")
+                        .first<{ cnt: number }>()
+                )?.cnt
+            ).toBe(1);
+        } finally {
+            for (const key of createdBackupKeys) {
+                await env.R2_MEDIA?.delete(key).catch(() => {});
+            }
+            await env.DB_CORE.batch([
+                env.DB_CORE.prepare("DELETE FROM memos WHERE user_id = 'usr_cleanup_keep_memo'"),
+                env.DB_CORE.prepare("DELETE FROM notifications WHERE id IN ('not_clean_old', 'not_clean_new')"),
+                env.DB_CORE.prepare("DELETE FROM friend_log_history WHERE user_id = 'usr_c1'")
+            ]);
+            await env.DB_GAMELOG.prepare(
+                "DELETE FROM gamelog_location WHERE world_id IN ('wrld_clean_old', 'wrld_clean_new', 'wrld_direct_old')"
+            ).run();
+            await env.DB_FEED.batch([
+                env.DB_FEED.prepare("DELETE FROM feed_gps WHERE user_id IN ('usr_c1', 'usr_c2')"),
+                env.DB_FEED.prepare("DELETE FROM activity_sessions_v2 WHERE user_id = 'usr_clean_act'")
+            ]);
+            await legacyDb
+                .prepare("DELETE FROM gamelog_location WHERE world_id IN ('wrld_legacy_clean_old', 'wrld_legacy_keep')")
+                .run();
         }
     });
 });
