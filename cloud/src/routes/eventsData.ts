@@ -1524,7 +1524,7 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
         }
 
         if (kind === 'user' && userId) {
-            const [[agg, lastSeen, recent], coreBatch] = await Promise.all([
+            const [[agg, lastSeen, recent], coreBatch, latestPresenceRow] = await Promise.all([
                 env.DB_GAMELOG.batch([
                     env.DB_GAMELOG.prepare(
                         "SELECT COUNT(DISTINCT CASE WHEN location != '' THEN location END) AS joinCount, COALESCE(SUM(time), 0) AS totalTime FROM gamelog_join_leave WHERE user_id = ?"
@@ -1544,7 +1544,13 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
                         userId
                     ),
                     env.DB_CORE.prepare('SELECT display_name FROM entity_users WHERE user_id = ? LIMIT 1').bind(userId)
-                ]).catch(() => null)
+                ]).catch(() => null),
+                env.DB_FEED.prepare(
+                    "SELECT created_at, type FROM feed_online_offline WHERE user_id = ? AND (type = 'Online' OR type = 'Offline') ORDER BY id DESC LIMIT 1"
+                )
+                    .bind(userId)
+                    .first<{ created_at?: string; type?: string }>()
+                    .catch(() => null)
             ]);
             const aggRow = (agg?.results?.[0] ?? {}) as { joinCount?: number; totalTime?: number };
             const seenRows = (lastSeen?.results ?? []) as Array<{
@@ -1720,6 +1726,8 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
                     lastSeen: lastRow.created_at ?? '',
                     secondLastSeen,
                     lastDisplayName: lastRow.display_name ?? '',
+                    lastPresenceType: latestPresenceRow?.type ?? '',
+                    lastPresenceAt: latestPresenceRow?.created_at ?? '',
                     previousDisplayNames: Array.from(prevNamesMap.entries()),
                     instances: formattedInstances,
                     recentEvents: formattedInstances

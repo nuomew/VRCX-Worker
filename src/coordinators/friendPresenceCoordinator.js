@@ -1,6 +1,10 @@
 import { getGroupName, getWorldName, isRealInstance } from '../shared/utils';
 import { AppDebug } from '../services/appConfig';
 import { database } from '../services/database';
+import {
+    clearCloudFriendPresenceTime,
+    getCloudFriendPresenceTime
+} from '../ipc-web/bootstrapCache.js';
 import { isCloudFeedWriteSuppressed } from '../services/database/cloud/index.js';
 import { useFeedStore } from '../stores/feed';
 import { useFriendStore } from '../stores/friend';
@@ -51,7 +55,11 @@ export async function runUpdateFriendDelayedCheckFlow(
     const suppressCloudFeed = typeof WEB !== 'undefined' && WEB && isCloudFeedWriteSuppressed();
     const ref = ctx.ref;
     if (ctx.state !== newState && typeof ctx.ref !== 'undefined') {
+        const isWebMode = typeof WEB !== 'undefined' && WEB;
         if ((newState === 'offline' || newState === 'active') && ctx.state === 'online') {
+            if (isWebMode) {
+                clearCloudFriendPresenceTime(id);
+            }
             ctx.ref.$online_for = '';
             ctx.ref.$offline_for = now();
             ctx.ref.$active_for = '';
@@ -81,10 +89,16 @@ export async function runUpdateFriendDelayedCheckFlow(
                 }
             }
         } else if (newState === 'online' && (ctx.state === 'offline' || ctx.state === 'active')) {
+            const cloudPresence = isWebMode ? getCloudFriendPresenceTime(id) : null;
+            // Preserve server-tracked online/location start times during initial Web hydration or RSS sync
+            // instead of resetting them to browser tab open time (`now()`).
+            const useCloudPresence = Boolean(cloudPresence && (!watchState.isFriendsLoaded || suppressCloudFeed));
             ctx.ref.$previousLocation = '';
             ctx.ref.$travelingToTime = now();
-            ctx.ref.$location_at = now();
-            ctx.ref.$online_for = now();
+            ctx.ref.$location_at =
+                useCloudPresence && cloudPresence.locationAt > 0 ? cloudPresence.locationAt : now();
+            ctx.ref.$online_for =
+                useCloudPresence && cloudPresence.onlineAt > 0 ? cloudPresence.onlineAt : now();
             ctx.ref.$offline_for = '';
             ctx.ref.$active_for = '';
             if (!suppressCloudFeed) {

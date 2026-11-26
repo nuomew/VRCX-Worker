@@ -56,10 +56,17 @@ export interface FriendSnapshotEntry {
     d: string;
     /** Epoch ms when friend entered current location/session */
     la: number;
+    /** Epoch ms when friend came online in-game (preserved across world hops until offline) */
+    oa?: number;
     /** Whether friend is in-game online (location != '' && location != 'offline') */
     o: boolean;
     /** Consecutive truncated-page polls where this friend was unseen (cleared immediately when seen again) */
     m?: number;
+}
+
+export interface FriendPresenceTime {
+    onlineAt?: number;
+    locationAt?: number;
 }
 
 export type FriendSnapshotMap = Record<string, FriendSnapshotEntry>;
@@ -207,6 +214,13 @@ export function diffFriendSnapshot(
         const effectiveGroupName = isTraveling ? (prev?.g ?? '') : '';
 
         let nextLocationAt = prev?.la && prev.la > 0 ? prev.la : nowMs;
+        let nextOnlineAt = isGameOnline
+            ? prev?.oa && prev.oa > 0
+                ? prev.oa
+                : prev?.o && prev.la > 0
+                  ? prev.la
+                  : nowMs
+            : 0;
 
         if (!isBaseline) {
             const wasGameOnline = Boolean(prev?.o);
@@ -214,6 +228,7 @@ export function diffFriendSnapshot(
             // 1. Online / Offline transitions
             if (isGameOnline && !wasGameOnline) {
                 nextLocationAt = nowMs;
+                nextOnlineAt = nowMs;
                 feedItems.push({
                     created_at: nowIso,
                     type: 'Online',
@@ -237,6 +252,7 @@ export function diffFriendSnapshot(
                     time: elapsedMs
                 });
                 nextLocationAt = nowMs;
+                nextOnlineAt = 0;
             } else if (isGameOnline && wasGameOnline && prev && !isTraveling) {
                 // 2. GPS (world/instance change, including first arrival after coming online while traveling)
                 const prevLoc = prev.l;
@@ -287,6 +303,7 @@ export function diffFriendSnapshot(
             s: status,
             d: statusDescription,
             la: nextLocationAt,
+            ...(isGameOnline && nextOnlineAt > 0 ? { oa: nextOnlineAt } : {}),
             o: isGameOnline
         };
     }
@@ -322,6 +339,117 @@ export function diffFriendSnapshot(
     }
 
     return { nextSnapshot, feedItems, isBaseline };
+}
+
+/**
+ * Backfills missing `oa` (initial online timestamp) on pre-upgrade `friends_snapshot` entries
+ * from `DB_FEED.feed_online_offline` so already-online friends immediately show their true session
+ * start time without waiting for their next logout/login cycle. Performs 0 D1 reads once `oa` is populated.
+ */
+async function hydrateMissingOnlineAtFromFeed(env: Env, snapshot: FriendSnapshotMap | null): Promise<void> {
+    if (!snapshot) return;
+    const missingIds: string[] = [];
+    for (const [uid, entry] of Object.entries(snapshot)) {
+        if (entry && entry.o && !(typeof entry.oa === 'number' && entry.oa > 0)) {
+            missingIds.push(uid);
+        }
+    }
+    if (missingIds.length === 0) return;
+
+    const latestByUser = new Map<string, { type: string; ts: number }>();
+    const boundedIds = missingIds.slice(0, 500);
+    const stmts: D1PreparedStatement[] = [];
+    for (let i = 0; i < boundedIds.length; i += 80) {
+        const chunk = boundedIds.slice(i, i + 80);
+        const ph = chunk.map(() => '?').join(', ');
+        stmts.push(
+            env.DB_FEED.prepare(
+                `SELECT user_id, type, created_at
+                 FROM feed_online_offline
+                 WHERE user_id IN (${ph}) AND (type = 'Online' OR type = 'Offline')
+                 ORDER BY id DESC
+                 LIMIT ?`
+            ).bind(...chunk, chunk.length * 4)
+        );
+    }
+    try {
+        const batchRes = await env.DB_FEED.batch(stmts);
+        for (const res of batchRes) {
+            for (const row of (res?.results ?? []) as Array<{
+                user_id?: string;
+                type?: string;
+                created_at?: string;
+            }>) {
+                const uid = typeof row.user_id === 'string' ? row.user_id : '';
+                if (!uid || latestByUser.has(uid)) continue;
+                const ts = row.created_at ? Date.parse(row.created_at) : NaN;
+                if (Number.isFinite(ts) && ts > 0) {
+                    latestByUser.set(uid, { type: String(row.type ?? ''), ts });
+                }
+            }
+        }
+    } catch {
+        // Non-fatal fallback: caller will fall back to entry.la
+    }
+
+    for (const uid of missingIds) {
+        const entry = snapshot[uid];
+        if (!entry || !entry.o) continue;
+        const latest = latestByUser.get(uid);
+        if (latest && latest.type === 'Online' && latest.ts > 0) {
+            entry.oa = latest.ts;
+        } else if (typeof entry.la === 'number' && entry.la > 0) {
+            entry.oa = entry.la;
+        }
+    }
+}
+
+function attachPresenceTimesToOnlineFriends(
+    records: Array<Record<string, unknown>>,
+    snapshot: FriendSnapshotMap | null
+): Array<Record<string, unknown>> {
+    if (!snapshot || records.length === 0) return records;
+    return records.map((item) => {
+        const id = typeof item.id === 'string' ? item.id.trim() : '';
+        const snap = id ? snapshot[id] : undefined;
+        if (!snap || !snap.o) return item;
+        const existingOnline = typeof item.$online_for === 'number' && item.$online_for > 0 ? item.$online_for : 0;
+        const existingLoc = typeof item.$location_at === 'number' && item.$location_at > 0 ? item.$location_at : 0;
+        const onlineAt = existingOnline || (typeof snap.oa === 'number' && snap.oa > 0 ? snap.oa : snap.la > 0 ? snap.la : 0);
+        const locationAt = existingLoc || (typeof snap.la === 'number' && snap.la > 0 ? snap.la : 0);
+        if (!onlineAt && !locationAt) return item;
+        return {
+            ...item,
+            ...(onlineAt > 0 ? { $online_for: onlineAt } : {}),
+            ...(locationAt > 0 ? { $location_at: locationAt } : {})
+        };
+    });
+}
+
+/**
+ * Builds the compact per-friend online/location timestamp map delivered inside GET /api/bootstrap
+ * so stateless Web clients restore true server-tracked friend session durations instead of `Date.now()`.
+ */
+export async function buildBootstrapFriendPresenceTimes(
+    env: Env,
+    rawSnapshotJson: string | null | undefined
+): Promise<Record<string, FriendPresenceTime>> {
+    const parsed = safeJsonParse<FriendSnapshotMap | null>(rawSnapshotJson, null);
+    if (!parsed || typeof parsed !== 'object') return {};
+    await hydrateMissingOnlineAtFromFeed(env, parsed);
+    const out: Record<string, FriendPresenceTime> = {};
+    for (const [uid, entry] of Object.entries(parsed)) {
+        if (!uid || !entry || !entry.o) continue;
+        const onlineAt = typeof entry.oa === 'number' && entry.oa > 0 ? entry.oa : entry.la > 0 ? entry.la : 0;
+        const locationAt = typeof entry.la === 'number' && entry.la > 0 ? entry.la : 0;
+        if (onlineAt > 0 || locationAt > 0) {
+            out[uid] = {
+                ...(onlineAt > 0 ? { onlineAt } : {}),
+                ...(locationAt > 0 ? { locationAt } : {})
+            };
+        }
+    }
+    return out;
 }
 
 async function readPollerState(env: Env): Promise<{
@@ -1510,6 +1638,10 @@ export async function runBackgroundFeedSync(
         if (worldRes.cookieChanged) cookieDirty = true;
         if (worldRes.cacheWrites.length > 0) allCacheWrites.push(...worldRes.cacheWrites);
 
+        // Hydrate `oa` on any pre-upgrade snapshot entries from DB_FEED before diffing so existing online
+        // sessions keep their real start time across the upgrade boundary.
+        await hydrateMissingOnlineAtFromFeed(env, snapshot);
+
         const { nextSnapshot, feedItems, isBaseline } = diffFriendSnapshot(
             snapshot,
             onlineFriends,
@@ -1822,7 +1954,7 @@ export async function runBackgroundFeedSync(
                 bioChecked: bioRes.bioChecked,
                 friendLogInserted: friendLogPrep.inserted,
                 onlineFriendsTruncated: onlineListTruncated,
-                onlineFriends: rawOnlineFriendRecords
+                onlineFriends: attachPresenceTimesToOnlineFriends(rawOnlineFriendRecords, nextSnapshot)
             };
             const rssSnapshotStmt = buildWriteRssSnapshotStatement(env, rssSnapshotPayload);
             const cacheDb = getCacheDb(env);
@@ -1904,6 +2036,7 @@ export async function getRssAggregatedFeed(
     let hasVrcSession = false;
     let syncResult: BackgroundFeedSyncResult | undefined;
     let snapshot: RssSnapshotPayload | null = null;
+    let presenceSnapshot: FriendSnapshotMap | null = null;
 
     if (options.forceSync) {
         // Run sync directly so poller state is read strictly AFTER acquiring poller_lock (prevents TOCTOU duplicates).
@@ -1922,12 +2055,14 @@ export async function getRssAggregatedFeed(
             const fallbackState = await readPollerState(env);
             webSyncIntervalSeconds = fallbackState.webSyncIntervalSeconds;
             hasVrcSession = Boolean(fallbackState.jar.auth?.trim());
+            presenceSnapshot = fallbackState.snapshot;
         }
         snapshot = rssSnapshot ?? (await readRssSnapshot(env));
     } else {
         const pollerState = await readPollerState(env);
         webSyncIntervalSeconds = pollerState.webSyncIntervalSeconds;
         hasVrcSession = Boolean(pollerState.jar.auth?.trim());
+        presenceSnapshot = pollerState.snapshot;
         snapshot = await readRssSnapshot(env);
         if (!snapshot && hasVrcSession) {
             const res = await runBackgroundFeedSync(env, { force: true, trigger: 'manual' });
@@ -2100,6 +2235,19 @@ export async function getRssAggregatedFeed(
         };
     });
 
+    // Enrich pre-upgrade cached RSS records that lack $online_for/$location_at using the persisted friends_snapshot.
+    let onlineFriendsOut = snapshot.onlineFriends;
+    if (
+        presenceSnapshot &&
+        onlineFriendsOut.some((f) => {
+            const loc = typeof f.location === 'string' ? f.location.trim() : '';
+            return Boolean(loc && loc !== 'offline' && !(typeof f.$online_for === 'number' && f.$online_for > 0));
+        })
+    ) {
+        await hydrateMissingOnlineAtFromFeed(env, presenceSnapshot);
+        onlineFriendsOut = attachPresenceTimesToOnlineFriends(onlineFriendsOut, presenceSnapshot);
+    }
+
     return {
         changed: true,
         syncedAt: snapshot.syncedAt,
@@ -2111,7 +2259,7 @@ export async function getRssAggregatedFeed(
         bioChecked: snapshot.bioChecked,
         friendLogInserted: Number(snapshot.friendLogInserted ?? 0),
         onlineFriendsTruncated: Boolean(snapshot.onlineFriendsTruncated),
-        onlineFriends: snapshot.onlineFriends,
+        onlineFriends: onlineFriendsOut,
         recentFeeds: filteredFeeds,
         notificationsV1,
         notificationsV2,

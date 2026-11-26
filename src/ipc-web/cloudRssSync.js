@@ -1,5 +1,9 @@
 import { cloudFetch, onCloudUnauthorized } from './apiClient.js';
-import { bootstrapCache } from './bootstrapCache.js';
+import {
+    bootstrapCache,
+    clearCloudFriendPresenceTime,
+    setCloudFriendPresenceTime
+} from './bootstrapCache.js';
 import { clampWebSyncIntervalSeconds, cloudState } from './cloudState.js';
 import { removeFriendSearchIndex } from '../coordinators/searchIndexCoordinator.js';
 import { applyUser } from '../coordinators/userCoordinator.js';
@@ -88,6 +92,15 @@ export function applyCloudRssSnapshot(data, storeOverrides = null) {
                         : raw.platform && raw.platform !== 'offline'
                           ? 'online'
                           : 'offline';
+                if (state === 'online') {
+                    const onlineAt = Number(raw.$online_for);
+                    const locationAt = Number(raw.$location_at);
+                    if ((Number.isFinite(onlineAt) && onlineAt > 0) || (Number.isFinite(locationAt) && locationAt > 0)) {
+                        setCloudFriendPresenceTime(raw.id, { onlineAt, locationAt });
+                    }
+                } else {
+                    clearCloudFriendPresenceTime(raw.id);
+                }
                 applyUserFn(
                     /** @type {any} */ ({
                         ...raw,
@@ -103,6 +116,7 @@ export function applyCloudRssSnapshot(data, storeOverrides = null) {
                 for (const [friendId, ctx] of friendStore.friends.entries()) {
                     if (friendId === userStore.currentUser?.id) continue;
                     if (!onlineIdSet.has(friendId) && ctx.state !== 'offline') {
+                        clearCloudFriendPresenceTime(friendId);
                         applyUserFn(
                             /** @type {any} */ ({
                                 id: friendId,

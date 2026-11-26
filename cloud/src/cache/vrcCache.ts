@@ -59,7 +59,9 @@ const RSS_FRIEND_CORE_KEYS = [
     'note',
     'last_login',
     'last_activity',
-    'date_joined'
+    'date_joined',
+    '$online_for',
+    '$location_at'
 ] as const;
 
 const RSS_FRIEND_MINIMAL_KEYS = [
@@ -72,7 +74,9 @@ const RSS_FRIEND_MINIMAL_KEYS = [
     'platform',
     'currentAvatarThumbnailImageUrl',
     'userIcon',
-    'profilePicOverride'
+    'profilePicOverride',
+    '$online_for',
+    '$location_at'
 ] as const;
 
 export function compactRssOnlineFriendRecord(raw: Record<string, unknown>, includeSecondary = true): Record<string, unknown> {

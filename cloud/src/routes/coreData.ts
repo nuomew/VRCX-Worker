@@ -1,7 +1,7 @@
 import { getLegacyDb } from '../db/schemaBootstrap';
 import type { Env } from '../env';
 import { loadExternalStorageConfig } from '../storage/objectStorage';
-import { markWebClientActive } from '../sync/backgroundFeedSync';
+import { buildBootstrapFriendPresenceTimes, markWebClientActive } from '../sync/backgroundFeedSync';
 import { getLegacyImportedStats, isSafeLegacyConfigKey } from './legacyMigration';
 
 function mergePrimaryAndLegacy<T>(primary: T[], legacy: T[], keyFn: (row: T) => string): T[] {
@@ -387,7 +387,10 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
                 env.DB_CORE.prepare('SELECT user_id, bio, bio_links, updated_at FROM user_profile'),
                 env.DB_CORE.prepare('SELECT counter_key, row_count FROM stats_counters'),
                 env.DB_CORE.prepare('SELECT device_id, device_name, last_seen_at FROM cloud_devices'),
-                env.DB_CORE.prepare('SELECT device_id, state_json, updated_at FROM cloud_device_states')
+                env.DB_CORE.prepare('SELECT device_id, state_json, updated_at FROM cloud_device_states'),
+                env.DB_CORE.prepare(
+                    "SELECT payload_json FROM cloud_bg_sync_state WHERE state_key = 'friends_snapshot' LIMIT 1"
+                )
             ]),
             hub
                 .fetch(new Request('https://agent-hub.internal/status'))
@@ -583,7 +586,11 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
             }
         }
 
-        const extStorageCfg = await loadExternalStorageConfig(env);
+        const snapshotRow = (batchRes[15]?.results?.[0] ?? null) as { payload_json?: string } | null;
+        const [extStorageCfg, friendPresenceTimes] = await Promise.all([
+            loadExternalStorageConfig(env),
+            buildBootstrapFriendPresenceTimes(env, snapshotRow?.payload_json)
+        ]);
         const b2Enabled = Boolean(
             extStorageCfg.enabled &&
                 extStorageCfg.endpoint &&
@@ -612,6 +619,7 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
                 moderations,
                 userProfiles,
                 statsCounters: counters,
+                friendPresenceTimes,
                 agentStatus: {
                     ...rawHub,
                     agentsOnline: mergedAgentsOnline,

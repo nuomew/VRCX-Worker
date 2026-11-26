@@ -8069,4 +8069,166 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
             ]).catch(() => {});
         }
     });
+
+    it('tracks true friend online start time (oa) across world hops, backfills pre-upgrade snapshots from DB_FEED, and exposes presence times in bootstrap/RSS/user stats', async () => {
+        // 1. diffFriendSnapshot records oa on initial Online and preserves oa across subsequent world/instance GPS changes
+        const tOnline = '2026-11-26T08:00:00.000Z';
+        const tWorldHop = '2026-11-26T08:45:00.000Z';
+        const tOffline = '2026-11-26T09:15:00.000Z';
+        const onlineMs = Date.parse(tOnline);
+        const hopMs = Date.parse(tWorldHop);
+
+        const stepBaseline = diffFriendSnapshot(null, [], '2026-11-26T07:55:00.000Z');
+        const stepOnline = diffFriendSnapshot(
+            stepBaseline.nextSnapshot,
+            [
+                {
+                    id: 'usr_pres_1',
+                    displayName: 'ArcFriend',
+                    location: 'wrld_11111111-1111-1111-1111-111111111111:100',
+                    status: 'active',
+                    platform: 'standalonewindows'
+                }
+            ],
+            tOnline
+        );
+        expect(stepOnline.nextSnapshot.usr_pres_1?.oa).toBe(onlineMs);
+        expect(stepOnline.nextSnapshot.usr_pres_1?.la).toBe(onlineMs);
+
+        const stepHop = diffFriendSnapshot(
+            stepOnline.nextSnapshot,
+            [
+                {
+                    id: 'usr_pres_1',
+                    displayName: 'ArcFriend',
+                    location: 'wrld_22222222-2222-2222-2222-222222222222:200',
+                    status: 'active',
+                    platform: 'standalonewindows'
+                }
+            ],
+            tWorldHop
+        );
+        expect(stepHop.nextSnapshot.usr_pres_1?.oa).toBe(onlineMs);
+        expect(stepHop.nextSnapshot.usr_pres_1?.la).toBe(hopMs);
+
+        const stepOffline = diffFriendSnapshot(stepHop.nextSnapshot, [], tOffline);
+        expect(stepOffline.nextSnapshot.usr_pres_1).toBeUndefined();
+
+        // 2. Pre-upgrade friends_snapshot (missing oa) automatically backfills true oa from DB_FEED.feed_online_offline in /api/bootstrap & /api/rss/feed
+        const legacyOnlineIso = '2026-11-26T07:10:00.000Z';
+        const legacyOnlineMs = Date.parse(legacyOnlineIso);
+        const legacyHopMs = Date.parse('2026-11-26T08:20:00.000Z');
+        await env.DB_FEED.prepare(
+            `INSERT INTO feed_online_offline (created_at, user_id, display_name, type, location, world_name, time, group_name)
+             VALUES (?, 'usr_pres_legacy', 'LegacyOnlineFriend', 'Online', 'wrld_11111111-1111-1111-1111-111111111111:10', 'Start World', 0, '')`
+        )
+            .bind(legacyOnlineIso)
+            .run();
+        await env.DB_FEED.prepare(
+            `INSERT INTO feed_online_offline (created_at, user_id, display_name, type, location, world_name, time, group_name)
+             VALUES ('2026-11-26T06:00:00.000Z', 'usr_pres_offline', 'OfflineFriend', 'Offline', 'wrld_11111111-1111-1111-1111-111111111111:10', 'Old World', 600000, '')`
+        ).run();
+
+        const preUpgradeSnapshot = {
+            usr_pres_legacy: {
+                n: 'LegacyOnlineFriend',
+                l: 'wrld_22222222-2222-2222-2222-222222222222:20',
+                w: 'Second World',
+                g: '',
+                s: 'active',
+                d: '',
+                la: legacyHopMs,
+                o: true
+            },
+            usr_pres_1: {
+                n: 'ArcFriend',
+                l: 'wrld_22222222-2222-2222-2222-222222222222:200',
+                w: 'Second World',
+                g: '',
+                s: 'active',
+                d: '',
+                la: hopMs,
+                oa: onlineMs,
+                o: true
+            }
+        };
+        await env.DB_CORE.prepare(
+            `INSERT OR REPLACE INTO cloud_bg_sync_state (state_key, payload_json, updated_at)
+             VALUES ('friends_snapshot', ?, '2026-11-26T08:50:00.000Z')`
+        )
+            .bind(JSON.stringify(preUpgradeSnapshot))
+            .run();
+
+        const bootRes = await exports.default.fetch('http://example.com/api/bootstrap');
+        expect(bootRes.status).toBe(200);
+        const bootJson = (await bootRes.json()) as {
+            data: { friendPresenceTimes?: Record<string, { onlineAt?: number; locationAt?: number }> };
+        };
+        expect(bootJson.data.friendPresenceTimes?.usr_pres_legacy).toEqual({
+            onlineAt: legacyOnlineMs,
+            locationAt: legacyHopMs
+        });
+        expect(bootJson.data.friendPresenceTimes?.usr_pres_1).toEqual({
+            onlineAt: onlineMs,
+            locationAt: hopMs
+        });
+
+        // 3. Cached RSS snapshot without $online_for gets enriched with persisted snapshot timestamps on /api/rss/feed
+        const cacheDb = env.DB_CACHE ?? env.DB_CORE;
+        await cacheDb
+            .prepare(
+                `INSERT OR REPLACE INTO cloud_rss_snapshot (snapshot_key, synced_at, payload_json)
+                 VALUES ('primary', '2026-11-26T08:50:00.000Z', ?)`
+            )
+            .bind(
+                JSON.stringify({
+                    syncedAt: '2026-11-26T08:50:00.000Z',
+                    onlineCount: 2,
+                    feedInserted: 0,
+                    notificationsInserted: 0,
+                    bioChecked: 0,
+                    friendLogInserted: 0,
+                    onlineFriendsTruncated: false,
+                    onlineFriends: [
+                        {
+                            id: 'usr_pres_legacy',
+                            displayName: 'LegacyOnlineFriend',
+                            location: 'wrld_22222222-2222-2222-2222-222222222222:20',
+                            platform: 'standalonewindows'
+                        }
+                    ]
+                })
+            )
+            .run();
+
+        const rssRes = await exports.default.fetch('http://example.com/api/rss/feed');
+        expect(rssRes.status).toBe(200);
+        const rssJson = (await rssRes.json()) as {
+            data: { onlineFriends: Array<{ id: string; $online_for?: number; $location_at?: number }> };
+        };
+        const legacyRssFriend = rssJson.data.onlineFriends.find((f) => f.id === 'usr_pres_legacy');
+        expect(legacyRssFriend?.$online_for).toBe(legacyOnlineMs);
+        expect(legacyRssFriend?.$location_at).toBe(legacyHopMs);
+
+        // 4. /api/gamelog/stats?kind=user returns latest Online/Offline presence fallback event
+        const statsOnlineRes = await exports.default.fetch(
+            'http://example.com/api/gamelog/stats?kind=user&userId=usr_pres_legacy'
+        );
+        expect(statsOnlineRes.status).toBe(200);
+        const statsOnlineJson = (await statsOnlineRes.json()) as {
+            data: { lastPresenceType?: string; lastPresenceAt?: string };
+        };
+        expect(statsOnlineJson.data.lastPresenceType).toBe('Online');
+        expect(statsOnlineJson.data.lastPresenceAt).toBe(legacyOnlineIso);
+
+        const statsOfflineRes = await exports.default.fetch(
+            'http://example.com/api/gamelog/stats?kind=user&userId=usr_pres_offline'
+        );
+        expect(statsOfflineRes.status).toBe(200);
+        const statsOfflineJson = (await statsOfflineRes.json()) as {
+            data: { lastPresenceType?: string; lastPresenceAt?: string };
+        };
+        expect(statsOfflineJson.data.lastPresenceType).toBe('Offline');
+        expect(statsOfflineJson.data.lastPresenceAt).toBe('2026-11-26T06:00:00.000Z');
+    });
 });

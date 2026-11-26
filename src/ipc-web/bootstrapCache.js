@@ -43,9 +43,50 @@ export const bootstrapCache = {
     moderations: new Map(),
     /** @type {Map<string, { userId: string; bio: string; bioLinks: any[]; updatedAt: string }>} */
     userProfiles: new Map(),
+    /** @type {Map<string, { onlineAt: number; locationAt: number }>} */
+    friendPresenceTimes: new Map(),
     /** @type {Record<string, number>} */
     statsCounters: {}
 };
+
+/**
+ * Returns server-tracked online/location start timestamps (epoch ms) for a friend, if present.
+ *
+ * @param {string} userId
+ * @returns {{ onlineAt: number; locationAt: number } | null}
+ */
+export function getCloudFriendPresenceTime(userId) {
+    if (!userId) return null;
+    return bootstrapCache.friendPresenceTimes.get(userId) || null;
+}
+
+/**
+ * Updates cached server-tracked presence start timestamps for an online friend.
+ *
+ * @param {string} userId
+ * @param {{ onlineAt?: unknown; locationAt?: unknown }} times
+ */
+export function setCloudFriendPresenceTime(userId, times) {
+    if (!userId || !times || typeof times !== 'object') return;
+    const prev = bootstrapCache.friendPresenceTimes.get(userId);
+    const rawOnline = Number(times.onlineAt);
+    const rawLocation = Number(times.locationAt);
+    const onlineAt = Number.isFinite(rawOnline) && rawOnline > 0 ? rawOnline : prev?.onlineAt || 0;
+    const locationAt = Number.isFinite(rawLocation) && rawLocation > 0 ? rawLocation : prev?.locationAt || 0;
+    if (onlineAt > 0 || locationAt > 0) {
+        bootstrapCache.friendPresenceTimes.set(userId, { onlineAt, locationAt });
+    }
+}
+
+/**
+ * Clears cached server-tracked presence timestamps when a friend goes offline so the next session starts fresh.
+ *
+ * @param {string} userId
+ */
+export function clearCloudFriendPresenceTime(userId) {
+    if (!userId) return;
+    bootstrapCache.friendPresenceTimes.delete(userId);
+}
 
 /** @type {Record<string, string | null>} */
 let pendingConfigPatch = {};
@@ -118,6 +159,14 @@ export async function loadBootstrap() {
             bioLinks: links,
             updatedAt: r.updated_at || ''
         });
+    }
+
+    bootstrapCache.friendPresenceTimes.clear();
+    if (data.friendPresenceTimes && typeof data.friendPresenceTimes === 'object') {
+        for (const [uid, entry] of Object.entries(data.friendPresenceTimes)) {
+            if (!uid || !entry || typeof entry !== 'object') continue;
+            setCloudFriendPresenceTime(uid, /** @type {any} */ (entry));
+        }
     }
 
     bootstrapCache.statsCounters = { ...(data.statsCounters || {}) };
@@ -219,6 +268,7 @@ export function resetBootstrapCache() {
     bootstrapCache.avatarTags = [];
     bootstrapCache.moderations.clear();
     bootstrapCache.userProfiles.clear();
+    bootstrapCache.friendPresenceTimes.clear();
     bootstrapCache.statsCounters = {};
 }
 

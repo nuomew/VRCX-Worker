@@ -1745,6 +1745,8 @@ export function createCloudDatabase(dbVars) {
                 joinCount: Number(s.joinCount) || 0,
                 timeSpent: Number(s.timeSpent) || 0,
                 lastSeen,
+                lastPresenceType: s.lastPresenceType || '',
+                lastPresenceAt: s.lastPresenceAt || '',
                 userId,
                 previousDisplayNames: prevNames,
                 instances: Array.isArray(s.instances) ? s.instances : [],

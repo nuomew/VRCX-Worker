@@ -21,6 +21,7 @@ import { avatarRequest, instanceRequest, queryRequest, userRequest } from '../ap
 import { processBulk, request } from '../services/request';
 import { AppDebug } from '../services/appConfig';
 import { database } from '../services/database';
+import { getCloudFriendPresenceTime } from '../ipc-web/bootstrapCache.js';
 import { patchUserFromEvent } from '../queries';
 import { watchState } from '../services/watchState';
 import { applyAvatar, showAvatarDialog } from './avatarCoordinator';
@@ -177,6 +178,7 @@ export function applyUser(json) {
         userDialog
     } = userStore;
 
+    const isWebMode = typeof WEB !== 'undefined' && WEB;
     let ref = cachedUsers.get(json.id);
     let previousDisplayName;
     let hasPropChanged = false;
@@ -188,6 +190,28 @@ export function applyUser(json) {
             const player = locationStore.lastLocation.playerList.get(json.id);
             ref.$location_at = player.joinTime;
             ref.$online_for = player.joinTime;
+        } else if (
+            isWebMode &&
+            ref.id !== currentUser.id &&
+            (ref.state === 'online' ||
+                friendStore.friends.get(ref.id)?.state === 'online' ||
+                Boolean(ref.location && ref.location !== 'offline'))
+        ) {
+            const cloudPresence = getCloudFriendPresenceTime(ref.id);
+            const cloudOnlineAt =
+                typeof json.$online_for === 'number' && json.$online_for > 0
+                    ? json.$online_for
+                    : cloudPresence?.onlineAt || 0;
+            const cloudLocationAt =
+                typeof json.$location_at === 'number' && json.$location_at > 0
+                    ? json.$location_at
+                    : cloudPresence?.locationAt || 0;
+            if (cloudOnlineAt > 0) {
+                ref.$online_for = cloudOnlineAt;
+            }
+            if (cloudLocationAt > 0) {
+                ref.$location_at = cloudLocationAt;
+            }
         }
         if (ref.isFriend || ref.id === currentUser.id) {
             let newCount = state.instancePlayerCount.get(ref.location);
@@ -258,7 +282,6 @@ export function applyUser(json) {
         ref.$location = parseLocation(ref.location);
         currentTravelers.delete(ref.id);
     }
-    const isWebMode = typeof WEB !== 'undefined' && WEB;
     if (!isWebMode && !instanceStore.cachedInstances.has(ref.$location.tag) && isRealInstance(ref.location)) {
         instanceRequest.getInstance({
             worldId: ref.$location.worldId,
@@ -323,6 +346,9 @@ export function applyUser(json) {
         if (changedProps.location && changedProps.location[0] !== 'traveling') {
             if (playerListRef) {
                 ref.$location_at = playerListRef.joinTime;
+            } else if (isWebMode && typeof json.$location_at === 'number' && json.$location_at > 0) {
+                changedProps.location.push(Math.max(0, Date.now() - json.$location_at));
+                ref.$location_at = json.$location_at;
             } else {
                 const ts = Date.now();
                 changedProps.location.push(ts - ref.$location_at);
@@ -494,6 +520,25 @@ export function showUserDialog(userId) {
                             D.lastSeen = ref1.lastSeen;
                             D.joinCount = ref1.joinCount;
                             D.timeSpent = ref1.timeSpent;
+                            if (typeof WEB !== 'undefined' && WEB && D.ref && D.ref.id === D.id && ref1.lastPresenceAt) {
+                                const presenceMs = Date.parse(ref1.lastPresenceAt);
+                                if (Number.isFinite(presenceMs) && presenceMs > 0) {
+                                    if (
+                                        ref1.lastPresenceType === 'Online' &&
+                                        D.ref.state === 'online' &&
+                                        !getCloudFriendPresenceTime(D.id)?.onlineAt &&
+                                        (!D.ref.$online_for || presenceMs < D.ref.$online_for)
+                                    ) {
+                                        D.ref.$online_for = presenceMs;
+                                    } else if (
+                                        ref1.lastPresenceType === 'Offline' &&
+                                        D.ref.state !== 'online' &&
+                                        !D.ref.$offline_for
+                                    ) {
+                                        D.ref.$offline_for = presenceMs;
+                                    }
+                                }
+                            }
                         }
                         const displayNameMap = ref1.previousDisplayNames;
                         const userNotifications = await database.getFriendLogHistoryForUserId(D.id, [

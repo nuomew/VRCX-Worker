@@ -1,14 +1,17 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
     bootstrapCache,
+    clearCloudFriendPresenceTime,
     fitPatchForKeepalive,
     flushStorageNow,
+    getCloudFriendPresenceTime,
     loadBootstrap,
     resetBootstrapCache,
     saveCloudSyncIntervalSeconds,
     saveWebSyncIntervalSeconds,
     scheduleConfigPatch,
-    scheduleStoragePatch
+    scheduleStoragePatch,
+    setCloudFriendPresenceTime
 } from '../bootstrapCache.js';
 import {
     applyCloudPresenceUpdate,
@@ -3069,5 +3072,101 @@ describe('WEB cloud adapter (stateless)', () => {
         expect(enJson.default.cloud_hub.settings.restoring_session).toBeTruthy();
         expect(zhCnJson.default.cloud_hub.settings.restoring_session).toBeTruthy();
         expect(zhTwJson.default.cloud_hub.settings.restoring_session).toBeTruthy();
+    });
+
+    it('hydrates friendPresenceTimes from /api/bootstrap, propagates $online_for/$location_at through RSS sync, clears them on offline, and passes lastPresence in getUserStats', async () => {
+        const onlineAt = Date.parse('2026-11-26T08:00:00.000Z');
+        const locationAt = Date.parse('2026-11-26T08:40:00.000Z');
+
+        fetchSpy.mockResolvedValueOnce(
+            mockOk({
+                configs: {},
+                storage: {},
+                memos: [],
+                worldMemos: [],
+                avatarMemos: [],
+                notes: [],
+                favoriteFriends: [],
+                favoriteWorlds: [],
+                favoriteAvatars: [],
+                favoritePrints: [],
+                avatarTags: [],
+                moderations: [],
+                userProfiles: [],
+                statsCounters: {},
+                friendPresenceTimes: {
+                    usr_arc: { onlineAt, locationAt }
+                }
+            })
+        );
+        await loadBootstrap();
+        expect(getCloudFriendPresenceTime('usr_arc')).toEqual({ onlineAt, locationAt });
+
+        // RSS snapshot updates cached presence times for online friends and clears them when a friend goes offline
+        const appliedPayloads = [];
+        const mockFriendStore = {
+            friends: new Map([
+                ['usr_arc', { id: 'usr_arc', state: 'online' }],
+                ['usr_left', { id: 'usr_left', state: 'online' }]
+            ]),
+            runInSortedFriendsBatch: (fn) => fn()
+        };
+        setCloudFriendPresenceTime('usr_left', { onlineAt: onlineAt - 10_000, locationAt: onlineAt - 10_000 });
+
+        const newerLocationAt = Date.parse('2026-11-26T09:05:00.000Z');
+        applyCloudRssSnapshot(
+            {
+                changed: true,
+                syncedAt: '2026-11-26T09:05:00.000Z',
+                onlineFriendsTruncated: false,
+                onlineFriends: [
+                    {
+                        id: 'usr_arc',
+                        displayName: 'arcxingye',
+                        platform: 'standalonewindows',
+                        location: 'wrld_new:123',
+                        $online_for: onlineAt,
+                        $location_at: newerLocationAt
+                    }
+                ]
+            },
+            {
+                friendStore: mockFriendStore,
+                userStore: { currentUser: { id: 'usr_me' } },
+                feedStore: { feedTableLookup: vi.fn() },
+                notificationStore: { notificationTable: { data: [] }, unseenNotifications: [] },
+                applyUser: (u) => appliedPayloads.push(u)
+            }
+        );
+
+        expect(getCloudFriendPresenceTime('usr_arc')).toEqual({ onlineAt, locationAt: newerLocationAt });
+        expect(getCloudFriendPresenceTime('usr_left')).toBeNull();
+        expect(appliedPayloads.find((u) => u.id === 'usr_arc')).toMatchObject({
+            state: 'online',
+            $online_for: onlineAt,
+            $location_at: newerLocationAt
+        });
+
+        // getUserStats forwards lastPresenceType & lastPresenceAt from /api/gamelog/stats?kind=user
+        const db = createCloudDatabase({ userId: 'usr_me', userPrefix: 'usr_me', maxTableSize: 500 });
+        fetchSpy.mockResolvedValueOnce(
+            mockOk({
+                joinCount: 2,
+                timeSpent: 3600000,
+                lastSeen: '2026-11-26T08:00:00.000Z',
+                lastPresenceType: 'Online',
+                lastPresenceAt: '2026-11-26T08:00:00.000Z',
+                previousDisplayNames: [],
+                instances: [],
+                recentEvents: []
+            })
+        );
+        const stats = await db.getUserStats('usr_arc');
+        expect(stats.lastPresenceType).toBe('Online');
+        expect(stats.lastPresenceAt).toBe('2026-11-26T08:00:00.000Z');
+
+        clearCloudFriendPresenceTime('usr_arc');
+        expect(getCloudFriendPresenceTime('usr_arc')).toBeNull();
+        resetBootstrapCache();
     });
 });
