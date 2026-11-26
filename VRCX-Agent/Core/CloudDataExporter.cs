@@ -1,9 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
-using System.IO.Compression;
 using System.Linq;
-using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Data.Sqlite;
@@ -81,18 +79,17 @@ public sealed class CloudExportProgress
 
 public sealed class CloudExportResult
 {
-    public string OutputZipPath { get; set; } = string.Empty;
-    public long ZipBytes { get; set; }
+    public string OutputSqlitePath { get; set; } = string.Empty;
+    public long FileBytes { get; set; }
     public long TotalRows { get; set; }
     public string UserPrefix { get; set; } = string.Empty;
     public Dictionary<string, long> TableCounts { get; set; } = new(StringComparer.Ordinal);
 }
 
 /// <summary>
-/// One-click cloud-to-desktop exporter that downloads all sanitized cloud data (active shards + optional DB_LEGACY),
-/// constructs a 100% upstream desktop VRCX compatible `VRCX.sqlite3` database, and packages it together with
-/// JSON backups and bilingual restore instructions into a standard ZIP archive.
-/// Never modifies or overwrites the user's existing local `%AppData%\VRCX\VRCX.sqlite3`.
+/// One-click cloud-to-desktop exporter that downloads all sanitized cloud data (active shards + optional DB_LEGACY)
+/// and directly produces a 100% upstream desktop VRCX compatible `VRCX.sqlite3` database file.
+/// Never auto-overwrites the user's local `%AppData%\VRCX\VRCX.sqlite3`.
 /// </summary>
 public static class CloudDataExporter
 {
@@ -145,19 +142,19 @@ public static class CloudDataExporter
         return "usrdefault";
     }
 
-    public static async Task<CloudExportResult> ExportToZipAsync(
+    public static async Task<CloudExportResult> ExportToSqliteAsync(
         AgentConfig config,
         HttpSyncClient syncClient,
-        string outputZipPath,
+        string outputSqlitePath,
         bool includeLegacy = true,
         string? userPrefixOverride = null,
         string? localDesktopDbPathOverride = null,
         IProgress<CloudExportProgress>? progress = null,
         CancellationToken ct = default)
     {
-        if (string.IsNullOrWhiteSpace(outputZipPath))
+        if (string.IsNullOrWhiteSpace(outputSqlitePath))
         {
-            throw new ArgumentException("Output ZIP path is required.", nameof(outputZipPath));
+            throw new ArgumentException("Output SQLite file path is required.", nameof(outputSqlitePath));
         }
 
         progress?.Report(new CloudExportProgress { Phase = "summary", Percent = 2 });
@@ -228,14 +225,11 @@ public static class CloudDataExporter
         }
 
         long totalExportedRows = tableCounts.Values.Sum();
-        string exportedAt = string.IsNullOrWhiteSpace(summary.ExportedAt)
-            ? DateTimeOffset.UtcNow.ToString("O")
-            : summary.ExportedAt;
 
         string workDir = Path.Combine(Path.GetTempPath(), "vrcx_cloud_export_" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(workDir);
-        string tempZipPath = outputZipPath + ".part";
-        string? targetDir = Path.GetDirectoryName(outputZipPath);
+        string tempTargetPath = outputSqlitePath + ".part";
+        string? targetDir = Path.GetDirectoryName(outputSqlitePath);
         if (!string.IsNullOrWhiteSpace(targetDir))
         {
             Directory.CreateDirectory(targetDir);
@@ -247,7 +241,7 @@ public static class CloudDataExporter
             progress?.Report(new CloudExportProgress
             {
                 Phase = "building_sqlite",
-                CurrentTable = "VRCX.sqlite3",
+                CurrentTable = Path.GetFileName(outputSqlitePath),
                 ProcessedRows = totalExportedRows,
                 TotalRows = totalExportedRows,
                 Percent = 88
@@ -259,46 +253,22 @@ public static class CloudDataExporter
             ct.ThrowIfCancellationRequested();
             progress?.Report(new CloudExportProgress
             {
-                Phase = "packaging",
-                CurrentTable = Path.GetFileName(outputZipPath),
+                Phase = "saving",
+                CurrentTable = Path.GetFileName(outputSqlitePath),
                 ProcessedRows = totalExportedRows,
                 TotalRows = totalExportedRows,
-                Percent = 95
+                Percent = 96
             });
 
-            if (File.Exists(tempZipPath))
+            if (File.Exists(tempTargetPath))
             {
-                File.Delete(tempZipPath);
+                File.Delete(tempTargetPath);
             }
 
-            var manifestObj = new
-            {
-                format = "vrcx-worker-desktop-export-v1",
-                exportedAt,
-                agentVersion = AgentMetadata.Version,
-                userId = summary.UserId ?? string.Empty,
-                userPrefix = resolvedPrefix,
-                includeLegacy,
-                totalRows = totalExportedRows,
-                tableCounts
-            };
-
-            using (var zipStream = new FileStream(tempZipPath, FileMode.Create, FileAccess.Write, FileShare.None))
-            using (var archive = new ZipArchive(zipStream, ZipArchiveMode.Create, leaveOpen: false))
-            {
-                archive.CreateEntryFromFile(sqlitePath, "VRCX.sqlite3", CompressionLevel.Optimal);
-                WriteTextZipEntry(archive, "manifest.json", JsonConvert.SerializeObject(manifestObj, Formatting.Indented));
-                WriteTextZipEntry(archive, "使用说明_README.txt", BuildDesktopReadmeText(resolvedPrefix, totalExportedRows, exportedAt));
-
-                foreach (var kv in mergedTables)
-                {
-                    if (kv.Value.Count == 0) continue;
-                    WriteTextZipEntry(archive, $"data/{kv.Key}.json", JsonConvert.SerializeObject(kv.Value, Formatting.Indented));
-                }
-            }
-
-            File.Move(tempZipPath, outputZipPath, overwrite: true);
-            long zipBytes = new FileInfo(outputZipPath).Length;
+            // Copy into target directory first so final rename is atomic even across volumes/drives.
+            File.Copy(sqlitePath, tempTargetPath, overwrite: true);
+            File.Move(tempTargetPath, outputSqlitePath, overwrite: true);
+            long fileBytes = new FileInfo(outputSqlitePath).Length;
 
             progress?.Report(new CloudExportProgress
             {
@@ -311,8 +281,8 @@ public static class CloudDataExporter
 
             return new CloudExportResult
             {
-                OutputZipPath = outputZipPath,
-                ZipBytes = zipBytes,
+                OutputSqlitePath = outputSqlitePath,
+                FileBytes = fileBytes,
                 TotalRows = totalExportedRows,
                 UserPrefix = resolvedPrefix,
                 TableCounts = tableCounts
@@ -322,7 +292,7 @@ public static class CloudDataExporter
         {
             try
             {
-                if (File.Exists(tempZipPath)) File.Delete(tempZipPath);
+                if (File.Exists(tempTargetPath)) File.Delete(tempTargetPath);
             }
             catch
             {
@@ -341,14 +311,6 @@ public static class CloudDataExporter
                 // Ignore temporary workspace cleanup errors
             }
         }
-    }
-
-    private static void WriteTextZipEntry(ZipArchive archive, string entryName, string text)
-    {
-        ZipArchiveEntry entry = archive.CreateEntry(entryName, CompressionLevel.Optimal);
-        using Stream stream = entry.Open();
-        using var writer = new StreamWriter(stream, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
-        writer.Write(text);
     }
 
     private static string GetStr(JObject row, string prop)
@@ -726,29 +688,5 @@ CREATE TABLE IF NOT EXISTS {p}_feed_bio (id INTEGER PRIMARY KEY, created_at TEXT
         }
         conn.Close();
         SqliteConnection.ClearPool(conn);
-    }
-
-    private static string BuildDesktopReadmeText(string userPrefix, long totalRows, string exportedAt)
-    {
-        return string.Join(Environment.NewLine, new[]
-        {
-            "VRCX.Agent 云端数据一键导出包（原版桌面 VRCX 兼容）",
-            "===================================================",
-            $"导出时间 (UTC)：{exportedAt}",
-            $"桌面 VRCX 账号前缀：{userPrefix}",
-            $"导出记录总条数：{totalRows}",
-            "",
-            "【三步傻瓜式还原到原版桌面 VRCX】",
-            "1. 完全退出正在运行的原版桌面 VRCX（右下角托盘右键退出）。",
-            "2. 打开文件夹：%AppData%\\VRCX\\ ，先将原来的 VRCX.sqlite3 复制一份备份。",
-            "3. 将本压缩包里的 VRCX.sqlite3 解压放入 %AppData%\\VRCX\\ 替换后重新打开原版 VRCX 即可。",
-            "   （本包已自动剔除全部密码、Cookie、代理与云端密钥，安全无敏感信息；data/ 目录另附完整 JSON 归档。）",
-            "",
-            "[English · 3-Step Restore to Original Desktop VRCX]",
-            "1. Quit original desktop VRCX completely from the system tray.",
-            "2. Open %AppData%\\VRCX\\ and back up any existing VRCX.sqlite3 file.",
-            "3. Extract VRCX.sqlite3 from this ZIP into %AppData%\\VRCX\\ and launch VRCX.",
-            ""
-        });
     }
 }

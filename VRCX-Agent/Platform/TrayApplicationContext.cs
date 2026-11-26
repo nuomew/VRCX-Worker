@@ -1394,16 +1394,16 @@ public sealed class TrayApplicationContext : ApplicationContext
             return;
         }
 
-        string targetZipPath;
+        string targetSqlitePath;
         using (var saveDialog = new SaveFileDialog
         {
             Title = AgentStrings.ExportSaveDialogTitle,
             Filter = AgentStrings.ExportSaveDialogFilter,
-            DefaultExt = "zip",
+            DefaultExt = "sqlite3",
             AddExtension = true,
             OverwritePrompt = true,
             InitialDirectory = ResolveDefaultExportDirectory(),
-            FileName = $"VRCX-Cloud-Export-{DateTime.Now:yyyyMMdd-HHmmss}.zip"
+            FileName = "VRCX.sqlite3"
         })
         {
             DialogResult pickResult = _activeSettingsDialog != null && !_activeSettingsDialog.IsDisposed
@@ -1413,11 +1413,11 @@ public sealed class TrayApplicationContext : ApplicationContext
             {
                 return;
             }
-            targetZipPath = saveDialog.FileName;
+            targetSqlitePath = saveDialog.FileName;
         }
 
         using Icon? dialogIcon = CloneDialogIconSafe();
-        using var exportDialog = new CloudExportForm(cfg, _syncClient, targetZipPath, dialogIcon);
+        using var exportDialog = new CloudExportForm(cfg, _syncClient, targetSqlitePath, dialogIcon);
         _activeExportDialog = exportDialog;
         try
         {

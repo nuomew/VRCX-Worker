@@ -1,7 +1,6 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
-using System.IO.Compression;
 using System.Linq;
 using System.Net;
 using System.Net.Http;
@@ -2745,8 +2744,22 @@ INSERT INTO {acctPrefix}_friend_log_history (created_at, type, user_id, display_
     }
 
     [Fact]
-    public async Task CloudDataExporter_BuildsUpstreamDesktopSqliteAndZipArchiveFromPaginatedApi()
+    public async Task CloudDataExporter_BuildsUpstreamDesktopSqliteDirectlyFromPaginatedApi()
     {
+        // Verify streamlined Chinese UI labels requested by user ("导出数据" / "保存")
+        string? prevLang = AgentStrings.LanguageOverride;
+        try
+        {
+            AgentStrings.LanguageOverride = "zh-CN";
+            Assert.Equal("导出数据", AgentStrings.MenuExportCloudData);
+            Assert.Equal("导出数据", AgentStrings.ExportCloudDataButton);
+            Assert.Equal("保存", AgentStrings.TestAndSaveButton);
+        }
+        finally
+        {
+            AgentStrings.LanguageOverride = prevLang;
+        }
+
         string tempRoot = Path.Combine(Path.GetTempPath(), "vrcx_cloud_export_test_" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(tempRoot);
         try
@@ -2987,32 +3000,24 @@ INSERT INTO {acctPrefix}_friend_log_history (created_at, type, user_id, display_
                 SyncSecret = "vrcx_sync_export_key",
                 DeviceId = "dev_export_test"
             };
-            string outZipPath = Path.Combine(tempRoot, "VRCX-Cloud-Export-Test.zip");
+            string outSqlitePath = Path.Combine(tempRoot, "VRCX.sqlite3");
 
-            CloudExportResult result = await CloudDataExporter.ExportToZipAsync(
+            CloudExportResult result = await CloudDataExporter.ExportToSqliteAsync(
                 cfg,
                 syncClient,
-                outZipPath,
+                outSqlitePath,
                 includeLegacy: true,
                 ct: CancellationToken.None);
 
-            Assert.True(File.Exists(outZipPath));
-            Assert.False(File.Exists(outZipPath + ".part"));
-            Assert.True(result.ZipBytes > 0);
+            Assert.True(File.Exists(outSqlitePath));
+            Assert.False(File.Exists(outSqlitePath + ".part"));
+            Assert.True(result.FileBytes > 0);
+            Assert.Equal(outSqlitePath, result.OutputSqlitePath);
             Assert.Equal(expectedPrefix, result.UserPrefix);
             Assert.Equal(9, result.TotalRows); // 2 configs + 2 memos + 1 note + 2 locations + 1 feed_gps + 1 noty_v2
 
-            // 3. Extract and inspect ZIP entries & open generated VRCX.sqlite3 with Microsoft.Data.Sqlite
-            string extractDir = Path.Combine(tempRoot, "extracted");
-            ZipFile.ExtractToDirectory(outZipPath, extractDir);
-            string exportedDb = Path.Combine(extractDir, "VRCX.sqlite3");
-            Assert.True(File.Exists(exportedDb));
-            Assert.True(File.Exists(Path.Combine(extractDir, "manifest.json")));
-            Assert.True(File.Exists(Path.Combine(extractDir, "使用说明_README.txt")));
-            Assert.True(File.Exists(Path.Combine(extractDir, "data", "memos.json")));
-            Assert.True(File.Exists(Path.Combine(extractDir, "data", "gamelog_location.json")));
-
-            using (var conn = new SqliteConnection($"Data Source={exportedDb};Mode=ReadOnly;Pooling=False"))
+            // 3. Open generated VRCX.sqlite3 directly with Microsoft.Data.Sqlite (no ZIP wrapper)
+            using (var conn = new SqliteConnection($"Data Source={outSqlitePath};Mode=ReadOnly;Pooling=False"))
             {
                 conn.Open();
 

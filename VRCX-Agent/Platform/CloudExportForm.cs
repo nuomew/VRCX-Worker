@@ -10,14 +10,14 @@ using VRCX.Agent.Core;
 namespace VRCX.Agent.Platform;
 
 /// <summary>
-/// One-click modal progress dialog that exports all sanitized cloud data into a ZIP archive
-/// containing a ready-to-use original desktop `VRCX.sqlite3` database, JSON backups, and restore guide.
+/// One-click modal progress dialog that exports all sanitized cloud data directly into
+/// a ready-to-use original desktop `VRCX.sqlite3` database file.
 /// </summary>
 public sealed class CloudExportForm : Form
 {
     private readonly AgentConfig _config;
     private readonly HttpSyncClient _syncClient;
-    private readonly string _outputZipPath;
+    private readonly string _outputFilePath;
     private readonly Label _statusLabel;
     private readonly ProgressBar _progressBar;
     private readonly Button _openFolderButton;
@@ -34,12 +34,12 @@ public sealed class CloudExportForm : Form
     public CloudExportForm(
         AgentConfig config,
         HttpSyncClient syncClient,
-        string outputZipPath,
+        string outputFilePath,
         Icon? windowIcon = null)
     {
         _config = config;
         _syncClient = syncClient;
-        _outputZipPath = outputZipPath;
+        _outputFilePath = outputFilePath;
 
         SuspendLayout();
         AutoScaleDimensions = new SizeF(96F, 96F);
@@ -148,21 +148,21 @@ public sealed class CloudExportForm : Form
 
     private void OpenContainingFolder()
     {
-        if (string.IsNullOrWhiteSpace(_outputZipPath)) return;
+        if (string.IsNullOrWhiteSpace(_outputFilePath)) return;
         try
         {
-            if (File.Exists(_outputZipPath))
+            if (File.Exists(_outputFilePath))
             {
                 using Process? _ = Process.Start(new ProcessStartInfo
                 {
                     FileName = "explorer.exe",
-                    Arguments = $"/select,\"{_outputZipPath}\"",
+                    Arguments = $"/select,\"{_outputFilePath}\"",
                     UseShellExecute = false
                 });
             }
             else
             {
-                string? dir = Path.GetDirectoryName(_outputZipPath);
+                string? dir = Path.GetDirectoryName(_outputFilePath);
                 if (!string.IsNullOrWhiteSpace(dir) && Directory.Exists(dir))
                 {
                     using Process? _ = Process.Start(new ProcessStartInfo
@@ -189,7 +189,7 @@ public sealed class CloudExportForm : Form
             _statusLabel.Text = p.Phase switch
             {
                 "building_sqlite" => AgentStrings.ExportBuildingSqliteHint,
-                "packaging" => AgentStrings.ExportPackagingZipHint,
+                "saving" => AgentStrings.ExportSavingSqliteHint,
                 "fetching" => AgentStrings.FormatExportFetching(p.CurrentTable, p.ProcessedRows, p.TotalRows),
                 _ => AgentStrings.ExportStartingHint
             };
@@ -198,10 +198,10 @@ public sealed class CloudExportForm : Form
         try
         {
             CloudExportResult result = await CloudDataExporter
-                .ExportToZipAsync(
+                .ExportToSqliteAsync(
                     _config,
                     _syncClient,
-                    _outputZipPath,
+                    _outputFilePath,
                     includeLegacy: true,
                     progress: progress,
                     ct: _cts.Token)
@@ -215,7 +215,7 @@ public sealed class CloudExportForm : Form
             _statusLabel.Text = AgentStrings.FormatExportCompleted(
                 result.TotalRows,
                 result.UserPrefix,
-                result.ZipBytes / (1024.0 * 1024.0));
+                result.FileBytes / (1024.0 * 1024.0));
             _openFolderButton.Enabled = true;
             _closeButton.Text = AgentStrings.CloseButton;
             AcceptButton = _openFolderButton;

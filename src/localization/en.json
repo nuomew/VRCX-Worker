@@ -3958,7 +3958,7 @@
             "export_packaging": "Packaging ZIP archive...",
             "export_done_toast": "Exported {rows} rows into {file}.",
             "export_cancelled_toast": "Cloud data export cancelled.",
-            "export_agent_tip": "Tip: For one-click export of a ready-to-drop desktop VRCX.sqlite3 database ZIP, right-click VRCX.Agent (v1.12.0+) in the Windows tray and select \"Export Cloud Data...\"."
+            "export_agent_tip": "Tip: For one-click direct export of a ready-to-drop desktop VRCX.sqlite3 database file, right-click VRCX.Agent (v1.12.1+) in the Windows tray and select \"Export Data\"."
         }
     }
 }

@@ -3956,7 +3956,7 @@
             "export_packaging": "正在打包 ZIP 文件...",
             "export_done_toast": "导出完成：共 {rows} 条数据，已保存为 {file}。",
             "export_cancelled_toast": "已取消云端数据导出。",
-            "export_agent_tip": "提示：如需傻瓜式一键直接导出内含现成原版 VRCX.sqlite3 的 ZIP 包，可在电脑右下角右键点击 VRCX.Agent（v1.12.0+）选择「一键导出云端数据…」。"
+            "export_agent_tip": "提示：如需一键直接导出原版桌面可用的 VRCX.sqlite3 数据库文件，可在电脑右下角右键点击 VRCX.Agent（v1.12.1+）选择「导出数据」。"
         }
     }
 }

@@ -212,7 +212,7 @@ public sealed class SyncSettingsForm : Form
         {
             Text = AgentStrings.ExportCloudDataButton,
             Location = new Point(20, 482),
-            Width = 148,
+            Width = 104,
             Height = 34,
             Visible = _onExportCloudData != null
         };
@@ -230,8 +230,8 @@ public sealed class SyncSettingsForm : Form
         _saveButton = new Button
         {
             Text = AgentStrings.TestAndSaveButton,
-            Location = new Point(252, 482),
-            Width = 134,
+            Location = new Point(298, 482),
+            Width = 88,
             Height = 34
         };
         _saveButton.Click += async (_, _) => await TestAndSaveAsync();
