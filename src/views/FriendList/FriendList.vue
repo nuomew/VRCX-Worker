@@ -4,7 +4,7 @@
             <DataTableLayout
                 class="min-w-0 w-full"
                 :table="table"
-                :loading="friendsListLoading"
+                :loading="friendsListLoading || !watchState.isFriendsLoaded"
                 auto-height
                 :page-sizes="pageSizes"
                 :total-items="totalItems"
@@ -171,6 +171,7 @@
     import { confirmDeleteFriend, handleFriendDelete } from '../../coordinators/friendRelationshipCoordinator';
     import { useUserDisplay } from '../../composables/useUserDisplay';
     import { database } from '../../services/database';
+    import { watchState } from '../../services/watchState';
 
     const { t } = useI18n();
 
@@ -286,6 +287,12 @@
     watch(
         () => route.path,
         () => {
+            if (route.name !== 'friend-list') {
+                return;
+            }
+            if (!watchState.isFriendsLoaded) {
+                return;
+            }
             refreshFriendStats();
             loadFriendProfiles();
             nextTick(() => applyFriendsListSearchChange());
@@ -294,8 +301,24 @@
     );
 
     watch(
+        () => watchState.isFriendsLoaded,
+        (isFriendsLoaded) => {
+            if (!isFriendsLoaded) {
+                return;
+            }
+            friendSearchCache.clear();
+            refreshFriendStats({ force: true });
+            loadFriendProfiles();
+            applyFriendsListSearchChange();
+        }
+    );
+
+    watch(
         () => friends.value.size,
         () => {
+            if (!watchState.isFriendsLoaded) {
+                return;
+            }
             friendSearchCache.clear();
             refreshFriendStats({ force: true });
             loadFriendProfiles();

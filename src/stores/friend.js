@@ -547,14 +547,23 @@ export const useFriendStore = defineStore('Friend', () => {
         isRefreshFriendsLoading.value = true;
         const isWebMode = typeof WEB !== 'undefined' && WEB;
         try {
-            const onlineFriends = await bulkRefreshFriends({
-                offline: false
-            });
-            const offlineFriends = await bulkRefreshFriends({
-                offline: true
-            });
-            var friends = onlineFriends.concat(offlineFriends);
-            if (!isWebMode) {
+            let friends;
+            if (isWebMode) {
+                // Fetch online and offline friend pages in parallel so webApiRemote coalesces
+                // same-tick page GETs into a single /api/vrc/execute-batch hitting DB_CACHE in 1 RTT.
+                const [onlineFriends, offlineFriends] = await Promise.all([
+                    bulkRefreshFriends({ offline: false }),
+                    bulkRefreshFriends({ offline: true })
+                ]);
+                friends = onlineFriends.concat(offlineFriends);
+            } else {
+                const onlineFriends = await bulkRefreshFriends({
+                    offline: false
+                });
+                const offlineFriends = await bulkRefreshFriends({
+                    offline: true
+                });
+                friends = onlineFriends.concat(offlineFriends);
                 friends = await refetchBrokenFriends(friends);
                 if (!watchState.isFriendsLoaded) {
                     friends = await refreshRemainingFriends(friends);
@@ -579,7 +588,20 @@ export const useFriendStore = defineStore('Friend', () => {
         const isWebMode = typeof WEB !== 'undefined' && WEB;
         const MAX_OFFSET = 7500;
         const PAGE_SIZE = isWebMode ? 100 : 50;
-        const CONCURRENCY = isWebMode ? 1 : 5;
+        const knownExpectedCount = isWebMode
+            ? args?.offline
+                ? Array.isArray(userStore.currentUser?.offlineFriends)
+                    ? userStore.currentUser.offlineFriends.length
+                    : 0
+                : (Array.isArray(userStore.currentUser?.onlineFriends)
+                      ? userStore.currentUser.onlineFriends.length
+                      : 0) +
+                  (Array.isArray(userStore.currentUser?.activeFriends)
+                      ? userStore.currentUser.activeFriends.length
+                      : 0)
+            : 0;
+        const expectedPages = knownExpectedCount > 0 ? Math.ceil(knownExpectedCount / PAGE_SIZE) : 1;
+        const CONCURRENCY = isWebMode ? Math.min(4, Math.max(1, expectedPages)) : 5;
         const RATE_PER_MINUTE = 60;
         const MAX_RETRY = 5;
         const RETRY_BASE_DELAY = 1000;
@@ -615,17 +637,21 @@ export const useFriendStore = defineStore('Friend', () => {
         let stopFlag = false;
         const friends = [];
 
-        function getNextOffset() {
+        function getNextOffset(workerIndex) {
             if (stopFlag) return null;
+            // Beyond the known expected page window, let only worker 0 probe tail pages to avoid empty cache misses.
+            if (isWebMode && workerIndex > 0 && nextOffset >= expectedPages * PAGE_SIZE) {
+                return null;
+            }
             const cur = nextOffset;
             nextOffset += PAGE_SIZE;
             if (cur > MAX_OFFSET) return null;
             return cur;
         }
 
-        async function worker() {
+        async function worker(workerIndex) {
             while (true) {
-                const offset = getNextOffset();
+                const offset = getNextOffset(workerIndex);
                 if (offset === null) break;
 
                 await rateLimiter.wait();
@@ -643,7 +669,7 @@ export const useFriendStore = defineStore('Friend', () => {
             }
         }
 
-        await Promise.all(Array.from({ length: CONCURRENCY }, () => worker()));
+        await Promise.all(Array.from({ length: CONCURRENCY }, (_, idx) => worker(idx)));
 
         return friends;
     }
