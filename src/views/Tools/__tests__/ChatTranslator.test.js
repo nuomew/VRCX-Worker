@@ -264,8 +264,9 @@ describe('ChatTranslator.vue', () => {
         const wrapper = mount(ChatTranslator);
         await flushPromises();
 
-        // Translation is OFF by default and OSC dialog is closed (not expanded inline)
+        // Translation is OFF by default, OSC dialog is closed, and zero native checkboxes are rendered
         expect(wrapper.find('.mock-osc-dialog').exists()).toBe(false);
+        expect(wrapper.findAll('input[type="checkbox"]')).toHaveLength(0);
         expect(wrapper.text()).toContain('view.tools.chat_translator.translate_off_hint');
 
         const textarea = wrapper.find('textarea');
@@ -291,13 +292,12 @@ describe('ChatTranslator.vue', () => {
             })
         );
 
-        // Even if user enables translation without configuring an API, sending still sends original text cleanly
-        const translateCheckbox = wrapper
-            .findAll('label')
-            .find((l) => l.text().includes('view.tools.chat_translator.translate_enabled_label'))
-            ?.find('input[type="checkbox"]');
-        expect(translateCheckbox).toBeTruthy();
-        await translateCheckbox.setValue(true);
+        // Even if user enables translation via Switch without configuring an API, sending still sends original text cleanly
+        const translateSwitch = wrapper.find(
+            'button[role="switch"][aria-label="view.tools.chat_translator.translate_enabled_label"]'
+        );
+        expect(translateSwitch.exists()).toBe(true);
+        await translateSwitch.trigger('click');
         await flushPromises();
 
         await textarea.setValue('未配置接口也发原文');
@@ -488,14 +488,13 @@ describe('ChatTranslator.vue', () => {
         await oscSettingsBtn.trigger('click');
         await flushPromises();
         expect(wrapper.find('.mock-osc-dialog').exists()).toBe(true);
+        expect(wrapper.findAll('input[type="checkbox"]')).toHaveLength(0);
 
-        const listenCheckbox = wrapper
+        const listenSwitch = wrapper
             .find('.mock-osc-dialog')
-            .findAll('label')
-            .find((l) => l.text().includes('view.tools.chat_translator.osc_listen_enabled_label'))
-            ?.find('input[type="checkbox"]');
-        expect(listenCheckbox).toBeTruthy();
-        await listenCheckbox.setValue(true);
+            .find('button[role="switch"][aria-label="view.tools.chat_translator.osc_listen_enabled_label"]');
+        expect(listenSwitch.exists()).toBe(true);
+        await listenSwitch.trigger('click');
         await flushPromises();
 
         expect(mocks.cloudFetch).toHaveBeenCalledWith(

@@ -110,14 +110,13 @@
         <!-- Compact Translation Toggle Bar (Translation OFF by default; sends original text when off or unconfigured) -->
         <div class="shrink-0 mb-3 rounded-lg border border-border bg-card/60 px-3 py-2">
             <div class="flex flex-wrap items-center gap-2.5 text-xs">
-                <label class="inline-flex items-center gap-1.5 cursor-pointer select-none font-medium text-foreground">
-                    <input
-                        v-model="prefs.translateEnabled"
-                        type="checkbox"
-                        class="accent-primary rounded"
-                        @change="persistPrefs" />
+                <div class="inline-flex items-center gap-2 select-none font-medium text-foreground">
+                    <Switch
+                        :model-value="prefs.translateEnabled"
+                        :aria-label="t('view.tools.chat_translator.translate_enabled_label')"
+                        @update:model-value="(val) => setBoolPref('translateEnabled', val)" />
                     <span>{{ t('view.tools.chat_translator.translate_enabled_label') }}</span>
-                </label>
+                </div>
 
                 <template v-if="prefs.translateEnabled">
                     <!-- Source Language -->
@@ -194,14 +193,13 @@
                         </select>
                     </div>
 
-                    <label class="inline-flex items-center gap-1.5 cursor-pointer select-none ml-auto">
-                        <input
-                            v-model="prefs.autoTranslateDesktop"
-                            type="checkbox"
-                            class="accent-primary rounded"
-                            @change="persistPrefs" />
+                    <div class="inline-flex items-center gap-2 select-none ml-auto">
+                        <Switch
+                            :model-value="prefs.autoTranslateDesktop"
+                            :aria-label="t('view.tools.chat_translator.auto_translate_desktop')"
+                            @update:model-value="(val) => setBoolPref('autoTranslateDesktop', val)" />
                         <span>{{ t('view.tools.chat_translator.auto_translate_desktop') }}</span>
-                    </label>
+                    </div>
 
                     <button
                         v-if="!isTranslationConfigured"
@@ -485,14 +483,15 @@
 
                 <div class="space-y-4 py-1 text-xs">
                     <!-- Master Switch -->
-                    <label class="flex items-center gap-2 cursor-pointer select-none font-medium text-sm text-foreground">
-                        <input
-                            v-model="prefs.oscEnabled"
-                            type="checkbox"
-                            class="accent-primary rounded"
-                            @change="persistPrefs" />
-                        <span>{{ t('view.tools.chat_translator.osc_enabled_label') }}</span>
-                    </label>
+                    <div class="flex items-center justify-between gap-3 rounded-lg border border-border/80 bg-card/60 px-3 py-2.5">
+                        <span class="font-medium text-sm text-foreground">
+                            {{ t('view.tools.chat_translator.osc_enabled_label') }}
+                        </span>
+                        <Switch
+                            :model-value="prefs.oscEnabled"
+                            :aria-label="t('view.tools.chat_translator.osc_enabled_label')"
+                            @update:model-value="(val) => setBoolPref('oscEnabled', val)" />
+                    </div>
 
                     <!-- Target Companion & VRChat Send Port -->
                     <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
@@ -536,61 +535,57 @@
                     </div>
 
                     <!-- Chatbox Delivery Options -->
-                    <div class="space-y-1.5">
+                    <div class="space-y-2 rounded-lg border border-border/70 px-3 py-2.5">
                         <div class="text-muted-foreground font-medium">
                             {{ t('view.tools.chat_translator.osc_send_options_label') }}
                         </div>
-                        <div class="flex flex-wrap items-center gap-x-4 gap-y-2">
-                            <label class="inline-flex items-center gap-1.5 cursor-pointer select-none">
-                                <input
-                                    v-model="prefs.immediate"
-                                    type="checkbox"
-                                    class="accent-primary rounded"
-                                    @change="persistPrefs" />
-                                <span>{{ t('view.tools.chat_translator.osc_immediate') }}</span>
-                            </label>
-                            <label class="inline-flex items-center gap-1.5 cursor-pointer select-none">
-                                <input
-                                    v-model="prefs.playSfx"
-                                    type="checkbox"
-                                    class="accent-primary rounded"
-                                    @change="persistPrefs" />
-                                <span>{{ t('view.tools.chat_translator.osc_play_sfx') }}</span>
-                            </label>
-                            <label class="inline-flex items-center gap-1.5 cursor-pointer select-none">
-                                <input
-                                    v-model="prefs.syncTyping"
-                                    type="checkbox"
-                                    class="accent-primary rounded"
-                                    @change="persistPrefs" />
-                                <span>{{ t('view.tools.chat_translator.sync_typing') }}</span>
-                            </label>
+                        <div class="flex items-center justify-between gap-3">
+                            <span class="text-foreground">{{ t('view.tools.chat_translator.osc_immediate') }}</span>
+                            <Switch
+                                :model-value="prefs.immediate"
+                                :aria-label="t('view.tools.chat_translator.osc_immediate')"
+                                @update:model-value="(val) => setBoolPref('immediate', val)" />
+                        </div>
+                        <div class="flex items-center justify-between gap-3">
+                            <span class="text-foreground">{{ t('view.tools.chat_translator.osc_play_sfx') }}</span>
+                            <Switch
+                                :model-value="prefs.playSfx"
+                                :aria-label="t('view.tools.chat_translator.osc_play_sfx')"
+                                @update:model-value="(val) => setBoolPref('playSfx', val)" />
+                        </div>
+                        <div class="flex items-center justify-between gap-3">
+                            <span class="text-foreground">{{ t('view.tools.chat_translator.sync_typing') }}</span>
+                            <Switch
+                                :model-value="prefs.syncTyping"
+                                :aria-label="t('view.tools.chat_translator.sync_typing')"
+                                @update:model-value="(val) => setBoolPref('syncTyping', val)" />
                         </div>
                     </div>
 
                     <!-- Desktop OSC Relay Listener Section -->
-                    <div class="rounded-lg border border-border/80 bg-muted/30 p-3 space-y-2">
-                        <div class="flex items-center justify-between gap-2 flex-wrap">
-                            <label class="inline-flex items-center gap-1.5 cursor-pointer select-none font-medium text-foreground">
-                                <input
-                                    v-model="prefs.oscListenEnabled"
-                                    type="checkbox"
-                                    class="accent-primary rounded"
-                                    @change="persistPrefs" />
-                                <span>{{ t('view.tools.chat_translator.osc_listen_enabled_label') }}</span>
-                            </label>
-                            <Badge variant="outline" class="text-[10px] font-mono">
-                                {{
-                                    activeDevice?.osc?.listenEnabled
-                                        ? `127.0.0.1:${activeDevice.osc.listenPort}${activeDevice.osc.forwardToVrchat ? ` → ${activeDevice.osc.sendPort}` : ''}`
-                                        : prefs.oscListenEnabled
-                                          ? t('view.tools.chat_translator.relay_standby')
-                                          : t('view.tools.chat_translator.relay_disabled_badge')
-                                }}
-                            </Badge>
+                    <div class="rounded-lg border border-border/80 bg-muted/30 p-3 space-y-2.5">
+                        <div class="flex items-center justify-between gap-2">
+                            <div class="flex items-center gap-2 flex-wrap">
+                                <span class="font-medium text-foreground">
+                                    {{ t('view.tools.chat_translator.osc_listen_enabled_label') }}
+                                </span>
+                                <Badge variant="outline" class="text-[10px] font-mono">
+                                    {{
+                                        activeDevice?.osc?.listenEnabled
+                                            ? `127.0.0.1:${activeDevice.osc.listenPort}${activeDevice.osc.forwardToVrchat ? ` → ${activeDevice.osc.sendPort}` : ''}`
+                                            : prefs.oscListenEnabled
+                                              ? t('view.tools.chat_translator.relay_standby')
+                                              : t('view.tools.chat_translator.relay_disabled_badge')
+                                    }}
+                                </Badge>
+                            </div>
+                            <Switch
+                                :model-value="prefs.oscListenEnabled"
+                                :aria-label="t('view.tools.chat_translator.osc_listen_enabled_label')"
+                                @update:model-value="(val) => setBoolPref('oscListenEnabled', val)" />
                         </div>
 
-                        <div class="flex items-center gap-3 flex-wrap">
+                        <div class="flex items-center justify-between gap-3 flex-wrap">
                             <div class="flex items-center gap-1.5">
                                 <span class="text-muted-foreground">{{ t('view.tools.chat_translator.osc_listen_port_label') }}</span>
                                 <input
@@ -601,14 +596,13 @@
                                     class="h-7 w-20 rounded-md border border-input bg-background px-2 text-xs font-mono text-foreground"
                                     @change="handleOscListenPortChange" />
                             </div>
-                            <label class="inline-flex items-center gap-1.5 cursor-pointer select-none">
-                                <input
-                                    v-model="prefs.oscForwardToVrchat"
-                                    type="checkbox"
-                                    class="accent-primary rounded"
-                                    @change="persistPrefs" />
-                                <span>{{ t('view.tools.chat_translator.osc_forward_vrc_label') }}</span>
-                            </label>
+                            <div class="inline-flex items-center gap-2 select-none">
+                                <span class="text-foreground">{{ t('view.tools.chat_translator.osc_forward_vrc_label') }}</span>
+                                <Switch
+                                    :model-value="prefs.oscForwardToVrchat"
+                                    :aria-label="t('view.tools.chat_translator.osc_forward_vrc_label')"
+                                    @update:model-value="(val) => setBoolPref('oscForwardToVrchat', val)" />
+                            </div>
                         </div>
 
                         <div v-if="hasPortConflict" class="text-[11px] text-destructive font-medium">
@@ -676,6 +670,7 @@
         DialogTitle
     } from '@/components/ui/dialog';
     import { Spinner } from '@/components/ui/spinner';
+    import { Switch } from '@/components/ui/switch';
     import {
         cloudFetch,
         connectCloudHubWs,
@@ -913,6 +908,11 @@
         } catch (err) {
             toast.error(err?.message || t('view.tools.chat_translator.cloud_config_save_failed'));
         }
+    }
+
+    function setBoolPref(key, value) {
+        prefs[key] = Boolean(value);
+        persistPrefs();
     }
 
     function handleOscPortChange() {

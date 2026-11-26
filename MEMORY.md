@@ -15,6 +15,7 @@
 - **Cloudflare D1 Free Tier**: Max **500 MB per database**, up to **10 databases** (5 GB account total), 5M rows read/day, 100K rows written/day, max **50 D1 queries per Worker invocation**. Supports native `FTS5` including `trigram` tokenizer. Forbids manual `BEGIN`/`COMMIT` SQL (must use `db.batch()`).
 - **Cloudflare Durable Objects Free Tier**: SQLite-backed DOs are included on Workers Free (100K requests/day, 13,000 GB-s/day, 5 GB total / 1 GB per DO). Must use WebSocket Hibernation (`ctx.acceptWebSocket` + `ctx.setWebSocketAutoResponse`) so idle connections consume 0 duration; incoming WS messages bill at 20:1, outgoing & protocol pings are free.
 - **Upstream Environment Notes**: Root `package.json` declares `engines.node >= 24.15.0`, while dev container currently runs Node `v22.23.5` and `.NET SDK 10.0.115`. `cloud/` is isolated with its own `package.json` to avoid disturbing upstream lockfiles.
+- **UI Preference (Hard Rule)**: Always use the native `<Switch>` component (`@/components/ui/switch`) for all Web UI toggle switches; never use raw HTML `<input type="checkbox">` toggles.
 - **Secret Locations**: Runtime secrets (`COOKIE_MASTER_KEY`, auth credentials, CF tokens) are never stored in repo or docs; configure locally via `cloud/.dev.vars` (gitignored) and remotely via `wrangler secret put`.
 
 ## Progress Log
