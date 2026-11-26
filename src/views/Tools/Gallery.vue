@@ -142,15 +142,16 @@
                         <span class="text-xs text-muted-foreground">
                             {{
                                 t('cloud_hub.gallery.r2_status', {
-                                    status: cloudState.r2Enabled
-                                        ? t('cloud_hub.gallery.r2_enabled')
-                                        : t('cloud_hub.gallery.r2_disabled')
+                                    status:
+                                        cloudState.r2Enabled || cloudState.b2Enabled
+                                            ? t('cloud_hub.gallery.r2_enabled')
+                                            : t('cloud_hub.gallery.r2_disabled')
                                 })
                             }}
                         </span>
                     </div>
                     <div
-                        v-if="!cloudState.r2Enabled"
+                        v-if="!cloudState.r2Enabled && !cloudState.b2Enabled"
                         class="rounded-lg border border-border bg-background/50 p-3.5 space-y-2 text-[11px]">
                         <div class="font-medium text-foreground text-xs">
                             {{ t('cloud_hub.gallery.r2_setup_title') }}
@@ -243,7 +244,10 @@
                                             </div>
                                         </div>
                                         <ItemHeader
-                                            v-if="shot.r2_thumb_key && cloudState.r2Enabled"
+                                            v-if="
+                                                shot.r2_thumb_key &&
+                                                (cloudState.r2Enabled || shot.r2_thumb_key.startsWith('b2:'))
+                                            "
                                             class="cursor-pointer"
                                             @click="
                                                 showFullscreenImageDialog(

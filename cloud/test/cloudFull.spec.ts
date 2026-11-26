@@ -7325,21 +7325,68 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
                 { redirect: 'manual' }
             );
             expect(backupOfficialRes.status).toBe(302);
-            const backupLoc = new URL(backupOfficialRes.headers.get('Location') ?? '');
+            const backupLocRaw = backupOfficialRes.headers.get('Location') ?? '';
+            const backupLoc = new URL(backupLocRaw);
             expect(backupLoc.hostname).toBe(b2VirtualHost);
             expect(backupLoc.searchParams.get('response-content-disposition')).toContain('attachment; filename=');
             expect(backupLoc.searchParams.get('X-Amz-Signature')).toMatch(/^[0-9a-f]{64}$/);
+            // Regression #1: AWS SigV4 requires strict ASCII code-point order (uppercase 'X-Amz-*' BEFORE lowercase 'response-*')
+            expect(backupLocRaw.indexOf('X-Amz-Algorithm=')).toBeLessThan(
+                backupLocRaw.indexOf('response-content-disposition=')
+            );
 
-            // Re-enable Workers direct proxy before testing full disable fallback
+            // Regression #2: Explicit ?proxy=1 stays same-origin 200 even in official direct mode (for copy/download without CORS errors)
+            const shotProxyOverrideRes = await exports.default.fetch(
+                'http://example.com/api/media/screenshots/shot_b2_overflow_01?proxy=1',
+                { redirect: 'manual' }
+            );
+            expect(shotProxyOverrideRes.status).toBe(200);
+            expect(new Uint8Array(await shotProxyOverrideRes.arrayBuffer())).toEqual(fakePng);
+
+            // Regression #3: /api/bootstrap surfaces b2Enabled=true so pure-B2 galleries render thumbnails without R2
+            const bootB2Res = await exports.default.fetch('http://example.com/api/bootstrap');
+            expect(bootB2Res.status).toBe(200);
+            expect(((await bootB2Res.json()) as { data: { b2Enabled: boolean } }).data.b2Enabled).toBe(true);
+
+            // Regression #4: Switching B2 endpoint to a different region auto-reinfers region when form sends stale previous region
+            const regionSwitchRes = await exports.default.fetch('http://example.com/api/storage/config', {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+                body: JSON.stringify({
+                    enabled: true,
+                    endpoint: 'https://s3.eu-central-003.backblazeb2.com',
+                    region: 'us-west-004' // stale region previously auto-filled into form
+                })
+            });
+            expect(regionSwitchRes.status).toBe(200);
+            expect(
+                ((await regionSwitchRes.json()) as { data: { externalStorage: { region: string } } }).data
+                    .externalStorage.region
+            ).toBe('eu-central-003');
+            // Restore original mock endpoint/region and re-enable Workers direct proxy
             expect(
                 (
                     await exports.default.fetch('http://example.com/api/storage/config', {
                         method: 'PUT',
                         headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
-                        body: JSON.stringify({ useWorkerDirectProxy: true })
+                        body: JSON.stringify({
+                            enabled: true,
+                            endpoint: `https://${b2Host}`,
+                            region: 'eu-central-003',
+                            useWorkerDirectProxy: true
+                        })
                     })
                 ).status
             ).toBe(200);
+
+            // Regression #7: Upstream network errors in B2 proxy return structured 502 instead of 500
+            fetchSpy.mockImplementationOnce(async () => {
+                throw new Error('simulated upstream socket drop');
+            });
+            const upstreamDropRes = await exports.default.fetch(
+                `http://example.com/api/storage/b2/${shotLogicalKey}`
+            );
+            expect(upstreamDropRes.status).toBe(502);
 
             // Disabling B2 immediately disables /api/storage/b2/* direct proxy while preserving historical screenshot read
             const disableRes = await exports.default.fetch('http://example.com/api/storage/config', {

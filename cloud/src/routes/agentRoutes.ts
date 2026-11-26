@@ -1560,7 +1560,8 @@ export async function handleAgentWebRoutes(request: Request, env: Env, url: URL)
                 );
             }
             const method = request.method === 'HEAD' ? 'HEAD' : 'GET';
-            if (extCfg.useWorkerDirectProxy === false) {
+            const forceProxy = url.searchParams.get('proxy') === '1';
+            if (extCfg.useWorkerDirectProxy === false && !forceProxy) {
                 const directUrl = await createPresignedB2Url(creds, logicalKey, { method, expiresSeconds: 300 });
                 return new Response(null, {
                     status: 302,
@@ -1571,7 +1572,21 @@ export async function handleAgentWebRoutes(request: Request, env: Env, url: URL)
                     }
                 });
             }
-            const upstreamRes = await proxyB2DirectFetch(creds, logicalKey, request, { method });
+            let upstreamRes: Response;
+            try {
+                upstreamRes = await proxyB2DirectFetch(creds, logicalKey, request, { method });
+            } catch (err) {
+                return Response.json(
+                    {
+                        ok: false,
+                        error: {
+                            code: 'B2_PROXY_ERROR',
+                            message: err instanceof Error ? err.message : 'Backblaze B2 proxy network error'
+                        }
+                    },
+                    { status: 502 }
+                );
+            }
             if (upstreamRes.status === 404) {
                 await upstreamRes.body?.cancel().catch(() => {});
                 return Response.json(

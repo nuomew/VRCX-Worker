@@ -141,11 +141,12 @@
                             {{ t('cloud_hub.quota.cleanup_direct_btn') }}
                         </button>
                         <button
+                            v-if="!quotaInfo || quotaInfo.r2Enabled || !cleanupPreview?.b2Enabled"
                             type="button"
                             class="rounded-md bg-primary px-3 py-1.5 font-medium text-primary-foreground hover:opacity-90 disabled:opacity-50"
                             :disabled="
                                 cleaningDb ||
-                                (!quotaInfo?.r2Enabled && !cleanupPreview?.b2Enabled) ||
+                                !quotaInfo?.r2Enabled ||
                                 !cleanupPreview ||
                                 cleanupPreview.totalRows === 0
                             "
@@ -494,7 +495,7 @@
                         </div>
 
                         <!-- Overflow Threshold & B2 S3-Compatible Credentials -->
-                        <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                        <div class="grid grid-cols-1 gap-3 sm:grid-cols-2" @input="b2FormDirty = true">
                             <div class="space-y-1 sm:col-span-2">
                                 <label class="block text-[11px] font-medium text-muted-foreground">
                                     {{ t('cloud_hub.storage.threshold_label') }}
@@ -657,6 +658,7 @@
     const overflowActive = ref(false);
     const hasSavedSecret = ref(false);
     const savedEnabled = ref(false);
+    const b2FormDirty = ref(false);
     const formUseWorkerDirectProxy = ref(true);
     const pendingDisableDirectProxyConfirm = ref(false);
 
@@ -800,7 +802,7 @@
         loadCleanupPreview();
     });
 
-    function applyStatusPayload(data) {
+    function applyStatusPayload(data, { forceFormSync = false } = {}) {
         if (!data) return;
         r2Usage.value = data.r2 ?? null;
         b2Usage.value = data.b2 ?? null;
@@ -808,17 +810,22 @@
         const ext = data.externalStorage;
         if (ext) {
             savedEnabled.value = Boolean(ext.enabled);
-            formEnabled.value = Boolean(ext.enabled);
-            formUseWorkerDirectProxy.value = ext.useWorkerDirectProxy !== false;
-            pendingDisableDirectProxyConfirm.value = false;
-            formEndpoint.value = ext.endpoint || '';
-            formBucket.value = ext.bucket || '';
-            formRegion.value = ext.region || '';
-            formAccessKeyId.value = ext.accessKeyId || '';
-            formKeyPrefix.value = (ext.keyPrefix || '').replace(/\/+$/, '');
+            cloudState.b2Enabled = Boolean(ext.enabled && ext.endpoint && ext.bucket && ext.accessKeyId && ext.hasSecretKey);
             hasSavedSecret.value = Boolean(ext.hasSecretKey);
-            const gb = Number(ext.r2OverflowThresholdBytes || 0) / (1024 * 1024 * 1024);
-            formThresholdGb.value = Number.isFinite(gb) && gb > 0 ? Number(gb.toFixed(2)) : 9;
+            // Do not clobber user's in-progress form edits if an async refresh finishes late.
+            if (forceFormSync || !b2FormDirty.value) {
+                formEnabled.value = Boolean(ext.enabled);
+                formUseWorkerDirectProxy.value = ext.useWorkerDirectProxy !== false;
+                pendingDisableDirectProxyConfirm.value = false;
+                formEndpoint.value = ext.endpoint || '';
+                formBucket.value = ext.bucket || '';
+                formRegion.value = ext.region || '';
+                formAccessKeyId.value = ext.accessKeyId || '';
+                formKeyPrefix.value = (ext.keyPrefix || '').replace(/\/+$/, '');
+                const gb = Number(ext.r2OverflowThresholdBytes || 0) / (1024 * 1024 * 1024);
+                formThresholdGb.value = Number.isFinite(gb) && gb > 0 ? Number(gb.toFixed(2)) : 9;
+                b2FormDirty.value = false;
+            }
         }
     }
 
@@ -854,7 +861,7 @@
                 method: 'PUT',
                 json: { useWorkerDirectProxy: nextVal }
             });
-            applyStatusPayload(data);
+            applyStatusPayload(data, { forceFormSync: true });
             const msg = t('cloud_hub.storage.saved_toast');
             statusNotice.value = msg;
             toast.success(msg);
@@ -884,6 +891,7 @@
 
     async function onToggleExtraStorage(nextEnabled) {
         formEnabled.value = Boolean(nextEnabled);
+        b2FormDirty.value = true;
         pendingDisableDirectProxyConfirm.value = false;
         statusError.value = '';
         statusNotice.value = '';
@@ -897,7 +905,7 @@
                     method: 'PUT',
                     json: { enabled: false }
                 });
-                applyStatusPayload(data);
+                applyStatusPayload(data, { forceFormSync: true });
                 const msg = t('cloud_hub.storage.saved_toast');
                 statusNotice.value = msg;
                 toast.success(msg);
@@ -909,6 +917,8 @@
             } finally {
                 savingConfig.value = false;
             }
+        } else if (!formEnabled.value && !savedEnabled.value) {
+            b2FormDirty.value = false;
         }
     }
 
@@ -935,7 +945,7 @@
                 }
             });
             formSecretAccessKey.value = '';
-            applyStatusPayload(data);
+            applyStatusPayload(data, { forceFormSync: true });
             const msg = t('cloud_hub.storage.saved_toast');
             statusNotice.value = msg;
             toast.success(msg);

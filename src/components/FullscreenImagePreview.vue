@@ -304,7 +304,11 @@
     useEventListener(window, 'keydown', onKeydown);
 
     async function fetchCloudMediaBlob(url) {
-        const res = await fetch(url, { credentials: 'include' });
+        // Append proxy=1 so explicit copy/download reads stay same-origin even when B2 official 302 direct mode is active.
+        const fetchUrl = url.startsWith('/api/media/')
+            ? `${url}${url.includes('?') ? '&' : '?'}proxy=1`
+            : url;
+        const res = await fetch(fetchUrl, { credentials: 'include' });
         if (!res.ok) {
             throw new Error(`HTTP ${res.status}`);
         }

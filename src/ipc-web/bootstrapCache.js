@@ -122,6 +122,7 @@ export async function loadBootstrap() {
 
     bootstrapCache.statsCounters = { ...(data.statsCounters || {}) };
     cloudState.r2Enabled = Boolean(data.r2Enabled);
+    cloudState.b2Enabled = Boolean(data.b2Enabled);
     cloudState.syncIntervalSeconds = clampSyncIntervalSeconds(
         data.syncIntervalSeconds ?? bootstrapCache.configs['cloud:syncIntervalSeconds']
     );

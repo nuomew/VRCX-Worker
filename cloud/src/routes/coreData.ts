@@ -1,5 +1,6 @@
 import { getLegacyDb } from '../db/schemaBootstrap';
 import type { Env } from '../env';
+import { loadExternalStorageConfig } from '../storage/objectStorage';
 import { markWebClientActive } from '../sync/backgroundFeedSync';
 import { getLegacyImportedStats, isSafeLegacyConfigKey } from './legacyMigration';
 
@@ -582,6 +583,15 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
             }
         }
 
+        const extStorageCfg = await loadExternalStorageConfig(env);
+        const b2Enabled = Boolean(
+            extStorageCfg.enabled &&
+                extStorageCfg.endpoint &&
+                extStorageCfg.bucket &&
+                extStorageCfg.accessKeyId &&
+                extStorageCfg.secretAccessKeyEnc
+        );
+
         return Response.json({
             ok: true,
             data: {
@@ -609,7 +619,8 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
                     deviceLastSeen,
                     deviceStates: mergedDeviceStates
                 },
-                r2Enabled: Boolean(env.R2_MEDIA)
+                r2Enabled: Boolean(env.R2_MEDIA),
+                b2Enabled
             }
         });
     }

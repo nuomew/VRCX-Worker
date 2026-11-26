@@ -2,6 +2,7 @@ import type { Env } from '../env';
 import {
     buildSafeDirectProxyResponse,
     clampOverflowThresholdBytes,
+    clearB2UsageCache,
     decryptB2Secret,
     encryptB2Secret,
     isValidBucketName,
@@ -140,7 +141,14 @@ export async function handleStorageRoutes(request: Request, env: Env, url: URL):
                 );
             }
             normalizedEndpoint = ep.endpoint;
-            resolvedRegion = rawRegion ? rawRegion : ep.inferredRegion;
+            const endpointChanged = Boolean(existing.endpoint) && normalizedEndpoint !== existing.endpoint;
+            // If the user switched to a new regional endpoint without manually entering a different region,
+            // auto-infer the new region instead of reusing the stale previous region.
+            if (!rawRegion || (endpointChanged && rawRegion === existing.region)) {
+                resolvedRegion = ep.inferredRegion;
+            } else {
+                resolvedRegion = rawRegion;
+            }
         } else if (rawRegion) {
             resolvedRegion = rawRegion;
         }
@@ -208,7 +216,15 @@ export async function handleStorageRoutes(request: Request, env: Env, url: URL):
             updatedAt: new Date().toISOString()
         };
 
+        const b2TargetChanged =
+            existing.endpoint !== nextConfig.endpoint ||
+            existing.bucket !== nextConfig.bucket ||
+            existing.keyPrefix !== nextConfig.keyPrefix ||
+            existing.enabled !== nextConfig.enabled;
         await saveExternalStorageConfig(env, nextConfig);
+        if (b2TargetChanged) {
+            await clearB2UsageCache(env);
+        }
 
         const b2Creds = nextConfig.enabled ? await resolveActiveB2Credentials(env, nextConfig) : null;
         const [r2, b2] = await Promise.all([
@@ -379,7 +395,21 @@ export async function handleStorageRoutes(request: Request, env: Env, url: URL):
             );
         }
 
-        const upstreamRes = await proxyB2DirectFetch(creds, safeKey, request, { method });
+        let upstreamRes: Response;
+        try {
+            upstreamRes = await proxyB2DirectFetch(creds, safeKey, request, { method });
+        } catch (err) {
+            return Response.json(
+                {
+                    ok: false,
+                    error: {
+                        code: 'B2_PROXY_ERROR',
+                        message: err instanceof Error ? err.message : 'Backblaze B2 proxy network error'
+                    }
+                },
+                { status: 502 }
+            );
+        }
         if (upstreamRes.status === 404) {
             await upstreamRes.body?.cancel().catch(() => {});
             return new Response(null, { status: 404, statusText: 'Not Found' });

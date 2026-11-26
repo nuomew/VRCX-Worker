@@ -519,7 +519,21 @@ export async function handleDbCleanupRoutes(
                     }
                 });
             }
-            const upstreamRes = await proxyB2DirectFetch(creds, logicalKey, request, { method });
+            let upstreamRes: Response;
+            try {
+                upstreamRes = await proxyB2DirectFetch(creds, logicalKey, request, { method });
+            } catch (err) {
+                return Response.json(
+                    {
+                        ok: false,
+                        error: {
+                            code: 'B2_PROXY_ERROR',
+                            message: err instanceof Error ? err.message : 'Backblaze B2 proxy network error'
+                        }
+                    },
+                    { status: 502 }
+                );
+            }
             if (upstreamRes.status === 404) {
                 await upstreamRes.body?.cancel().catch(() => {});
                 return Response.json(
@@ -612,6 +626,18 @@ export async function handleDbCleanupRoutes(
                         error: {
                             code: 'B2_NOT_CONFIGURED',
                             message: 'Backblaze B2 extra storage is disabled or not configured.'
+                        }
+                    },
+                    { status: 503 }
+                );
+            }
+            if (backupTarget === 'r2' && !env.R2_MEDIA) {
+                return Response.json(
+                    {
+                        ok: false,
+                        error: {
+                            code: 'R2_NOT_BOUND',
+                            message: 'R2_MEDIA bucket is not bound.'
                         }
                     },
                     { status: 503 }

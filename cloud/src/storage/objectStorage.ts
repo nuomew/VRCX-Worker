@@ -324,6 +324,10 @@ function encodeS3Path(path: string): string {
         .join('/');
 }
 
+function compareAsciiCodePoints(a: string, b: string): number {
+    return a < b ? -1 : a > b ? 1 : 0;
+}
+
 function formatAmzDate(now: Date): { amzDate: string; dateStamp: string } {
     const pad = (n: number) => String(n).padStart(2, '0');
     const dateStamp = `${now.getUTCFullYear()}${pad(now.getUTCMonth() + 1)}${pad(now.getUTCDate())}`;
@@ -352,7 +356,9 @@ export async function signedB2Fetch(
     const queryEntries = Object.entries(opts.query ?? {})
         .filter(([, v]) => v !== undefined && v !== null)
         .map(([k, v]) => [rfc3986Encode(k), rfc3986Encode(v)] as const)
-        .sort(([aK, aV], [bK, bV]) => (aK === bK ? aV.localeCompare(bV) : aK.localeCompare(bK)));
+        .sort(([aK, aV], [bK, bV]) =>
+            aK === bK ? compareAsciiCodePoints(aV, bV) : compareAsciiCodePoints(aK, bK)
+        );
     const canonicalQueryString = queryEntries.map(([k, v]) => `${k}=${v}`).join('&');
 
     const payloadBytes = opts.body ?? new Uint8Array(0);
@@ -666,7 +672,9 @@ export async function createPresignedB2Url(
 
     const encodedPairs = queryPairs
         .map(([k, v]) => [rfc3986Encode(k), rfc3986Encode(v)] as const)
-        .sort(([aK, aV], [bK, bV]) => (aK === bK ? aV.localeCompare(bV) : aK.localeCompare(bK)));
+        .sort(([aK, aV], [bK, bV]) =>
+            aK === bK ? compareAsciiCodePoints(aV, bV) : compareAsciiCodePoints(aK, bK)
+        );
     const canonicalQueryString = encodedPairs.map(([k, v]) => `${k}=${v}`).join('&');
 
     const canonicalRequest = [
@@ -802,6 +810,7 @@ export function buildSafeDirectProxyResponse(
 ): Response {
     const status = upstreamRes.status;
     if (status === 304) {
+        void upstreamRes.body?.cancel().catch(() => {});
         const headers = new Headers();
         for (const h of ['etag', 'last-modified', 'cache-control']) {
             const v = upstreamRes.headers.get(h);
@@ -883,6 +892,25 @@ async function writeUsageCache(env: Env, patch: Partial<UsageCachePayload>): Pro
             .run();
     } catch {
         // Non-fatal telemetry cache write
+    }
+}
+
+export async function clearB2UsageCache(env: Env): Promise<void> {
+    try {
+        const prev = await readUsageCache(env);
+        if (!prev.b2) return;
+        const { b2: _drop, ...rest } = prev;
+        await env.DB_CORE.prepare(
+            `INSERT INTO cloud_bg_sync_state (state_key, payload_json, updated_at)
+             VALUES (?, ?, ?)
+             ON CONFLICT(state_key) DO UPDATE SET
+                payload_json = excluded.payload_json,
+                updated_at = excluded.updated_at`
+        )
+            .bind(STATE_KEY_STORAGE_USAGE_CACHE, JSON.stringify(rest), new Date().toISOString())
+            .run();
+    } catch {
+        // Non-fatal cache cleanup
     }
 }
 
@@ -1193,7 +1221,7 @@ export async function deleteStoredObject(env: Env, storedKey: string): Promise<v
     if (!storedKey) return;
     if (storedKey.startsWith(B2_KEY_PREFIX_TAG)) {
         const logicalKey = storedKey.slice(B2_KEY_PREFIX_TAG.length);
-        const creds = await resolveActiveB2Credentials(env);
+        const creds = await resolveActiveB2Credentials(env, undefined, { allowDisabled: true });
         if (creds) {
             await deleteB2Object(creds, logicalKey).catch(() => {});
         }

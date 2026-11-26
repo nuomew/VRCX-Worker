@@ -127,6 +127,7 @@ export const cloudState = reactive({
     subject: '',
     wsConnected: false,
     r2Enabled: false,
+    b2Enabled: false,
     cloudFallbackAllowed: true,
     /** Authoritative VRCX.Agent periodic upload interval in seconds (default 60s). */
     syncIntervalSeconds: DEFAULT_CLOUD_SYNC_INTERVAL_SECONDS,
