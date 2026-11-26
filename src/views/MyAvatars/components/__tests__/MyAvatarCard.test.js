@@ -135,12 +135,17 @@ describe('MyAvatarCard.vue', () => {
         expect(wrapper.emitted('context-action')[0]).toEqual(['details', expect.objectContaining({ id: 'avtr_1' })]);
     });
 
-    test('disables wear action when avatar is active', () => {
-        const wrapper = mountCard({ currentAvatarId: 'avtr_1' });
-        const wearItem = wrapper
+    test('disables wear action and applies active breathing border class when avatar is active', () => {
+        const activeWrapper = mountCard({ currentAvatarId: 'avtr_1' });
+        const wearItem = activeWrapper
             .findAll('[data-testid="ctx-item"]')
             .find((node) => node.text().includes('view.favorite.select_avatar_tooltip'));
 
         expect(wearItem.attributes('disabled')).toBeDefined();
+        expect(activeWrapper.find('[data-testid="card"]').classes()).toContain('avatar-card--active');
+        expect(activeWrapper.find('[data-testid="card"]').classes()).not.toContain('x-highlight-ring');
+
+        const inactiveWrapper = mountCard({ currentAvatarId: 'avtr_other' });
+        expect(inactiveWrapper.find('[data-testid="card"]').classes()).not.toContain('avatar-card--active');
     });
 });
