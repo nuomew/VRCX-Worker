@@ -7738,4 +7738,193 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
             ]).catch(() => {});
         }
     });
+
+    it('delivers bidirectional real-time OSC chat over isolated /ws/chat-agent without affecting ws_agent_hint or scheduled sync', async () => {
+        const guardedEnv: Env = { ...env, AGENT_SYNC_KEY: 'osc-realtime-secret-key' };
+        const realtimeDeviceId = 'win-osc-realtime-1';
+
+        const waitForWsMatch = (ws: WebSocket, predicate: (msg: string) => boolean, timeoutMs = 4000) =>
+            new Promise<string>((resolve, reject) => {
+                const timer = setTimeout(() => {
+                    ws.removeEventListener('message', onMsg);
+                    reject(new Error('Timed out waiting for WebSocket message'));
+                }, timeoutMs);
+                const onMsg = (ev: MessageEvent) => {
+                    const text = typeof ev.data === 'string' ? ev.data : '';
+                    if (predicate(text)) {
+                        clearTimeout(timer);
+                        ws.removeEventListener('message', onMsg);
+                        resolve(text);
+                    }
+                };
+                ws.addEventListener('message', onMsg);
+            });
+
+        const webUpgrade = await exports.default.fetch('http://example.com/ws/web', {
+            headers: { Upgrade: 'websocket', Origin: 'http://example.com' }
+        });
+        expect(webUpgrade.status).toBe(101);
+        const webWs = webUpgrade.webSocket!;
+        webWs.accept();
+
+        const agentStatusOnline = waitForWsMatch(
+            webWs,
+            (m) => m.includes('"chat.agent_status"') && m.includes(realtimeDeviceId) && m.includes('"connected":true')
+        );
+
+        const chatAgentUpgrade = await worker.fetch(
+            new Request('http://example.com/ws/chat-agent', {
+                headers: {
+                    Upgrade: 'websocket',
+                    Authorization: 'Bearer osc-realtime-secret-key',
+                    'X-Device-Id': realtimeDeviceId
+                }
+            }),
+            guardedEnv
+        );
+        expect(chatAgentUpgrade.status).toBe(101);
+        const chatAgentWs = chatAgentUpgrade.webSocket!;
+        chatAgentWs.accept();
+
+        try {
+            await agentStatusOnline;
+
+            // Isolation check 1: /ws/chat-agent MUST NOT appear in general agent status or ws_agent_hint (no vrc_http RPC hijack)
+            const generalStatusRes = await exports.default.fetch('http://example.com/api/agent/status');
+            const generalStatusJson = (await generalStatusRes.json()) as { data: { agentsOnline: string[] } };
+            expect(generalStatusJson.data.agentsOnline).not.toContain(realtimeDeviceId);
+            const wsHintRow = await env.DB_CORE.prepare(
+                "SELECT payload_json FROM cloud_bg_sync_state WHERE state_key = 'ws_agent_hint' LIMIT 1"
+            ).first<{ payload_json?: string }>();
+            expect(wsHintRow?.payload_json ?? '').not.toContain(realtimeDeviceId);
+
+            // Isolation check 2: /dispatch-chat-osc rejects non-OSC actions like sync_now
+            const hub = env.AGENT_HUB.get(env.AGENT_HUB.idFromName('primary'));
+            const blockedNonOsc = await hub.fetch(
+                new Request('https://agent-hub.internal/dispatch-chat-osc', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ cmdId: 'cmd_bad', action: 'sync_now', params: {} })
+                })
+            );
+            expect(blockedNonOsc.status).toBe(400);
+
+            // Push live OSC state from chat agent -> reflected in GET /api/chat/messages with realtimeConnected=true
+            const stateUpdated = waitForWsMatch(
+                webWs,
+                (m) => m.includes('"chat.agent_status"') && m.includes('MyVrcRig')
+            );
+            chatAgentWs.send(
+                JSON.stringify({
+                    v: 1,
+                    type: 'chat.osc_state',
+                    payload: {
+                        enabled: true,
+                        sendPort: 9000,
+                        listenEnabled: true,
+                        listenPort: 9002,
+                        forwardToVrchat: true,
+                        vrcRunning: true,
+                        deviceName: 'MyVrcRig'
+                    }
+                })
+            );
+            await stateUpdated;
+
+            const listRes = await exports.default.fetch('http://example.com/api/chat/messages?limit=10');
+            const listJson = (await listRes.json()) as {
+                data: { devices: Array<{ deviceId: string; deviceName: string; realtimeConnected: boolean }> };
+            };
+            const rtDev = listJson.data.devices.find((d) => d.deviceId === realtimeDeviceId);
+            expect(rtDev?.realtimeConnected).toBe(true);
+            expect(rtDev?.deviceName).toBe('MyVrcRig');
+
+            // Direction A: Web -> Game immediate push over /ws/chat-agent (bypasses sync interval & cloud_commands queue)
+            const agentReceivedOsc = waitForWsMatch(
+                chatAgentWs,
+                (m) => m.includes('"chat.osc_send"') && m.includes('Instant Hello!')
+            );
+            const sendRes = await exports.default.fetch('http://example.com/api/chat/send', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+                body: JSON.stringify({
+                    sourceText: '立即发送！',
+                    translatedText: 'Instant Hello!',
+                    sentText: 'Instant Hello!',
+                    oscPort: 9000,
+                    targetDeviceId: realtimeDeviceId
+                })
+            });
+            expect(sendRes.status).toBe(200);
+            const sendJson = (await sendRes.json()) as {
+                data: { deliveryStatus: string; message: { id: string; cmdId: string } };
+            };
+            expect(sendJson.data.deliveryStatus).toBe('dispatched');
+
+            const oscFrameRaw = await agentReceivedOsc;
+            const oscFrame = JSON.parse(oscFrameRaw) as {
+                payload: { cmdId: string; chatMsgId: string; action: string; params: { message: string } };
+            };
+            expect(oscFrame.payload.action).toBe('send_osc_chatbox');
+            expect(oscFrame.payload.params.message).toBe('Instant Hello!');
+            expect(oscFrame.payload.chatMsgId).toBe(sendJson.data.message.id);
+
+            // Agent immediately sends delivery receipt -> Web WS receives cmd.result & DB updates to 'sent'
+            const webReceivedReceipt = waitForWsMatch(
+                webWs,
+                (m) => m.includes('"cmd.result"') && m.includes(sendJson.data.message.id) && m.includes('"succeeded"')
+            );
+            chatAgentWs.send(
+                JSON.stringify({
+                    v: 1,
+                    id: oscFrame.payload.cmdId,
+                    type: 'chat.osc_result',
+                    payload: {
+                        cmdId: oscFrame.payload.cmdId,
+                        chatMsgId: oscFrame.payload.chatMsgId,
+                        status: 'succeeded',
+                        message: 'Sent to 127.0.0.1:9000'
+                    }
+                })
+            );
+            await webReceivedReceipt;
+
+            // Direction B: Game/Desktop OSC -> Web immediate push over /ws/chat-agent
+            const webReceivedGameChat = waitForWsMatch(
+                webWs,
+                (m) => m.includes('"chat.message"') && m.includes('游戏里刚打的字')
+            );
+            chatAgentWs.send(
+                JSON.stringify({
+                    v: 1,
+                    type: 'chat.osc_incoming',
+                    payload: {
+                        id: 'osc_rt_in_1',
+                        sourceText: '游戏里刚打的字',
+                        sentText: '游戏里刚打的字',
+                        oscPort: 9000,
+                        immediate: true,
+                        playSfx: true
+                    }
+                })
+            );
+            const gameChatFrame = await webReceivedGameChat;
+            expect(gameChatFrame).toContain('"direction":"desktop_sync"');
+
+            // Verify both messages persisted cleanly in D1
+            const afterRes = await exports.default.fetch('http://example.com/api/chat/messages?limit=20&heartbeat=0');
+            const afterJson = (await afterRes.json()) as {
+                data: { messages: Array<{ id: string; status: string; sourceText: string }> };
+            };
+            expect(afterJson.data.messages.find((m) => m.id === sendJson.data.message.id)?.status).toBe('sent');
+            expect(afterJson.data.messages.find((m) => m.id === 'osc_rt_in_1')?.sourceText).toBe('游戏里刚打的字');
+        } finally {
+            chatAgentWs.close(1000, 'done');
+            webWs.close(1000, 'done');
+            await env.DB_CORE.batch([
+                env.DB_CORE.prepare('DELETE FROM cloud_chat_messages'),
+                env.DB_CORE.prepare("DELETE FROM cloud_bg_sync_state WHERE state_key = 'chat_web_active'")
+            ]).catch(() => {});
+        }
+    });
 });

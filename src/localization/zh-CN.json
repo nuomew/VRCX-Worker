@@ -766,6 +766,8 @@
             },
             "chat_translator": {
                 "open_companion_hub": "打开 Windows 云端伴侣管理",
+                "agent_realtime": "OSC 实时直连 · {name}",
+                "realtime_isolated_hint": "独立实时 OSC 通道：双向立即同步，不受定时同步间隔影响，也不会触发日志或照片上传",
                 "agent_online": "伴侣在线 · {name}",
                 "agent_offline": "桌面端伴侣未在线",
                 "vrc_running": "VRChat 运行中",

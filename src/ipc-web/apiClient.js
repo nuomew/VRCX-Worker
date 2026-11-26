@@ -290,7 +290,8 @@ export function connectCloudHubWs() {
             } else if (
                 msg.type === 'chat.message' ||
                 msg.type === 'chat.deleted' ||
-                msg.type === 'chat.cleared'
+                msg.type === 'chat.cleared' ||
+                msg.type === 'chat.agent_status'
             ) {
                 for (const fn of chatEventListeners) {
                     try {

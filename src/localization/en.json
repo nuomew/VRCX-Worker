@@ -766,6 +766,8 @@
             },
             "chat_translator": {
                 "open_companion_hub": "Open Windows companion hub",
+                "agent_realtime": "OSC Realtime · {name}",
+                "realtime_isolated_hint": "Dedicated instant OSC channel (independent of scheduled log/photo sync)",
                 "agent_online": "Companion Online · {name}",
                 "agent_offline": "Desktop Companion Offline",
                 "vrc_running": "VRChat Running",

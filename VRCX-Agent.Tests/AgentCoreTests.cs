@@ -3200,6 +3200,55 @@ INSERT INTO {acctPrefix}_friend_log_history (created_at, type, user_id, display_
         Assert.Single(chatResp.PendingCommands);
         Assert.Equal("send_osc_chatbox", chatResp.PendingCommands[0].Action);
         Assert.Contains("\"oscState\"", capturedBody);
+
+        // 7. OscChatRealtimeClient URI builder & strict OSC-only isolation (never executes sync_now / log / screenshot actions)
+        Assert.True(OscChatRealtimeClient.TryBuildChatAgentWebSocketUri("https://vrcx.example.workers.dev/#/tools/chat-translator", out Uri? wssUri));
+        Assert.Equal("wss://vrcx.example.workers.dev/ws/chat-agent", wssUri!.AbsoluteUri);
+        Assert.True(OscChatRealtimeClient.TryBuildChatAgentWebSocketUri("http://127.0.0.1:8787/", out Uri? wsUri));
+        Assert.Equal("ws://127.0.0.1:8787/ws/chat-agent", wsUri!.AbsoluteUri);
+
+        string? receivedChatMsg = null;
+        int receivedPort = 0;
+        bool? receivedTyping = null;
+        using var rtBridge = new OscChatBridge();
+        using var rtClient = new OscChatRealtimeClient(
+            () => cfg,
+            () => stubHttp,
+            () => true,
+            () => true,
+            rtBridge,
+            (msg, imm, sfx, port, _) =>
+            {
+                receivedChatMsg = msg;
+                receivedPort = port;
+                return Task.FromResult((true, "ok"));
+            },
+            (typing, port, _) =>
+            {
+                receivedTyping = typing;
+                receivedPort = port;
+                return Task.FromResult((true, "ok"));
+            });
+
+        // Must reject sync_now / launch_vrc / clear_cache on isolated OSC chat channel
+        Assert.False((await rtClient.ExecuteOscOnlyActionAsync("sync_now", new Dictionary<string, object?>(), CancellationToken.None)).Ok);
+        Assert.False((await rtClient.ExecuteOscOnlyActionAsync("launch_vrc", new Dictionary<string, object?>(), CancellationToken.None)).Ok);
+        Assert.False((await rtClient.ExecuteOscOnlyActionAsync("clear_cache", new Dictionary<string, object?>(), CancellationToken.None)).Ok);
+
+        // Must dispatch valid chat.osc_send frames immediately to loopback OSC
+        await rtClient.HandleInboundEnvelopeAsync(
+            null,
+            "{\"type\":\"chat.osc_send\",\"id\":\"osc_1\",\"payload\":{\"cmdId\":\"osc_1\",\"chatMsgId\":\"chat_1\",\"action\":\"send_osc_chatbox\",\"params\":{\"message\":\"即时到游戏\",\"immediate\":true,\"playSfx\":true,\"oscPort\":9005}}}",
+            CancellationToken.None);
+        Assert.Equal("即时到游戏", receivedChatMsg);
+        Assert.Equal(9005, receivedPort);
+
+        await rtClient.HandleInboundEnvelopeAsync(
+            null,
+            "{\"type\":\"chat.osc_send\",\"id\":\"osc_2\",\"payload\":{\"cmdId\":\"osc_2\",\"action\":\"send_osc_typing\",\"params\":{\"typing\":true,\"oscPort\":9000}}}",
+            CancellationToken.None);
+        Assert.Equal(true, receivedTyping);
+        Assert.Equal(9000, receivedPort);
     }
 
     private sealed class StubHttpHandler : HttpMessageHandler

@@ -733,6 +733,8 @@
             },
             "chat_translator": {
                 "open_companion_hub": "開啟 Windows 雲端伴侶管理",
+                "agent_realtime": "OSC 即時直連 · {name}",
+                "realtime_isolated_hint": "獨立即時 OSC 通道：雙向立即同步，不受定時同步間隔影響，也不會觸發日誌或照片上傳",
                 "agent_online": "伴侶在線 · {name}",
                 "agent_offline": "桌面伴侶未在線",
                 "vrc_running": "VRChat 執行中",

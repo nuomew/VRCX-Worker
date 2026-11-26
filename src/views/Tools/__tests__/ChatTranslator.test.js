@@ -5,13 +5,16 @@ import { flushPromises, mount } from '@vue/test-utils';
 const mocks = vi.hoisted(() => ({
     push: vi.fn(),
     cloudFetch: vi.fn(),
-    onCloudChatEvent: vi.fn(() => () => {}),
-    onCloudCommandResult: vi.fn(() => () => {}),
+    connectCloudHubWs: vi.fn(),
+    onCloudChatEvent: vi.fn(),
+    onCloudCommandResult: vi.fn(),
     translateText: vi.fn(),
     setTranslationApi: vi.fn(),
     confirm: vi.fn(),
     getString: vi.fn(),
-    setString: vi.fn()
+    setString: vi.fn(),
+    chatListeners: [],
+    cmdListeners: []
 }));
 
 const translationApi = ref(true);
@@ -51,8 +54,23 @@ vi.mock('vue-sonner', () => ({
 
 vi.mock('@/ipc-web/apiClient', () => ({
     cloudFetch: (...args) => mocks.cloudFetch(...args),
-    onCloudChatEvent: (...args) => mocks.onCloudChatEvent(...args),
-    onCloudCommandResult: (...args) => mocks.onCloudCommandResult(...args)
+    connectCloudHubWs: (...args) => mocks.connectCloudHubWs(...args),
+    onCloudChatEvent: (fn) => {
+        mocks.chatListeners.push(fn);
+        mocks.onCloudChatEvent(fn);
+        return () => {
+            const idx = mocks.chatListeners.indexOf(fn);
+            if (idx >= 0) mocks.chatListeners.splice(idx, 1);
+        };
+    },
+    onCloudCommandResult: (fn) => {
+        mocks.cmdListeners.push(fn);
+        mocks.onCloudCommandResult(fn);
+        return () => {
+            const idx = mocks.cmdListeners.indexOf(fn);
+            if (idx >= 0) mocks.cmdListeners.splice(idx, 1);
+        };
+    }
 }));
 
 vi.mock('@/services/config', () => ({
@@ -163,6 +181,8 @@ describe('chatTranslatorUtils', () => {
 describe('ChatTranslator.vue', () => {
     beforeEach(() => {
         vi.clearAllMocks();
+        mocks.chatListeners.length = 0;
+        mocks.cmdListeners.length = 0;
         vi.stubGlobal('WEB', true);
         translationApi.value = true;
         translationApiType.value = 'openai';
@@ -265,7 +285,46 @@ describe('ChatTranslator.vue', () => {
                 })
             })
         );
+        expect(mocks.connectCloudHubWs).toHaveBeenCalled();
         expect(wrapper.text()).toContain('Hello world');
+
+        // Instant WebSocket delivery of incoming desktop OSC message & delivery receipt without polling
+        for (const fn of mocks.chatListeners) {
+            fn({
+                type: 'chat.agent_status',
+                payload: {
+                    deviceId: 'win-desk-1',
+                    connected: true,
+                    osc: { deviceName: 'Main-PC', vrcRunning: true, sendPort: 9000, listenEnabled: true, listenPort: 9002 }
+                }
+            });
+            fn({
+                type: 'chat.message',
+                payload: {
+                    message: {
+                        id: 'osc_instant_2',
+                        direction: 'desktop_sync',
+                        sourceText: '实时游戏打字消息',
+                        translatedText: '',
+                        sentText: '实时游戏打字消息',
+                        oscPort: 9000,
+                        status: 'synced',
+                        createdAt: '2026-11-26T10:02:00.000Z'
+                    }
+                }
+            });
+        }
+        for (const fn of mocks.cmdListeners) {
+            fn({
+                type: 'cmd.result',
+                payload: { chatMsgId: 'chat_sent_1', status: 'succeeded', message: 'Sent OSC' }
+            });
+        }
+        await flushPromises();
+
+        expect(wrapper.text()).toContain('view.tools.chat_translator.agent_realtime');
+        expect(wrapper.text()).toContain('实时游戏打字消息');
+        expect(wrapper.text()).toContain('view.tools.chat_translator.status_sent');
 
         wrapper.unmount();
     });

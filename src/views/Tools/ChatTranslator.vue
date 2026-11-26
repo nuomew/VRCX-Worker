@@ -15,22 +15,34 @@
                     type="button"
                     class="inline-flex items-center gap-1.5 rounded-full border px-2.5 py-0.5 text-xs transition-colors hover:bg-muted/70"
                     :class="
-                        hasOnlineDevice
+                        hasRealtimeDevice
                             ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400'
-                            : 'border-amber-500/40 bg-amber-500/10 text-amber-600 dark:text-amber-400'
+                            : hasOnlineDevice
+                              ? 'border-sky-500/40 bg-sky-500/10 text-sky-600 dark:text-sky-400'
+                              : 'border-amber-500/40 bg-amber-500/10 text-amber-600 dark:text-amber-400'
                     "
-                    :title="t('view.tools.chat_translator.open_companion_hub')"
+                    :title="t('view.tools.chat_translator.realtime_isolated_hint')"
                     @click="openCloudHubDialog">
                     <span
                         class="size-2 rounded-full"
-                        :class="hasOnlineDevice ? 'bg-emerald-500 animate-pulse' : 'bg-amber-500'" />
+                        :class="
+                            hasRealtimeDevice
+                                ? 'bg-emerald-500 animate-pulse'
+                                : hasOnlineDevice
+                                  ? 'bg-sky-500'
+                                  : 'bg-amber-500'
+                        " />
                     <span>
                         {{
-                            hasOnlineDevice
-                                ? t('view.tools.chat_translator.agent_online', {
+                            hasRealtimeDevice
+                                ? t('view.tools.chat_translator.agent_realtime', {
                                       name: activeDevice?.deviceName || 'Windows PC'
                                   })
-                                : t('view.tools.chat_translator.agent_offline')
+                                : hasOnlineDevice
+                                  ? t('view.tools.chat_translator.agent_online', {
+                                        name: activeDevice?.deviceName || 'Windows PC'
+                                    })
+                                  : t('view.tools.chat_translator.agent_offline')
                         }}
                     </span>
                 </button>
@@ -550,7 +562,12 @@
     import { Badge } from '@/components/ui/badge';
     import { Button } from '@/components/ui/button';
     import { Spinner } from '@/components/ui/spinner';
-    import { cloudFetch, onCloudChatEvent, onCloudCommandResult } from '@/ipc-web/apiClient';
+    import {
+        cloudFetch,
+        connectCloudHubWs,
+        onCloudChatEvent,
+        onCloudCommandResult
+    } from '@/ipc-web/apiClient';
     import { cloudState } from '@/ipc-web/cloudState';
     import configRepository from '@/services/config';
     import { useAdvancedSettingsStore, useModalStore } from '@/stores';
@@ -632,12 +649,19 @@
         if (prefs.targetDeviceId) {
             return devices.value.find((d) => d.deviceId === prefs.targetDeviceId) || null;
         }
-        return devices.value.find((d) => d.online) || devices.value[0] || null;
+        return (
+            devices.value.find((d) => d.realtimeConnected) ||
+            devices.value.find((d) => d.online) ||
+            devices.value[0] ||
+            null
+        );
     });
+
+    const hasRealtimeDevice = computed(() => Boolean(activeDevice.value?.realtimeConnected));
 
     const hasOnlineDevice = computed(() => {
         if (activeDevice.value) {
-            return Boolean(activeDevice.value.online);
+            return Boolean(activeDevice.value.realtimeConnected || activeDevice.value.online);
         }
         return cloudState.agentsOnline.length > 0;
     });
@@ -1148,9 +1172,55 @@
         return dt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
     }
 
+    function applyChatAgentStatusEvent(payload) {
+        const deviceId = typeof payload?.deviceId === 'string' ? payload.deviceId : '';
+        if (!deviceId) return;
+        const connected = payload.connected === true;
+        const oscPayload = payload.osc && typeof payload.osc === 'object' ? payload.osc : null;
+        const idx = devices.value.findIndex((d) => d.deviceId === deviceId);
+        if (idx >= 0) {
+            const existing = devices.value[idx];
+            devices.value[idx] = {
+                ...existing,
+                deviceName: oscPayload?.deviceName || existing.deviceName,
+                realtimeConnected: connected,
+                online: connected || existing.online,
+                vrcRunning: oscPayload?.vrcRunning !== undefined ? Boolean(oscPayload.vrcRunning) : existing.vrcRunning,
+                osc: oscPayload
+                    ? {
+                          enabled: oscPayload.enabled !== false,
+                          sendPort: oscPayload.sendPort ?? existing.osc?.sendPort ?? DEFAULT_OSC_SEND_PORT,
+                          listenEnabled: Boolean(oscPayload.listenEnabled),
+                          listenPort: oscPayload.listenPort ?? existing.osc?.listenPort ?? 9002,
+                          forwardToVrchat: oscPayload.forwardToVrchat !== false
+                      }
+                    : existing.osc
+            };
+        } else if (connected) {
+            devices.value.push({
+                deviceId,
+                deviceName: oscPayload?.deviceName || deviceId,
+                online: true,
+                realtimeConnected: true,
+                vrcRunning: Boolean(oscPayload?.vrcRunning),
+                lastSeenAt: new Date().toISOString(),
+                osc: {
+                    enabled: oscPayload?.enabled !== false,
+                    sendPort: oscPayload?.sendPort ?? DEFAULT_OSC_SEND_PORT,
+                    listenEnabled: Boolean(oscPayload?.listenEnabled),
+                    listenPort: oscPayload?.listenPort ?? 9002,
+                    forwardToVrchat: oscPayload?.forwardToVrchat !== false
+                }
+            });
+        }
+    }
+
     function startLiveSync() {
         if (!isWebMode) return;
         stopLiveSync();
+
+        // Proactively connect `/ws/web` so game/desktop OSC input & delivery receipts arrive instantaneously.
+        connectCloudHubWs();
 
         unsubChatEvent = onCloudChatEvent((evt) => {
             if (evt.type === 'chat.message' && evt.payload?.message) {
@@ -1160,13 +1230,18 @@
             } else if (evt.type === 'chat.cleared') {
                 messages.value = [];
                 autoTranslatedIds.clear();
+            } else if (evt.type === 'chat.agent_status' && evt.payload) {
+                applyChatAgentStatusEvent(evt.payload);
             }
         });
 
         unsubCmdResult = onCloudCommandResult((evt) => {
             const cmdId = evt?.id || evt?.payload?.cmdId;
-            if (!cmdId) return;
-            const target = messages.value.find((m) => m.cmdId === cmdId);
+            const chatMsgId = evt?.payload?.chatMsgId;
+            if (!cmdId && !chatMsgId) return;
+            const target = messages.value.find(
+                (m) => (chatMsgId && m.id === chatMsgId) || (cmdId && m.cmdId === cmdId)
+            );
             if (!target) return;
             const ok = evt?.payload?.status === 'succeeded';
             target.status = ok ? 'sent' : 'failed';
@@ -1174,8 +1249,21 @@
         });
 
         fetchMessages({ showLoader: messages.value.length === 0 });
+        let fallbackTicks = 0;
         pollTimer = setInterval(() => {
-            if (typeof document === 'undefined' || document.visibilityState === 'visible') {
+            if (typeof document !== 'undefined' && document.visibilityState !== 'visible') {
+                return;
+            }
+            if (!cloudState.wsConnected) {
+                connectCloudHubWs();
+                fetchMessages({ showLoader: false });
+                return;
+            }
+            // When both Web WS and desktop OSC WS are live, only run a light safety sync every 30s.
+            fallbackTicks++;
+            const intervalTicks = hasRealtimeDevice.value ? 10 : 2;
+            if (fallbackTicks >= intervalTicks) {
+                fallbackTicks = 0;
                 fetchMessages({ showLoader: false });
             }
         }, 3000);

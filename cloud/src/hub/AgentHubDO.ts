@@ -1,12 +1,32 @@
 import { DurableObject } from 'cloudflare:workers';
 import type { Env } from '../env';
 
-type ClientRole = 'agent' | 'web';
+type ClientRole = 'agent' | 'chat_agent' | 'web';
 
 interface SocketAttachment {
     role: ClientRole;
     deviceId: string;
     connectedAt: string;
+}
+
+const CHAT_OSC_ALLOWED_ACTIONS = new Set(['send_osc_chatbox', 'send_osc_typing']);
+const CHAT_OSC_MAX_CHARS = 144;
+const CHAT_OSC_MAX_LINES = 9;
+const CHAT_OSC_MAX_STORED = 500;
+const CHAT_OSC_ID_RE = /^[A-Za-z0-9_-]{4,64}$/;
+
+function sanitizeOscTextInline(raw: unknown, maxChars = CHAT_OSC_MAX_CHARS): string {
+    if (typeof raw !== 'string') return '';
+    const cleaned = raw.replace(/\r\n?/g, '\n').replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '').trim();
+    if (!cleaned) return '';
+    const boundedLines = cleaned.split('\n').slice(0, CHAT_OSC_MAX_LINES).join('\n');
+    const runes = Array.from(boundedLines);
+    return runes.length > maxChars ? runes.slice(0, maxChars).join('').trim() : boundedLines;
+}
+
+function clampOscPortInline(raw: unknown, fallback = 9000): number {
+    const n = typeof raw === 'number' ? raw : typeof raw === 'string' && /^\d+$/.test(raw.trim()) ? Number(raw.trim()) : NaN;
+    return Number.isInteger(n) && n >= 1024 && n <= 65535 ? n : fallback;
 }
 
 interface HubEnvelope {
@@ -45,6 +65,13 @@ export class AgentHubDO extends DurableObject<Env> {
         this.ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair('ping', 'pong'));
         this.ctx.storage.sql.exec(`
             CREATE TABLE IF NOT EXISTS live_device_state (
+                device_id TEXT PRIMARY KEY,
+                state_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        `);
+        this.ctx.storage.sql.exec(`
+            CREATE TABLE IF NOT EXISTS live_chat_osc_state (
                 device_id TEXT PRIMARY KEY,
                 state_json TEXT NOT NULL,
                 updated_at TEXT NOT NULL
@@ -100,6 +127,17 @@ export class AgentHubDO extends DurableObject<Env> {
             return this.handleDispatchCommand(request);
         }
 
+        if (url.pathname === '/dispatch-chat-osc' && request.method === 'POST') {
+            return this.handleDispatchChatOsc(request);
+        }
+
+        if (url.pathname === '/chat-osc-status' && request.method === 'GET') {
+            return Response.json({
+                ok: true,
+                data: this.getLiveChatOscStatus()
+            });
+        }
+
         if (url.pathname === '/revoke-device' && request.method === 'POST') {
             const body = (await request.json().catch(() => ({}))) as { deviceId?: string };
             const deviceId = typeof body.deviceId === 'string' ? body.deviceId.trim() : '';
@@ -113,7 +151,11 @@ export class AgentHubDO extends DurableObject<Env> {
                 const a = s.deserializeAttachment() as SocketAttachment | null;
                 return a?.role === 'agent';
             });
-            for (const sock of sockets) {
+            const chatSockets = this.ctx.getWebSockets(`chatdev:${deviceId}`).filter((s) => {
+                const a = s.deserializeAttachment() as SocketAttachment | null;
+                return a?.role === 'chat_agent';
+            });
+            for (const sock of [...sockets, ...chatSockets]) {
                 try {
                     sock.close(4001, 'Device revoked');
                 } catch {
@@ -127,28 +169,42 @@ export class AgentHubDO extends DurableObject<Env> {
                 this.pendingRpcs.delete(id);
             }
             this.ctx.storage.sql.exec('DELETE FROM live_device_state WHERE device_id = ?', deviceId);
+            this.ctx.storage.sql.exec('DELETE FROM live_chat_osc_state WHERE device_id = ?', deviceId);
             this.broadcastToRole('web', {
                 v: 1,
                 type: 'agent.offline',
                 ts: Date.now(),
                 payload: { deviceId, revoked: true }
             });
+            if (chatSockets.length > 0) {
+                this.broadcastToRole('web', {
+                    v: 1,
+                    type: 'chat.agent_status',
+                    ts: Date.now(),
+                    payload: { deviceId, connected: false, revoked: true }
+                });
+            }
             // Server-initiated ws.close() does not trigger webSocketClose() under DO Hibernation;
             // explicitly rewrite or delete ws_agent_hint excluding revoked sockets.
             await this.syncWsAgentHint(new Set(sockets));
-            return Response.json({ ok: true, data: { deviceId, closedSockets: sockets.length } });
+            return Response.json({ ok: true, data: { deviceId, closedSockets: sockets.length + chatSockets.length } });
         }
 
-        if (url.pathname === '/ws/agent' || url.pathname === '/ws/web') {
+        if (url.pathname === '/ws/agent' || url.pathname === '/ws/chat-agent' || url.pathname === '/ws/web') {
             if (request.headers.get('Upgrade')?.toLowerCase() !== 'websocket') {
                 return new Response('Expected WebSocket Upgrade', { status: 426 });
             }
 
-            const role: ClientRole = url.pathname === '/ws/agent' ? 'agent' : 'web';
+            const role: ClientRole =
+                url.pathname === '/ws/agent'
+                    ? 'agent'
+                    : url.pathname === '/ws/chat-agent'
+                      ? 'chat_agent'
+                      : 'web';
             const deviceId =
-                role === 'agent'
-                    ? (url.searchParams.get('deviceId')?.trim() || 'default-win-agent').slice(0, 64)
-                    : `web-${crypto.randomUUID().slice(0, 8)}`;
+                role === 'web'
+                    ? `web-${crypto.randomUUID().slice(0, 8)}`
+                    : (url.searchParams.get('deviceId')?.trim() || 'default-win-agent').slice(0, 64);
 
             const pair = new WebSocketPair();
             const [client, server] = Object.values(pair) as [WebSocket, WebSocket];
@@ -179,10 +235,27 @@ export class AgentHubDO extends DurableObject<Env> {
                         // Ignore already-closed sockets
                     }
                 }
+            } else if (role === 'chat_agent') {
+                // Dedicated isolated chat/OSC socket: never touches ws_agent_hint, vrc_http RPCs, or scheduled sync.
+                const staleChatSockets = this.ctx.getWebSockets(`chatdev:${deviceId}`).filter((s) => {
+                    const a = s.deserializeAttachment() as SocketAttachment | null;
+                    return a?.role === 'chat_agent';
+                });
+                for (const stale of staleChatSockets) {
+                    try {
+                        stale.close(4000, 'Replaced by newer chat OSC connection');
+                    } catch {
+                        // Ignore already-closed sockets
+                    }
+                }
             }
 
-            // Mandatory hibernation acceptance; prefix tags to prevent role/deviceId namespace collisions.
-            this.ctx.acceptWebSocket(server, [`role:${role}`, `dev:${deviceId}`]);
+            // Mandatory hibernation acceptance; keep chat_agent tags strictly isolated from general agent tags.
+            const socketTags =
+                role === 'chat_agent'
+                    ? [`role:${role}`, `chatdev:${deviceId}`]
+                    : [`role:${role}`, `dev:${deviceId}`];
+            this.ctx.acceptWebSocket(server, socketTags);
             server.serializeAttachment(attachment);
 
             if (role === 'agent') {
@@ -194,6 +267,13 @@ export class AgentHubDO extends DurableObject<Env> {
                 });
                 // Persist authoritative list of live WS agent IDs only AFTER genuine WebSocket upgrade succeeds.
                 await this.syncWsAgentHint();
+            } else if (role === 'chat_agent') {
+                this.broadcastToRole('web', {
+                    v: 1,
+                    type: 'chat.agent_status',
+                    ts: Date.now(),
+                    payload: { deviceId, connected: true, connectedAt: attachment.connectedAt }
+                });
             }
 
             return new Response(null, { status: 101, webSocket: client });
@@ -298,6 +378,92 @@ export class AgentHubDO extends DurableObject<Env> {
         }
     }
 
+    private pickChatAgentSocket(targetDeviceId?: string): WebSocket | null {
+        const candidates = (
+            targetDeviceId
+                ? this.ctx.getWebSockets(`chatdev:${targetDeviceId}`).filter((s) => {
+                      const a = s.deserializeAttachment() as SocketAttachment | null;
+                      return a?.role === 'chat_agent';
+                  })
+                : this.ctx.getWebSockets('role:chat_agent')
+        ).filter((s) => this.isSocketOpen(s));
+        if (candidates.length === 0) return null;
+        candidates.sort((a, b) => {
+            const atA = (a.deserializeAttachment() as SocketAttachment | null)?.connectedAt ?? '';
+            const atB = (b.deserializeAttachment() as SocketAttachment | null)?.connectedAt ?? '';
+            return atB.localeCompare(atA);
+        });
+        return candidates[0] ?? null;
+    }
+
+    private async handleDispatchChatOsc(request: Request): Promise<Response> {
+        const body = (await request.json()) as {
+            cmdId: string;
+            chatMsgId?: string;
+            targetDeviceId?: string;
+            action: string;
+            params?: Record<string, unknown>;
+        };
+
+        if (!CHAT_OSC_ALLOWED_ACTIONS.has(body.action)) {
+            return Response.json(
+                {
+                    ok: false,
+                    error: { code: 'COMMAND_REJECTED', message: 'Only OSC chat actions are allowed on chat channel' }
+                },
+                { status: 400 }
+            );
+        }
+
+        const chatSocket = this.pickChatAgentSocket(body.targetDeviceId);
+        if (!chatSocket) {
+            return Response.json(
+                {
+                    ok: false,
+                    error: { code: 'CHAT_AGENT_OFFLINE', message: 'No realtime OSC chat companion connected' }
+                },
+                { status: 503 }
+            );
+        }
+
+        const attachment = chatSocket.deserializeAttachment() as SocketAttachment | null;
+        try {
+            chatSocket.send(
+                JSON.stringify({
+                    v: 1,
+                    id: body.cmdId,
+                    type: 'chat.osc_send',
+                    ts: Date.now(),
+                    payload: {
+                        cmdId: body.cmdId,
+                        chatMsgId: body.chatMsgId ?? '',
+                        action: body.action,
+                        params: body.params ?? {}
+                    }
+                })
+            );
+            return Response.json({
+                ok: true,
+                data: {
+                    dispatched: true,
+                    realtime: true,
+                    deviceId: attachment?.deviceId ?? body.targetDeviceId ?? 'default-win-agent'
+                }
+            });
+        } catch (err) {
+            return Response.json(
+                {
+                    ok: false,
+                    error: {
+                        code: 'DISPATCH_FAILED',
+                        message: err instanceof Error ? err.message : 'Failed to dispatch realtime OSC chat'
+                    }
+                },
+                { status: 502 }
+            );
+        }
+    }
+
     private async handleDispatchCommand(request: Request): Promise<Response> {
         const body = (await request.json()) as {
             cmdId: string;
@@ -391,6 +557,160 @@ export class AgentHubDO extends DurableObject<Env> {
         }
 
         if (!envelope || typeof envelope.type !== 'string') {
+            return;
+        }
+
+        if (attachment.role === 'chat_agent') {
+            const safePayload =
+                envelope.payload && typeof envelope.payload === 'object' && !Array.isArray(envelope.payload)
+                    ? (envelope.payload as Record<string, unknown>)
+                    : null;
+
+            if (envelope.type === 'chat.osc_state' && safePayload) {
+                const nowIso = new Date().toISOString();
+                const normalizedState = {
+                    enabled: safePayload.enabled !== false,
+                    sendPort: clampOscPortInline(safePayload.sendPort, 9000),
+                    listenEnabled: safePayload.listenEnabled === true,
+                    listenPort: clampOscPortInline(safePayload.listenPort, 9002),
+                    forwardToVrchat: safePayload.forwardToVrchat !== false,
+                    vrcRunning: safePayload.vrcRunning === true,
+                    deviceName:
+                        typeof safePayload.deviceName === 'string' ? safePayload.deviceName.slice(0, 64) : ''
+                };
+                this.ctx.storage.sql.exec(
+                    `INSERT INTO live_chat_osc_state (device_id, state_json, updated_at)
+                     VALUES (?, ?, ?)
+                     ON CONFLICT(device_id) DO UPDATE SET state_json = excluded.state_json, updated_at = excluded.updated_at`,
+                    attachment.deviceId,
+                    JSON.stringify(normalizedState),
+                    nowIso
+                );
+                this.broadcastToRole('web', {
+                    v: 1,
+                    type: 'chat.agent_status',
+                    ts: Date.now(),
+                    payload: {
+                        deviceId: attachment.deviceId,
+                        connected: true,
+                        osc: normalizedState,
+                        updatedAt: nowIso
+                    }
+                });
+                return;
+            }
+
+            if (envelope.type === 'chat.osc_incoming' && safePayload) {
+                const text = sanitizeOscTextInline(safePayload.sentText ?? safePayload.sourceText ?? safePayload.message);
+                if (!text) return;
+                const rawId = typeof safePayload.id === 'string' ? safePayload.id.trim() : '';
+                const msgId = CHAT_OSC_ID_RE.test(rawId) ? rawId : `osc_${crypto.randomUUID().replace(/-/g, '').slice(0, 16)}`;
+                const oscPort = clampOscPortInline(safePayload.oscPort, 9000);
+                const immediate = safePayload.immediate !== false;
+                const playSfx = safePayload.playSfx !== false;
+                const rawCreated =
+                    typeof safePayload.createdAt === 'string' && Number.isFinite(Date.parse(safePayload.createdAt))
+                        ? new Date(Date.parse(safePayload.createdAt)).toISOString()
+                        : new Date().toISOString();
+
+                const dto = {
+                    id: msgId,
+                    deviceId: attachment.deviceId,
+                    direction: 'desktop_sync',
+                    sourceText: text,
+                    translatedText: '',
+                    sentText: text,
+                    sourceLang: 'auto',
+                    targetLang: '',
+                    displayMode: 'source_only',
+                    oscAddress: '/chatbox/input',
+                    oscPort,
+                    immediate,
+                    playSfx,
+                    status: 'synced',
+                    cmdId: '',
+                    errorMessage: '',
+                    createdAt: rawCreated
+                };
+
+                // Broadcast to Web tabs IMMEDIATELY before waiting on D1 persistence.
+                this.broadcastToRole('web', {
+                    v: 1,
+                    type: 'chat.message',
+                    ts: Date.now(),
+                    payload: { message: dto }
+                });
+
+                this.ctx.waitUntil(
+                    (async () => {
+                        try {
+                            await this.env.DB_CORE.prepare(
+                                `INSERT OR IGNORE INTO cloud_chat_messages
+                                 (id, device_id, direction, source_text, translated_text, sent_text, source_lang, target_lang, display_mode, osc_address, osc_port, immediate, play_sfx, status, cmd_id, error_message, created_at)
+                                 VALUES (?, ?, 'desktop_sync', ?, '', ?, 'auto', '', 'source_only', '/chatbox/input', ?, ?, ?, 'synced', '', '', ?)`
+                            )
+                                .bind(
+                                    msgId,
+                                    attachment.deviceId,
+                                    text,
+                                    text,
+                                    oscPort,
+                                    immediate ? 1 : 0,
+                                    playSfx ? 1 : 0,
+                                    rawCreated
+                                )
+                                .run();
+                            await this.env.DB_CORE.prepare(
+                                `DELETE FROM cloud_chat_messages
+                                 WHERE id NOT IN (SELECT id FROM cloud_chat_messages ORDER BY created_at DESC LIMIT ?)`
+                            )
+                                .bind(CHAT_OSC_MAX_STORED)
+                                .run();
+                        } catch {
+                            // Non-fatal in minimal test fixtures
+                        }
+                    })()
+                );
+                return;
+            }
+
+            if (envelope.type === 'chat.osc_result' && safePayload) {
+                const cmdId = envelope.id || (typeof safePayload.cmdId === 'string' ? safePayload.cmdId : '');
+                const chatMsgId = typeof safePayload.chatMsgId === 'string' ? safePayload.chatMsgId.trim() : '';
+                const succeeded = safePayload.status === 'succeeded';
+                const chatStatus = succeeded ? 'sent' : 'failed';
+                const errMsg = succeeded ? '' : String(safePayload.message ?? 'OSC dispatch failed').slice(0, 512);
+
+                // Broadcast instant delivery receipt to Web tabs immediately.
+                this.broadcastToRole('web', {
+                    v: 1,
+                    id: cmdId || undefined,
+                    type: 'cmd.result',
+                    ts: Date.now(),
+                    payload: {
+                        cmdId,
+                        chatMsgId,
+                        status: succeeded ? 'succeeded' : 'failed',
+                        message: errMsg || String(safePayload.message ?? ''),
+                        deviceId: attachment.deviceId
+                    }
+                });
+
+                if (chatMsgId || cmdId) {
+                    this.ctx.waitUntil(
+                        (chatMsgId
+                            ? this.env.DB_CORE.prepare(
+                                  `UPDATE cloud_chat_messages SET status = ?, error_message = ? WHERE id = ?`
+                              ).bind(chatStatus, errMsg, chatMsgId)
+                            : this.env.DB_CORE.prepare(
+                                  `UPDATE cloud_chat_messages SET status = ?, error_message = ? WHERE cmd_id = ?`
+                              ).bind(chatStatus, errMsg, cmdId)
+                        )
+                            .run()
+                            .catch(() => {})
+                    );
+                }
+            }
             return;
         }
 
@@ -545,6 +865,22 @@ export class AgentHubDO extends DurableObject<Env> {
     }
 
     private cleanupAgentSocket(ws: WebSocket, attachment: SocketAttachment | null): void {
+        if (attachment?.role === 'chat_agent') {
+            const stillOnline = this.ctx.getWebSockets(`chatdev:${attachment.deviceId}`).some((s) => {
+                if (s === ws || !this.isSocketOpen(s)) return false;
+                const a = s.deserializeAttachment() as SocketAttachment | null;
+                return a?.role === 'chat_agent';
+            });
+            if (!stillOnline) {
+                this.broadcastToRole('web', {
+                    v: 1,
+                    type: 'chat.agent_status',
+                    ts: Date.now(),
+                    payload: { deviceId: attachment.deviceId, connected: false }
+                });
+            }
+            return;
+        }
         if (attachment?.role !== 'agent') {
             return;
         }
@@ -625,6 +961,40 @@ export class AgentHubDO extends DurableObject<Env> {
         }
 
         return { agentsOnline, webClientsCount, deviceStates };
+    }
+
+    private getLiveChatOscStatus(): {
+        chatAgentsOnline: string[];
+        chatOscStates: Record<string, { state: unknown; updatedAt: string }>;
+    } {
+        const sockets = this.ctx.getWebSockets('role:chat_agent').filter((s) => this.isSocketOpen(s));
+        const chatAgentsOnline = Array.from(
+            new Set(
+                sockets
+                    .map((s) => (s.deserializeAttachment() as SocketAttachment | null)?.deviceId)
+                    .filter((id): id is string => Boolean(id))
+            )
+        );
+
+        const chatOscStates: Record<string, { state: unknown; updatedAt: string }> = {};
+        const cursor = this.ctx.storage.sql.exec<{
+            device_id: string;
+            state_json: string;
+            updated_at: string;
+        }>(`SELECT device_id, state_json, updated_at FROM live_chat_osc_state ORDER BY updated_at DESC LIMIT 20`);
+
+        for (const row of cursor) {
+            try {
+                chatOscStates[row.device_id] = {
+                    state: JSON.parse(row.state_json),
+                    updatedAt: row.updated_at
+                };
+            } catch {
+                // Skip malformed row.
+            }
+        }
+
+        return { chatAgentsOnline, chatOscStates };
     }
 
     private broadcastToRole(role: ClientRole, envelope: HubEnvelope): void {

@@ -216,11 +216,77 @@ async function pruneChatMessages(env: Env): Promise<void> {
         .catch(() => {});
 }
 
+async function fetchLiveChatOscHubStatus(env: Env): Promise<{
+    chatAgentsOnline: Set<string>;
+    chatOscStates: Record<string, Record<string, unknown>>;
+}> {
+    const empty = { chatAgentsOnline: new Set<string>(), chatOscStates: {} };
+    try {
+        const hub = env.AGENT_HUB.get(env.AGENT_HUB.idFromName('primary'));
+        const res = await hub.fetch(new Request('https://agent-hub.internal/chat-osc-status'));
+        if (!res.ok) {
+            await res.body?.cancel().catch(() => {});
+            return empty;
+        }
+        const json = (await res.json()) as {
+            data?: {
+                chatAgentsOnline?: string[];
+                chatOscStates?: Record<string, { state?: Record<string, unknown> }>;
+            };
+        };
+        const chatAgentsOnline = new Set(
+            Array.isArray(json.data?.chatAgentsOnline) ? json.data!.chatAgentsOnline.filter(Boolean) : []
+        );
+        const chatOscStates: Record<string, Record<string, unknown>> = {};
+        if (json.data?.chatOscStates && typeof json.data.chatOscStates === 'object') {
+            for (const [devId, entry] of Object.entries(json.data.chatOscStates)) {
+                if (entry?.state && typeof entry.state === 'object') {
+                    chatOscStates[devId] = entry.state;
+                }
+            }
+        }
+        return { chatAgentsOnline, chatOscStates };
+    } catch {
+        return empty;
+    }
+}
+
+async function dispatchRealtimeChatOsc(
+    env: Env,
+    opts: {
+        cmdId: string;
+        chatMsgId?: string;
+        targetDeviceId?: string;
+        action: 'send_osc_chatbox' | 'send_osc_typing';
+        params: Record<string, unknown>;
+    }
+): Promise<{ ok: true; deviceId: string } | { ok: false }> {
+    try {
+        const hub = env.AGENT_HUB.get(env.AGENT_HUB.idFromName('primary'));
+        const res = await hub.fetch(
+            new Request('https://agent-hub.internal/dispatch-chat-osc', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(opts)
+            })
+        );
+        if (!res.ok) {
+            await res.body?.cancel().catch(() => {});
+            return { ok: false };
+        }
+        const json = (await res.json()) as { data?: { deviceId?: string } };
+        return { ok: true, deviceId: json.data?.deviceId || opts.targetDeviceId || '' };
+    } catch {
+        return { ok: false };
+    }
+}
+
 async function listChatAgentDevices(env: Env): Promise<
     Array<{
         deviceId: string;
         deviceName: string;
         online: boolean;
+        realtimeConnected: boolean;
         vrcRunning: boolean;
         lastSeenAt: string;
         osc: {
@@ -233,7 +299,7 @@ async function listChatAgentDevices(env: Env): Promise<
     }>
 > {
     const now = Date.now();
-    const [syncIntervalSeconds, devRes, stateRes, wsHintRow] = await Promise.all([
+    const [syncIntervalSeconds, devRes, stateRes, wsHintRow, liveChatHub] = await Promise.all([
         getCloudSyncIntervalSeconds(env).catch(() => 60),
         env.DB_CORE.prepare(
             'SELECT device_id, device_name, last_seen_at FROM cloud_devices ORDER BY last_seen_at DESC LIMIT 20'
@@ -243,7 +309,8 @@ async function listChatAgentDevices(env: Env): Promise<
         ).all<{ device_id: string; state_json: string; updated_at: string }>(),
         env.DB_CORE.prepare("SELECT payload_json FROM cloud_bg_sync_state WHERE state_key = 'ws_agent_hint' LIMIT 1")
             .first<{ payload_json?: string }>()
-            .catch(() => null)
+            .catch(() => null),
+        fetchLiveChatOscHubStatus(env)
     ]);
 
     const wsOnlineSet = new Set<string>();
@@ -276,25 +343,56 @@ async function listChatAgentDevices(env: Env): Promise<
         }
     }
 
-    return devRows.map((dev) => {
+    const deviceMap = new Map<string, { device_id: string; device_name: string; last_seen_at: string }>();
+    for (const dev of devRows) {
+        deviceMap.set(dev.device_id, dev);
+    }
+    // Include realtime chat_agent companions even if their periodic HTTP sync hasn't ticked yet.
+    for (const realtimeId of liveChatHub.chatAgentsOnline) {
+        if (!deviceMap.has(realtimeId)) {
+            const rtState = liveChatHub.chatOscStates[realtimeId];
+            deviceMap.set(realtimeId, {
+                device_id: realtimeId,
+                device_name: typeof rtState?.deviceName === 'string' && rtState.deviceName ? rtState.deviceName : realtimeId,
+                last_seen_at: new Date(now).toISOString()
+            });
+        }
+    }
+
+    return Array.from(deviceMap.values()).map((dev) => {
         const st = stateMap.get(dev.device_id) ?? {};
+        const rtSt = liveChatHub.chatOscStates[dev.device_id] ?? {};
+        const realtimeConnected = liveChatHub.chatAgentsOnline.has(dev.device_id);
         const oscRaw = st.osc && typeof st.osc === 'object' && !Array.isArray(st.osc)
             ? (st.osc as Record<string, unknown>)
             : {};
-        const sendPort = parseOscPort(st.oscSendPort ?? oscRaw.sendPort, DEFAULT_OSC_SEND_PORT) ?? DEFAULT_OSC_SEND_PORT;
-        const listenPort = parseOscPort(st.oscListenPort ?? oscRaw.listenPort, 9002) ?? 9002;
+        const sendPort =
+            parseOscPort(rtSt.sendPort ?? st.oscSendPort ?? oscRaw.sendPort, DEFAULT_OSC_SEND_PORT) ??
+            DEFAULT_OSC_SEND_PORT;
+        const listenPort =
+            parseOscPort(rtSt.listenPort ?? st.oscListenPort ?? oscRaw.listenPort, 9002) ?? 9002;
         return {
             deviceId: dev.device_id,
-            deviceName: dev.device_name || dev.device_id,
-            online: wsOnlineSet.has(dev.device_id) || httpOnlineSet.has(dev.device_id),
-            vrcRunning: st.vrcRunning === true || st.isGameRunning === true,
+            deviceName:
+                (typeof rtSt.deviceName === 'string' && rtSt.deviceName) || dev.device_name || dev.device_id,
+            online: realtimeConnected || wsOnlineSet.has(dev.device_id) || httpOnlineSet.has(dev.device_id),
+            realtimeConnected,
+            vrcRunning:
+                rtSt.vrcRunning === true || st.vrcRunning === true || st.isGameRunning === true,
             lastSeenAt: dev.last_seen_at || '',
             osc: {
-                enabled: st.oscChatSyncEnabled !== false && oscRaw.enabled !== false,
+                enabled:
+                    (rtSt.enabled !== undefined ? rtSt.enabled !== false : true) &&
+                    st.oscChatSyncEnabled !== false &&
+                    oscRaw.enabled !== false,
                 sendPort,
-                listenEnabled: st.oscListenEnabled === true || oscRaw.listenEnabled === true,
+                listenEnabled:
+                    rtSt.listenEnabled === true || st.oscListenEnabled === true || oscRaw.listenEnabled === true,
                 listenPort,
-                forwardToVrchat: st.oscForwardToVrchat !== false && oscRaw.forwardToVrchat !== false
+                forwardToVrchat:
+                    (rtSt.forwardToVrchat !== undefined ? rtSt.forwardToVrchat !== false : true) &&
+                    st.oscForwardToVrchat !== false &&
+                    oscRaw.forwardToVrchat !== false
             }
         };
     });
@@ -670,40 +768,96 @@ export async function handleChatOscWebRoutes(request: Request, env: Env, url: UR
         const nowIso = new Date().toISOString();
         await touchChatWebActive(env, nowIso);
 
-        let status = sendToVrc ? 'queued' : 'synced';
-        let cmdId = '';
+        let status = sendToVrc ? 'dispatching' : 'synced';
+        let cmdId = sendToVrc ? `osc_${randomHex(8)}` : '';
         let resolvedDeviceId = targetDeviceId;
         let errorMessage = '';
         let deliveryStatus: 'dispatched' | 'queued' | 'skipped' | 'failed' = 'skipped';
 
+        // Persist the row BEFORE dispatching over realtime WebSocket so sub-millisecond `chat.osc_result`
+        // callbacks from the desktop companion always find and update this row cleanly.
+        await env.DB_CORE.prepare(
+            `INSERT INTO cloud_chat_messages
+             (id, device_id, direction, source_text, translated_text, sent_text, source_lang, target_lang, display_mode, osc_address, osc_port, immediate, play_sfx, status, cmd_id, error_message, created_at)
+             VALUES (?, ?, 'web_to_vrc', ?, ?, ?, ?, ?, ?, '/chatbox/input', ?, ?, ?, ?, ?, '', ?)`
+        )
+            .bind(
+                msgId,
+                resolvedDeviceId,
+                sourceText || sentText,
+                translatedText,
+                sentText,
+                sourceLang,
+                targetLang,
+                displayMode,
+                oscPort,
+                immediate ? 1 : 0,
+                playSfx ? 1 : 0,
+                status,
+                cmdId,
+                nowIso
+            )
+            .run();
+
         if (sendToVrc) {
-            const dispatch = await dispatchAgentCommandInternal(env, {
-                action: 'send_osc_chatbox',
-                params: {
-                    message: sentText,
-                    immediate,
-                    playSfx,
-                    oscPort,
-                    chatMsgId: msgId
-                },
+            const oscParams = {
+                message: sentText,
+                immediate,
+                playSfx,
+                oscPort,
+                chatMsgId: msgId
+            };
+            // Priority 1: Immediate push over isolated `/ws/chat-agent` channel (zero sync-interval delay, zero GameLog/photo coupling).
+            const realtimeDispatch = await dispatchRealtimeChatOsc(env, {
+                cmdId,
+                chatMsgId: msgId,
                 targetDeviceId: targetDeviceId || undefined,
-                ttlSec: 120,
-                requireOnline: false
+                action: 'send_osc_chatbox',
+                params: oscParams
             });
 
-            if (dispatch.ok) {
-                cmdId = dispatch.cmdId;
-                resolvedDeviceId = dispatch.deviceId || targetDeviceId;
-                deliveryStatus = dispatch.deliveryStatus;
-                status = dispatch.deliveryStatus === 'dispatched' ? 'dispatched' : 'queued';
+            if (realtimeDispatch.ok) {
+                resolvedDeviceId = realtimeDispatch.deviceId || targetDeviceId;
+                deliveryStatus = 'dispatched';
+                status = 'dispatched';
             } else {
-                status = 'failed';
-                deliveryStatus = 'failed';
-                errorMessage = dispatch.message;
+                // Fallback: queue command if the dedicated chat WS is temporarily disconnected.
+                const dispatch = await dispatchAgentCommandInternal(env, {
+                    action: 'send_osc_chatbox',
+                    params: oscParams,
+                    targetDeviceId: targetDeviceId || undefined,
+                    ttlSec: 120,
+                    requireOnline: false
+                });
+
+                if (dispatch.ok) {
+                    cmdId = dispatch.cmdId;
+                    resolvedDeviceId = dispatch.deviceId || targetDeviceId;
+                    deliveryStatus = dispatch.deliveryStatus;
+                    status = dispatch.deliveryStatus === 'dispatched' ? 'dispatched' : 'queued';
+                } else {
+                    cmdId = '';
+                    status = 'failed';
+                    deliveryStatus = 'failed';
+                    errorMessage = dispatch.message;
+                }
             }
+
+            // Conditional update prevents clobbering an ultra-fast `chat.osc_result` ('sent'/'failed') already written by AgentHubDO.
+            await env.DB_CORE.prepare(
+                `UPDATE cloud_chat_messages
+                 SET device_id = ?, status = ?, cmd_id = ?, error_message = ?
+                 WHERE id = ? AND status = 'dispatching'`
+            )
+                .bind(resolvedDeviceId, status, cmdId, errorMessage, msgId)
+                .run();
         }
 
-        const row: ChatMessageRow = {
+        await pruneChatMessages(env);
+        const latestRow = await env.DB_CORE.prepare('SELECT * FROM cloud_chat_messages WHERE id = ? LIMIT 1')
+            .bind(msgId)
+            .first<ChatMessageRow>();
+        const row: ChatMessageRow = latestRow ?? {
             id: msgId,
             device_id: resolvedDeviceId,
             direction: 'web_to_vrc',
@@ -722,34 +876,6 @@ export async function handleChatOscWebRoutes(request: Request, env: Env, url: UR
             error_message: errorMessage,
             created_at: nowIso
         };
-
-        await env.DB_CORE.prepare(
-            `INSERT INTO cloud_chat_messages
-             (id, device_id, direction, source_text, translated_text, sent_text, source_lang, target_lang, display_mode, osc_address, osc_port, immediate, play_sfx, status, cmd_id, error_message, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-        )
-            .bind(
-                row.id,
-                row.device_id,
-                row.direction,
-                row.source_text,
-                row.translated_text,
-                row.sent_text,
-                row.source_lang,
-                row.target_lang,
-                row.display_mode,
-                row.osc_address,
-                row.osc_port,
-                row.immediate,
-                row.play_sfx,
-                row.status,
-                row.cmd_id,
-                row.error_message,
-                row.created_at
-            )
-            .run();
-
-        await pruneChatMessages(env);
         const dto = formatChatMessageDto(row);
         await broadcastChatEvent(env, 'chat.message', { message: dto });
 
@@ -784,6 +910,20 @@ export async function handleChatOscWebRoutes(request: Request, env: Env, url: UR
         }
         const targetDeviceId = typeof body.targetDeviceId === 'string' ? body.targetDeviceId.trim().slice(0, 64) : '';
         await touchChatWebActive(env, new Date().toISOString());
+
+        const realtimeCmdId = `osc_${randomHex(8)}`;
+        const realtimeDispatch = await dispatchRealtimeChatOsc(env, {
+            cmdId: realtimeCmdId,
+            targetDeviceId: targetDeviceId || undefined,
+            action: 'send_osc_typing',
+            params: { typing, oscPort }
+        });
+        if (realtimeDispatch.ok) {
+            return Response.json({
+                ok: true,
+                data: { skipped: false, cmdId: realtimeCmdId, deliveryStatus: 'dispatched' }
+            });
+        }
 
         const dispatch = await dispatchAgentCommandInternal(env, {
             action: 'send_osc_typing',

@@ -138,8 +138,9 @@ export default {
                 return legacyAgentResp;
             }
 
-            // 4. Windows Agent WebSocket upgrade (Device Bearer auth)
-            if (url.pathname === '/ws/agent') {
+            // 4. Windows Agent WebSocket upgrades (Device Bearer auth)
+            // `/ws/chat-agent` is a dedicated real-time OSC chat channel strictly isolated from scheduled sync & vrc_http RPCs.
+            if (url.pathname === '/ws/agent' || url.pathname === '/ws/chat-agent') {
                 const agentAuth = await authenticateAgent(request, env, '');
                 if (!agentAuth.authenticated || !agentAuth.deviceId) {
                     return unauthorizedResponse();

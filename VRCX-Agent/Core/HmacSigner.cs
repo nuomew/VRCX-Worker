@@ -40,6 +40,18 @@ public static class HmacSigner
         return true;
     }
 
+    public static string ResolveDeviceId(AgentConfig config)
+    {
+        string deviceId = (config.DeviceId ?? string.Empty).Trim();
+        if (string.IsNullOrEmpty(deviceId) || !IsValidSyncSecret(deviceId))
+        {
+            // Compute deterministic ASCII-safe fallback locally without mutating the caller's AgentConfig snapshot.
+            string seed = $"{Environment.MachineName}:{Environment.UserName}";
+            deviceId = "win-" + Sha256Hex(seed)[..12];
+        }
+        return deviceId;
+    }
+
     /// <summary>
     /// Attaches ASCII-safe Bearer Sync Secret and X-Device-Id headers to outgoing Worker API calls.
     /// Human-readable UTF-8 device names are sent in the JSON body to avoid non-ASCII HTTP header errors on Windows.
@@ -56,13 +68,7 @@ public static class HmacSigner
             request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", secret);
         }
 
-        string deviceId = (config.DeviceId ?? string.Empty).Trim();
-        if (string.IsNullOrEmpty(deviceId) || !IsValidSyncSecret(deviceId))
-        {
-            // Compute deterministic ASCII-safe fallback locally without mutating the caller's AgentConfig snapshot.
-            string seed = $"{Environment.MachineName}:{Environment.UserName}";
-            deviceId = "win-" + Sha256Hex(seed)[..12];
-        }
+        string deviceId = ResolveDeviceId(config);
         request.Headers.Remove("X-Device-Id");
         request.Headers.Add("X-Device-Id", deviceId);
     }
