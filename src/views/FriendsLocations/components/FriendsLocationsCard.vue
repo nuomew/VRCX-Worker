@@ -2,7 +2,6 @@
     <UserContextMenu :user-id="friend.id" :state="friend.state" :location="friend.ref?.location">
         <Card
             class="friend-card x-hover-card hover:bg-muted relative overflow-hidden"
-            :class="{ 'friend-card--has-world-bg': Boolean(worldBgUrl) }"
             :style="cardStyle"
             @click="showUserDialog(friend.id)">
             <div
@@ -17,7 +16,6 @@
                     fetchpriority="low"
                     class="friend-card__world-bg-img h-full w-full object-cover"
                     @error="worldBgFailed = true" />
-                <div class="friend-card__world-bg-scrim absolute inset-0" />
             </div>
             <ProfileEffect
                 :enabled="showCosmetics"
@@ -197,45 +195,15 @@
     }
 
     .friend-card__world-bg-img {
-        opacity: 0.28;
+        opacity: 0.3;
         transition:
             opacity 0.2s ease,
             transform 0.25s ease;
     }
 
-    :global(html.dark) .friend-card__world-bg-img,
-    :global(:root.dark) .friend-card__world-bg-img,
-    :global(:root[data-theme='dark']) .friend-card__world-bg-img {
-        opacity: 0.34;
-    }
-
     .friend-card:hover .friend-card__world-bg-img {
-        opacity: 0.36;
+        opacity: 0.4;
         transform: scale(1.03);
-    }
-
-    :global(html.dark) .friend-card:hover .friend-card__world-bg-img,
-    :global(:root.dark) .friend-card:hover .friend-card__world-bg-img,
-    :global(:root[data-theme='dark']) .friend-card:hover .friend-card__world-bg-img {
-        opacity: 0.42;
-    }
-
-    .friend-card__world-bg-scrim {
-        background: linear-gradient(
-            135deg,
-            color-mix(in oklch, var(--card) 68%, transparent) 0%,
-            color-mix(in oklch, var(--card) 32%, transparent) 100%
-        );
-    }
-
-    :global(html.dark) .friend-card__world-bg-scrim,
-    :global(:root.dark) .friend-card__world-bg-scrim,
-    :global(:root[data-theme='dark']) .friend-card__world-bg-scrim {
-        background: linear-gradient(
-            135deg,
-            color-mix(in oklch, var(--card) 66%, transparent) 0%,
-            color-mix(in oklch, var(--card) 28%, transparent) 100%
-        );
     }
 
     .friend-card__header {
