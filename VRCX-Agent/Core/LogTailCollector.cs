@@ -1,4 +1,5 @@
 using System;
+using System.Buffers;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -91,6 +92,41 @@ public sealed class LogTailCollector
         long ticks = 0L;
         try { ticks = File.GetLastWriteTimeUtc(filePath).Ticks; } catch { /* ignore */ }
         return (false, string.Empty, ticks, fileName);
+    }
+
+    private static (bool HasTimestamp, string TimestampKey, long WriteTicksUtc, string FileName) BuildChronologicalSortKey(FileInfo fi)
+    {
+        string fileName = fi.Name ?? string.Empty;
+        string? ts = TryExtractLogFilenameTimestamp(fileName);
+        if (ts != null)
+        {
+            return (true, ts, 0L, fileName);
+        }
+        long ticks = 0L;
+        try { ticks = fi.LastWriteTimeUtc.Ticks; } catch { /* ignore */ }
+        return (false, string.Empty, ticks, fileName);
+    }
+
+    private static int CompareLogFileInfosChronologically(FileInfo leftInfo, FileInfo rightInfo)
+    {
+        var left = BuildChronologicalSortKey(leftInfo);
+        var right = BuildChronologicalSortKey(rightInfo);
+
+        int hasTsCmp = left.HasTimestamp.CompareTo(right.HasTimestamp);
+        if (hasTsCmp != 0) return hasTsCmp;
+
+        if (left.HasTimestamp)
+        {
+            int tsCmp = StringComparer.Ordinal.Compare(left.TimestampKey, right.TimestampKey);
+            if (tsCmp != 0) return tsCmp;
+        }
+        else
+        {
+            int timeCmp = left.WriteTicksUtc.CompareTo(right.WriteTicksUtc);
+            if (timeCmp != 0) return timeCmp;
+        }
+
+        return StringComparer.OrdinalIgnoreCase.Compare(left.FileName, right.FileName);
     }
 
     internal static int CompareLogFilesChronologically(string leftPath, string rightPath)
@@ -245,18 +281,19 @@ public sealed class LogTailCollector
 
         lock (_pollLock)
         {
-            List<string> orderedFiles = Directory
-                .EnumerateFiles(logDirectory, "output_log_*.txt", SearchOption.TopDirectoryOnly)
+            List<FileInfo> orderedInfos = new DirectoryInfo(logDirectory)
+                .EnumerateFiles("output_log_*.txt", SearchOption.TopDirectoryOnly)
                 .ToList();
-            orderedFiles.Sort(CompareLogFilesChronologically);
+            orderedInfos.Sort(CompareLogFileInfosChronologically);
 
-            if (orderedFiles.Count == 0)
+            if (orderedInfos.Count == 0)
             {
                 return 0;
             }
 
-            string latestFile = orderedFiles[orderedFiles.Count - 1];
-            string latestName = Path.GetFileName(latestFile);
+            FileInfo latestInfo = orderedInfos[orderedInfos.Count - 1];
+            string latestFile = latestInfo.FullName;
+            string latestName = latestInfo.Name;
             bool cursorDirty = false;
 
             // Never regress backwards to an older timestamped log file if an older VRChat process flushed late.
@@ -267,11 +304,12 @@ public sealed class LogTailCollector
                 string? latestTs = TryExtractLogFilenameTimestamp(latestName);
                 if (curTs != null && latestTs != null && StringComparer.Ordinal.Compare(latestTs, curTs) < 0)
                 {
-                    string? activeFile = orderedFiles.FirstOrDefault(
-                        f => string.Equals(Path.GetFileName(f), _cursor.FileName, StringComparison.OrdinalIgnoreCase));
-                    if (!string.IsNullOrEmpty(activeFile))
+                    FileInfo? activeInfo = orderedInfos.FirstOrDefault(
+                        f => string.Equals(f.Name, _cursor.FileName, StringComparison.OrdinalIgnoreCase));
+                    if (activeInfo != null)
                     {
-                        latestFile = activeFile;
+                        latestInfo = activeInfo;
+                        latestFile = activeInfo.FullName;
                         latestName = _cursor.FileName;
                     }
                 }
@@ -282,11 +320,11 @@ public sealed class LogTailCollector
             if (!string.IsNullOrWhiteSpace(_cursor.FileName) &&
                 !string.Equals(_cursor.FileName, latestName, StringComparison.OrdinalIgnoreCase))
             {
-                string? prevFile = orderedFiles.FirstOrDefault(
-                    f => string.Equals(Path.GetFileName(f), _cursor.FileName, StringComparison.OrdinalIgnoreCase));
-                if (!string.IsNullOrEmpty(prevFile))
+                FileInfo? prevInfo = orderedInfos.FirstOrDefault(
+                    f => string.Equals(f.Name, _cursor.FileName, StringComparison.OrdinalIgnoreCase));
+                if (prevInfo != null)
                 {
-                    totalParsed += DrainRotatedActiveFileLocked(prevFile, capturedScreenshots, out bool prevUpdated, out bool prevMutated);
+                    totalParsed += DrainRotatedActiveFileLocked(prevInfo.FullName, prevInfo.Length, capturedScreenshots, out bool prevUpdated, out bool prevMutated);
                     cursorDirty |= prevUpdated;
                     worldStateMutated |= prevMutated;
                 }
@@ -296,9 +334,9 @@ public sealed class LogTailCollector
             }
 
             // 1. Backfill any unread historical output_log_*.txt files oldest-first (chunked & paused if offline queue is heavy).
-            foreach (string histFile in orderedFiles)
+            foreach (FileInfo histInfo in orderedInfos)
             {
-                if (string.Equals(Path.GetFileName(histFile), latestName, StringComparison.OrdinalIgnoreCase))
+                if (string.Equals(histInfo.Name, latestName, StringComparison.OrdinalIgnoreCase))
                 {
                     continue;
                 }
@@ -306,19 +344,24 @@ public sealed class LogTailCollector
                 {
                     break;
                 }
-                int added = ReadHistoricalLogFile(histFile, out bool fileCursorUpdated);
+                // Fast zero-IO skip: historical file already fully read based on cached directory enumeration length.
+                if (_cursor.FileOffsets.TryGetValue(histInfo.Name, out long recordedHistOffset) && histInfo.Length <= recordedHistOffset)
+                {
+                    continue;
+                }
+                int added = ReadHistoricalLogFile(histInfo.FullName, histInfo.Length, out bool fileCursorUpdated);
                 totalParsed += added;
                 cursorDirty |= fileCursorUpdated;
             }
 
             // 2. Tail the active/latest output_log_*.txt file using the live parser (complete newline-terminated lines only).
-            totalParsed += ReadLatestLogFile(latestFile, capturedScreenshots, out bool latestCursorUpdated, out bool latestMutated);
+            totalParsed += ReadLatestLogFile(latestFile, latestInfo.Length, capturedScreenshots, out bool latestCursorUpdated, out bool latestMutated);
             cursorDirty |= latestCursorUpdated;
             worldStateMutated |= latestMutated;
 
             if (cursorDirty)
             {
-                PruneTrackedOffsets(orderedFiles);
+                PruneTrackedOffsets(orderedInfos);
                 SaveCursor();
             }
         }
@@ -337,18 +380,15 @@ public sealed class LogTailCollector
         return totalParsed;
     }
 
-    private int ReadHistoricalLogFile(string filePath, out bool cursorUpdated)
+    private int ReadHistoricalLogFile(string filePath, long knownFileLen, out bool cursorUpdated)
     {
         cursorUpdated = false;
         string fileName = Path.GetFileName(filePath);
-        long fileLen;
-        try
+        long fileLen = knownFileLen;
+        if (fileLen < 0)
         {
-            fileLen = new FileInfo(filePath).Length;
-        }
-        catch
-        {
-            return 0;
+            try { fileLen = new FileInfo(filePath).Length; }
+            catch { return 0; }
         }
 
         long startOffset = 0;
@@ -399,32 +439,40 @@ public sealed class LogTailCollector
                     {
                         using var fsTail = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
                         fsTail.Seek(scanOffset, SeekOrigin.Begin);
-                        byte[] tailBuf = new byte[(int)tailBytesLen];
-                        int tailRead = 0;
-                        while (tailRead < tailBuf.Length)
+                        int wantedLen = (int)tailBytesLen;
+                        byte[] tailBuf = ArrayPool<byte>.Shared.Rent(wantedLen);
+                        try
                         {
-                            int n = fsTail.Read(tailBuf, tailRead, tailBuf.Length - tailRead);
-                            if (n == 0) break;
-                            tailRead += n;
-                        }
-                        if (tailRead > 0)
-                        {
-                            int startIdx = (scanOffset == 0 && tailRead >= 3 && tailBuf[0] == 0xEF && tailBuf[1] == 0xBB && tailBuf[2] == 0xBF) ? 3 : 0;
-                            int len = tailRead - startIdx;
-                            if (len > 0 && tailBuf[startIdx + len - 1] == (byte)'\r') len--;
-                            string tailLine = Encoding.UTF8.GetString(tailBuf, startIdx, len);
-                            GameLogEventItem? ev = isolatedParser.ParseLine(tailLine);
-                            if (ev != null)
+                            int tailRead = 0;
+                            while (tailRead < wantedLen)
                             {
-                                if (ev.Type != "Location")
-                                {
-                                    GameLogEventItem? pendingLoc = isolatedParser.FlushPendingLocation();
-                                    if (pendingLoc != null) batch.Add(pendingLoc);
-                                }
-                                batch.Add(ev);
+                                int n = fsTail.Read(tailBuf, tailRead, wantedLen - tailRead);
+                                if (n == 0) break;
+                                tailRead += n;
                             }
+                            if (tailRead > 0)
+                            {
+                                int startIdx = (scanOffset == 0 && tailRead >= 3 && tailBuf[0] == 0xEF && tailBuf[1] == 0xBB && tailBuf[2] == 0xBF) ? 3 : 0;
+                                int len = tailRead - startIdx;
+                                if (len > 0 && tailBuf[startIdx + len - 1] == (byte)'\r') len--;
+                                string tailLine = Encoding.UTF8.GetString(tailBuf, startIdx, len);
+                                GameLogEventItem? ev = isolatedParser.ParseLine(tailLine);
+                                if (ev != null)
+                                {
+                                    if (ev.Type != "Location")
+                                    {
+                                        GameLogEventItem? pendingLoc = isolatedParser.FlushPendingLocation();
+                                        if (pendingLoc != null) batch.Add(pendingLoc);
+                                    }
+                                    batch.Add(ev);
+                                }
+                            }
+                            endPosition = scanOffset + tailRead;
                         }
-                        endPosition = scanOffset + tailRead;
+                        finally
+                        {
+                            ArrayPool<byte>.Shared.Return(tailBuf);
+                        }
                     }
                     else
                     {
@@ -601,6 +649,7 @@ public sealed class LogTailCollector
 
     private int DrainRotatedActiveFileLocked(
         string prevFile,
+        long knownFileLen,
         List<GameLogEventItem> screenshots,
         out bool cursorUpdated,
         out bool stateMutated)
@@ -608,14 +657,11 @@ public sealed class LogTailCollector
         cursorUpdated = false;
         stateMutated = false;
         string fileName = Path.GetFileName(prevFile);
-        long fileLen;
-        try
+        long fileLen = knownFileLen;
+        if (fileLen < 0)
         {
-            fileLen = new FileInfo(prevFile).Length;
-        }
-        catch
-        {
-            return 0;
+            try { fileLen = new FileInfo(prevFile).Length; }
+            catch { return 0; }
         }
 
         long persistedOffset = _cursor.FileOffsets.TryGetValue(fileName, out long mapped)
@@ -696,76 +742,90 @@ public sealed class LogTailCollector
         }
 
         int toRead = (int)Math.Min(remaining, MaxLiveReadChunkBytes);
-        byte[] buffer = new byte[toRead];
-        fs.Seek(startOffset, SeekOrigin.Begin);
-        int readTotal = 0;
-        while (readTotal < toRead)
+        byte[] buffer = ArrayPool<byte>.Shared.Rent(toRead);
+        try
         {
-            int n = fs.Read(buffer, readTotal, toRead - readTotal);
-            if (n == 0) break;
-            readTotal += n;
-        }
-        if (readTotal <= 0)
-        {
-            return lines;
-        }
-
-        // Only advance through the last newline byte so half-written lines are deferred until complete.
-        int lastNewline = Array.LastIndexOf(buffer, (byte)'\n', readTotal - 1);
-        if (lastNewline < 0)
-        {
-            // Guard against livelock when a single log line exceeds MaxLiveReadChunkBytes (8 MiB):
-            // scan forward in 64 KiB chunks until the terminating '\n' and skip past the oversized noise line.
-            if (readTotal >= MaxLiveReadChunkBytes && remaining > MaxLiveReadChunkBytes)
+            fs.Seek(startOffset, SeekOrigin.Begin);
+            int readTotal = 0;
+            while (readTotal < toRead)
             {
-                byte[] scanBuf = new byte[64 * 1024];
-                long pos = startOffset + readTotal;
-                while (true)
+                int n = fs.Read(buffer, readTotal, toRead - readTotal);
+                if (n == 0) break;
+                readTotal += n;
+            }
+            if (readTotal <= 0)
+            {
+                return lines;
+            }
+
+            // Only advance through the last newline byte so half-written lines are deferred until complete.
+            int lastNewline = Array.LastIndexOf(buffer, (byte)'\n', readTotal - 1);
+            if (lastNewline < 0)
+            {
+                // Guard against livelock when a single log line exceeds MaxLiveReadChunkBytes (8 MiB):
+                // scan forward in pooled 64 KiB chunks until the terminating '\n' and skip past the oversized noise line.
+                if (readTotal >= MaxLiveReadChunkBytes && remaining > MaxLiveReadChunkBytes)
                 {
-                    int n = fs.Read(scanBuf, 0, scanBuf.Length);
-                    if (n <= 0)
+                    byte[] scanBuf = ArrayPool<byte>.Shared.Rent(64 * 1024);
+                    try
                     {
-                        // Still actively being written without '\n' yet: wait without advancing past incomplete line.
-                        return lines;
+                        long pos = startOffset + readTotal;
+                        while (true)
+                        {
+                            int n = fs.Read(scanBuf, 0, 64 * 1024);
+                            if (n <= 0)
+                            {
+                                // Still actively being written without '\n' yet: wait without advancing past incomplete line.
+                                return lines;
+                            }
+                            int nlIdx = Array.IndexOf(scanBuf, (byte)'\n', 0, n);
+                            if (nlIdx >= 0)
+                            {
+                                nextOffset = pos + nlIdx + 1;
+                                Log.Warn("Skipped oversized single VRChat log line ({Bytes} bytes) to prevent tail livelock.", nextOffset - startOffset);
+                                return lines;
+                            }
+                            pos += n;
+                        }
                     }
-                    int nlIdx = Array.IndexOf(scanBuf, (byte)'\n', 0, n);
-                    if (nlIdx >= 0)
+                    finally
                     {
-                        nextOffset = pos + nlIdx + 1;
-                        Log.Warn("Skipped oversized single VRChat log line ({Bytes} bytes) to prevent tail livelock.", nextOffset - startOffset);
-                        return lines;
+                        ArrayPool<byte>.Shared.Return(scanBuf);
                     }
-                    pos += n;
                 }
+                return lines;
             }
+
+            int consumeLen = lastNewline + 1;
+            int bytePos = 0;
+            if (startOffset == 0 && consumeLen >= 3 && buffer[0] == 0xEF && buffer[1] == 0xBB && buffer[2] == 0xBF)
+            {
+                bytePos = 3;
+            }
+
+            while (bytePos < consumeLen)
+            {
+                int nl = Array.IndexOf(buffer, (byte)'\n', bytePos, consumeLen - bytePos);
+                if (nl < 0) break;
+                int contentLen = nl - bytePos;
+                if (contentLen > 0 && buffer[nl - 1] == (byte)'\r')
+                {
+                    contentLen--;
+                }
+                string lineText = Encoding.UTF8.GetString(buffer, bytePos, contentLen);
+                long lineStartOffset = startOffset + bytePos;
+                long lineEndOffset = startOffset + nl + 1;
+                lines.Add((lineText, lineStartOffset, lineEndOffset));
+                bytePos = nl + 1;
+            }
+
+            nextOffset = startOffset + consumeLen;
             return lines;
         }
-
-        int consumeLen = lastNewline + 1;
-        int bytePos = 0;
-        if (startOffset == 0 && consumeLen >= 3 && buffer[0] == 0xEF && buffer[1] == 0xBB && buffer[2] == 0xBF)
+        finally
         {
-            bytePos = 3;
+            ArrayPool<byte>.Shared.Return(buffer);
         }
-
-        while (bytePos < consumeLen)
-        {
-            int nl = Array.IndexOf(buffer, (byte)'\n', bytePos, consumeLen - bytePos);
-            if (nl < 0) break;
-            int contentLen = nl - bytePos;
-            if (contentLen > 0 && buffer[nl - 1] == (byte)'\r')
-            {
-                contentLen--;
-            }
-            string lineText = Encoding.UTF8.GetString(buffer, bytePos, contentLen);
-            long lineStartOffset = startOffset + bytePos;
-            long lineEndOffset = startOffset + nl + 1;
-            lines.Add((lineText, lineStartOffset, lineEndOffset));
-            bytePos = nl + 1;
-        }
-
-        nextOffset = startOffset + consumeLen;
-        return lines;
     }
 
     private void ClearPendingLocationTracking()
@@ -845,6 +905,7 @@ public sealed class LogTailCollector
 
     private int ReadLatestLogFile(
         string latestFile,
+        long knownFileLen,
         List<GameLogEventItem> screenshots,
         out bool cursorUpdated,
         out bool stateMutated)
@@ -852,14 +913,11 @@ public sealed class LogTailCollector
         cursorUpdated = false;
         stateMutated = false;
         string fileName = Path.GetFileName(latestFile);
-        long fileLen;
-        try
+        long fileLen = knownFileLen;
+        if (fileLen < 0)
         {
-            fileLen = new FileInfo(latestFile).Length;
-        }
-        catch
-        {
-            return 0;
+            try { fileLen = new FileInfo(latestFile).Length; }
+            catch { return 0; }
         }
 
         long persistedOffset;
@@ -1082,11 +1140,11 @@ public sealed class LogTailCollector
         return batch.Count;
     }
 
-    private void PruneTrackedOffsets(List<string> existingFilePaths)
+    private void PruneTrackedOffsets(List<FileInfo> existingFiles)
     {
         if (_cursor.FileOffsets.Count <= MaxTrackedLogFiles) return;
         var existingNames = new HashSet<string>(
-            existingFilePaths.Select(Path.GetFileName).Where(n => !string.IsNullOrEmpty(n))!,
+            existingFiles.Select(f => f.Name).Where(n => !string.IsNullOrEmpty(n)),
             StringComparer.OrdinalIgnoreCase);
         foreach (string key in _cursor.FileOffsets.Keys.ToList())
         {

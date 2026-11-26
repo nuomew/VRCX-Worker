@@ -6,6 +6,8 @@ export interface Env {
     DB_CACHE?: D1Database;
     /** Dedicated legacy D1 shard (vrcx-legacy) storing migrated upstream desktop VRCX historical data. */
     DB_LEGACY?: D1Database;
+    /** Dedicated chat translator D1 shard (vrcx-chat) storing OSC chat history & cloud-managed OSC settings. */
+    DB_CHAT?: D1Database;
     AGENT_HUB: DurableObjectNamespace;
     R2_MEDIA?: R2Bucket;
     /** Optional bearer token for API/POC access. */

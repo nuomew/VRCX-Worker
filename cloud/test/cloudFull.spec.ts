@@ -7730,16 +7730,18 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
             });
             expect(delAll.status).toBe(200);
         } finally {
+            await env.DB_CHAT?.batch([
+                env.DB_CHAT.prepare('DELETE FROM cloud_chat_messages'),
+                env.DB_CHAT.prepare('DELETE FROM cloud_chat_config')
+            ]).catch(() => {});
             await env.DB_CORE.batch([
-                env.DB_CORE.prepare('DELETE FROM cloud_chat_messages'),
                 env.DB_CORE.prepare('DELETE FROM cloud_devices WHERE device_id = ?').bind(deviceId),
-                env.DB_CORE.prepare('DELETE FROM cloud_device_states WHERE device_id = ?').bind(deviceId),
-                env.DB_CORE.prepare("DELETE FROM cloud_bg_sync_state WHERE state_key = 'chat_web_active'")
+                env.DB_CORE.prepare('DELETE FROM cloud_device_states WHERE device_id = ?').bind(deviceId)
             ]).catch(() => {});
         }
     });
 
-    it('delivers bidirectional real-time OSC chat over isolated /ws/chat-agent without affecting ws_agent_hint or scheduled sync', async () => {
+    it('delivers bidirectional real-time OSC chat over isolated /ws/chat-agent, stores all chat/config in dedicated DB_CHAT, and pushes cloud OSC config live', async () => {
         const guardedEnv: Env = { ...env, AGENT_SYNC_KEY: 'osc-realtime-secret-key' };
         const realtimeDeviceId = 'win-osc-realtime-1';
 
@@ -7759,6 +7761,49 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
                 };
                 ws.addEventListener('message', onMsg);
             });
+
+        // 0. Dedicated DB_CHAT health & isolation check (DB_CORE must NOT contain cloud_chat_messages / cloud_chat_config)
+        expect(env.DB_CHAT).toBeDefined();
+        const healthRes = await exports.default.fetch('http://example.com/health');
+        const healthJson = (await healthRes.json()) as { data?: { chatDbDedicated?: boolean } };
+        expect(healthJson.data?.chatDbDedicated).toBe(true);
+
+        const coreChatTable = await env.DB_CORE.prepare(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('cloud_chat_messages', 'cloud_chat_config')"
+        ).all<{ name: string }>();
+        expect(coreChatTable.results ?? []).toHaveLength(0);
+
+        // Self-loop port conflict rejected by PUT /api/chat/config
+        const conflictCfgRes = await exports.default.fetch('http://example.com/api/chat/config', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+            body: JSON.stringify({
+                oscEnabled: true,
+                oscSendPort: 9000,
+                oscListenEnabled: true,
+                oscListenPort: 9000,
+                oscForwardToVrchat: true
+            })
+        });
+        expect(conflictCfgRes.status).toBe(400);
+
+        // Save valid cloud OSC config into DB_CHAT BEFORE agent connects -> agent must auto-receive it on handshake
+        const preSaveRes = await exports.default.fetch('http://example.com/api/chat/config', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+            body: JSON.stringify({
+                oscEnabled: true,
+                oscSendPort: 9000,
+                oscListenEnabled: true,
+                oscListenPort: 9005,
+                oscForwardToVrchat: true,
+                targetLang: 'ja'
+            })
+        });
+        expect(preSaveRes.status).toBe(200);
+        const preSaveJson = (await preSaveRes.json()) as { data: { chatDbDedicated: boolean; config: { oscListenPort: number } } };
+        expect(preSaveJson.data.chatDbDedicated).toBe(true);
+        expect(preSaveJson.data.config.oscListenPort).toBe(9005);
 
         const webUpgrade = await exports.default.fetch('http://example.com/ws/web', {
             headers: { Upgrade: 'websocket', Origin: 'http://example.com' }
@@ -7784,10 +7829,33 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
         );
         expect(chatAgentUpgrade.status).toBe(101);
         const chatAgentWs = chatAgentUpgrade.webSocket!;
+        const initialConfigPush = waitForWsMatch(
+            chatAgentWs,
+            (m) => m.includes('"chat.osc_config"') && m.includes('"listenPort":9005')
+        );
         chatAgentWs.accept();
 
         try {
-            await agentStatusOnline;
+            await Promise.all([agentStatusOnline, initialConfigPush]);
+
+            // Updating cloud config live pushes `chat.osc_config` to connected agent & `chat.config_updated` to Web
+            const liveAgentConfigPush = waitForWsMatch(
+                chatAgentWs,
+                (m) => m.includes('"chat.osc_config"') && m.includes('"listenPort":9006')
+            );
+            const liveWebConfigPush = waitForWsMatch(
+                webWs,
+                (m) => m.includes('"chat.config_updated"') && m.includes('"oscListenPort":9006')
+            );
+            const liveUpdateRes = await exports.default.fetch('http://example.com/api/chat/config', {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+                body: JSON.stringify({ oscListenPort: 9006 })
+            });
+            expect(liveUpdateRes.status).toBe(200);
+            const liveUpdateJson = (await liveUpdateRes.json()) as { data: { pushedAgents: number } };
+            expect(liveUpdateJson.data.pushedAgents).toBeGreaterThanOrEqual(1);
+            await Promise.all([liveAgentConfigPush, liveWebConfigPush]);
 
             // Isolation check 1: /ws/chat-agent MUST NOT appear in general agent status or ws_agent_hint (no vrc_http RPC hijack)
             const generalStatusRes = await exports.default.fetch('http://example.com/api/agent/status');
@@ -7822,7 +7890,7 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
                         enabled: true,
                         sendPort: 9000,
                         listenEnabled: true,
-                        listenPort: 9002,
+                        listenPort: 9006,
                         forwardToVrchat: true,
                         vrcRunning: true,
                         deviceName: 'MyVrcRig'
@@ -7833,8 +7901,14 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
 
             const listRes = await exports.default.fetch('http://example.com/api/chat/messages?limit=10');
             const listJson = (await listRes.json()) as {
-                data: { devices: Array<{ deviceId: string; deviceName: string; realtimeConnected: boolean }> };
+                data: {
+                    chatDbDedicated: boolean;
+                    config: { oscListenPort: number };
+                    devices: Array<{ deviceId: string; deviceName: string; realtimeConnected: boolean }>;
+                };
             };
+            expect(listJson.data.chatDbDedicated).toBe(true);
+            expect(listJson.data.config.oscListenPort).toBe(9006);
             const rtDev = listJson.data.devices.find((d) => d.deviceId === realtimeDeviceId);
             expect(rtDev?.realtimeConnected).toBe(true);
             expect(rtDev?.deviceName).toBe('MyVrcRig');
@@ -7869,7 +7943,7 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
             expect(oscFrame.payload.params.message).toBe('Instant Hello!');
             expect(oscFrame.payload.chatMsgId).toBe(sendJson.data.message.id);
 
-            // Agent immediately sends delivery receipt -> Web WS receives cmd.result & DB updates to 'sent'
+            // Agent immediately sends delivery receipt -> Web WS receives cmd.result & DB_CHAT updates to 'sent'
             const webReceivedReceipt = waitForWsMatch(
                 webWs,
                 (m) => m.includes('"cmd.result"') && m.includes(sendJson.data.message.id) && m.includes('"succeeded"')
@@ -7911,19 +7985,21 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
             const gameChatFrame = await webReceivedGameChat;
             expect(gameChatFrame).toContain('"direction":"desktop_sync"');
 
-            // Verify both messages persisted cleanly in D1
-            const afterRes = await exports.default.fetch('http://example.com/api/chat/messages?limit=20&heartbeat=0');
-            const afterJson = (await afterRes.json()) as {
-                data: { messages: Array<{ id: string; status: string; sourceText: string }> };
-            };
-            expect(afterJson.data.messages.find((m) => m.id === sendJson.data.message.id)?.status).toBe('sent');
-            expect(afterJson.data.messages.find((m) => m.id === 'osc_rt_in_1')?.sourceText).toBe('游戏里刚打的字');
+            // Verify both messages persisted cleanly inside dedicated DB_CHAT
+            const chatDbRows = await env.DB_CHAT!.prepare(
+                'SELECT id, status, source_text FROM cloud_chat_messages WHERE id IN (?, ?)'
+            )
+                .bind(sendJson.data.message.id, 'osc_rt_in_1')
+                .all<{ id: string; status: string; source_text: string }>();
+            expect(chatDbRows.results ?? []).toHaveLength(2);
+            expect((chatDbRows.results ?? []).find((r) => r.id === sendJson.data.message.id)?.status).toBe('sent');
+            expect((chatDbRows.results ?? []).find((r) => r.id === 'osc_rt_in_1')?.source_text).toBe('游戏里刚打的字');
         } finally {
             chatAgentWs.close(1000, 'done');
             webWs.close(1000, 'done');
-            await env.DB_CORE.batch([
-                env.DB_CORE.prepare('DELETE FROM cloud_chat_messages'),
-                env.DB_CORE.prepare("DELETE FROM cloud_bg_sync_state WHERE state_key = 'chat_web_active'")
+            await env.DB_CHAT?.batch([
+                env.DB_CHAT.prepare('DELETE FROM cloud_chat_messages'),
+                env.DB_CHAT.prepare('DELETE FROM cloud_chat_config')
             ]).catch(() => {});
         }
     });

@@ -44,7 +44,6 @@ public sealed class TrayApplicationContext : ApplicationContext
     private readonly Dictionary<string, int> _screenshotFailureCounts = new(StringComparer.OrdinalIgnoreCase);
     private readonly SemaphoreSlim _syncLock = new(1, 1);
     private readonly SemaphoreSlim _chatOscSyncLock = new(1, 1);
-    private readonly SemaphoreSlim _chatOscWakeSignal = new(0, 1);
     private readonly SemaphoreSlim _updateCheckLock = new(1, 1);
     private readonly object _configLock = new();
     private readonly object _migrationLock = new();
@@ -60,8 +59,6 @@ public sealed class TrayApplicationContext : ApplicationContext
     private readonly ToolStripMenuItem _proxyModeItem;
     private readonly ToolStripMenuItem _syncScreenshotsItem;
     private readonly ToolStripMenuItem _compressScreenshotsItem;
-    private readonly ToolStripMenuItem _oscChatSyncItem;
-    private readonly ToolStripMenuItem _oscRelayListenItem;
     private readonly ToolStripMenuItem _autoStartItem;
     private readonly ToolStripMenuItem _checkUpdateItem;
     private readonly System.Windows.Forms.Timer _singleClickTimer;
@@ -92,7 +89,7 @@ public sealed class TrayApplicationContext : ApplicationContext
     private string _lastSentStateSignature = string.Empty;
     private long _configGeneration;
     private int _rerunForcedSyncRequested;
-    private long _chatSessionActiveUntilMonoMs;
+    private long _lastWorkingSetTrimMonoMs;
 
     private AgentConfig GetConfigSnapshot()
     {
@@ -153,10 +150,10 @@ public sealed class TrayApplicationContext : ApplicationContext
             ct => RunSyncCycleAsync(force: true, ct),
             RunDesktopLegacyScanAsync,
             StartDesktopLegacyMigrationAsync,
-            CancelDesktopLegacyMigration);
+            CancelDesktopLegacyMigration,
+            _oscRealtimeClient.GetRuntimeConfigSnapshot);
 
         VRCX.Discord.Instance.Init();
-        ApplyOscBridgeConfiguration(_config);
 
         _logCollector.ScreenshotCaptured += OnScreenshotCaptured;
 
@@ -183,21 +180,6 @@ public sealed class TrayApplicationContext : ApplicationContext
         };
         _compressScreenshotsItem.Click += (_, _) => ToggleCompressScreenshots(_compressScreenshotsItem.Checked);
 
-        _oscChatSyncItem = new ToolStripMenuItem(AgentStrings.MenuOscChatSync)
-        {
-            CheckOnClick = true,
-            Checked = _config.OscChatSyncEnabled
-        };
-        _oscChatSyncItem.Click += (_, _) => ToggleOscChatSync(_oscChatSyncItem.Checked);
-
-        _oscRelayListenItem = new ToolStripMenuItem(AgentStrings.MenuOscRelayListen)
-        {
-            CheckOnClick = true,
-            Checked = _config.OscListenEnabled,
-            Enabled = _config.OscChatSyncEnabled
-        };
-        _oscRelayListenItem.Click += (_, _) => ToggleOscRelayListen(_oscRelayListenItem.Checked);
-
         _autoStartItem = new ToolStripMenuItem(AgentStrings.MenuAutoStart)
         {
             CheckOnClick = true,
@@ -219,8 +201,6 @@ public sealed class TrayApplicationContext : ApplicationContext
         menu.Items.Add(_proxyModeItem);
         menu.Items.Add(_syncScreenshotsItem);
         menu.Items.Add(_compressScreenshotsItem);
-        menu.Items.Add(_oscChatSyncItem);
-        menu.Items.Add(_oscRelayListenItem);
         menu.Items.Add(AgentStrings.MenuSyncNow, null, (_, _) => _ = Task.Run(() => RunSyncCycleAsync(force: true, _shutdownToken)));
         menu.Items.Add(AgentStrings.MenuOpenWebUi, null, (_, _) => OpenCloudWebUi());
         menu.Items.Add(AgentStrings.MenuExportCloudData, null, (_, _) => ShowCloudExportFlow());
@@ -296,8 +276,11 @@ public sealed class TrayApplicationContext : ApplicationContext
         UpdateTrayStatus();
         _ = Task.Run(() => BackgroundSyncLoopAsync(_shutdownToken));
         _ = Task.Run(() => _oscRealtimeClient.RunLoopAsync(_shutdownToken));
-        _ = Task.Run(() => ChatOscFallbackSyncLoopAsync(_shutdownToken));
         _ = Task.Run(() => AutoUpdateCheckLoopAsync(_shutdownToken));
+        _ = Task.Delay(TimeSpan.FromSeconds(15), _shutdownToken).ContinueWith(t =>
+        {
+            if (!t.IsCanceled && !_isExiting) TrimWorkingSetIfEligible();
+        }, TaskScheduler.Default);
 
         if (!_config.IsConfigured)
         {
@@ -327,24 +310,35 @@ public sealed class TrayApplicationContext : ApplicationContext
 
     private async Task BackgroundSyncLoopAsync(CancellationToken ct)
     {
-        int tick = 0;
+        long lastProcessProbeMono = 0;
+        long lastIdleLogPollMono = 0;
         while (!ct.IsCancellationRequested)
         {
+            bool vrcRunning = _processMonitor.IsVrcRunning;
             try
             {
                 AgentConfig cfg = GetConfigSnapshot();
+                long nowMono = Environment.TickCount64;
                 string logDir = string.IsNullOrWhiteSpace(cfg.VrChatLogDirectory)
                     ? LogTailCollector.ResolveDefaultVrChatLogDirectory()
                     : cfg.VrChatLogDirectory;
 
-                // Always tail local VRChat logs and persist to local offline queue (zero network requests).
-                int newlyParsed = _logCollector.PollLogDirectory(logDir);
-
-                // Refresh local process & AutoAppLaunch monitor every 4 seconds (zero network requests).
+                // Adaptive process probing: every 6s when VRChat is active, every 10s when idle (single native Win32 snapshot).
+                long procIntervalMs = vrcRunning ? 6_000L : 10_000L;
                 bool procChanged = false;
-                if (tick % 2 == 0)
+                if (lastProcessProbeMono == 0 || (nowMono - lastProcessProbeMono) >= procIntervalMs)
                 {
                     procChanged = _processMonitor.Refresh(cfg);
+                    lastProcessProbeMono = nowMono;
+                    vrcRunning = _processMonitor.IsVrcRunning;
+                }
+
+                // Adaptive log polling: every 3s while VRChat runs; every 10s when VRChat is idle (near-zero idle IO/CPU).
+                int newlyParsed = 0;
+                if (vrcRunning || procChanged || lastIdleLogPollMono == 0 || (nowMono - lastIdleLogPollMono) >= 10_000L)
+                {
+                    newlyParsed = _logCollector.PollLogDirectory(logDir);
+                    lastIdleLogPollMono = nowMono;
                 }
 
                 if (newlyParsed > 0 || procChanged)
@@ -366,8 +360,6 @@ public sealed class TrayApplicationContext : ApplicationContext
                 {
                     await RunSyncCycleAsync(force: immediateStatePush, ct).ConfigureAwait(false);
                 }
-
-                tick++;
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {
@@ -380,7 +372,9 @@ public sealed class TrayApplicationContext : ApplicationContext
 
             try
             {
-                await Task.Delay(2000, ct).ConfigureAwait(false);
+                // Active gaming: 3s cadence; VRChat idle with empty queue: 10s deep sleep (~0% background CPU).
+                int sleepMs = vrcRunning || _logCollector.OfflineQueueCount > 0 ? 3_000 : 10_000;
+                await Task.Delay(sleepMs, ct).ConfigureAwait(false);
             }
             catch (OperationCanceledException)
             {
@@ -571,6 +565,7 @@ public sealed class TrayApplicationContext : ApplicationContext
                 await FlushQueuedScreenshotsAsync(ct).ConfigureAwait(false);
 
                 UpdateTrayStatus();
+                TrimWorkingSetIfEligible();
             }
             finally
             {
@@ -912,7 +907,7 @@ public sealed class TrayApplicationContext : ApplicationContext
             ? room.PlayerDetails
             : null;
 
-        AgentConfig cfgSnap = GetConfigSnapshot();
+        CloudOscRuntimeConfig oscRuntime = _oscRealtimeClient.GetRuntimeConfigSnapshot();
         var state = new LiveAgentState
         {
             VrcRunning = vrcRunning,
@@ -926,11 +921,11 @@ public sealed class TrayApplicationContext : ApplicationContext
             PlayerCount = room.CurrentPlayerCount,
             CurrentPlayers = currentPlayers,
             OfflineQueueCount = _logCollector.OfflineQueueCount,
-            OscChatSyncEnabled = cfgSnap.OscChatSyncEnabled,
-            OscSendPort = OscProtocol.IsValidOscPort(cfgSnap.OscSendPort) ? cfgSnap.OscSendPort : OscProtocol.DefaultVrChatOscSendPort,
-            OscListenEnabled = cfgSnap.OscListenEnabled && _oscChatBridge.IsListening,
-            OscListenPort = OscProtocol.IsValidOscPort(cfgSnap.OscListenPort) ? cfgSnap.OscListenPort : OscProtocol.DefaultOscRelayListenPort,
-            OscForwardToVrchat = cfgSnap.OscForwardToVrchat
+            OscChatSyncEnabled = oscRuntime.Enabled,
+            OscSendPort = oscRuntime.SendPort,
+            OscListenEnabled = oscRuntime.ListenEnabled && _oscChatBridge.IsListening,
+            OscListenPort = oscRuntime.ListenPort,
+            OscForwardToVrchat = oscRuntime.ForwardToVrchat
         };
 
         string playersSig = currentPlayers is null
@@ -1072,10 +1067,6 @@ public sealed class TrayApplicationContext : ApplicationContext
                 _syncScreenshotsItem.Checked = savedCfg.AutoUploadScreenshots;
                 _compressScreenshotsItem.Checked = savedCfg.CompressScreenshots;
                 _compressScreenshotsItem.Enabled = savedCfg.AutoUploadScreenshots;
-                _oscChatSyncItem.Checked = savedCfg.OscChatSyncEnabled;
-                _oscRelayListenItem.Checked = savedCfg.OscListenEnabled;
-                _oscRelayListenItem.Enabled = savedCfg.OscChatSyncEnabled;
-                ApplyOscBridgeConfiguration(savedCfg);
                 RebuildCloudHttpClient();
                 _oscRealtimeClient.NotifyConfigChanged();
                 _consecutiveFailures = 0;
@@ -1240,172 +1231,50 @@ public sealed class TrayApplicationContext : ApplicationContext
 
     private void OnLocalOscChatCaptured()
     {
-        // Immediately flush over isolated `/ws/chat-agent` WS; fall back to HTTP chat-only sync only if WS is offline.
-        // Never touches RunSyncCycleAsync, GameLog, or Screenshot queues.
+        // Immediately flush over isolated `/ws/chat-agent` WS; fall back to one-shot chat-only HTTP upload only if WS is offline.
+        // Zero background polling thread; never touches RunSyncCycleAsync, GameLog, or Screenshot queues.
         _oscRealtimeClient.SignalOutboundFlush();
         if (!_oscRealtimeClient.IsConnected)
         {
-            SignalChatOscSyncWake();
-        }
-    }
-
-    private void SignalChatOscSyncWake()
-    {
-        try
-        {
-            if (_chatOscWakeSignal.CurrentCount == 0)
+            AgentConfig cfg = GetConfigSnapshot();
+            if (cfg.IsConfigured)
             {
-                _chatOscWakeSignal.Release();
+                _ = Task.Run(() => RunChatOscSyncOnceAsync(cfg, _processMonitor.IsVrcRunning, _shutdownToken));
             }
         }
-        catch
-        {
-            // Semaphore already released or shutting down
-        }
-    }
-
-    private void ExtendChatSessionActiveWindow(long durationMs)
-    {
-        long target = Environment.TickCount64 + Math.Max(durationMs, 10_000L);
-        long prev = Interlocked.Read(ref _chatSessionActiveUntilMonoMs);
-        if (target > prev)
-        {
-            Interlocked.Exchange(ref _chatSessionActiveUntilMonoMs, target);
-        }
-        SignalChatOscSyncWake();
-    }
-
-    private bool ApplyOscBridgeConfiguration(AgentConfig cfg)
-    {
-        bool listenActive = cfg.OscChatSyncEnabled && cfg.OscListenEnabled;
-        return _oscChatBridge.Reconfigure(
-            listenActive,
-            cfg.OscListenPort,
-            cfg.OscSendPort,
-            cfg.OscForwardToVrchat);
-    }
-
-    private void ToggleOscChatSync(bool enabled)
-    {
-        AgentConfig cfg;
-        lock (_configLock)
-        {
-            AgentConfig next = _config.Clone();
-            next.OscChatSyncEnabled = enabled;
-            _config = next;
-            _configStore.SaveConfig(next);
-            cfg = next.Clone();
-        }
-        _oscRelayListenItem.Enabled = enabled;
-        ApplyOscBridgeConfiguration(cfg);
-        _lastSentStateSignature = string.Empty;
-        _oscRealtimeClient.NotifyConfigChanged();
-        if (enabled && !_oscRealtimeClient.IsConnected)
-        {
-            SignalChatOscSyncWake();
-        }
-        _balloonPointsToUpdate = false;
-        _trayIcon.ShowBalloonTip(
-            2500,
-            AgentStrings.AppTitle,
-            enabled ? AgentStrings.BalloonOscChatSyncOn : AgentStrings.BalloonOscChatSyncOff,
-            ToolTipIcon.Info);
-    }
-
-    private void ToggleOscRelayListen(bool enabled)
-    {
-        AgentConfig cfg;
-        lock (_configLock)
-        {
-            AgentConfig next = _config.Clone();
-            next.OscListenEnabled = enabled;
-            _config = next;
-            _configStore.SaveConfig(next);
-            cfg = next.Clone();
-        }
-
-        bool bound = ApplyOscBridgeConfiguration(cfg);
-        if (enabled && !bound)
-        {
-            lock (_configLock)
-            {
-                AgentConfig revert = _config.Clone();
-                revert.OscListenEnabled = false;
-                _config = revert;
-                _configStore.SaveConfig(revert);
-            }
-            _oscRelayListenItem.Checked = false;
-            _balloonPointsToUpdate = false;
-            _trayIcon.ShowBalloonTip(
-                3500,
-                AgentStrings.AppTitle,
-                AgentStrings.FormatBalloonOscRelayFailed(cfg.OscListenPort),
-                ToolTipIcon.Warning);
-            return;
-        }
-
-        _lastSentStateSignature = string.Empty;
-        _oscRealtimeClient.SignalOutboundFlush();
-        if (enabled && !_oscRealtimeClient.IsConnected)
-        {
-            SignalChatOscSyncWake();
-        }
-        _balloonPointsToUpdate = false;
-        _trayIcon.ShowBalloonTip(
-            3000,
-            AgentStrings.AppTitle,
-            enabled
-                ? AgentStrings.FormatBalloonOscRelayOn(cfg.OscListenPort, cfg.OscSendPort)
-                : AgentStrings.BalloonOscRelayOff,
-            ToolTipIcon.Info);
     }
 
     /// <summary>
-    /// Isolated HTTP fallback loop for OSC chat ONLY when the real-time `/ws/chat-agent` WebSocket is offline.
-    /// When the real-time WS is connected, this loop sends ZERO HTTP requests; it NEVER triggers GameLog or photo sync.
+    /// Gently trims idle Windows working-set pages at most once every 5 minutes after startup or sync bursts
+    /// so the background tray companion maintains a minimal RAM footprint without page-fault thrashing.
     /// </summary>
-    private async Task ChatOscFallbackSyncLoopAsync(CancellationToken ct)
+    private void TrimWorkingSetIfEligible()
     {
-        while (!ct.IsCancellationRequested)
+        if (!OperatingSystem.IsWindows() || _isExiting) return;
+        long nowMono = Environment.TickCount64;
+        long prev = Interlocked.Read(ref _lastWorkingSetTrimMonoMs);
+        if (prev > 0 && (nowMono - prev) < 300_000L)
         {
-            int delayMs = 10_000;
-            try
-            {
-                AgentConfig cfg = GetConfigSnapshot();
-                bool realtimeUp = _oscRealtimeClient.IsConnected;
-                bool hasLocalMessages = _oscChatBridge.PendingCount > 0;
-                bool webActive = Environment.TickCount64 < Interlocked.Read(ref _chatSessionActiveUntilMonoMs);
-
-                if (!realtimeUp && cfg.IsConfigured && cfg.OscChatSyncEnabled && (hasLocalMessages || webActive))
-                {
-                    await RunChatOscSyncOnceAsync(cfg, _processMonitor.IsVrcRunning, ct).ConfigureAwait(false);
-                    delayMs = _oscChatBridge.PendingCount > 0 ? 2500 : 8000;
-                }
-                else
-                {
-                    delayMs = 10_000;
-                }
-            }
-            catch (OperationCanceledException) when (ct.IsCancellationRequested)
-            {
-                break;
-            }
-            catch (Exception ex)
-            {
-                Log.Debug(ex, "OSC chat HTTP fallback sync failed.");
-                delayMs = 10_000;
-            }
-
-            try
-            {
-                await _chatOscWakeSignal.WaitAsync(delayMs, ct).ConfigureAwait(false);
-            }
-            catch (OperationCanceledException)
-            {
-                break;
-            }
+            return;
+        }
+        if (Interlocked.CompareExchange(ref _lastWorkingSetTrimMonoMs, nowMono, prev) != prev)
+        {
+            return;
+        }
+        try
+        {
+            using Process current = Process.GetCurrentProcess();
+            SetProcessWorkingSetSizeEx(current.Handle, new IntPtr(-1), new IntPtr(-1), 0);
+        }
+        catch
+        {
+            // Non-fatal on restricted environments
         }
     }
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+    [return: System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.Bool)]
+    private static extern bool SetProcessWorkingSetSizeEx(IntPtr hProcess, IntPtr dwMinimumWorkingSetSize, IntPtr dwMaximumWorkingSetSize, uint flags);
 
     private async Task RunChatOscSyncOnceAsync(AgentConfig cfg, bool vrcRunning, CancellationToken ct)
     {
@@ -1416,25 +1285,34 @@ public sealed class TrayApplicationContext : ApplicationContext
         try
         {
             List<OscChatMessageUpload> batch = _oscChatBridge.PeekBatch(20);
+            if (batch.Count == 0)
+            {
+                return;
+            }
             AgentChatSyncResponse resp = await _syncClient
                 .SyncChatOscAsync(cfg, batch, vrcRunning, ct)
                 .ConfigureAwait(false);
 
-            if (batch.Count > 0)
-            {
-                _oscChatBridge.AcknowledgeBatch(batch.Count);
-            }
+            _oscChatBridge.AcknowledgeBatch(batch.Count);
 
-            if (resp.ChatSessionActive)
+            if (resp.OscConfig != null)
             {
-                ExtendChatSessionActiveWindow(60_000L);
+                _oscRealtimeClient.ApplyCloudOscConfig(
+                    resp.OscConfig.Enabled,
+                    resp.OscConfig.SendPort,
+                    resp.OscConfig.ListenEnabled,
+                    resp.OscConfig.ListenPort,
+                    resp.OscConfig.ForwardToVrchat);
             }
 
             if (resp.PendingCommands.Count > 0 && !ct.IsCancellationRequested)
             {
-                ExtendChatSessionActiveWindow(90_000L);
                 await ExecuteClaimedCommandsAsync(cfg, resp.PendingCommands, ct).ConfigureAwait(false);
             }
+        }
+        catch (Exception ex)
+        {
+            Log.Debug(ex, "One-shot OSC chat HTTP fallback failed.");
         }
         finally
         {
@@ -2340,6 +2218,7 @@ public sealed class TrayApplicationContext : ApplicationContext
         try { _wakeWaitHandle?.Unregister(null); } catch { /* ignore */ }
         try { _oscRealtimeClient.Dispose(); } catch { /* ignore */ }
         try { _oscChatBridge.Dispose(); } catch { /* ignore */ }
+        try { OscProtocol.DisposeSharedSender(); } catch { /* ignore */ }
         try { VRCX.Discord.Instance.Exit(); } catch { /* ignore */ }
         try { _trayIcon.Visible = false; } catch { /* ignore */ }
         try

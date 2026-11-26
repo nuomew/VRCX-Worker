@@ -12,26 +12,36 @@ using NLog;
 
 namespace VRCX.Agent.Core;
 
+public sealed record CloudOscRuntimeConfig(
+    bool Enabled,
+    int SendPort,
+    bool ListenEnabled,
+    int ListenPort,
+    bool ForwardToVrchat);
+
 /// <summary>
 /// Dedicated, strictly isolated real-time WebSocket client (`/ws/chat-agent`) for VRChat OSC Chat Translator.
 ///
 /// Design guarantees:
-/// 1. Sub-second bidirectional delivery: Web -> VRChat OSC and local OSC -> Web happen immediately over a
+/// 1. Zero local settings required: receives authoritative OSC configuration (`chat.osc_config`) directly
+///    from VRCX Cloud DB_CHAT on connect and on every Web UI change, automatically reconfiguring loopback OSC.
+/// 2. Sub-second bidirectional delivery: Web -> VRChat OSC and local OSC -> Web happen immediately over a
 ///    hibernatable WebSocket, completely independent of the periodic `SyncScheduleGate` interval.
-/// 2. Zero coupling with scheduled sync: never triggers GameLog uploads, screenshot uploads, or `sync_now`.
+/// 3. Zero coupling with scheduled sync: never triggers GameLog uploads, screenshot uploads, or `sync_now`.
 ///    Only allowlisted OSC actions (`send_osc_chatbox`, `send_osc_typing`) are accepted on this socket.
-/// 3. Full proxy & VMess compatibility via .NET 10 `ClientWebSocket.ConnectAsync(uri, HttpMessageInvoker, ct)`.
+/// 4. Minimal footprint: single reusable 4 KiB receive buffer, 110s zero-CPU DO hibernation ping/pong,
+///    and full proxy/VMess support via .NET 10 `ClientWebSocket.ConnectAsync(uri, HttpMessageInvoker, ct)`.
 /// </summary>
 public sealed class OscChatRealtimeClient : IDisposable
 {
+    private const int ReceiveBufferBytes = 4096;
     private const int MaxInboundFrameBytes = 128 * 1024;
-    private static readonly TimeSpan KeepaliveInterval = TimeSpan.FromSeconds(90);
+    private static readonly TimeSpan KeepaliveInterval = TimeSpan.FromSeconds(110);
     private static readonly Logger Log = LogManager.GetCurrentClassLogger();
 
     private readonly Func<AgentConfig> _configProvider;
     private readonly Func<HttpMessageInvoker> _httpInvokerProvider;
     private readonly Func<bool> _isVrcRunningProvider;
-    private readonly Func<bool> _isOscRelayListeningProvider;
     private readonly OscChatBridge _bridge;
     private readonly Func<string, bool, bool, int, CancellationToken, Task<(bool Ok, string Message)>> _sendChatboxFunc;
     private readonly Func<bool, int, CancellationToken, Task<(bool Ok, string Message)>> _sendTypingFunc;
@@ -39,6 +49,14 @@ public sealed class OscChatRealtimeClient : IDisposable
     private readonly SemaphoreSlim _sendLock = new(1, 1);
     private readonly SemaphoreSlim _wakeSignal = new(0, 1);
     private readonly object _socketLock = new();
+    private readonly object _runtimeConfigLock = new();
+
+    private CloudOscRuntimeConfig _runtimeConfig = new(
+        Enabled: true,
+        SendPort: OscProtocol.DefaultVrChatOscSendPort,
+        ListenEnabled: false,
+        ListenPort: OscProtocol.DefaultOscRelayListenPort,
+        ForwardToVrchat: true);
 
     private ClientWebSocket? _activeSocket;
     private CancellationTokenSource? _reconnectCts;
@@ -58,13 +76,46 @@ public sealed class OscChatRealtimeClient : IDisposable
         _configProvider = configProvider;
         _httpInvokerProvider = httpInvokerProvider;
         _isVrcRunningProvider = isVrcRunningProvider;
-        _isOscRelayListeningProvider = isOscRelayListeningProvider;
+        _ = isOscRelayListeningProvider; // Bridge state is read directly from _bridge
         _bridge = bridge;
         _sendChatboxFunc = sendChatboxFunc ?? OscProtocol.SendChatboxInputAsync;
         _sendTypingFunc = sendTypingFunc ?? OscProtocol.SendChatboxTypingAsync;
     }
 
     public bool IsConnected => _isConnected;
+
+    public CloudOscRuntimeConfig GetRuntimeConfigSnapshot()
+    {
+        lock (_runtimeConfigLock)
+        {
+            return _runtimeConfig;
+        }
+    }
+
+    /// <summary>
+    /// Applies cloud-managed OSC settings in memory and immediately reconciles the local loopback OSC relay listener.
+    /// </summary>
+    public bool ApplyCloudOscConfig(
+        bool enabled,
+        int sendPort,
+        bool listenEnabled,
+        int listenPort,
+        bool forwardToVrchat)
+    {
+        int safeSendPort = OscProtocol.IsValidOscPort(sendPort) ? sendPort : OscProtocol.DefaultVrChatOscSendPort;
+        int safeListenPort = OscProtocol.IsValidOscPort(listenPort) ? listenPort : OscProtocol.DefaultOscRelayListenPort;
+        var next = new CloudOscRuntimeConfig(enabled, safeSendPort, listenEnabled, safeListenPort, forwardToVrchat);
+
+        lock (_runtimeConfigLock)
+        {
+            _runtimeConfig = next;
+        }
+
+        bool ok = _bridge.Reconfigure(enabled && listenEnabled, safeListenPort, safeSendPort, forwardToVrchat);
+        _lastSentOscStateSignature = string.Empty;
+        SignalWake();
+        return ok;
+    }
 
     /// <summary>
     /// Converts a configured Cloud Worker HTTP(S) base URL into the isolated `/ws/chat-agent` WebSocket URI.
@@ -99,7 +150,7 @@ public sealed class OscChatRealtimeClient : IDisposable
     }
 
     /// <summary>
-    /// Triggers an immediate reconnect (e.g. after proxy/URL/secret or OSC toggle changes).
+    /// Triggers an immediate reconnect (e.g. after Cloud URL/secret or proxy mode changes).
     /// </summary>
     public void NotifyConfigChanged()
     {
@@ -112,7 +163,7 @@ public sealed class OscChatRealtimeClient : IDisposable
     }
 
     /// <summary>
-    /// Immediately pushes any buffered locally captured OSC messages or OSC/VRChat state deltas over the live socket.
+    /// Immediately pushes any buffered locally captured OSC messages or VRChat state deltas over the live socket.
     /// </summary>
     public void SignalOutboundFlush()
     {
@@ -125,11 +176,11 @@ public sealed class OscChatRealtimeClient : IDisposable
         while (!ct.IsCancellationRequested && !_disposed)
         {
             AgentConfig cfg = _configProvider();
-            if (!cfg.IsConfigured || !cfg.OscChatSyncEnabled || !TryBuildChatAgentWebSocketUri(cfg.CloudUrl, out Uri? wsUri) || wsUri == null)
+            if (!cfg.IsConfigured || !TryBuildChatAgentWebSocketUri(cfg.CloudUrl, out Uri? wsUri) || wsUri == null)
             {
                 _isConnected = false;
                 backoffMs = 2000;
-                await WaitWakeOrDelayAsync(5000, ct).ConfigureAwait(false);
+                await WaitWakeOrDelayAsync(10_000, ct).ConfigureAwait(false);
                 continue;
             }
 
@@ -147,7 +198,7 @@ public sealed class OscChatRealtimeClient : IDisposable
                 {
                     if (!HmacSigner.IsValidSyncSecret(secret))
                     {
-                        await WaitWakeOrDelayAsync(10_000, ct).ConfigureAwait(false);
+                        await WaitWakeOrDelayAsync(15_000, ct).ConfigureAwait(false);
                         continue;
                     }
                     ws.Options.SetRequestHeader("Authorization", "Bearer " + secret);
@@ -168,7 +219,6 @@ public sealed class OscChatRealtimeClient : IDisposable
                 _lastSentOscStateSignature = string.Empty;
                 Log.Info("Connected isolated OSC chat real-time channel to {Uri}.", wsUri);
 
-                // Push initial OSC capability state and flush any locally captured messages immediately.
                 await SendOscStateIfChangedAsync(ws, force: true, sessionCts.Token).ConfigureAwait(false);
                 await FlushCapturedMessagesAsync(ws, sessionCts.Token).ConfigureAwait(false);
 
@@ -222,20 +272,23 @@ public sealed class OscChatRealtimeClient : IDisposable
             await SendOscStateIfChangedAsync(ws, force: false, ct).ConfigureAwait(false);
 
             long nowMono = Environment.TickCount64;
-            if ((nowMono - lastPingMono) >= (long)KeepaliveInterval.TotalMilliseconds)
+            long remainingMs = (long)KeepaliveInterval.TotalMilliseconds - (nowMono - lastPingMono);
+            if (remainingMs <= 0)
             {
                 await SendTextFrameAsync(ws, "ping", ct).ConfigureAwait(false);
                 lastPingMono = nowMono;
+                remainingMs = (long)KeepaliveInterval.TotalMilliseconds;
             }
 
-            await WaitWakeOrDelayAsync(15_000, ct).ConfigureAwait(false);
+            // Sleep until an outbound chat/state wake signal arrives OR the next 110s keepalive ping is due (0% idle CPU).
+            await WaitWakeOrDelayAsync((int)Math.Clamp(remainingMs, 1000, 120_000), ct).ConfigureAwait(false);
         }
     }
 
     private async Task ReceiveLoopAsync(ClientWebSocket ws, CancellationToken ct)
     {
-        byte[] buffer = new byte[8192];
-        using var ms = new MemoryStream(8192);
+        byte[] buffer = new byte[ReceiveBufferBytes];
+        using var ms = new MemoryStream(ReceiveBufferBytes);
 
         while (!ct.IsCancellationRequested && ws.State == WebSocketState.Open)
         {
@@ -289,14 +342,30 @@ public sealed class OscChatRealtimeClient : IDisposable
         }
 
         string? type = envelope["type"]?.Value<string>();
+        JObject? payload = envelope["payload"] as JObject;
+        if (payload == null) return;
+
+        if (string.Equals(type, "chat.osc_config", StringComparison.Ordinal))
+        {
+            bool enabled = payload["enabled"]?.Value<bool?>() ?? true;
+            int sendPort = payload["sendPort"]?.Value<int?>() ?? OscProtocol.DefaultVrChatOscSendPort;
+            bool listenEnabled = payload["listenEnabled"]?.Value<bool?>() ?? false;
+            int listenPort = payload["listenPort"]?.Value<int?>() ?? OscProtocol.DefaultOscRelayListenPort;
+            bool forwardToVrchat = payload["forwardToVrchat"]?.Value<bool?>() ?? true;
+
+            ApplyCloudOscConfig(enabled, sendPort, listenEnabled, listenPort, forwardToVrchat);
+            if (ws != null && ws.State == WebSocketState.Open)
+            {
+                await SendOscStateIfChangedAsync(ws, force: true, ct).ConfigureAwait(false);
+            }
+            return;
+        }
+
         if (!string.Equals(type, "chat.osc_send", StringComparison.Ordinal))
         {
             // Ignore any non-OSC frame; never execute sync_now, gamelog, or screenshot triggers here.
             return;
         }
-
-        JObject? payload = envelope["payload"] as JObject;
-        if (payload == null) return;
 
         string cmdId = payload["cmdId"]?.Value<string>() ?? envelope["id"]?.Value<string>() ?? string.Empty;
         string chatMsgId = payload["chatMsgId"]?.Value<string>() ?? string.Empty;
@@ -347,18 +416,15 @@ public sealed class OscChatRealtimeClient : IDisposable
             return (false, validationErr);
         }
 
-        AgentConfig cfg = _configProvider();
-        if (!cfg.OscChatSyncEnabled)
+        CloudOscRuntimeConfig rtCfg = GetRuntimeConfigSnapshot();
+        if (!rtCfg.Enabled)
         {
-            return (false, "OSC chat sync is disabled on this Windows companion agent.");
+            return (false, "OSC chat sync is disabled in Cloud Chat Translator settings.");
         }
 
-        int defaultPort = OscProtocol.IsValidOscPort(cfg.OscSendPort)
-            ? cfg.OscSendPort
-            : OscProtocol.DefaultVrChatOscSendPort;
         int port = parameters.TryGetValue("oscPort", out var rawPort) && rawPort != null && CommandValidator.TryParseValidOscPort(rawPort, out int parsedPort)
             ? parsedPort
-            : defaultPort;
+            : rtCfg.SendPort;
 
         if (action == "send_osc_chatbox")
         {
@@ -405,13 +471,13 @@ public sealed class OscChatRealtimeClient : IDisposable
     private async Task SendOscStateIfChangedAsync(ClientWebSocket ws, bool force, CancellationToken ct)
     {
         AgentConfig cfg = _configProvider();
+        CloudOscRuntimeConfig rtCfg = GetRuntimeConfigSnapshot();
         bool vrcRunning = _isVrcRunningProvider();
-        bool listenActive = cfg.OscChatSyncEnabled && cfg.OscListenEnabled && _isOscRelayListeningProvider();
-        int sendPort = OscProtocol.IsValidOscPort(cfg.OscSendPort) ? cfg.OscSendPort : OscProtocol.DefaultVrChatOscSendPort;
-        int listenPort = OscProtocol.IsValidOscPort(cfg.OscListenPort) ? cfg.OscListenPort : OscProtocol.DefaultOscRelayListenPort;
+        bool listenActive = rtCfg.Enabled && rtCfg.ListenEnabled && _bridge.IsListening;
+        string listenError = _bridge.LastBindError;
         string deviceName = string.IsNullOrWhiteSpace(cfg.DeviceName) ? Environment.MachineName : cfg.DeviceName.Trim();
 
-        string sig = $"{cfg.OscChatSyncEnabled}|{sendPort}|{listenActive}|{listenPort}|{cfg.OscForwardToVrchat}|{vrcRunning}|{deviceName}";
+        string sig = $"{rtCfg.Enabled}|{rtCfg.SendPort}|{listenActive}|{rtCfg.ListenPort}|{rtCfg.ForwardToVrchat}|{vrcRunning}|{listenError}|{deviceName}";
         if (!force && string.Equals(sig, _lastSentOscStateSignature, StringComparison.Ordinal))
         {
             return;
@@ -424,12 +490,13 @@ public sealed class OscChatRealtimeClient : IDisposable
             ts = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
             payload = new
             {
-                enabled = cfg.OscChatSyncEnabled,
-                sendPort,
+                enabled = rtCfg.Enabled,
+                sendPort = rtCfg.SendPort,
                 listenEnabled = listenActive,
-                listenPort,
-                forwardToVrchat = cfg.OscForwardToVrchat,
+                listenPort = rtCfg.ListenPort,
+                forwardToVrchat = rtCfg.ForwardToVrchat,
                 vrcRunning,
+                listenError,
                 deviceName
             }
         });

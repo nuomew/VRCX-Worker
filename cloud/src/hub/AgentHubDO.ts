@@ -1,4 +1,5 @@
 import { DurableObject } from 'cloudflare:workers';
+import { getChatDb } from '../db/schemaBootstrap';
 import type { Env } from '../env';
 
 type ClientRole = 'agent' | 'chat_agent' | 'web';
@@ -129,6 +130,10 @@ export class AgentHubDO extends DurableObject<Env> {
 
         if (url.pathname === '/dispatch-chat-osc' && request.method === 'POST') {
             return this.handleDispatchChatOsc(request);
+        }
+
+        if (url.pathname === '/push-chat-config' && request.method === 'POST') {
+            return this.handlePushChatConfig(request);
         }
 
         if (url.pathname === '/chat-osc-status' && request.method === 'GET') {
@@ -274,6 +279,8 @@ export class AgentHubDO extends DurableObject<Env> {
                     ts: Date.now(),
                     payload: { deviceId, connected: true, connectedAt: attachment.connectedAt }
                 });
+                // Immediately push cloud-managed OSC config to the newly connected companion (zero local config required).
+                this.ctx.waitUntil(this.pushStoredChatConfigToSocket(server));
             }
 
             return new Response(null, { status: 101, webSocket: client });
@@ -394,6 +401,108 @@ export class AgentHubDO extends DurableObject<Env> {
             return atB.localeCompare(atA);
         });
         return candidates[0] ?? null;
+    }
+
+    private async loadCloudOscAgentConfig(): Promise<{
+        enabled: boolean;
+        sendPort: number;
+        listenEnabled: boolean;
+        listenPort: number;
+        forwardToVrchat: boolean;
+    }> {
+        const defaults = {
+            enabled: true,
+            sendPort: 9000,
+            listenEnabled: false,
+            listenPort: 9002,
+            forwardToVrchat: true
+        };
+        try {
+            const chatDb = getChatDb(this.env);
+            if (!chatDb) return defaults;
+            const row = await chatDb
+                .prepare("SELECT payload_json FROM cloud_chat_config WHERE config_key = 'default' LIMIT 1")
+                .first<{ payload_json?: string }>();
+            if (!row?.payload_json) return defaults;
+            const parsed = JSON.parse(row.payload_json) as Record<string, unknown>;
+            if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return defaults;
+            const sendPort = clampOscPortInline(parsed.oscSendPort, 9000);
+            const listenPort = clampOscPortInline(parsed.oscListenPort, 9002);
+            const forwardToVrchat = parsed.oscForwardToVrchat !== false;
+            const listenEnabled = parsed.oscListenEnabled === true && !(forwardToVrchat && listenPort === sendPort);
+            return {
+                enabled: parsed.oscEnabled !== false,
+                sendPort,
+                listenEnabled,
+                listenPort,
+                forwardToVrchat
+            };
+        } catch {
+            return defaults;
+        }
+    }
+
+    private async pushStoredChatConfigToSocket(sock: WebSocket): Promise<void> {
+        if (!this.isSocketOpen(sock)) return;
+        const cfg = await this.loadCloudOscAgentConfig();
+        if (!this.isSocketOpen(sock)) return;
+        try {
+            sock.send(
+                JSON.stringify({
+                    v: 1,
+                    type: 'chat.osc_config',
+                    ts: Date.now(),
+                    payload: cfg
+                })
+            );
+        } catch {
+            // Ignore closed socket
+        }
+    }
+
+    private async handlePushChatConfig(request: Request): Promise<Response> {
+        const raw = (await request.json().catch(() => ({}))) as Record<string, unknown>;
+        const sendPort = clampOscPortInline(raw.sendPort ?? raw.oscSendPort, 9000);
+        const listenPort = clampOscPortInline(raw.listenPort ?? raw.oscListenPort, 9002);
+        const forwardToVrchat = (raw.forwardToVrchat ?? raw.oscForwardToVrchat) !== false;
+        const listenEnabled =
+            (raw.listenEnabled === true || raw.oscListenEnabled === true) &&
+            !(forwardToVrchat && listenPort === sendPort);
+        const oscConfig = {
+            enabled: (raw.enabled ?? raw.oscEnabled) !== false,
+            sendPort,
+            listenEnabled,
+            listenPort,
+            forwardToVrchat
+        };
+
+        const chatSockets = this.ctx.getWebSockets('role:chat_agent').filter((s) => this.isSocketOpen(s));
+        const envelope = JSON.stringify({
+            v: 1,
+            type: 'chat.osc_config',
+            ts: Date.now(),
+            payload: oscConfig
+        });
+        let pushed = 0;
+        for (const sock of chatSockets) {
+            try {
+                sock.send(envelope);
+                pushed++;
+            } catch {
+                // Ignore broken sockets
+            }
+        }
+
+        if (raw.fullConfig && typeof raw.fullConfig === 'object' && !Array.isArray(raw.fullConfig)) {
+            this.broadcastToRole('web', {
+                v: 1,
+                type: 'chat.config_updated',
+                ts: Date.now(),
+                payload: { config: raw.fullConfig }
+            });
+        }
+
+        return Response.json({ ok: true, data: { pushed } });
     }
 
     private async handleDispatchChatOsc(request: Request): Promise<Response> {
@@ -575,6 +684,8 @@ export class AgentHubDO extends DurableObject<Env> {
                     listenPort: clampOscPortInline(safePayload.listenPort, 9002),
                     forwardToVrchat: safePayload.forwardToVrchat !== false,
                     vrcRunning: safePayload.vrcRunning === true,
+                    listenError:
+                        typeof safePayload.listenError === 'string' ? safePayload.listenError.slice(0, 256) : '',
                     deviceName:
                         typeof safePayload.deviceName === 'string' ? safePayload.deviceName.slice(0, 64) : ''
                 };
@@ -633,7 +744,7 @@ export class AgentHubDO extends DurableObject<Env> {
                     createdAt: rawCreated
                 };
 
-                // Broadcast to Web tabs IMMEDIATELY before waiting on D1 persistence.
+                // Broadcast to Web tabs IMMEDIATELY before waiting on dedicated DB_CHAT persistence.
                 this.broadcastToRole('web', {
                     v: 1,
                     type: 'chat.message',
@@ -644,11 +755,13 @@ export class AgentHubDO extends DurableObject<Env> {
                 this.ctx.waitUntil(
                     (async () => {
                         try {
-                            await this.env.DB_CORE.prepare(
-                                `INSERT OR IGNORE INTO cloud_chat_messages
-                                 (id, device_id, direction, source_text, translated_text, sent_text, source_lang, target_lang, display_mode, osc_address, osc_port, immediate, play_sfx, status, cmd_id, error_message, created_at)
-                                 VALUES (?, ?, 'desktop_sync', ?, '', ?, 'auto', '', 'source_only', '/chatbox/input', ?, ?, ?, 'synced', '', '', ?)`
-                            )
+                            const chatDb = getChatDb(this.env);
+                            await chatDb
+                                .prepare(
+                                    `INSERT OR IGNORE INTO cloud_chat_messages
+                                     (id, device_id, direction, source_text, translated_text, sent_text, source_lang, target_lang, display_mode, osc_address, osc_port, immediate, play_sfx, status, cmd_id, error_message, created_at)
+                                     VALUES (?, ?, 'desktop_sync', ?, '', ?, 'auto', '', 'source_only', '/chatbox/input', ?, ?, ?, 'synced', '', '', ?)`
+                                )
                                 .bind(
                                     msgId,
                                     attachment.deviceId,
@@ -660,10 +773,11 @@ export class AgentHubDO extends DurableObject<Env> {
                                     rawCreated
                                 )
                                 .run();
-                            await this.env.DB_CORE.prepare(
-                                `DELETE FROM cloud_chat_messages
-                                 WHERE id NOT IN (SELECT id FROM cloud_chat_messages ORDER BY created_at DESC LIMIT ?)`
-                            )
+                            await chatDb
+                                .prepare(
+                                    `DELETE FROM cloud_chat_messages
+                                     WHERE id NOT IN (SELECT id FROM cloud_chat_messages ORDER BY created_at DESC LIMIT ?)`
+                                )
                                 .bind(CHAT_OSC_MAX_STORED)
                                 .run();
                         } catch {
@@ -697,14 +811,15 @@ export class AgentHubDO extends DurableObject<Env> {
                 });
 
                 if (chatMsgId || cmdId) {
+                    const chatDb = getChatDb(this.env);
                     this.ctx.waitUntil(
                         (chatMsgId
-                            ? this.env.DB_CORE.prepare(
-                                  `UPDATE cloud_chat_messages SET status = ?, error_message = ? WHERE id = ?`
-                              ).bind(chatStatus, errMsg, chatMsgId)
-                            : this.env.DB_CORE.prepare(
-                                  `UPDATE cloud_chat_messages SET status = ?, error_message = ? WHERE cmd_id = ?`
-                              ).bind(chatStatus, errMsg, cmdId)
+                            ? chatDb
+                                  .prepare(`UPDATE cloud_chat_messages SET status = ?, error_message = ? WHERE id = ?`)
+                                  .bind(chatStatus, errMsg, chatMsgId)
+                            : chatDb
+                                  .prepare(`UPDATE cloud_chat_messages SET status = ?, error_message = ? WHERE cmd_id = ?`)
+                                  .bind(chatStatus, errMsg, cmdId)
                         )
                             .run()
                             .catch(() => {})
@@ -774,11 +889,12 @@ export class AgentHubDO extends DurableObject<Env> {
                                 .bind(status, JSON.stringify(cmdPayload), now, cmdId, attachment.deviceId)
                                 .run()
                                 .catch(() => {}),
-                            this.env.DB_CORE.prepare(
-                                `UPDATE cloud_chat_messages
-                                 SET status = ?, error_message = ?
-                                 WHERE cmd_id = ?`
-                            )
+                            getChatDb(this.env)
+                                .prepare(
+                                    `UPDATE cloud_chat_messages
+                                     SET status = ?, error_message = ?
+                                     WHERE cmd_id = ?`
+                                )
                                 .bind(chatStatus, errMsg, cmdId)
                                 .run()
                                 .catch(() => {})

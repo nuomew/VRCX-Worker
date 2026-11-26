@@ -29,6 +29,7 @@ public sealed class OscChatBridge : IDisposable
     private int _activeListenPort;
     private int _forwardSendPort = OscProtocol.DefaultVrChatOscSendPort;
     private bool _forwardToVrchat = true;
+    private string _lastBindError = string.Empty;
     private string _lastCapturedText = string.Empty;
     private DateTimeOffset _lastCapturedUtc = DateTimeOffset.MinValue;
     private bool _disposed;
@@ -36,6 +37,17 @@ public sealed class OscChatBridge : IDisposable
     public OscChatBridge(Action? onMessageCaptured = null)
     {
         _onMessageCaptured = onMessageCaptured;
+    }
+
+    public string LastBindError
+    {
+        get
+        {
+            lock (_stateLock)
+            {
+                return _lastBindError;
+            }
+        }
     }
 
     public bool IsListening
@@ -92,12 +104,14 @@ public sealed class OscChatBridge : IDisposable
 
             if (!enabled)
             {
+                _lastBindError = string.Empty;
                 StopListenerLocked();
                 return true;
             }
 
             if (safeListenPort == safeSendPort && forwardToVrchat)
             {
+                _lastBindError = $"OSC listen port {safeListenPort} conflicts with VRChat send port {safeSendPort}";
                 Log.Warn("Refusing to start OSC relay on port {Port} because it matches VRChat send port.", safeListenPort);
                 StopListenerLocked();
                 return false;
@@ -105,6 +119,7 @@ public sealed class OscChatBridge : IDisposable
 
             if (_listener != null && _activeListenPort == safeListenPort)
             {
+                _lastBindError = string.Empty;
                 return true;
             }
 
@@ -116,6 +131,7 @@ public sealed class OscChatBridge : IDisposable
                 _listener = udp;
                 _listenCts = cts;
                 _activeListenPort = safeListenPort;
+                _lastBindError = string.Empty;
                 _listenTask = Task.Run(() => ListenLoopAsync(udp, safeListenPort, cts.Token));
                 Log.Info("OSC chat relay listening on 127.0.0.1:{ListenPort} (forwardToVrchat={Forward}, targetPort={SendPort}).",
                     safeListenPort, forwardToVrchat, safeSendPort);
@@ -123,6 +139,7 @@ public sealed class OscChatBridge : IDisposable
             }
             catch (Exception ex)
             {
+                _lastBindError = $"Port {safeListenPort} unavailable: {ex.Message}";
                 Log.Warn(ex, "Could not bind local OSC chat relay on 127.0.0.1:{Port}.", safeListenPort);
                 StopListenerLocked();
                 return false;

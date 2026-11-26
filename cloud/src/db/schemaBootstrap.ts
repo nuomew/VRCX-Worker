@@ -5,7 +5,7 @@ let initPromise: Promise<void> | null = null;
 
 // Static DDL mirrored from cloud/migrations/*/0001_init.sql.
 // Uses a schema_meta version sentinel so upgrades from Phase 0 auto-add Phase 1 tables idempotently.
-const SCHEMA_VERSION = 'v8-chat-translator';
+const SCHEMA_VERSION = 'v7-unique-screenshot-filename';
 
 const CORE_STATEMENTS: readonly string[] = [
     `CREATE TABLE IF NOT EXISTS schema_meta (
@@ -281,28 +281,7 @@ const CORE_STATEMENTS: readonly string[] = [
         failures INTEGER NOT NULL DEFAULT 0,
         locked_until TEXT NOT NULL DEFAULT '',
         updated_at TEXT NOT NULL
-    )`,
-    `CREATE TABLE IF NOT EXISTS cloud_chat_messages (
-        id TEXT PRIMARY KEY,
-        device_id TEXT NOT NULL DEFAULT '',
-        direction TEXT NOT NULL DEFAULT 'web_to_vrc',
-        source_text TEXT NOT NULL DEFAULT '',
-        translated_text TEXT NOT NULL DEFAULT '',
-        sent_text TEXT NOT NULL DEFAULT '',
-        source_lang TEXT NOT NULL DEFAULT 'auto',
-        target_lang TEXT NOT NULL DEFAULT '',
-        display_mode TEXT NOT NULL DEFAULT 'translated_only',
-        osc_address TEXT NOT NULL DEFAULT '/chatbox/input',
-        osc_port INTEGER NOT NULL DEFAULT 9000,
-        immediate INTEGER NOT NULL DEFAULT 1,
-        play_sfx INTEGER NOT NULL DEFAULT 1,
-        status TEXT NOT NULL DEFAULT 'queued',
-        cmd_id TEXT NOT NULL DEFAULT '',
-        error_message TEXT NOT NULL DEFAULT '',
-        created_at TEXT NOT NULL
-    )`,
-    `CREATE INDEX IF NOT EXISTS idx_chat_messages_created ON cloud_chat_messages (created_at DESC)`,
-    `CREATE INDEX IF NOT EXISTS idx_chat_messages_cmd ON cloud_chat_messages (cmd_id)`
+    )`
 ];
 
 const GAMELOG_STATEMENTS: readonly string[] = [
@@ -767,11 +746,48 @@ const LEGACY_STATEMENTS: readonly string[] = [
     `CREATE INDEX IF NOT EXISTS idx_legacy_feed_bio_created ON feed_bio (created_at DESC)`
 ];
 
+const CHAT_STATEMENTS: readonly string[] = [
+    `CREATE TABLE IF NOT EXISTS cloud_chat_config (
+        config_key TEXT PRIMARY KEY,
+        payload_json TEXT NOT NULL DEFAULT '{}',
+        updated_at TEXT NOT NULL
+    )`,
+    `CREATE TABLE IF NOT EXISTS cloud_chat_messages (
+        id TEXT PRIMARY KEY,
+        device_id TEXT NOT NULL DEFAULT '',
+        direction TEXT NOT NULL DEFAULT 'web_to_vrc',
+        source_text TEXT NOT NULL DEFAULT '',
+        translated_text TEXT NOT NULL DEFAULT '',
+        sent_text TEXT NOT NULL DEFAULT '',
+        source_lang TEXT NOT NULL DEFAULT 'auto',
+        target_lang TEXT NOT NULL DEFAULT '',
+        display_mode TEXT NOT NULL DEFAULT 'translated_only',
+        osc_address TEXT NOT NULL DEFAULT '/chatbox/input',
+        osc_port INTEGER NOT NULL DEFAULT 9000,
+        immediate INTEGER NOT NULL DEFAULT 1,
+        play_sfx INTEGER NOT NULL DEFAULT 1,
+        status TEXT NOT NULL DEFAULT 'queued',
+        cmd_id TEXT NOT NULL DEFAULT '',
+        error_message TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_chat_messages_created ON cloud_chat_messages (created_at DESC)`,
+    `CREATE INDEX IF NOT EXISTS idx_chat_messages_cmd ON cloud_chat_messages (cmd_id)`
+];
+
 /**
  * Returns the dedicated DB_CACHE shard when bound, falling back gracefully to DB_CORE.
  */
 export function getCacheDb(env: Env): D1Database {
     return env.DB_CACHE ?? env.DB_CORE;
+}
+
+/**
+ * Returns the dedicated DB_CHAT shard (`vrcx-chat`) for chat translator records & config,
+ * falling back gracefully to DB_CORE only in legacy deployments where DB_CHAT is unbound.
+ */
+export function getChatDb(env: Env): D1Database {
+    return env.DB_CHAT ?? env.DB_CORE;
 }
 
 /**
@@ -847,7 +863,8 @@ export async function ensureSchemaReady(env: Env): Promise<void> {
             initCoreIfNeeded(env.DB_CORE),
             initShardIfNeeded(env.DB_GAMELOG, 'idx_gamelog_ext_user_id', GAMELOG_STATEMENTS, 'index'),
             initShardIfNeeded(env.DB_FEED, 'activity_sessions_v2', FEED_STATEMENTS, 'table'),
-            initShardIfNeeded(getCacheDb(env), 'cloud_rss_snapshot', CACHE_STATEMENTS, 'table')
+            initShardIfNeeded(getCacheDb(env), 'cloud_rss_snapshot', CACHE_STATEMENTS, 'table'),
+            initShardIfNeeded(getChatDb(env), 'cloud_chat_config', CHAT_STATEMENTS, 'table')
         ];
         if (env.DB_LEGACY) {
             tasks.push(initShardIfNeeded(env.DB_LEGACY, 'idx_legacy_feed_bio_created', LEGACY_STATEMENTS, 'index'));

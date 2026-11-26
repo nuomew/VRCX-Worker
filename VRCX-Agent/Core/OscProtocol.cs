@@ -34,6 +34,55 @@ public static class OscProtocol
     public const string ChatboxTypingAddress = "/chatbox/typing";
 
     private static readonly Logger Log = LogManager.GetCurrentClassLogger();
+    private static readonly SemaphoreSlim SharedUdpLock = new(1, 1);
+    private static UdpClient? _sharedSenderUdp;
+
+    private static async Task SendLoopbackDatagramAsync(byte[] packet, int port, CancellationToken ct)
+    {
+        var endpoint = new IPEndPoint(IPAddress.Loopback, port);
+        await SharedUdpLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            _sharedSenderUdp ??= new UdpClient(AddressFamily.InterNetwork);
+            try
+            {
+                await _sharedSenderUdp.SendAsync(packet, endpoint, ct).ConfigureAwait(false);
+            }
+            catch (ObjectDisposedException)
+            {
+                _sharedSenderUdp = new UdpClient(AddressFamily.InterNetwork);
+                await _sharedSenderUdp.SendAsync(packet, endpoint, ct).ConfigureAwait(false);
+            }
+            catch (SocketException)
+            {
+                try { _sharedSenderUdp.Dispose(); } catch { /* ignore */ }
+                _sharedSenderUdp = new UdpClient(AddressFamily.InterNetwork);
+                await _sharedSenderUdp.SendAsync(packet, endpoint, ct).ConfigureAwait(false);
+            }
+        }
+        finally
+        {
+            SharedUdpLock.Release();
+        }
+    }
+
+    public static void DisposeSharedSender()
+    {
+        if (!SharedUdpLock.Wait(500)) return;
+        try
+        {
+            _sharedSenderUdp?.Dispose();
+            _sharedSenderUdp = null;
+        }
+        catch
+        {
+            // Ignore shutdown errors
+        }
+        finally
+        {
+            SharedUdpLock.Release();
+        }
+    }
 
     public static bool IsValidOscPort(int port) => port >= MinOscPort && port <= MaxOscPort;
 
@@ -247,9 +296,7 @@ public static class OscProtocol
         try
         {
             byte[] packet = BuildChatboxInputPacket(safeMessage, immediate, playSfx);
-            using var udp = new UdpClient();
-            var endpoint = new IPEndPoint(IPAddress.Loopback, port);
-            await udp.SendAsync(packet, endpoint, ct).ConfigureAwait(false);
+            await SendLoopbackDatagramAsync(packet, port, ct).ConfigureAwait(false);
             return (true, $"Sent OSC chatbox message ({safeMessage.Length} chars) to 127.0.0.1:{port}");
         }
         catch (Exception ex)
@@ -272,9 +319,7 @@ public static class OscProtocol
         try
         {
             byte[] packet = BuildChatboxTypingPacket(isTyping);
-            using var udp = new UdpClient();
-            var endpoint = new IPEndPoint(IPAddress.Loopback, port);
-            await udp.SendAsync(packet, endpoint, ct).ConfigureAwait(false);
+            await SendLoopbackDatagramAsync(packet, port, ct).ConfigureAwait(false);
             return (true, $"Sent OSC typing={isTyping} to 127.0.0.1:{port}");
         }
         catch (Exception ex)

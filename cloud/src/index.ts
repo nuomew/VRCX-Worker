@@ -106,6 +106,7 @@ export default {
                         r2Enabled: Boolean(env.R2_MEDIA),
                         cacheDbDedicated: Boolean(env.DB_CACHE),
                         legacyDbDedicated: Boolean(env.DB_LEGACY),
+                        chatDbDedicated: Boolean(env.DB_CHAT),
                         timestamp: new Date().toISOString()
                     }
                 });

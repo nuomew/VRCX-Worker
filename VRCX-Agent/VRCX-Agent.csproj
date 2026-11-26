@@ -18,6 +18,11 @@
     <OutputPath>..\build\VRCX-Agent\</OutputPath>
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
     <AppendRuntimeIdentifierToOutputPath>false</AppendRuntimeIdentifierToOutputPath>
+    <!-- Low-footprint tray agent GC profile: Workstation GC + release unused VM pages back to Windows -->
+    <ServerGarbageCollection>false</ServerGarbageCollection>
+    <ConcurrentGarbageCollection>true</ConcurrentGarbageCollection>
+    <RetainVMGarbageCollection>false</RetainVMGarbageCollection>
+    <TieredCompilation>true</TieredCompilation>
     <NoWarn>$(NoWarn);CA1416</NoWarn>
   </PropertyGroup>
 

@@ -1,5 +1,6 @@
 import { preAuthenticateAgent, verifyAgentBodyHmac } from '../auth/auth';
 import { randomHex } from '../crypto/vault';
+import { getChatDb } from '../db/schemaBootstrap';
 import type { Env } from '../env';
 import {
     dispatchAgentCommandInternal,
@@ -16,12 +17,14 @@ import {
 export const VRC_OSC_MAX_CHARS = 144;
 export const VRC_OSC_MAX_LINES = 9;
 export const DEFAULT_OSC_SEND_PORT = 9000;
+export const DEFAULT_OSC_LISTEN_PORT = 9002;
 const MIN_OSC_PORT = 1024;
 const MAX_OSC_PORT = 65535;
 const MAX_CHAT_SYNC_BYTES = 131_072; // 128 KiB ceiling for agent chat sync payloads
 const MAX_STORED_CHAT_MESSAGES = 500;
 const CHAT_WEB_ACTIVE_TTL_MS = 90_000;
 const CHAT_WEB_ACTIVE_STATE_KEY = 'chat_web_active';
+const CHAT_CONFIG_KEY = 'default';
 const VALID_DIRECTIONS = new Set(['web_to_vrc', 'desktop_sync']);
 const VALID_DISPLAY_MODES = new Set([
     'translated_only',
@@ -31,6 +34,38 @@ const VALID_DISPLAY_MODES = new Set([
 ]);
 const CHAT_ID_RE = /^[A-Za-z0-9_-]{4,64}$/;
 const LANG_CODE_RE = /^[A-Za-z0-9_-]{1,24}$/;
+
+export interface ChatTranslatorCloudConfig {
+    oscEnabled: boolean;
+    oscSendPort: number;
+    oscListenEnabled: boolean;
+    oscListenPort: number;
+    oscForwardToVrchat: boolean;
+    sourceLang: string;
+    targetLang: string;
+    displayMode: string;
+    immediate: boolean;
+    playSfx: boolean;
+    syncTyping: boolean;
+    autoTranslateDesktop: boolean;
+    targetDeviceId: string;
+}
+
+export const DEFAULT_CHAT_TRANSLATOR_CONFIG: Readonly<ChatTranslatorCloudConfig> = Object.freeze({
+    oscEnabled: true,
+    oscSendPort: DEFAULT_OSC_SEND_PORT,
+    oscListenEnabled: false,
+    oscListenPort: DEFAULT_OSC_LISTEN_PORT,
+    oscForwardToVrchat: true,
+    sourceLang: 'auto',
+    targetLang: 'en',
+    displayMode: 'translated_and_source',
+    immediate: true,
+    playSfx: true,
+    syncTyping: false,
+    autoTranslateDesktop: false,
+    targetDeviceId: ''
+});
 
 export interface ChatMessageRow {
     id: string;
@@ -75,7 +110,12 @@ export function sanitizeChatTextField(raw: unknown, maxChars = 600): string {
 
 export function parseOscPort(raw: unknown, fallback = DEFAULT_OSC_SEND_PORT): number | null {
     if (raw === undefined || raw === null || raw === '') return fallback;
-    const n = typeof raw === 'number' ? raw : typeof raw === 'string' && /^\d+$/.test(raw.trim()) ? Number(raw.trim()) : NaN;
+    const n =
+        typeof raw === 'number'
+            ? raw
+            : typeof raw === 'string' && /^\d+$/.test(raw.trim())
+              ? Number(raw.trim())
+              : NaN;
     if (!Number.isInteger(n) || n < MIN_OSC_PORT || n > MAX_OSC_PORT) {
         return null;
     }
@@ -86,6 +126,94 @@ function normalizeLangCode(raw: unknown, fallback = ''): string {
     if (typeof raw !== 'string') return fallback;
     const trimmed = raw.trim();
     return LANG_CODE_RE.test(trimmed) ? trimmed : fallback;
+}
+
+export function normalizeChatTranslatorConfig(
+    raw: unknown,
+    base: ChatTranslatorCloudConfig = DEFAULT_CHAT_TRANSLATOR_CONFIG
+): { ok: true; config: ChatTranslatorCloudConfig } | { ok: false; message: string } {
+    const obj = raw && typeof raw === 'object' && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {};
+
+    const sendPort = parseOscPort(obj.oscSendPort, base.oscSendPort);
+    if (sendPort === null) {
+        return { ok: false, message: 'oscSendPort must be an integer between 1024 and 65535' };
+    }
+    const listenPort = parseOscPort(obj.oscListenPort, base.oscListenPort);
+    if (listenPort === null) {
+        return { ok: false, message: 'oscListenPort must be an integer between 1024 and 65535' };
+    }
+
+    const oscEnabled = typeof obj.oscEnabled === 'boolean' ? obj.oscEnabled : base.oscEnabled;
+    const oscListenEnabled = typeof obj.oscListenEnabled === 'boolean' ? obj.oscListenEnabled : base.oscListenEnabled;
+    const oscForwardToVrchat =
+        typeof obj.oscForwardToVrchat === 'boolean' ? obj.oscForwardToVrchat : base.oscForwardToVrchat;
+
+    if (oscListenEnabled && oscForwardToVrchat && listenPort === sendPort) {
+        return {
+            ok: false,
+            message: 'oscListenPort cannot equal oscSendPort when forwarding to VRChat is enabled'
+        };
+    }
+
+    const displayMode =
+        typeof obj.displayMode === 'string' && VALID_DISPLAY_MODES.has(obj.displayMode)
+            ? obj.displayMode
+            : base.displayMode;
+
+    return {
+        ok: true,
+        config: {
+            oscEnabled,
+            oscSendPort: sendPort,
+            oscListenEnabled,
+            oscListenPort: listenPort,
+            oscForwardToVrchat,
+            sourceLang: normalizeLangCode(obj.sourceLang, base.sourceLang),
+            targetLang: normalizeLangCode(obj.targetLang, base.targetLang),
+            displayMode,
+            immediate: typeof obj.immediate === 'boolean' ? obj.immediate : base.immediate,
+            playSfx: typeof obj.playSfx === 'boolean' ? obj.playSfx : base.playSfx,
+            syncTyping: typeof obj.syncTyping === 'boolean' ? obj.syncTyping : base.syncTyping,
+            autoTranslateDesktop:
+                typeof obj.autoTranslateDesktop === 'boolean' ? obj.autoTranslateDesktop : base.autoTranslateDesktop,
+            targetDeviceId:
+                typeof obj.targetDeviceId === 'string' ? obj.targetDeviceId.trim().slice(0, 64) : base.targetDeviceId
+        }
+    };
+}
+
+export async function loadChatTranslatorConfig(env: Env): Promise<ChatTranslatorCloudConfig> {
+    try {
+        const chatDb = getChatDb(env);
+        const row = await chatDb
+            .prepare('SELECT payload_json FROM cloud_chat_config WHERE config_key = ? LIMIT 1')
+            .bind(CHAT_CONFIG_KEY)
+            .first<{ payload_json?: string }>();
+        if (!row?.payload_json) {
+            return { ...DEFAULT_CHAT_TRANSLATOR_CONFIG };
+        }
+        const parsed = JSON.parse(row.payload_json) as unknown;
+        const normalized = normalizeChatTranslatorConfig(parsed, DEFAULT_CHAT_TRANSLATOR_CONFIG);
+        return normalized.ok ? normalized.config : { ...DEFAULT_CHAT_TRANSLATOR_CONFIG };
+    } catch {
+        return { ...DEFAULT_CHAT_TRANSLATOR_CONFIG };
+    }
+}
+
+export async function saveChatTranslatorConfig(env: Env, config: ChatTranslatorCloudConfig): Promise<string> {
+    const chatDb = getChatDb(env);
+    const nowIso = new Date().toISOString();
+    await chatDb
+        .prepare(
+            `INSERT INTO cloud_chat_config (config_key, payload_json, updated_at)
+             VALUES (?, ?, ?)
+             ON CONFLICT(config_key) DO UPDATE SET
+                payload_json = excluded.payload_json,
+                updated_at = excluded.updated_at`
+        )
+        .bind(CHAT_CONFIG_KEY, JSON.stringify(config), nowIso)
+        .run();
+    return nowIso;
 }
 
 export function formatChatMessageDto(row: ChatMessageRow): Record<string, unknown> {
@@ -111,16 +239,19 @@ export function formatChatMessageDto(row: ChatMessageRow): Record<string, unknow
 }
 
 /**
- * Checks whether any Web browser tab recently polled or sent in the Chat Translator view
- * so periodic HTTP agents can briefly switch into low-latency chat polling without idle waste.
+ * Checks whether any Web browser tab recently polled or sent in the Chat Translator view.
+ * Stored inside dedicated DB_CHAT (`cloud_chat_config`) so DB_CORE stays completely untouched.
  */
-export async function isChatWebSessionActive(env: Env, nowMs = Date.now()): Promise<{ active: boolean; activeUntilIso: string }> {
+export async function isChatWebSessionActive(
+    env: Env,
+    nowMs = Date.now()
+): Promise<{ active: boolean; activeUntilIso: string }> {
     try {
-        const row = await env.DB_CORE.prepare(
-            'SELECT payload_json, updated_at FROM cloud_bg_sync_state WHERE state_key = ? LIMIT 1'
-        )
+        const chatDb = getChatDb(env);
+        const row = await chatDb
+            .prepare('SELECT updated_at FROM cloud_chat_config WHERE config_key = ? LIMIT 1')
             .bind(CHAT_WEB_ACTIVE_STATE_KEY)
-            .first<{ payload_json?: string; updated_at?: string }>();
+            .first<{ updated_at?: string }>();
         if (!row?.updated_at) {
             return { active: false, activeUntilIso: '' };
         }
@@ -139,13 +270,15 @@ export async function isChatWebSessionActive(env: Env, nowMs = Date.now()): Prom
 }
 
 async function touchChatWebActive(env: Env, nowIso: string): Promise<void> {
-    await env.DB_CORE.prepare(
-        `INSERT INTO cloud_bg_sync_state (state_key, payload_json, updated_at)
-         VALUES (?, ?, ?)
-         ON CONFLICT(state_key) DO UPDATE SET
-            payload_json = excluded.payload_json,
-            updated_at = excluded.updated_at`
-    )
+    const chatDb = getChatDb(env);
+    await chatDb
+        .prepare(
+            `INSERT INTO cloud_chat_config (config_key, payload_json, updated_at)
+             VALUES (?, ?, ?)
+             ON CONFLICT(config_key) DO UPDATE SET
+                payload_json = excluded.payload_json,
+                updated_at = excluded.updated_at`
+        )
         .bind(CHAT_WEB_ACTIVE_STATE_KEY, JSON.stringify({ lastActiveAt: nowIso }), nowIso)
         .run()
         .catch(() => {});
@@ -167,8 +300,36 @@ async function broadcastChatEvent(env: Env, type: string, payload: Record<string
     }
 }
 
+async function pushChatConfigToAgents(env: Env, config: ChatTranslatorCloudConfig): Promise<number> {
+    try {
+        const hub = env.AGENT_HUB.get(env.AGENT_HUB.idFromName('primary'));
+        const res = await hub.fetch(
+            new Request('https://agent-hub.internal/push-chat-config', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    enabled: config.oscEnabled,
+                    sendPort: config.oscSendPort,
+                    listenEnabled: config.oscListenEnabled,
+                    listenPort: config.oscListenPort,
+                    forwardToVrchat: config.oscForwardToVrchat,
+                    fullConfig: config
+                })
+            })
+        );
+        if (!res.ok) {
+            await res.body?.cancel().catch(() => {});
+            return 0;
+        }
+        const json = (await res.json()) as { data?: { pushed?: number } };
+        return Number(json.data?.pushed ?? 0);
+    } catch {
+        return 0;
+    }
+}
+
 /**
- * Updates the delivery status of a chat message linked to an OSC remote command result.
+ * Updates the delivery status of a chat message linked to an OSC remote command result in DB_CHAT.
  */
 export async function syncChatMessageStatusByCmdId(
     env: Env,
@@ -177,20 +338,21 @@ export async function syncChatMessageStatusByCmdId(
     errorMessage: string
 ): Promise<void> {
     if (!cmdId) return;
+    const chatDb = getChatDb(env);
     const nextStatus = cmdStatus === 'succeeded' ? 'sent' : 'failed';
     const safeError = cmdStatus === 'succeeded' ? '' : String(errorMessage || 'OSC dispatch failed').slice(0, 512);
     try {
-        const res = await env.DB_CORE.prepare(
-            `UPDATE cloud_chat_messages
-             SET status = ?, error_message = ?
-             WHERE cmd_id = ?`
-        )
+        const res = await chatDb
+            .prepare(
+                `UPDATE cloud_chat_messages
+                 SET status = ?, error_message = ?
+                 WHERE cmd_id = ?`
+            )
             .bind(nextStatus, safeError, cmdId)
             .run();
         if ((res.meta?.changes ?? 0) > 0) {
-            const updated = await env.DB_CORE.prepare(
-                'SELECT * FROM cloud_chat_messages WHERE cmd_id = ? LIMIT 1'
-            )
+            const updated = await chatDb
+                .prepare('SELECT * FROM cloud_chat_messages WHERE cmd_id = ? LIMIT 1')
                 .bind(cmdId)
                 .first<ChatMessageRow>();
             if (updated) {
@@ -205,12 +367,14 @@ export async function syncChatMessageStatusByCmdId(
 }
 
 async function pruneChatMessages(env: Env): Promise<void> {
-    await env.DB_CORE.prepare(
-        `DELETE FROM cloud_chat_messages
-         WHERE id NOT IN (
-             SELECT id FROM cloud_chat_messages ORDER BY created_at DESC LIMIT ?
-         )`
-    )
+    const chatDb = getChatDb(env);
+    await chatDb
+        .prepare(
+            `DELETE FROM cloud_chat_messages
+             WHERE id NOT IN (
+                 SELECT id FROM cloud_chat_messages ORDER BY created_at DESC LIMIT ?
+             )`
+        )
         .bind(MAX_STORED_CHAT_MESSAGES)
         .run()
         .catch(() => {});
@@ -295,6 +459,7 @@ async function listChatAgentDevices(env: Env): Promise<
             listenEnabled: boolean;
             listenPort: number;
             forwardToVrchat: boolean;
+            listenError: string;
         };
     }>
 > {
@@ -347,7 +512,6 @@ async function listChatAgentDevices(env: Env): Promise<
     for (const dev of devRows) {
         deviceMap.set(dev.device_id, dev);
     }
-    // Include realtime chat_agent companions even if their periodic HTTP sync hasn't ticked yet.
     for (const realtimeId of liveChatHub.chatAgentsOnline) {
         if (!deviceMap.has(realtimeId)) {
             const rtState = liveChatHub.chatOscStates[realtimeId];
@@ -370,15 +534,15 @@ async function listChatAgentDevices(env: Env): Promise<
             parseOscPort(rtSt.sendPort ?? st.oscSendPort ?? oscRaw.sendPort, DEFAULT_OSC_SEND_PORT) ??
             DEFAULT_OSC_SEND_PORT;
         const listenPort =
-            parseOscPort(rtSt.listenPort ?? st.oscListenPort ?? oscRaw.listenPort, 9002) ?? 9002;
+            parseOscPort(rtSt.listenPort ?? st.oscListenPort ?? oscRaw.listenPort, DEFAULT_OSC_LISTEN_PORT) ??
+            DEFAULT_OSC_LISTEN_PORT;
         return {
             deviceId: dev.device_id,
             deviceName:
                 (typeof rtSt.deviceName === 'string' && rtSt.deviceName) || dev.device_name || dev.device_id,
             online: realtimeConnected || wsOnlineSet.has(dev.device_id) || httpOnlineSet.has(dev.device_id),
             realtimeConnected,
-            vrcRunning:
-                rtSt.vrcRunning === true || st.vrcRunning === true || st.isGameRunning === true,
+            vrcRunning: rtSt.vrcRunning === true || st.vrcRunning === true || st.isGameRunning === true,
             lastSeenAt: dev.last_seen_at || '',
             osc: {
                 enabled:
@@ -392,15 +556,16 @@ async function listChatAgentDevices(env: Env): Promise<
                 forwardToVrchat:
                     (rtSt.forwardToVrchat !== undefined ? rtSt.forwardToVrchat !== false : true) &&
                     st.oscForwardToVrchat !== false &&
-                    oscRaw.forwardToVrchat !== false
+                    oscRaw.forwardToVrchat !== false,
+                listenError: typeof rtSt.listenError === 'string' ? rtSt.listenError : ''
             }
         };
     });
 }
 
 /**
- * Agent-authenticated lightweight chat/OSC sync endpoint (`POST /api/agent/chat/sync`).
- * Enables low-latency bidirectional OSC chat sync without waking Durable Objects on idle ticks.
+ * Agent-authenticated lightweight chat/OSC fallback endpoint (`POST /api/agent/chat/sync`).
+ * Stores incoming messages strictly into dedicated DB_CHAT and returns cloud-managed OSC config.
  */
 export async function handleChatOscAgentRoutes(request: Request, env: Env, url: URL): Promise<Response | null> {
     if (url.pathname !== '/api/agent/chat/sync' || request.method !== 'POST') {
@@ -460,9 +625,9 @@ export async function handleChatOscAgentRoutes(request: Request, env: Env, url: 
     const nowMs = Date.now();
     const nowIso = new Date(nowMs).toISOString();
     const isRegisteredDevice = Boolean(auth.fromDeviceTable);
+    const chatDb = getChatDb(env);
 
-    // 1. Validate device liveness + claim pending OSC chat commands + inspect web chat session liveness
-    const [pendingRes, existingStateRow, webActive] = await Promise.all([
+    const [pendingRes, existingStateRow, webActive, cloudConfig] = await Promise.all([
         env.DB_CORE.prepare(
             `SELECT cmd_id, action, payload_json, expires_at
              FROM cloud_commands
@@ -477,7 +642,8 @@ export async function handleChatOscAgentRoutes(request: Request, env: Env, url: 
         env.DB_CORE.prepare('SELECT state_json FROM cloud_device_states WHERE device_id = ? LIMIT 1')
             .bind(auth.deviceId)
             .first<{ state_json?: string }>(),
-        isChatWebSessionActive(env, nowMs)
+        isChatWebSessionActive(env, nowMs),
+        loadChatTranslatorConfig(env)
     ]);
 
     const coreWrites: D1PreparedStatement[] = [
@@ -494,7 +660,6 @@ export async function handleChatOscAgentRoutes(request: Request, env: Env, url: 
               ).bind(auth.deviceId, auth.deviceName || 'Windows PC', `sync:${auth.deviceId}`, nowIso, nowIso)
     ];
 
-    // Merge optional OSC state snapshot into cloud_device_states without clobbering VRChat/SteamVR fields
     if (body.oscState && typeof body.oscState === 'object' && !Array.isArray(body.oscState)) {
         let prevState: Record<string, unknown> = {};
         if (existingStateRow?.state_json) {
@@ -508,7 +673,7 @@ export async function handleChatOscAgentRoutes(request: Request, env: Env, url: 
             }
         }
         const oscSendPort = parseOscPort(body.oscState.sendPort, DEFAULT_OSC_SEND_PORT) ?? DEFAULT_OSC_SEND_PORT;
-        const oscListenPort = parseOscPort(body.oscState.listenPort, 9002) ?? 9002;
+        const oscListenPort = parseOscPort(body.oscState.listenPort, DEFAULT_OSC_LISTEN_PORT) ?? DEFAULT_OSC_LISTEN_PORT;
         const nextState: Record<string, unknown> = {
             ...prevState,
             ...(typeof body.oscState.vrcRunning === 'boolean' ? { vrcRunning: body.oscState.vrcRunning } : {}),
@@ -538,9 +703,32 @@ export async function handleChatOscAgentRoutes(request: Request, env: Env, url: 
         );
     }
 
-    // Ingest desktop/OSC-captured chat messages (bounded to 20 per sync)
+    const candidateRows = pendingRes.results ?? [];
+    const claimStartIndex = coreWrites.length;
+    for (const row of candidateRows) {
+        coreWrites.push(
+            isRegisteredDevice
+                ? env.DB_CORE.prepare(
+                      "UPDATE cloud_commands SET status = 'dispatched', target_device_id = ? WHERE cmd_id = ? AND status = 'pending' AND (target_device_id = '' OR target_device_id = ?) AND EXISTS (SELECT 1 FROM cloud_devices WHERE device_id = ?)"
+                  ).bind(auth.deviceId, row.cmd_id, auth.deviceId, auth.deviceId)
+                : env.DB_CORE.prepare(
+                      "UPDATE cloud_commands SET status = 'dispatched', target_device_id = ? WHERE cmd_id = ? AND status = 'pending' AND (target_device_id = '' OR target_device_id = ?)"
+                  ).bind(auth.deviceId, row.cmd_id, auth.deviceId)
+        );
+    }
+
+    const writeResults = await env.DB_CORE.batch(coreWrites);
+    if (isRegisteredDevice && (writeResults[0]?.meta?.changes ?? 0) === 0) {
+        return Response.json(
+            { ok: false, error: { code: 'DEVICE_REVOKED', message: 'Device has been revoked' } },
+            { status: 401 }
+        );
+    }
+
+    // Ingest desktop/OSC-captured chat messages into dedicated DB_CHAT (bounded to 20 per sync)
     const incomingRaw = Array.isArray(body.messages) ? body.messages.slice(0, 20) : [];
     const insertedRows: ChatMessageRow[] = [];
+    const chatWrites: D1PreparedStatement[] = [];
     for (const item of incomingRaw) {
         if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
         const rec = item as Record<string, unknown>;
@@ -564,9 +752,10 @@ export async function handleChatOscAgentRoutes(request: Request, env: Env, url: 
                 : '/chatbox/input';
         const immediate = rec.immediate === false ? 0 : 1;
         const playSfx = rec.playSfx === false ? 0 : 1;
-        const rawCreated = typeof rec.createdAt === 'string' && Number.isFinite(Date.parse(rec.createdAt))
-            ? new Date(Date.parse(rec.createdAt)).toISOString()
-            : nowIso;
+        const rawCreated =
+            typeof rec.createdAt === 'string' && Number.isFinite(Date.parse(rec.createdAt))
+                ? new Date(Date.parse(rec.createdAt)).toISOString()
+                : nowIso;
 
         const row: ChatMessageRow = {
             id: rawId,
@@ -588,51 +777,41 @@ export async function handleChatOscAgentRoutes(request: Request, env: Env, url: 
             created_at: rawCreated
         };
         insertedRows.push(row);
-        coreWrites.push(
-            env.DB_CORE.prepare(
-                `INSERT OR IGNORE INTO cloud_chat_messages
-                 (id, device_id, direction, source_text, translated_text, sent_text, source_lang, target_lang, display_mode, osc_address, osc_port, immediate, play_sfx, status, cmd_id, error_message, created_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', '', ?)`
-            ).bind(
-                row.id,
-                row.device_id,
-                row.direction,
-                row.source_text,
-                row.translated_text,
-                row.sent_text,
-                row.source_lang,
-                row.target_lang,
-                row.display_mode,
-                row.osc_address,
-                row.osc_port,
-                row.immediate,
-                row.play_sfx,
-                row.status,
-                row.created_at
-            )
+        chatWrites.push(
+            chatDb
+                .prepare(
+                    `INSERT OR IGNORE INTO cloud_chat_messages
+                     (id, device_id, direction, source_text, translated_text, sent_text, source_lang, target_lang, display_mode, osc_address, osc_port, immediate, play_sfx, status, cmd_id, error_message, created_at)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', '', ?)`
+                )
+                .bind(
+                    row.id,
+                    row.device_id,
+                    row.direction,
+                    row.source_text,
+                    row.translated_text,
+                    row.sent_text,
+                    row.source_lang,
+                    row.target_lang,
+                    row.display_mode,
+                    row.osc_address,
+                    row.osc_port,
+                    row.immediate,
+                    row.play_sfx,
+                    row.status,
+                    row.created_at
+                )
         );
     }
 
-    const candidateRows = pendingRes.results ?? [];
-    const claimStartIndex = coreWrites.length;
-    for (const row of candidateRows) {
-        coreWrites.push(
-            isRegisteredDevice
-                ? env.DB_CORE.prepare(
-                      "UPDATE cloud_commands SET status = 'dispatched', target_device_id = ? WHERE cmd_id = ? AND status = 'pending' AND (target_device_id = '' OR target_device_id = ?) AND EXISTS (SELECT 1 FROM cloud_devices WHERE device_id = ?)"
-                  ).bind(auth.deviceId, row.cmd_id, auth.deviceId, auth.deviceId)
-                : env.DB_CORE.prepare(
-                      "UPDATE cloud_commands SET status = 'dispatched', target_device_id = ? WHERE cmd_id = ? AND status = 'pending' AND (target_device_id = '' OR target_device_id = ?)"
-                  ).bind(auth.deviceId, row.cmd_id, auth.deviceId)
-        );
-    }
-
-    const writeResults = await env.DB_CORE.batch(coreWrites);
-    if (isRegisteredDevice && (writeResults[0]?.meta?.changes ?? 0) === 0) {
-        return Response.json(
-            { ok: false, error: { code: 'DEVICE_REVOKED', message: 'Device has been revoked' } },
-            { status: 401 }
-        );
+    if (chatWrites.length > 0) {
+        await chatDb.batch(chatWrites);
+        await pruneChatMessages(env);
+        for (const row of insertedRows) {
+            await broadcastChatEvent(env, 'chat.message', {
+                message: formatChatMessageDto(row)
+            });
+        }
     }
 
     const pendingCommands: Array<{
@@ -659,15 +838,6 @@ export async function handleChatOscAgentRoutes(request: Request, env: Env, url: 
         });
     }
 
-    if (insertedRows.length > 0) {
-        await pruneChatMessages(env);
-        for (const row of insertedRows) {
-            await broadcastChatEvent(env, 'chat.message', {
-                message: formatChatMessageDto(row)
-            });
-        }
-    }
-
     return Response.json({
         ok: true,
         data: {
@@ -676,26 +846,88 @@ export async function handleChatOscAgentRoutes(request: Request, env: Env, url: 
             ingested: insertedRows.length,
             chatSessionActive: webActive.active,
             activeUntilIso: webActive.activeUntilIso,
+            oscConfig: {
+                enabled: cloudConfig.oscEnabled,
+                sendPort: cloudConfig.oscSendPort,
+                listenEnabled: cloudConfig.oscListenEnabled,
+                listenPort: cloudConfig.oscListenPort,
+                forwardToVrchat: cloudConfig.oscForwardToVrchat
+            },
             pendingCommands
         }
     });
 }
 
 /**
- * Web-authenticated routes for the Chat Translator & OSC bridge UI (`/api/chat/*`).
+ * Web-authenticated routes for the Chat Translator & cloud-managed OSC bridge UI (`/api/chat/*`).
+ * All chat messages and chat/OSC configuration live inside the dedicated DB_CHAT database (`vrcx-chat`).
  */
 export async function handleChatOscWebRoutes(request: Request, env: Env, url: URL): Promise<Response | null> {
-    // 1. Fetch chat messages + companion OSC status (+ refresh active heartbeat)
+    const chatDb = getChatDb(env);
+
+    // 0. Cloud-managed Chat & OSC Configuration (pushed live to Windows VRCX.Agent)
+    if (url.pathname === '/api/chat/config') {
+        if (request.method === 'GET') {
+            const config = await loadChatTranslatorConfig(env);
+            return Response.json(
+                { ok: true, data: { config, chatDbDedicated: Boolean(env.DB_CHAT) } },
+                { headers: { 'Cache-Control': 'no-store' } }
+            );
+        }
+        if (request.method === 'PUT') {
+            let body: Record<string, unknown>;
+            try {
+                const parsed = (await request.json()) as unknown;
+                if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+                    return Response.json(
+                        { ok: false, error: { code: 'BAD_REQUEST', message: 'Invalid JSON body' } },
+                        { status: 400 }
+                    );
+                }
+                body = parsed as Record<string, unknown>;
+            } catch {
+                return Response.json(
+                    { ok: false, error: { code: 'BAD_REQUEST', message: 'Invalid JSON body' } },
+                    { status: 400 }
+                );
+            }
+
+            const existing = await loadChatTranslatorConfig(env);
+            const normalized = normalizeChatTranslatorConfig(body, existing);
+            if (!normalized.ok) {
+                return Response.json(
+                    { ok: false, error: { code: 'INVALID_CONFIG', message: normalized.message } },
+                    { status: 400 }
+                );
+            }
+
+            const updatedAt = await saveChatTranslatorConfig(env, normalized.config);
+            const pushedAgents = await pushChatConfigToAgents(env, normalized.config);
+            return Response.json({
+                ok: true,
+                data: {
+                    config: normalized.config,
+                    updatedAt,
+                    pushedAgents,
+                    chatDbDedicated: Boolean(env.DB_CHAT)
+                }
+            });
+        }
+    }
+
+    // 1. Fetch chat messages + companion OSC status + cloud config (+ refresh active heartbeat)
     if (url.pathname === '/api/chat/messages' && request.method === 'GET') {
         const limit = clampQueryLimit(url.searchParams.get('limit'), 80, 200);
         const heartbeat = url.searchParams.get('heartbeat') !== '0';
         const nowIso = new Date().toISOString();
 
-        const [rowsRes, devices] = await Promise.all([
-            env.DB_CORE.prepare('SELECT * FROM cloud_chat_messages ORDER BY created_at DESC LIMIT ?')
+        const [rowsRes, devices, config] = await Promise.all([
+            chatDb
+                .prepare('SELECT * FROM cloud_chat_messages ORDER BY created_at DESC LIMIT ?')
                 .bind(limit)
                 .all<ChatMessageRow>(),
             listChatAgentDevices(env),
+            loadChatTranslatorConfig(env),
             heartbeat ? touchChatWebActive(env, nowIso) : Promise.resolve()
         ]);
 
@@ -706,6 +938,8 @@ export async function handleChatOscWebRoutes(request: Request, env: Env, url: UR
                 data: {
                     messages,
                     devices,
+                    config,
+                    chatDbDedicated: Boolean(env.DB_CHAT),
                     serverTime: nowIso
                 }
             },
@@ -734,9 +968,10 @@ export async function handleChatOscWebRoutes(request: Request, env: Env, url: UR
 
         const sourceText = sanitizeChatTextField(body.sourceText, 600);
         const translatedText = sanitizeChatTextField(body.translatedText, 600);
-        const rawSentInput = typeof body.sentText === 'string' && body.sentText.trim()
-            ? body.sentText
-            : translatedText || sourceText;
+        const rawSentInput =
+            typeof body.sentText === 'string' && body.sentText.trim()
+                ? body.sentText
+                : translatedText || sourceText;
         const sentText = sanitizeOscChatboxText(rawSentInput, VRC_OSC_MAX_CHARS);
         if (!sentText) {
             return Response.json(
@@ -745,7 +980,8 @@ export async function handleChatOscWebRoutes(request: Request, env: Env, url: UR
             );
         }
 
-        const oscPort = parseOscPort(body.oscPort, DEFAULT_OSC_SEND_PORT);
+        const cloudCfg = await loadChatTranslatorConfig(env);
+        const oscPort = parseOscPort(body.oscPort, cloudCfg.oscSendPort);
         if (oscPort === null) {
             return Response.json(
                 { ok: false, error: { code: 'INVALID_OSC_PORT', message: 'OSC port must be between 1024 and 65535' } },
@@ -761,7 +997,7 @@ export async function handleChatOscWebRoutes(request: Request, env: Env, url: UR
                 : 'translated_only';
         const immediate = body.immediate !== false;
         const playSfx = body.playSfx !== false;
-        const sendToVrc = body.sendToVrc !== false;
+        const sendToVrc = body.sendToVrc !== false && cloudCfg.oscEnabled;
         const targetDeviceId = typeof body.targetDeviceId === 'string' ? body.targetDeviceId.trim().slice(0, 64) : '';
 
         const msgId = `chat_${randomHex(8)}`;
@@ -775,12 +1011,13 @@ export async function handleChatOscWebRoutes(request: Request, env: Env, url: UR
         let deliveryStatus: 'dispatched' | 'queued' | 'skipped' | 'failed' = 'skipped';
 
         // Persist the row BEFORE dispatching over realtime WebSocket so sub-millisecond `chat.osc_result`
-        // callbacks from the desktop companion always find and update this row cleanly.
-        await env.DB_CORE.prepare(
-            `INSERT INTO cloud_chat_messages
-             (id, device_id, direction, source_text, translated_text, sent_text, source_lang, target_lang, display_mode, osc_address, osc_port, immediate, play_sfx, status, cmd_id, error_message, created_at)
-             VALUES (?, ?, 'web_to_vrc', ?, ?, ?, ?, ?, ?, '/chatbox/input', ?, ?, ?, ?, ?, '', ?)`
-        )
+        // callbacks from the desktop companion always find and update this row cleanly in DB_CHAT.
+        await chatDb
+            .prepare(
+                `INSERT INTO cloud_chat_messages
+                 (id, device_id, direction, source_text, translated_text, sent_text, source_lang, target_lang, display_mode, osc_address, osc_port, immediate, play_sfx, status, cmd_id, error_message, created_at)
+                 VALUES (?, ?, 'web_to_vrc', ?, ?, ?, ?, ?, ?, '/chatbox/input', ?, ?, ?, ?, ?, '', ?)`
+            )
             .bind(
                 msgId,
                 resolvedDeviceId,
@@ -843,18 +1080,19 @@ export async function handleChatOscWebRoutes(request: Request, env: Env, url: UR
                 }
             }
 
-            // Conditional update prevents clobbering an ultra-fast `chat.osc_result` ('sent'/'failed') already written by AgentHubDO.
-            await env.DB_CORE.prepare(
-                `UPDATE cloud_chat_messages
-                 SET device_id = ?, status = ?, cmd_id = ?, error_message = ?
-                 WHERE id = ? AND status = 'dispatching'`
-            )
+            await chatDb
+                .prepare(
+                    `UPDATE cloud_chat_messages
+                     SET device_id = ?, status = ?, cmd_id = ?, error_message = ?
+                     WHERE id = ? AND status = 'dispatching'`
+                )
                 .bind(resolvedDeviceId, status, cmdId, errorMessage, msgId)
                 .run();
         }
 
         await pruneChatMessages(env);
-        const latestRow = await env.DB_CORE.prepare('SELECT * FROM cloud_chat_messages WHERE id = ? LIMIT 1')
+        const latestRow = await chatDb
+            .prepare('SELECT * FROM cloud_chat_messages WHERE id = ? LIMIT 1')
             .bind(msgId)
             .first<ChatMessageRow>();
         const row: ChatMessageRow = latestRow ?? {
@@ -900,8 +1138,13 @@ export async function handleChatOscWebRoutes(request: Request, env: Env, url: UR
             body = {};
         }
 
+        const cloudCfg = await loadChatTranslatorConfig(env);
+        if (!cloudCfg.oscEnabled) {
+            return Response.json({ ok: true, data: { skipped: true, reason: 'OSC disabled in cloud config' } });
+        }
+
         const typing = body.typing === true;
-        const oscPort = parseOscPort(body.oscPort, DEFAULT_OSC_SEND_PORT);
+        const oscPort = parseOscPort(body.oscPort, cloudCfg.oscSendPort);
         if (oscPort === null) {
             return Response.json(
                 { ok: false, error: { code: 'INVALID_OSC_PORT', message: 'OSC port must be between 1024 and 65535' } },
@@ -967,11 +1210,12 @@ export async function handleChatOscWebRoutes(request: Request, env: Env, url: UR
 
         const translatedText = sanitizeChatTextField(body.translatedText, 600);
         const targetLang = normalizeLangCode(body.targetLang, '');
-        const res = await env.DB_CORE.prepare(
-            `UPDATE cloud_chat_messages
-             SET translated_text = ?, target_lang = CASE WHEN ? != '' THEN ? ELSE target_lang END
-             WHERE id = ?`
-        )
+        const res = await chatDb
+            .prepare(
+                `UPDATE cloud_chat_messages
+                 SET translated_text = ?, target_lang = CASE WHEN ? != '' THEN ? ELSE target_lang END
+                 WHERE id = ?`
+            )
             .bind(translatedText, targetLang, targetLang, msgId)
             .run();
 
@@ -982,7 +1226,8 @@ export async function handleChatOscWebRoutes(request: Request, env: Env, url: UR
             );
         }
 
-        const updated = await env.DB_CORE.prepare('SELECT * FROM cloud_chat_messages WHERE id = ? LIMIT 1')
+        const updated = await chatDb
+            .prepare('SELECT * FROM cloud_chat_messages WHERE id = ? LIMIT 1')
             .bind(msgId)
             .first<ChatMessageRow>();
         const dto = updated ? formatChatMessageDto(updated) : null;
@@ -992,7 +1237,7 @@ export async function handleChatOscWebRoutes(request: Request, env: Env, url: UR
         return Response.json({ ok: true, data: { message: dto } });
     }
 
-    // 5. Delete a single chat message or clear all chat history
+    // 5. Delete a single chat message or clear all chat history in DB_CHAT
     if (url.pathname === '/api/chat/messages' && request.method === 'DELETE') {
         const id = url.searchParams.get('id')?.trim() ?? '';
         if (id) {
@@ -1002,12 +1247,12 @@ export async function handleChatOscWebRoutes(request: Request, env: Env, url: UR
                     { status: 400 }
                 );
             }
-            await env.DB_CORE.prepare('DELETE FROM cloud_chat_messages WHERE id = ?').bind(id).run();
+            await chatDb.prepare('DELETE FROM cloud_chat_messages WHERE id = ?').bind(id).run();
             await broadcastChatEvent(env, 'chat.deleted', { id });
             return Response.json({ ok: true, data: { deletedId: id } });
         }
 
-        await env.DB_CORE.prepare('DELETE FROM cloud_chat_messages').run();
+        await chatDb.prepare('DELETE FROM cloud_chat_messages').run();
         await broadcastChatEvent(env, 'chat.cleared', {});
         return Response.json({ ok: true, data: { cleared: true } });
     }

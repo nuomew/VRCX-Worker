@@ -3249,6 +3249,49 @@ INSERT INTO {acctPrefix}_friend_log_history (created_at, type, user_id, display_
             CancellationToken.None);
         Assert.Equal(true, receivedTyping);
         Assert.Equal(9000, receivedPort);
+
+        // 8. Cloud-pushed `chat.osc_config` dynamically reconfigures local OscChatBridge with zero local settings
+        using var dynamicProbe = new System.Net.Sockets.UdpClient(new System.Net.IPEndPoint(System.Net.IPAddress.Loopback, 0));
+        int dynamicListenPort = ((System.Net.IPEndPoint)dynamicProbe.Client.LocalEndPoint!).Port;
+        dynamicProbe.Dispose();
+
+        await rtClient.HandleInboundEnvelopeAsync(
+            null,
+            $"{{\"type\":\"chat.osc_config\",\"payload\":{{\"enabled\":true,\"sendPort\":{targetPort},\"listenEnabled\":true,\"listenPort\":{dynamicListenPort},\"forwardToVrchat\":true}}}}",
+            CancellationToken.None);
+        CloudOscRuntimeConfig applied = rtClient.GetRuntimeConfigSnapshot();
+        Assert.True(applied.Enabled);
+        Assert.True(applied.ListenEnabled);
+        Assert.Equal(dynamicListenPort, applied.ListenPort);
+        Assert.True(rtBridge.IsListening);
+        Assert.Equal(string.Empty, rtBridge.LastBindError);
+
+        // Self-loop port conflict records LastBindError clearly
+        await rtClient.HandleInboundEnvelopeAsync(
+            null,
+            $"{{\"type\":\"chat.osc_config\",\"payload\":{{\"enabled\":true,\"sendPort\":{targetPort},\"listenEnabled\":true,\"listenPort\":{targetPort},\"forwardToVrchat\":true}}}}",
+            CancellationToken.None);
+        Assert.False(rtBridge.IsListening);
+        Assert.False(string.IsNullOrEmpty(rtBridge.LastBindError));
+
+        // Cloud disabling OSC immediately pauses outbound OSC dispatch
+        await rtClient.HandleInboundEnvelopeAsync(
+            null,
+            "{\"type\":\"chat.osc_config\",\"payload\":{\"enabled\":false,\"sendPort\":9000,\"listenEnabled\":false,\"listenPort\":9002,\"forwardToVrchat\":true}}",
+            CancellationToken.None);
+        var (disabledOk, disabledMsg) = await rtClient.ExecuteOscOnlyActionAsync(
+            "send_osc_chatbox",
+            new Dictionary<string, object?> { ["message"] = "blocked while paused" },
+            CancellationToken.None);
+        Assert.False(disabledOk);
+        Assert.Contains("disabled", disabledMsg, StringComparison.OrdinalIgnoreCase);
+
+        // 9. Shared UDP sender reuses socket across sends and self-heals cleanly after DisposeSharedSender()
+        var (send1Ok, _) = await OscProtocol.SendChatboxInputAsync("Reusable socket #1", true, true, targetPort);
+        Assert.True(send1Ok);
+        OscProtocol.DisposeSharedSender();
+        var (send2Ok, _) = await OscProtocol.SendChatboxInputAsync("Reusable socket #2", true, true, targetPort);
+        Assert.True(send2Ok);
     }
 
     private sealed class StubHttpHandler : HttpMessageHandler

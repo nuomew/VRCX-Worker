@@ -24,19 +24,22 @@ public sealed class RemoteCommandExecutor
     private readonly Func<CancellationToken, Task<string>>? _desktopScanCallback;
     private readonly Func<string, string, IReadOnlyList<string>, Task<string>>? _desktopMigrateCallback;
     private readonly Func<string, string>? _desktopMigrateCancelCallback;
+    private readonly Func<CloudOscRuntimeConfig>? _oscRuntimeConfigProvider;
 
     public RemoteCommandExecutor(
         Func<AgentConfig> configProvider,
         Func<CancellationToken, Task> syncNowCallback,
         Func<CancellationToken, Task<string>>? desktopScanCallback = null,
         Func<string, string, IReadOnlyList<string>, Task<string>>? desktopMigrateCallback = null,
-        Func<string, string>? desktopMigrateCancelCallback = null)
+        Func<string, string>? desktopMigrateCancelCallback = null,
+        Func<CloudOscRuntimeConfig>? oscRuntimeConfigProvider = null)
     {
         _configProvider = configProvider;
         _syncNowCallback = syncNowCallback;
         _desktopScanCallback = desktopScanCallback;
         _desktopMigrateCallback = desktopMigrateCallback;
         _desktopMigrateCancelCallback = desktopMigrateCancelCallback;
+        _oscRuntimeConfigProvider = oscRuntimeConfigProvider;
     }
 
     public async Task<CommandExecutionResult> ExecuteAsync(
@@ -247,22 +250,26 @@ public sealed class RemoteCommandExecutor
         Dictionary<string, object?> parameters,
         CancellationToken ct)
     {
+        CloudOscRuntimeConfig? rtCfg = _oscRuntimeConfigProvider?.Invoke();
         AgentConfig cfg = _configProvider();
-        if (!cfg.OscChatSyncEnabled)
+        bool oscEnabled = rtCfg?.Enabled ?? cfg.OscChatSyncEnabled;
+        int configuredSendPort = rtCfg?.SendPort ?? cfg.OscSendPort;
+
+        if (!oscEnabled)
         {
             return new CommandExecutionResult
             {
                 CmdId = cmdId,
                 Status = "failed",
-                Message = "OSC chat sync is disabled on this Windows companion agent"
+                Message = "OSC chat sync is disabled in Cloud Chat Translator settings"
             };
         }
 
         string message = GetString(parameters, "message");
         bool immediate = GetBool(parameters, "immediate", true);
         bool playSfx = GetBool(parameters, "playSfx", true);
-        int defaultPort = OscProtocol.IsValidOscPort(cfg.OscSendPort)
-            ? cfg.OscSendPort
+        int defaultPort = OscProtocol.IsValidOscPort(configuredSendPort)
+            ? configuredSendPort
             : OscProtocol.DefaultVrChatOscSendPort;
         int port = parameters.TryGetValue("oscPort", out var rawPort) && rawPort != null && CommandValidator.TryParseValidOscPort(rawPort, out int parsedPort)
             ? parsedPort
@@ -282,20 +289,24 @@ public sealed class RemoteCommandExecutor
         Dictionary<string, object?> parameters,
         CancellationToken ct)
     {
+        CloudOscRuntimeConfig? rtCfg = _oscRuntimeConfigProvider?.Invoke();
         AgentConfig cfg = _configProvider();
-        if (!cfg.OscChatSyncEnabled)
+        bool oscEnabled = rtCfg?.Enabled ?? cfg.OscChatSyncEnabled;
+        int configuredSendPort = rtCfg?.SendPort ?? cfg.OscSendPort;
+
+        if (!oscEnabled)
         {
             return new CommandExecutionResult
             {
                 CmdId = cmdId,
                 Status = "failed",
-                Message = "OSC chat sync is disabled on this Windows companion agent"
+                Message = "OSC chat sync is disabled in Cloud Chat Translator settings"
             };
         }
 
         bool isTyping = GetBool(parameters, "typing", false);
-        int defaultPort = OscProtocol.IsValidOscPort(cfg.OscSendPort)
-            ? cfg.OscSendPort
+        int defaultPort = OscProtocol.IsValidOscPort(configuredSendPort)
+            ? configuredSendPort
             : OscProtocol.DefaultVrChatOscSendPort;
         int port = parameters.TryGetValue("oscPort", out var rawPort) && rawPort != null && CommandValidator.TryParseValidOscPort(rawPort, out int parsedPort)
             ? parsedPort

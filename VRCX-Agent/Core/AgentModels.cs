@@ -384,6 +384,24 @@ public sealed class OscChatMessageUpload
     public string CreatedAt { get; set; } = string.Empty;
 }
 
+public sealed class CloudOscConfigDto
+{
+    [JsonProperty("enabled")]
+    public bool Enabled { get; set; } = true;
+
+    [JsonProperty("sendPort")]
+    public int SendPort { get; set; } = OscProtocol.DefaultVrChatOscSendPort;
+
+    [JsonProperty("listenEnabled")]
+    public bool ListenEnabled { get; set; }
+
+    [JsonProperty("listenPort")]
+    public int ListenPort { get; set; } = OscProtocol.DefaultOscRelayListenPort;
+
+    [JsonProperty("forwardToVrchat")]
+    public bool ForwardToVrchat { get; set; } = true;
+}
+
 public sealed class AgentChatSyncResponse
 {
     [JsonProperty("deviceId")]
@@ -400,6 +418,9 @@ public sealed class AgentChatSyncResponse
 
     [JsonProperty("activeUntilIso")]
     public string ActiveUntilIso { get; set; } = string.Empty;
+
+    [JsonProperty("oscConfig", NullValueHandling = NullValueHandling.Ignore)]
+    public CloudOscConfigDto? OscConfig { get; set; }
 
     [JsonProperty("pendingCommands")]
     public List<PendingRemoteCommand> PendingCommands { get; set; } = new();

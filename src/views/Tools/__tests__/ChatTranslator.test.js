@@ -200,6 +200,22 @@ describe('ChatTranslator.vue', () => {
         mocks.cloudFetch.mockImplementation(async (url, opts) => {
             if (url.startsWith('/api/chat/messages') && (!opts || !opts.method || opts.method === 'GET')) {
                 return {
+                    chatDbDedicated: true,
+                    config: {
+                        oscEnabled: true,
+                        oscSendPort: 9000,
+                        oscListenEnabled: false,
+                        oscListenPort: 9002,
+                        oscForwardToVrchat: true,
+                        sourceLang: 'auto',
+                        targetLang: 'en',
+                        displayMode: 'translated_and_source',
+                        immediate: true,
+                        playSfx: true,
+                        syncTyping: false,
+                        autoTranslateDesktop: false,
+                        targetDeviceId: ''
+                    },
                     messages: [
                         {
                             id: 'osc_sync_1',
@@ -225,10 +241,18 @@ describe('ChatTranslator.vue', () => {
                                 sendPort: 9000,
                                 listenEnabled: true,
                                 listenPort: 9002,
-                                forwardToVrchat: true
+                                forwardToVrchat: true,
+                                listenError: ''
                             }
                         }
                     ]
+                };
+            }
+            if (url === '/api/chat/config' && opts?.method === 'PUT') {
+                return {
+                    chatDbDedicated: true,
+                    pushedAgents: 1,
+                    config: opts.json
                 };
             }
             if (url === '/api/chat/send' && opts?.method === 'POST') {
@@ -323,8 +347,39 @@ describe('ChatTranslator.vue', () => {
         await flushPromises();
 
         expect(wrapper.text()).toContain('view.tools.chat_translator.agent_realtime');
+        expect(wrapper.text()).toContain('view.tools.chat_translator.dedicated_db_badge');
         expect(wrapper.text()).toContain('实时游戏打字消息');
         expect(wrapper.text()).toContain('view.tools.chat_translator.status_sent');
+
+        // Expanding Cloud OSC Settings and toggling Desktop OSC Relay saves directly to PUT /api/chat/config
+        const oscSettingsBtn = wrapper
+            .findAll('button')
+            .find((b) => b.text().includes('view.tools.chat_translator.osc_settings_btn'));
+        expect(oscSettingsBtn).toBeTruthy();
+        await oscSettingsBtn.trigger('click');
+        await flushPromises();
+
+        const listenCheckbox = wrapper
+            .findAll('label')
+            .find((l) => l.text().includes('view.tools.chat_translator.osc_listen_enabled_label'))
+            ?.find('input[type="checkbox"]');
+        expect(listenCheckbox).toBeTruthy();
+        await listenCheckbox.setValue(true);
+        await flushPromises();
+
+        expect(mocks.cloudFetch).toHaveBeenCalledWith(
+            '/api/chat/config',
+            expect.objectContaining({
+                method: 'PUT',
+                json: expect.objectContaining({
+                    oscEnabled: true,
+                    oscSendPort: 9000,
+                    oscListenEnabled: true,
+                    oscListenPort: 9002,
+                    oscForwardToVrchat: true
+                })
+            })
+        );
 
         wrapper.unmount();
     });

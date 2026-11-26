@@ -291,7 +291,8 @@ export function connectCloudHubWs() {
                 msg.type === 'chat.message' ||
                 msg.type === 'chat.deleted' ||
                 msg.type === 'chat.cleared' ||
-                msg.type === 'chat.agent_status'
+                msg.type === 'chat.agent_status' ||
+                msg.type === 'chat.config_updated'
             ) {
                 for (const fn of chatEventListeners) {
                     try {

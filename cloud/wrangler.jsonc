@@ -37,6 +37,11 @@
             "binding": "DB_LEGACY",
             "database_name": "vrcx-legacy",
             "migrations_dir": "migrations/legacy"
+        },
+        {
+            "binding": "DB_CHAT",
+            "database_name": "vrcx-chat",
+            "migrations_dir": "migrations/chat"
         }
     ],
     "durable_objects": {

@@ -53,6 +53,21 @@
                     class="text-xs font-normal border-sky-500/40 text-sky-600 dark:text-sky-400">
                     {{ t('view.tools.chat_translator.vrc_running') }}
                 </Badge>
+
+                <Badge
+                    v-if="isWebMode"
+                    variant="outline"
+                    class="text-xs font-normal border-border/80 text-muted-foreground"
+                    :title="t('view.tools.chat_translator.dedicated_db_hint')">
+                    {{ t('view.tools.chat_translator.dedicated_db_badge') }}
+                </Badge>
+
+                <Badge
+                    v-if="isWebMode && !prefs.oscEnabled"
+                    variant="outline"
+                    class="text-xs font-normal border-amber-500/50 bg-amber-500/10 text-amber-600 dark:text-amber-400">
+                    {{ t('view.tools.chat_translator.osc_paused_badge') }}
+                </Badge>
             </div>
 
             <div class="flex items-center gap-1.5 flex-wrap">
@@ -198,70 +213,127 @@
                 </div>
             </div>
 
-            <!-- Collapsible Advanced OSC & Companion Bridge Panel -->
+            <!-- Collapsible Cloud-Managed OSC & Companion Bridge Panel (Zero Local Agent Settings) -->
             <div
                 v-if="showOscSettings"
                 class="pt-2.5 border-t border-border/70 grid grid-cols-1 md:grid-cols-3 gap-3 text-xs">
-                <div class="space-y-1">
-                    <div class="text-muted-foreground font-medium">
-                        {{ t('view.tools.chat_translator.target_device_label') }}
+                <!-- Column 1: Master Switch & Target Device -->
+                <div class="space-y-2">
+                    <label class="inline-flex items-center gap-2 cursor-pointer select-none font-medium text-foreground">
+                        <input
+                            v-model="prefs.oscEnabled"
+                            type="checkbox"
+                            class="accent-primary rounded"
+                            @change="persistPrefs" />
+                        <span>{{ t('view.tools.chat_translator.osc_enabled_label') }}</span>
+                    </label>
+                    <div class="space-y-1">
+                        <div class="text-muted-foreground font-medium">
+                            {{ t('view.tools.chat_translator.target_device_label') }}
+                        </div>
+                        <select
+                            v-model="prefs.targetDeviceId"
+                            :aria-label="t('view.tools.chat_translator.target_device_label')"
+                            class="h-8 w-full rounded-md border border-input bg-background px-2 text-xs text-foreground dark:[color-scheme:dark]"
+                            @change="persistPrefs">
+                            <option class="bg-card text-foreground" value="">
+                                {{ t('view.tools.chat_translator.target_device_auto') }}
+                            </option>
+                            <option
+                                v-for="dev in devices"
+                                :key="dev.deviceId"
+                                class="bg-card text-foreground"
+                                :value="dev.deviceId">
+                                {{ dev.deviceName }} ({{ dev.online ? t('view.tools.chat_translator.online_short') : t('view.tools.chat_translator.offline_short') }})
+                            </option>
+                        </select>
                     </div>
-                    <select
-                        v-model="prefs.targetDeviceId"
-                        :aria-label="t('view.tools.chat_translator.target_device_label')"
-                        class="h-8 w-full rounded-md border border-input bg-background px-2 text-xs text-foreground dark:[color-scheme:dark]"
-                        @change="persistPrefs">
-                        <option class="bg-card text-foreground" value="">
-                            {{ t('view.tools.chat_translator.target_device_auto') }}
-                        </option>
-                        <option
-                            v-for="dev in devices"
-                            :key="dev.deviceId"
-                            class="bg-card text-foreground"
-                            :value="dev.deviceId">
-                            {{ dev.deviceName }} ({{ dev.online ? t('view.tools.chat_translator.online_short') : t('view.tools.chat_translator.offline_short') }})
-                        </option>
-                    </select>
+                    <label class="inline-flex items-center gap-1.5 cursor-pointer select-none">
+                        <input
+                            v-model="prefs.syncTyping"
+                            type="checkbox"
+                            class="accent-primary rounded"
+                            @change="persistPrefs" />
+                        <span>{{ t('view.tools.chat_translator.sync_typing') }}</span>
+                    </label>
                 </div>
 
-                <div class="space-y-1">
-                    <div class="text-muted-foreground font-medium">
-                        {{ t('view.tools.chat_translator.osc_port_label') }}
-                    </div>
-                    <div class="flex items-center gap-2">
-                        <span class="font-mono text-muted-foreground">127.0.0.1 :</span>
-                        <input
-                            v-model.number="prefs.oscPort"
-                            type="number"
-                            min="1024"
-                            max="65535"
-                            class="h-8 w-24 rounded-md border border-input bg-background px-2 text-xs font-mono text-foreground"
-                            @change="handleOscPortChange" />
-                        <label class="inline-flex items-center gap-1.5 cursor-pointer select-none ml-1">
+                <!-- Column 2: Cloud-Controlled Ports & Desktop Relay -->
+                <div class="space-y-2">
+                    <div class="space-y-1">
+                        <div class="text-muted-foreground font-medium">
+                            {{ t('view.tools.chat_translator.osc_port_label') }}
+                        </div>
+                        <div class="flex items-center gap-1.5">
+                            <span class="font-mono text-muted-foreground">127.0.0.1 :</span>
                             <input
-                                v-model="prefs.syncTyping"
+                                v-model.number="prefs.oscPort"
+                                type="number"
+                                min="1024"
+                                max="65535"
+                                class="h-8 w-24 rounded-md border border-input bg-background px-2 text-xs font-mono text-foreground"
+                                @change="handleOscPortChange" />
+                        </div>
+                    </div>
+
+                    <div class="space-y-1.5 pt-0.5">
+                        <label class="inline-flex items-center gap-1.5 cursor-pointer select-none font-medium text-foreground">
+                            <input
+                                v-model="prefs.oscListenEnabled"
                                 type="checkbox"
                                 class="accent-primary rounded"
                                 @change="persistPrefs" />
-                            <span>{{ t('view.tools.chat_translator.sync_typing') }}</span>
+                            <span>{{ t('view.tools.chat_translator.osc_listen_enabled_label') }}</span>
                         </label>
+                        <div class="flex items-center gap-2 flex-wrap">
+                            <span class="text-muted-foreground">{{ t('view.tools.chat_translator.osc_listen_port_label') }}</span>
+                            <input
+                                v-model.number="prefs.oscListenPort"
+                                type="number"
+                                min="1024"
+                                max="65535"
+                                class="h-7 w-20 rounded-md border border-input bg-background px-2 text-xs font-mono text-foreground"
+                                @change="handleOscListenPortChange" />
+                            <label class="inline-flex items-center gap-1.5 cursor-pointer select-none">
+                                <input
+                                    v-model="prefs.oscForwardToVrchat"
+                                    type="checkbox"
+                                    class="accent-primary rounded"
+                                    @change="persistPrefs" />
+                                <span>{{ t('view.tools.chat_translator.osc_forward_vrc_label') }}</span>
+                            </label>
+                        </div>
+                        <div v-if="hasPortConflict" class="text-[11px] text-destructive font-medium">
+                            {{ t('view.tools.chat_translator.osc_port_conflict') }}
+                        </div>
                     </div>
                 </div>
 
-                <div class="rounded-md border border-border/70 bg-muted/30 px-2.5 py-2 space-y-1">
-                    <div class="flex items-center justify-between gap-2 font-medium">
+                <!-- Column 3: Live Cloud-Synced Relay & Dedicated DB Status -->
+                <div class="rounded-md border border-border/70 bg-muted/30 px-2.5 py-2 space-y-1.5">
+                    <div class="flex items-center justify-between gap-2 font-medium flex-wrap">
                         <span>{{ t('view.tools.chat_translator.desktop_relay_title') }}</span>
                         <Badge variant="outline" class="text-[10px] font-mono">
                             {{
                                 activeDevice?.osc?.listenEnabled
-                                    ? `127.0.0.1:${activeDevice.osc.listenPort} → ${activeDevice.osc.sendPort}`
-                                    : t('view.tools.chat_translator.relay_standby')
+                                    ? `127.0.0.1:${activeDevice.osc.listenPort}${activeDevice.osc.forwardToVrchat ? ` → ${activeDevice.osc.sendPort}` : ''}`
+                                    : prefs.oscListenEnabled
+                                      ? t('view.tools.chat_translator.relay_standby')
+                                      : t('view.tools.chat_translator.relay_disabled_badge')
                             }}
                         </Badge>
                     </div>
                     <p class="text-[11px] leading-relaxed text-muted-foreground">
                         {{ t('view.tools.chat_translator.desktop_relay_hint') }}
                     </p>
+                    <p class="text-[11px] leading-relaxed text-muted-foreground/90">
+                        {{ t('view.tools.chat_translator.cloud_control_note') }}
+                    </p>
+                    <div
+                        v-if="activeDevice?.osc?.listenError"
+                        class="rounded border border-destructive/40 bg-destructive/10 px-2 py-1 text-[11px] text-destructive break-words">
+                        {{ t('view.tools.chat_translator.relay_bind_error_prefix') }} {{ activeDevice.osc.listenError }}
+                    </div>
                 </div>
             </div>
 
@@ -577,6 +649,7 @@
         CHAT_TRANSLATOR_LANGUAGES,
         CHAT_TRANSLATOR_PREFS_KEY,
         composeOscChatboxPayload,
+        DEFAULT_OSC_LISTEN_PORT,
         DEFAULT_OSC_SEND_PORT,
         getChatLanguageLabel,
         normalizeOscPort,
@@ -602,12 +675,16 @@
     const isWebMode = typeof WEB !== 'undefined' && WEB;
 
     const prefs = reactive({
+        oscEnabled: true,
         sourceLang: 'auto',
         targetLang: 'en',
         displayMode: 'translated_and_source',
         immediate: true,
         playSfx: true,
         oscPort: DEFAULT_OSC_SEND_PORT,
+        oscListenEnabled: false,
+        oscListenPort: DEFAULT_OSC_LISTEN_PORT,
+        oscForwardToVrchat: true,
         targetDeviceId: '',
         syncTyping: false,
         autoTranslateDesktop: false
@@ -619,6 +696,7 @@
     const clearingHistory = ref(false);
     const translatingDraft = ref(false);
     const sending = ref(false);
+    const chatDbDedicated = ref(true);
 
     const draftInput = ref('');
     const previewVisible = ref(false);
@@ -637,6 +715,15 @@
     let typingResetTimer = null;
     let isCurrentlyTyping = false;
     let lastTypingSentAt = 0;
+    let configSaveGeneration = 0;
+
+    const hasPortConflict = computed(
+        () =>
+            prefs.oscListenEnabled &&
+            prefs.oscForwardToVrchat &&
+            normalizeOscPort(prefs.oscListenPort, DEFAULT_OSC_LISTEN_PORT) ===
+                normalizeOscPort(prefs.oscPort, DEFAULT_OSC_SEND_PORT)
+    );
 
     const quickPhrases = computed(() => [
         t('view.tools.chat_translator.quick_phrase_1'),
@@ -701,35 +788,95 @@
         cloudState.hubDialogOpen = true;
     }
 
+    function applyCloudConfig(cfg) {
+        if (!cfg || typeof cfg !== 'object') return;
+        if (typeof cfg.oscEnabled === 'boolean') prefs.oscEnabled = cfg.oscEnabled;
+        if (cfg.oscSendPort !== undefined) {
+            prefs.oscPort = normalizeOscPort(cfg.oscSendPort, DEFAULT_OSC_SEND_PORT);
+        }
+        if (typeof cfg.oscListenEnabled === 'boolean') prefs.oscListenEnabled = cfg.oscListenEnabled;
+        if (cfg.oscListenPort !== undefined) {
+            prefs.oscListenPort = normalizeOscPort(cfg.oscListenPort, DEFAULT_OSC_LISTEN_PORT);
+        }
+        if (typeof cfg.oscForwardToVrchat === 'boolean') prefs.oscForwardToVrchat = cfg.oscForwardToVrchat;
+        if (typeof cfg.sourceLang === 'string') prefs.sourceLang = cfg.sourceLang;
+        if (typeof cfg.targetLang === 'string') prefs.targetLang = cfg.targetLang;
+        if (typeof cfg.displayMode === 'string') prefs.displayMode = cfg.displayMode;
+        if (typeof cfg.immediate === 'boolean') prefs.immediate = cfg.immediate;
+        if (typeof cfg.playSfx === 'boolean') prefs.playSfx = cfg.playSfx;
+        if (typeof cfg.targetDeviceId === 'string') prefs.targetDeviceId = cfg.targetDeviceId;
+        if (typeof cfg.syncTyping === 'boolean') prefs.syncTyping = cfg.syncTyping;
+        if (typeof cfg.autoTranslateDesktop === 'boolean') prefs.autoTranslateDesktop = cfg.autoTranslateDesktop;
+    }
+
     async function loadPrefs() {
+        if (isWebMode) {
+            // Cloud DB_CHAT is the single source of truth in Web mode (hydrated via /api/chat/messages).
+            return;
+        }
         try {
             const raw = await configRepository.getString(CHAT_TRANSLATOR_PREFS_KEY, '');
             if (!raw) return;
             const parsed = JSON.parse(raw);
             if (!parsed || typeof parsed !== 'object') return;
-            if (typeof parsed.sourceLang === 'string') prefs.sourceLang = parsed.sourceLang;
-            if (typeof parsed.targetLang === 'string') prefs.targetLang = parsed.targetLang;
-            if (typeof parsed.displayMode === 'string') prefs.displayMode = parsed.displayMode;
-            if (typeof parsed.immediate === 'boolean') prefs.immediate = parsed.immediate;
-            if (typeof parsed.playSfx === 'boolean') prefs.playSfx = parsed.playSfx;
-            if (parsed.oscPort !== undefined) prefs.oscPort = normalizeOscPort(parsed.oscPort, DEFAULT_OSC_SEND_PORT);
-            if (typeof parsed.targetDeviceId === 'string') prefs.targetDeviceId = parsed.targetDeviceId;
-            if (typeof parsed.syncTyping === 'boolean') prefs.syncTyping = parsed.syncTyping;
-            if (typeof parsed.autoTranslateDesktop === 'boolean') {
-                prefs.autoTranslateDesktop = parsed.autoTranslateDesktop;
-            }
+            applyCloudConfig({
+                ...parsed,
+                oscSendPort: parsed.oscSendPort ?? parsed.oscPort
+            });
         } catch {
             // Keep default preferences if stored JSON is corrupted
         }
     }
 
-    function persistPrefs() {
+    async function persistPrefs() {
         prefs.oscPort = normalizeOscPort(prefs.oscPort, DEFAULT_OSC_SEND_PORT);
-        configRepository.setString(CHAT_TRANSLATOR_PREFS_KEY, JSON.stringify({ ...prefs }));
+        prefs.oscListenPort = normalizeOscPort(prefs.oscListenPort, DEFAULT_OSC_LISTEN_PORT);
+        if (!isWebMode) {
+            configRepository.setString(CHAT_TRANSLATOR_PREFS_KEY, JSON.stringify({ ...prefs }));
+            return;
+        }
+        if (hasPortConflict.value) {
+            toast.warning(t('view.tools.chat_translator.osc_port_conflict'));
+            return;
+        }
+        const gen = ++configSaveGeneration;
+        try {
+            const res = await cloudFetch('/api/chat/config', {
+                method: 'PUT',
+                json: {
+                    oscEnabled: prefs.oscEnabled,
+                    oscSendPort: prefs.oscPort,
+                    oscListenEnabled: prefs.oscListenEnabled,
+                    oscListenPort: prefs.oscListenPort,
+                    oscForwardToVrchat: prefs.oscForwardToVrchat,
+                    sourceLang: prefs.sourceLang,
+                    targetLang: prefs.targetLang,
+                    displayMode: prefs.displayMode,
+                    immediate: prefs.immediate,
+                    playSfx: prefs.playSfx,
+                    syncTyping: prefs.syncTyping,
+                    autoTranslateDesktop: prefs.autoTranslateDesktop,
+                    targetDeviceId: prefs.targetDeviceId
+                }
+            });
+            if (gen === configSaveGeneration && res?.config) {
+                applyCloudConfig(res.config);
+            }
+            if (typeof res?.chatDbDedicated === 'boolean') {
+                chatDbDedicated.value = res.chatDbDedicated;
+            }
+        } catch (err) {
+            toast.error(err?.message || t('view.tools.chat_translator.cloud_config_save_failed'));
+        }
     }
 
     function handleOscPortChange() {
         prefs.oscPort = normalizeOscPort(prefs.oscPort, DEFAULT_OSC_SEND_PORT);
+        persistPrefs();
+    }
+
+    function handleOscListenPortChange() {
+        prefs.oscListenPort = normalizeOscPort(prefs.oscListenPort, DEFAULT_OSC_LISTEN_PORT);
         persistPrefs();
     }
 
@@ -793,6 +940,12 @@
             }
             if (Array.isArray(data?.devices)) {
                 devices.value = data.devices;
+            }
+            if (data?.config && typeof data.config === 'object') {
+                applyCloudConfig(data.config);
+            }
+            if (typeof data?.chatDbDedicated === 'boolean') {
+                chatDbDedicated.value = data.chatDbDedicated;
             }
         } catch (err) {
             if (showLoader) {
@@ -1191,8 +1344,9 @@
                           enabled: oscPayload.enabled !== false,
                           sendPort: oscPayload.sendPort ?? existing.osc?.sendPort ?? DEFAULT_OSC_SEND_PORT,
                           listenEnabled: Boolean(oscPayload.listenEnabled),
-                          listenPort: oscPayload.listenPort ?? existing.osc?.listenPort ?? 9002,
-                          forwardToVrchat: oscPayload.forwardToVrchat !== false
+                          listenPort: oscPayload.listenPort ?? existing.osc?.listenPort ?? DEFAULT_OSC_LISTEN_PORT,
+                          forwardToVrchat: oscPayload.forwardToVrchat !== false,
+                          listenError: typeof oscPayload.listenError === 'string' ? oscPayload.listenError : ''
                       }
                     : existing.osc
             };
@@ -1208,8 +1362,9 @@
                     enabled: oscPayload?.enabled !== false,
                     sendPort: oscPayload?.sendPort ?? DEFAULT_OSC_SEND_PORT,
                     listenEnabled: Boolean(oscPayload?.listenEnabled),
-                    listenPort: oscPayload?.listenPort ?? 9002,
-                    forwardToVrchat: oscPayload?.forwardToVrchat !== false
+                    listenPort: oscPayload?.listenPort ?? DEFAULT_OSC_LISTEN_PORT,
+                    forwardToVrchat: oscPayload?.forwardToVrchat !== false,
+                    listenError: typeof oscPayload?.listenError === 'string' ? oscPayload.listenError : ''
                 }
             });
         }
@@ -1232,6 +1387,8 @@
                 autoTranslatedIds.clear();
             } else if (evt.type === 'chat.agent_status' && evt.payload) {
                 applyChatAgentStatusEvent(evt.payload);
+            } else if (evt.type === 'chat.config_updated' && evt.payload?.config) {
+                applyCloudConfig(evt.payload.config);
             }
         });
 
