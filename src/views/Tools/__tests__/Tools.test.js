@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, test, vi } from 'vitest';
-import { ref } from 'vue';
+import { effectScope, ref } from 'vue';
 import { flushPromises, mount } from '@vue/test-utils';
 
 const push = vi.fn();
@@ -74,6 +74,7 @@ vi.mock('../../../components/ui/tooltip', () => ({
 }));
 
 import Tools from '../Tools.vue';
+import { useNavLayout } from '../../../components/nav-menu/composables/useNavLayout';
 
 function findToolItemByTitle(wrapper, titleKey) {
     return wrapper.findAllComponents({ name: 'ToolItem' }).find((component) => component.text().includes(titleKey));
@@ -152,5 +153,76 @@ describe('Tools.vue', () => {
 
         await avatarSearchItem.trigger('click');
         expect(push).toHaveBeenCalledWith({ name: 'avatar-search' });
+    });
+
+    test('useNavLayout preserves non-feed reload target routes instead of redirecting to first nav item', async () => {
+        const memStore = new Map();
+        getString.mockImplementation(async (key, fallback = null) =>
+            memStore.has(key) ? memStore.get(key) : fallback
+        );
+        setString.mockImplementation(async (key, value) => {
+            memStore.set(key, value);
+        });
+
+        const scope1 = effectScope();
+        try {
+            const navPush = vi.fn();
+            const mockRouter = {
+                currentRoute: ref({ name: 'avatar-search', params: {} }),
+                push: navPush
+            };
+            const layoutApi = scope1.run(() =>
+                useNavLayout({
+                    t: (key) => key,
+                    locale: ref('en'),
+                    router: mockRouter,
+                    dashboardStore: {
+                        getDashboardNavDefinitions: () => [],
+                        dashboardNavKeys: new Set()
+                    },
+                    dashboards: ref([]),
+                    directAccessPaste: vi.fn(),
+                    triggerTool: vi.fn()
+                })
+            );
+
+            await layoutApi.loadNavMenuConfig();
+            expect(navPush).not.toHaveBeenCalled();
+        } finally {
+            scope1.stop();
+        }
+
+        // Landing on default feed when first custom nav entry is different still redirects normally
+        memStore.set(
+            'VRCX_customNavMenuLayoutList',
+            JSON.stringify({ layout: [{ type: 'item', key: 'friends-locations' }], hiddenKeys: [] })
+        );
+        const scope2 = effectScope();
+        try {
+            const feedNavPush = vi.fn();
+            const feedRouter = {
+                currentRoute: ref({ name: 'feed', params: {} }),
+                push: feedNavPush
+            };
+            const feedLayoutApi = scope2.run(() =>
+                useNavLayout({
+                    t: (key) => key,
+                    locale: ref('en'),
+                    router: feedRouter,
+                    dashboardStore: {
+                        getDashboardNavDefinitions: () => [],
+                        dashboardNavKeys: new Set()
+                    },
+                    dashboards: ref([]),
+                    directAccessPaste: vi.fn(),
+                    triggerTool: vi.fn()
+                })
+            );
+
+            await feedLayoutApi.loadNavMenuConfig();
+            expect(feedNavPush).toHaveBeenCalledWith({ name: 'friends-locations' });
+        } finally {
+            scope2.stop();
+        }
     });
 });

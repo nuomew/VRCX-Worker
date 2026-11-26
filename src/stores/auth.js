@@ -24,6 +24,8 @@ import { useVrcxStore } from './vrcx';
 import { watchState } from '../services/watchState';
 
 import configRepository from '../services/config';
+import { bootstrapCache } from '../ipc-web/bootstrapCache.js';
+import { cloudState } from '../ipc-web/cloudState.js';
 import security from '../services/security';
 import webApiService from '../services/webapi';
 
@@ -81,6 +83,26 @@ export const useAuthStore = defineStore('Auth', () => {
     const enableCustomEndpoint = ref(false);
 
     const attemptingAutoLogin = ref(false);
+    const isWebRuntime = typeof WEB !== 'undefined' && WEB;
+    const initialWebLastUser =
+        isWebRuntime && cloudState.authenticated ? bootstrapCache.configs['config:lastuserloggedin'] : '';
+    const restoringSession = ref(
+        Boolean(isWebRuntime && cloudState.authenticated && initialWebLastUser && initialWebLastUser !== 'undefined')
+    );
+    let restoringSessionGuardTimer = null;
+
+    function clearRestoringSessionGuard() {
+        if (restoringSessionGuardTimer) {
+            clearTimeout(restoringSessionGuardTimer);
+            restoringSessionGuardTimer = null;
+        }
+    }
+
+    function setRestoringSession(value) {
+        clearRestoringSessionGuard();
+        restoringSession.value = Boolean(value);
+    }
+
     const loginNetworkIssueHintState = reactive({
         hinted: false,
         timestamps: [],
@@ -95,6 +117,7 @@ export const useAuthStore = defineStore('Auth', () => {
         ([isLoggedIn, currentUser]) => {
             twoFactorAuthDialogVisible.value = false;
             if (isLoggedIn) {
+                setRestoringSession(false);
                 resetLoginNetworkIssueHintState();
                 updateStoredUser(currentUser);
                 new Noty({
@@ -183,20 +206,22 @@ export const useAuthStore = defineStore('Auth', () => {
     async function autoLoginAfterMounted() {
         const canAutoLogin = await vrcxStore.waitForDatabaseInit();
         if (!canAutoLogin) {
+            setRestoringSession(false);
             console.warn(
                 'Skipping auto-login after mount because database initialization did not complete successfully.'
             );
             return;
         }
         const isWeb = typeof WEB !== 'undefined' && WEB;
-        if (
-            (isWeb || !advancedSettingsStore.enablePrimaryPassword) &&
-            (await configRepository.getString('lastUserLoggedIn')) !== null
-        ) {
-            const user = await getSavedCredentials(loginForm.value.lastUserLoggedIn);
+        const lastUser = await configRepository.getString('lastUserLoggedIn');
+        if ((isWeb || !advancedSettingsStore.enablePrimaryPassword) && lastUser !== null && lastUser !== '') {
+            const user = await getSavedCredentials(loginForm.value.lastUserLoggedIn || lastUser);
             if (!isWeb && user?.loginParams?.endpoint) {
                 AppDebug.endpointDomain = user.loginParams.endpoint;
                 AppDebug.websocketDomain = user.loginParams.websocket;
+            }
+            if (isWeb) {
+                setRestoringSession(true);
             }
             await applyAutoLoginDelay();
             // login at startup
@@ -211,7 +236,20 @@ export const useAuthStore = defineStore('Auth', () => {
                 }
             } finally {
                 loginForm.value.loading = false;
+                if (isWeb && !watchState.isLoggedIn) {
+                    if (userStore.currentUser?.id && !twoFactorAuthDialogVisible.value) {
+                        // Allow async loginComplete() -> initUserTables() to flip watchState.isLoggedIn without flashing login form.
+                        clearRestoringSessionGuard();
+                        restoringSessionGuardTimer = setTimeout(() => {
+                            setRestoringSession(false);
+                        }, 3000);
+                    } else {
+                        setRestoringSession(false);
+                    }
+                }
             }
+        } else {
+            setRestoringSession(false);
         }
     }
 
@@ -760,6 +798,7 @@ export const useAuthStore = defineStore('Auth', () => {
         if (twoFactorAuthDialogVisible.value) {
             return;
         }
+        setRestoringSession(false);
         AppApi.FlashWindow();
         twoFactorAuthDialogVisible.value = true;
         modalStore
@@ -804,6 +843,7 @@ export const useAuthStore = defineStore('Auth', () => {
         if (twoFactorAuthDialogVisible.value) {
             return;
         }
+        setRestoringSession(false);
         twoFactorAuthDialogVisible.value = true;
         modalStore
             .otpPrompt({
@@ -847,6 +887,7 @@ export const useAuthStore = defineStore('Auth', () => {
         if (twoFactorAuthDialogVisible.value) {
             return;
         }
+        setRestoringSession(false);
         AppApi.FlashWindow();
         twoFactorAuthDialogVisible.value = true;
         modalStore
@@ -1034,8 +1075,10 @@ export const useAuthStore = defineStore('Auth', () => {
         cachedPermissions,
         enableCustomEndpoint,
         attemptingAutoLogin,
+        restoringSession,
 
         clearCookiesTryLogin,
+        setRestoringSession,
         resendEmail2fa,
         enablePrimaryPasswordChange,
         setPrimaryPassword,

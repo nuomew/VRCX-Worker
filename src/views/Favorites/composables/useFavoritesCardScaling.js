@@ -157,7 +157,7 @@ export function useFavoritesCardScaling(options = {}) {
         containerWidth.value = Math.max(width, 0);
     });
 
-    onBeforeMount(async () => {
+    const reloadPreferences = async () => {
         try {
             if (configKey) {
                 const storedScale = await configRepository.getString(configKey, '1');
@@ -177,7 +177,10 @@ export function useFavoritesCardScaling(options = {}) {
         } catch (error) {
             console.error('Failed to load favorites card preferences', error);
         }
-    });
+        nextTick(() => updateContainerWidth());
+    };
+
+    onBeforeMount(reloadPreferences);
 
     return {
         cardScale,
@@ -185,6 +188,7 @@ export function useFavoritesCardScaling(options = {}) {
         slider,
         spacingSlider,
         containerRef,
-        gridStyle
+        gridStyle,
+        reloadPreferences
     };
 }

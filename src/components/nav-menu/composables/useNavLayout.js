@@ -182,9 +182,16 @@ export function useNavLayout({ t, locale, router, dashboardStore, dashboards, di
             return;
         }
         hasNavigatedToInitialRoute = true;
+        const currentRoute = router.currentRoute.value;
+        const currentRouteName = currentRoute?.name;
+        // Preserve explicit deep-link / page-reload routes (e.g. /settings, /tools/avatar-search, /favorites/avatars);
+        // only redirect to the first custom nav entry when landing on the default root/feed route.
+        if (currentRouteName && currentRouteName !== 'feed') {
+            return;
+        }
         if (
-            router.currentRoute.value?.name !== firstEntry.routeName ||
-            (firstEntry.routeParams?.id && router.currentRoute.value?.params?.id !== firstEntry.routeParams.id)
+            currentRouteName !== firstEntry.routeName ||
+            (firstEntry.routeParams?.id && currentRoute?.params?.id !== firstEntry.routeParams.id)
         ) {
             triggerNavAction(firstEntry);
         }

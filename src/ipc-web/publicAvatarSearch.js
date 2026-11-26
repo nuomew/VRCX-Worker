@@ -259,7 +259,12 @@ async function fetchAvtrDbPage({ query, page, pageSize, fetchImpl, executeFallba
             throw abortErr;
         }
         if (response && Number(response.status) === 200) {
-            const parsed = typeof response.data === 'string' ? JSON.parse(response.data) : response.data;
+            let parsed;
+            try {
+                parsed = typeof response.data === 'string' ? JSON.parse(response.data) : response.data;
+            } catch {
+                throw new Error('Unexpected non-JSON response from avatar search proxy');
+            }
             return parseAvtrDbPayload(parsed);
         }
         throw new Error(`HTTP ${response?.status ?? 'network error'}`);
@@ -340,7 +345,7 @@ export async function searchPublicAvatars({
     // Direct lookup by exact avatar ID (`avtr_...` or full VRChat avatar URL):
     // query VRChat official API first for fresh public status, then fall back to avtrDB index if needed.
     if (extractedAvatarId && (searchType === 'id' || searchType === 'all')) {
-        let officialPrivate = false;
+        let officialPrivateOrMissing = false;
         if (typeof getOfficialAvatar === 'function') {
             try {
                 const res = await getOfficialAvatar(extractedAvatarId);
@@ -353,7 +358,7 @@ export async function searchPublicAvatars({
                 if (officialJson && typeof officialJson === 'object') {
                     const status = String(officialJson.releaseStatus || '').toLowerCase();
                     if (status && status !== 'public') {
-                        officialPrivate = true;
+                        officialPrivateOrMissing = true;
                     } else {
                         const normalized = normalizePublicAvatar(officialJson, 'vrchat');
                         if (normalized) {
@@ -375,11 +380,16 @@ export async function searchPublicAvatars({
                 if (err?.name === 'AbortError' || signal?.aborted) {
                     throw err;
                 }
-                // Fall back to public avtrDB lookup if VRChat API returned an error
+                // VRChat Official API returns HTTP 404 for other users' private avatars and deleted avatars;
+                // stop here instead of surfacing stale cached entries from avtrDB that will fail when clicked.
+                if (Number(err?.status) === 404) {
+                    officialPrivateOrMissing = true;
+                }
+                // Fall back to public avtrDB lookup only for transient non-404 errors (network/5xx/429)
             }
         }
 
-        if (officialPrivate) {
+        if (officialPrivateOrMissing) {
             return {
                 avatars: [],
                 hasMore: false,
@@ -413,7 +423,11 @@ export async function searchPublicAvatars({
     const extractedUserId = extractUserId(trimmed);
     const effectiveQuery = extractedUserId || trimmed;
     const hasClientFilter = searchType !== 'all' || platform !== 'all';
-    const upstreamBatchSize = hasClientFilter ? Math.min(50, Math.max(safePageSize, 40)) : safePageSize;
+    // Use moderate upstream batches under client-side filters so multi-batch aggregation fills a page
+    // without returning ~2x pageSize or dropping items across page boundaries.
+    const upstreamBatchSize = hasClientFilter
+        ? Math.min(50, Math.max(20, Math.ceil(safePageSize / 2)))
+        : safePageSize;
     const maxUpstreamBatches = hasClientFilter ? 3 : 1;
 
     const seenIds = new Set();

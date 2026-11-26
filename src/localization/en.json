@@ -699,6 +699,7 @@
                 "retry_btn": "Retry",
                 "empty_guide_title": "Search Public VRChat Avatars",
                 "empty_guide_desc": "Search public avatars by avatar ID (avtr_...), VRChat link, author name, author ID (usr_...), or avatar name. Click any card to open the full avatar detail dialog.",
+                "empty_filtered_page": "No avatars matched your current filter on this page. Click Next to keep searching.",
                 "result_summary": "Showing {count} public avatars (Page {page})",
                 "click_card_hint": "Click a card to view avatar details",
                 "filter_by_author_tooltip": "Search public avatars by this author",
@@ -3876,9 +3877,11 @@
             "direct_proxy_disable_confirm_btn": "Confirm Disable",
             "direct_proxy_disable_cancel_btn": "Cancel",
             "b2_pricing_hint_prefix": "Register an account and create a B2 bucket at ",
-            "b2_pricing_hint_suffix": " (first 10 GB free; storage pricing is $6.95 / TB / month)."
+            "b2_pricing_hint_suffix": " (first 10 GB free; storage pricing is $6.95 / TB / month).",
+            "status_unsaved": "Unsaved"
         },
         "settings": {
+            "restoring_session": "Restoring session...",
             "sync_interval_label": "Cloud Sync Interval (Web & Background Feed)",
             "sync_interval_desc": "Controls Web sync throttling and offline cloud background feed fetch interval (default 5 min)",
             "interval_60": "1 min (60s)",

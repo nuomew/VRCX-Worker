@@ -96,15 +96,23 @@
 
     onMounted(async () => {
         if (isWeb && !cloudState.authenticated) {
+            store.auth.setRestoringSession(false);
             return;
         }
-        if (await store.vrcx.waitForDatabaseInit()) {
-            getGameLogTable();
-            await store.auth.migrateStoredUsers();
-            store.auth.autoLoginAfterMounted();
-            if (!isWeb) {
-                store.vrcx.checkAutoBackupRestoreVrcRegistry();
+        try {
+            if (await store.vrcx.waitForDatabaseInit()) {
+                getGameLogTable();
+                await store.auth.migrateStoredUsers();
+                store.auth.autoLoginAfterMounted();
+                if (!isWeb) {
+                    store.vrcx.checkAutoBackupRestoreVrcRegistry();
+                }
+            } else {
+                store.auth.setRestoringSession(false);
             }
+        } catch (err) {
+            store.auth.setRestoringSession(false);
+            console.error('[app] Startup initialization failed:', err);
         }
 
         if (!isWeb) {

@@ -670,6 +670,7 @@
                 "retry_btn": "重試",
                 "empty_guide_title": "查詢公開 VRChat 模型",
                 "empty_guide_desc": "支援依模型 ID（avtr_...）、VRChat 連結、作者名稱、作者 ID（usr_...）或模型名稱查詢公開模型，點擊結果卡片可檢視完整模型詳情。",
+                "empty_filtered_page": "目前篩選條件下本頁暫無符合模型，可點擊「下一頁」繼續尋找。",
                 "result_summary": "本頁共 {count} 個公開模型（第 {page} 頁）",
                 "click_card_hint": "點擊模型卡片檢視完整詳情",
                 "filter_by_author_tooltip": "依此作者查詢公開模型",
@@ -3539,9 +3540,11 @@
             "direct_proxy_disable_confirm_btn": "確認關閉",
             "direct_proxy_disable_cancel_btn": "取消",
             "b2_pricing_hint_prefix": "可於 Backblaze 官網註冊帳戶並建立 B2 儲存桶：",
-            "b2_pricing_hint_suffix": "（前 10 GB 免費，超出後儲存費用約為 6.95 美元 / TB / 月）。"
+            "b2_pricing_hint_suffix": "（前 10 GB 免費，超出後儲存費用約為 6.95 美元 / TB / 月）。",
+            "status_unsaved": "未儲存"
         },
         "settings": {
+            "restoring_session": "正在恢復工作階段...",
             "sync_interval_label": "雲端同步間隔（網頁端與背景動態）",
             "sync_interval_desc": "控制網頁端同步節流及關閉網頁後的雲端背景好友動態取得間隔（預設 5 分鐘）",
             "interval_60": "1 分鐘（60 秒）",

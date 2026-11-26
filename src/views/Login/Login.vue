@@ -1,5 +1,11 @@
 <template>
-    <div class="absolute inset-0 flex flex-col items-center overflow-y-auto px-4 pt-12">
+    <div
+        v-if="isWeb && restoringSession"
+        class="absolute inset-0 flex flex-col items-center justify-center gap-3 px-4 text-muted-foreground">
+        <Spinner class="size-6" />
+        <span class="text-xs">{{ t('cloud_hub.settings.restoring_session') }}</span>
+    </div>
+    <div v-else class="absolute inset-0 flex flex-col items-center overflow-y-auto px-4 pt-12">
         <div class="absolute top-0 left-0 m-1.5">
             <LoginSettingsDialog v-if="!isWeb" />
             <TooltipWrapper v-if="!noUpdater" side="top" :content="t('view.login.updater')">
@@ -207,6 +213,7 @@
     import { Button } from '@/components/ui/button';
     import { Checkbox } from '@/components/ui/checkbox';
     import { InputGroupField } from '@/components/ui/input-group';
+    import { Spinner } from '@/components/ui/spinner';
     import { storeToRefs } from 'pinia';
     import { toTypedSchema } from '@vee-validate/zod';
     import { useI18n } from 'vue-i18n';
@@ -236,7 +243,7 @@
     const { showVRCXUpdateDialog } = useVRCXUpdaterStore();
     const router = useRouter();
     const route = useRoute();
-    const { loginForm } = storeToRefs(useAuthStore());
+    const { loginForm, restoringSession } = storeToRefs(useAuthStore());
     const { relogin, deleteSavedLogin, login, getAllSavedCredentials } = useAuthStore();
     const { noUpdater, pendingVRCXUpdate } = storeToRefs(useVRCXUpdaterStore());
 
@@ -334,7 +341,8 @@
             if (isLoggedIn) {
                 router.replace(postLoginRedirect());
             }
-        }
+        },
+        { immediate: true }
     );
 
     watch(
@@ -403,9 +411,22 @@
     }
 
     onBeforeMount(async () => {
+        if (isWeb && restoringSession?.value) {
+            return;
+        }
         updateSavedCredentials();
         detectAndPromptLanguage();
     });
+
+    watch(
+        () => Boolean(restoringSession?.value),
+        (restoring) => {
+            if (!restoring && !watchState.isLoggedIn) {
+                updateSavedCredentials();
+                detectAndPromptLanguage();
+            }
+        }
+    );
 
     onBeforeUnmount(() => {
         isActive = false;

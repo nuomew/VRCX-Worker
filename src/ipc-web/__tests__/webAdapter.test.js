@@ -2935,6 +2935,60 @@ describe('WEB cloud adapter (stateless)', () => {
         expect(privateRes.avatars).toEqual([]);
         expect(directFetchUnused).not.toHaveBeenCalled();
 
+        // 4b. Exact avatar ID returning official HTTP 404 (other user's private or deleted) stops instead of falling back to stale avtrDB cache
+        const official404Err = Object.assign(new Error('404 Not Found'), { status: 404 });
+        const official404Spy = vi.fn().mockRejectedValue(official404Err);
+        const avtrDbShouldNotRun = vi.fn();
+        const notFoundRes = await searchPublicAvatars({
+            query: sampleAvatarId,
+            searchType: 'id',
+            fetchImpl: avtrDbShouldNotRun,
+            executeFallback: avtrDbShouldNotRun,
+            getOfficialAvatar: official404Spy
+        });
+        expect(notFoundRes.privateNotice).toBe(true);
+        expect(notFoundRes.avatars).toEqual([]);
+        expect(avtrDbShouldNotRun).not.toHaveBeenCalled();
+
+        // 4c. Transient non-404 official failure (e.g. 503) still falls back to public avtrDB lookup
+        const official503Err = Object.assign(new Error('503 Unavailable'), { status: 503 });
+        const official503Spy = vi.fn().mockRejectedValue(official503Err);
+        const avtrDbFallbackFetch = vi.fn().mockResolvedValue({
+            ok: true,
+            status: 200,
+            json: async () => ({
+                avatars: [
+                    {
+                        vrc_id: sampleAvatarId,
+                        name: 'Fallback Public Avatar',
+                        author: { name: 'Naffna', vrc_id: sampleUserId },
+                        compatibility: ['pc'],
+                        image_url: 'https://thumb.avtrdb.com/fallback.webp'
+                    }
+                ],
+                has_more: false
+            })
+        });
+        const fallbackRes = await searchPublicAvatars({
+            query: sampleAvatarId,
+            searchType: 'id',
+            fetchImpl: avtrDbFallbackFetch,
+            executeFallback: vi.fn(),
+            getOfficialAvatar: official503Spy
+        });
+        expect(fallbackRes.source).toBe('avtrdb');
+        expect(fallbackRes.avatars).toHaveLength(1);
+        expect(fallbackRes.avatars[0].name).toBe('Fallback Public Avatar');
+
+        // 4d. Non-JSON proxy fallback response throws a clear error message instead of raw SyntaxError
+        await expect(
+            searchPublicAvatars({
+                query: 'Runya',
+                fetchImpl: vi.fn().mockRejectedValue(new TypeError('Failed to fetch')),
+                executeFallback: vi.fn().mockResolvedValue({ status: 200, data: '<html>WAF challenge</html>' })
+            })
+        ).rejects.toThrow('Unexpected non-JSON response');
+
         // 5. Exact public avatar ID via VRChat URL returns normalized official avatar immediately
         const officialPublicSpy = vi.fn().mockResolvedValue({
             json: {
@@ -2999,15 +3053,21 @@ describe('WEB cloud adapter (stateless)', () => {
             releaseStatus: 'public'
         });
 
-        // 7. Trilingual parity for all view.tools.avatar.* keys
+        // 7. Trilingual parity for all view.tools.avatar.*, cloud_hub.storage.status_unsaved, and cloud_hub.settings.restoring_session keys
         const [enJson, zhCnJson, zhTwJson] = await Promise.all([
             import('../../localization/en.json'),
             import('../../localization/zh-CN.json'),
             import('../../localization/zh-TW.json')
         ]);
         const enAvatarKeys = Object.keys(enJson.default.view.tools.avatar).sort();
-        expect(enAvatarKeys).toHaveLength(28);
+        expect(enAvatarKeys).toHaveLength(29);
         expect(Object.keys(zhCnJson.default.view.tools.avatar).sort()).toEqual(enAvatarKeys);
         expect(Object.keys(zhTwJson.default.view.tools.avatar).sort()).toEqual(enAvatarKeys);
+        expect(enJson.default.cloud_hub.storage.status_unsaved).toBeTruthy();
+        expect(zhCnJson.default.cloud_hub.storage.status_unsaved).toBeTruthy();
+        expect(zhTwJson.default.cloud_hub.storage.status_unsaved).toBeTruthy();
+        expect(enJson.default.cloud_hub.settings.restoring_session).toBeTruthy();
+        expect(zhCnJson.default.cloud_hub.settings.restoring_session).toBeTruthy();
+        expect(zhTwJson.default.cloud_hub.settings.restoring_session).toBeTruthy();
     });
 });

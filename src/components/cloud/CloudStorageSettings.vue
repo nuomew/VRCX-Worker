@@ -347,17 +347,27 @@
                             <span
                                 class="inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-[11px] font-medium"
                                 :class="
-                                    formEnabled
+                                    savedEnabled
                                         ? 'border-status-online/40 bg-status-online/10 text-foreground'
-                                        : 'border-border bg-muted/50 text-muted-foreground'
+                                        : formEnabled
+                                          ? 'border-amber-500/40 bg-amber-500/10 text-amber-600 dark:text-amber-400'
+                                          : 'border-border bg-muted/50 text-muted-foreground'
                                 ">
                                 <span
                                     class="inline-block size-1.5 rounded-full"
-                                    :class="formEnabled ? 'bg-status-online' : 'bg-muted-foreground/60'" />
+                                    :class="
+                                        savedEnabled
+                                            ? 'bg-status-online'
+                                            : formEnabled
+                                              ? 'bg-amber-500'
+                                              : 'bg-muted-foreground/60'
+                                    " />
                                 {{
-                                    formEnabled
+                                    savedEnabled
                                         ? t('cloud_hub.storage.status_enabled')
-                                        : t('cloud_hub.storage.status_disabled')
+                                        : formEnabled
+                                          ? t('cloud_hub.storage.status_unsaved')
+                                          : t('cloud_hub.storage.status_disabled')
                                 }}
                             </span>
                         </div>
@@ -888,20 +898,27 @@
     }
 
     async function onToggleExtraStorage(nextEnabled) {
-        formEnabled.value = Boolean(nextEnabled);
-        b2FormDirty.value = true;
+        const wantEnable = Boolean(nextEnabled);
+        const hadUnsavedEdits = b2FormDirty.value;
+        formEnabled.value = wantEnable;
         pendingDisableDirectProxyConfirm.value = false;
         statusError.value = '';
         statusNotice.value = '';
-        // When collapsing a previously enabled config, persist disabled state immediately
-        // while keeping saved encrypted B2 credentials intact on the server.
-        if (!formEnabled.value && savedEnabled.value) {
+
+        // Auto-persist when toggling an already-configured B2 integration OFF or back ON so the switch takes effect immediately.
+        const hasCompleteSavedConfig = Boolean(
+            hasSavedSecret.value &&
+                formEndpoint.value.trim() &&
+                formBucket.value.trim() &&
+                formAccessKeyId.value.trim()
+        );
+        if ((!wantEnable && savedEnabled.value) || (wantEnable && !savedEnabled.value && hasCompleteSavedConfig && !hadUnsavedEdits)) {
             if (savingConfig.value) return;
             savingConfig.value = true;
             try {
                 const data = await cloudFetch('/api/storage/config', {
                     method: 'PUT',
-                    json: { enabled: false }
+                    json: { enabled: wantEnable }
                 });
                 applyStatusPayload(data, { forceFormSync: true });
                 const msg = t('cloud_hub.storage.saved_toast');
@@ -909,15 +926,16 @@
                 toast.success(msg);
                 await Promise.all([loadCleanupPreview(), loadCleanupBackups()]);
             } catch (err) {
-                formEnabled.value = true;
+                formEnabled.value = !wantEnable;
                 statusError.value = err?.message || String(err);
                 toast.error(statusError.value);
             } finally {
                 savingConfig.value = false;
             }
-        } else if (!formEnabled.value && !savedEnabled.value) {
-            b2FormDirty.value = false;
+            return;
         }
+
+        b2FormDirty.value = wantEnable;
     }
 
     async function saveConfig() {

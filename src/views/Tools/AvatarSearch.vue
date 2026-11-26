@@ -225,6 +225,19 @@
                 </div>
             </template>
 
+            <!-- Empty Filtered Page while Upstream Still Has More Pages -->
+            <div
+                v-else-if="hasMore"
+                class="flex flex-col items-center justify-center rounded-xl border border-dashed border-border bg-card/30 px-6 py-12 text-center space-y-3">
+                <p class="text-xs text-muted-foreground">
+                    {{ t('view.tools.avatar.empty_filtered_page') }}
+                </p>
+                <Button size="sm" variant="outline" :disabled="loading" @click="goNextPage">
+                    <span>{{ t('view.tools.avatar.next_page') }}</span>
+                    <ChevronRight class="size-4" />
+                </Button>
+            </div>
+
             <!-- No Match State -->
             <DataTableEmpty v-else type="nodata" />
         </div>
@@ -261,11 +274,13 @@
         Smartphone,
         X
     } from 'lucide-vue-next';
-    import { computed, onBeforeUnmount, ref } from 'vue';
+    import { computed, onActivated, onBeforeUnmount, ref } from 'vue';
     import { storeToRefs } from 'pinia';
+    import { toast } from 'vue-sonner';
     import { useI18n } from 'vue-i18n';
     import { useRouter } from 'vue-router';
 
+    import { avatarRequest } from '@/api';
     import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar';
     import { Badge } from '@/components/ui/badge';
     import { Button } from '@/components/ui/button';
@@ -298,7 +313,11 @@
     const { currentUser } = storeToRefs(useUserStore());
 
     // Reuse the same card scaling & spacing preferences as Favorites -> Avatars for visual parity.
-    const { containerRef: avatarSearchContainerRef, gridStyle: avatarSearchGridStyle } = useFavoritesCardScaling({
+    const {
+        containerRef: avatarSearchContainerRef,
+        gridStyle: avatarSearchGridStyle,
+        reloadPreferences: reloadCardScalingPreferences
+    } = useFavoritesCardScaling({
         configKey: 'VRCX_FavoritesAvatarCardScale',
         spacingConfigKey: 'VRCX_FavoritesAvatarCardSpacing',
         min: 0.6,
@@ -328,6 +347,11 @@
     const searchType = ref('all');
     const platformFilter = ref('all');
     const searchInput = ref('');
+
+    // Frozen snapshot of the currently displayed search so pagination & retry ignore unsubmitted input edits.
+    const activeQuery = ref('');
+    const activeSearchType = ref('all');
+    const activePlatform = ref('all');
 
     const loading = ref(false);
     const hasSearched = ref(false);
@@ -363,27 +387,9 @@
         return rawUrl;
     }
 
-    function hydrateAvatarCache(avatar) {
-        if (!avatar?.id || avatarStore.cachedAvatars.has(avatar.id)) return;
-        applyAvatar({
-            id: avatar.id,
-            name: avatar.name,
-            authorId: avatar.authorId,
-            authorName: avatar.authorName,
-            description: avatar.description,
-            imageUrl: avatar.imageUrl || avatar.thumbnailImageUrl,
-            thumbnailImageUrl: avatar.thumbnailImageUrl || avatar.imageUrl,
-            releaseStatus: 'public',
-            styles: avatar.styles,
-            tags: avatar.tags,
-            created_at: avatar.created_at,
-            updated_at: avatar.updated_at
-        });
-    }
-
     async function executeSearchPage(targetPageIndex, upstreamCursor) {
-        const trimmed = searchInput.value.trim();
-        if (!trimmed) return;
+        const querySnapshot = activeQuery.value;
+        if (!querySnapshot) return;
 
         activeAbort?.abort();
         const controller = new AbortController();
@@ -396,9 +402,9 @@
 
         try {
             const res = await searchPublicAvatars({
-                query: trimmed,
-                searchType: searchType.value,
-                platform: platformFilter.value,
+                query: querySnapshot,
+                searchType: activeSearchType.value,
+                platform: activePlatform.value,
                 upstreamPage: upstreamCursor,
                 pageSize: 40,
                 signal: controller.signal
@@ -439,7 +445,11 @@
     }
 
     function runNewSearch() {
-        if (!searchInput.value.trim()) return;
+        const trimmed = searchInput.value.trim();
+        if (!trimmed) return;
+        activeQuery.value = trimmed;
+        activeSearchType.value = searchType.value;
+        activePlatform.value = platformFilter.value;
         pageCursorHistory.value = [0];
         pageIndex.value = 0;
         hasMore.value = false;
@@ -448,12 +458,13 @@
     }
 
     function retryCurrentPage() {
+        if (!activeQuery.value) return;
         const cursor = pageCursorHistory.value[pageIndex.value] ?? 0;
         executeSearchPage(pageIndex.value, cursor);
     }
 
     function goNextPage() {
-        if (loading.value || !hasMore.value) return;
+        if (loading.value || !hasMore.value || !activeQuery.value) return;
         const nextIdx = pageIndex.value + 1;
         const nextCursor = nextUpstreamCursor.value;
         pageCursorHistory.value[nextIdx] = nextCursor;
@@ -461,7 +472,7 @@
     }
 
     function goPrevPage() {
-        if (loading.value || pageIndex.value <= 0) return;
+        if (loading.value || pageIndex.value <= 0 || !activeQuery.value) return;
         const prevIdx = pageIndex.value - 1;
         const prevCursor = pageCursorHistory.value[prevIdx] ?? 0;
         executeSearchPage(prevIdx, prevCursor);
@@ -471,6 +482,7 @@
         activeAbort?.abort();
         activeAbort = null;
         searchInput.value = '';
+        activeQuery.value = '';
         results.value = [];
         hasSearched.value = false;
         errorMessage.value = '';
@@ -492,27 +504,45 @@
 
     function openAvatarDetail(avatar) {
         if (!avatar?.id) return;
-        hydrateAvatarCache(avatar);
         showAvatarDialog(avatar.id);
     }
 
     function handleSelectAvatar(avatar) {
         if (!avatar?.id) return;
-        hydrateAvatarCache(avatar);
         selectAvatarWithConfirmation(avatar.id);
     }
 
-    function handleOpenFavoriteDialog(avatar) {
+    async function handleOpenFavoriteDialog(avatar) {
         if (!avatar?.id) return;
-        hydrateAvatarCache(avatar);
+        if (!avatarStore.cachedAvatars.has(avatar.id)) {
+            try {
+                const res = await avatarRequest.getAvatar({ avatarId: avatar.id });
+                const official = res?.json;
+                if (!official || (official.releaseStatus !== 'public' && official.authorId !== currentUser.value?.id)) {
+                    toast.error(t('message.api_handler.avatar_private_or_deleted'));
+                    return;
+                }
+                applyAvatar(official);
+            } catch {
+                toast.error(t('message.api_handler.avatar_private_or_deleted'));
+                return;
+            }
+        }
         showFavoriteDialog('avatar', avatar.id);
     }
 
     function handleFilterChange() {
-        if (hasSearched.value && searchInput.value.trim()) {
+        if (hasSearched.value && (searchInput.value.trim() || activeQuery.value)) {
+            if (!searchInput.value.trim() && activeQuery.value) {
+                searchInput.value = activeQuery.value;
+            }
             runNewSearch();
         }
     }
+
+    onActivated(() => {
+        reloadCardScalingPreferences();
+    });
 
     onBeforeUnmount(() => {
         activeAbort?.abort();
