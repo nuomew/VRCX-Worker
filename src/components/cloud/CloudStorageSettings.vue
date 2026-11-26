@@ -423,32 +423,62 @@
                             </template>
                         </div>
 
-                        <!-- Built-in Cloudflare Workers Direct Proxy Status (auto-enabled once B2 is configured) -->
-                        <div
-                            v-if="b2DirectProxyEnabled"
-                            class="flex flex-wrap items-center justify-between gap-2 rounded-md border border-primary/25 bg-primary/5 px-3 py-2">
-                            <div class="min-w-0 flex flex-wrap items-center gap-2">
-                                <span class="font-medium text-foreground">
-                                    {{ t('cloud_hub.storage.direct_proxy_label') }}
-                                </span>
-                                <span
-                                    class="rounded bg-status-online/15 px-1.5 py-0.5 text-[10px] font-medium text-foreground">
-                                    {{ t('cloud_hub.storage.direct_proxy_active') }}
-                                </span>
-                                <code class="truncate font-mono text-[11px] text-muted-foreground">{{
-                                    b2DirectProxyUrl
-                                }}</code>
+                        <!-- Built-in Cloudflare Workers Direct Proxy Toggle (default ON; disabling warns about official B2 egress fees) -->
+                        <div class="rounded-md border border-border/70 bg-muted/20 p-3 space-y-2.5">
+                            <div class="flex flex-wrap items-center justify-between gap-2">
+                                <div class="flex flex-wrap items-center gap-2">
+                                    <span class="font-medium text-foreground">
+                                        {{ t('cloud_hub.storage.direct_proxy_label') }}
+                                    </span>
+                                    <span
+                                        class="inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-[11px] font-medium"
+                                        :class="
+                                            formUseWorkerDirectProxy
+                                                ? 'border-status-online/40 bg-status-online/10 text-foreground'
+                                                : 'border-amber-500/40 bg-amber-500/10 text-amber-600 dark:text-amber-400'
+                                        ">
+                                        <span
+                                            class="inline-block size-1.5 rounded-full"
+                                            :class="
+                                                formUseWorkerDirectProxy ? 'bg-status-online' : 'bg-amber-500'
+                                            " />
+                                        {{
+                                            formUseWorkerDirectProxy
+                                                ? t('cloud_hub.storage.direct_proxy_active')
+                                                : t('cloud_hub.storage.direct_proxy_official')
+                                        }}
+                                    </span>
+                                </div>
+                                <Switch
+                                    :model-value="formUseWorkerDirectProxy"
+                                    :disabled="savingConfig"
+                                    :aria-label="t('cloud_hub.storage.direct_proxy_label')"
+                                    @update:model-value="onToggleWorkerDirectProxy" />
                             </div>
-                            <button
-                                type="button"
-                                class="shrink-0 rounded border border-border px-2 py-0.5 text-[11px] font-medium text-foreground hover:bg-accent"
-                                @click="copyDirectProxyUrl">
-                                {{
-                                    copiedDirectProxyUrl
-                                        ? t('cloud_hub.storage.direct_proxy_copied')
-                                        : t('cloud_hub.storage.direct_proxy_copy')
-                                }}
-                            </button>
+
+                            <div
+                                v-if="pendingDisableDirectProxyConfirm"
+                                class="rounded-md border border-destructive/40 bg-destructive/5 p-3 space-y-2">
+                                <div class="text-[11px] font-medium text-foreground">
+                                    {{ t('cloud_hub.storage.direct_proxy_disable_confirm_desc') }}
+                                </div>
+                                <div class="flex flex-wrap items-center gap-2">
+                                    <button
+                                        type="button"
+                                        class="rounded-md bg-destructive px-3 py-1 text-[11px] font-medium text-white hover:opacity-90 disabled:opacity-50"
+                                        :disabled="savingConfig"
+                                        @click="confirmDisableWorkerDirectProxy">
+                                        {{ t('cloud_hub.storage.direct_proxy_disable_confirm_btn') }}
+                                    </button>
+                                    <button
+                                        type="button"
+                                        class="rounded-md border border-border px-3 py-1 text-[11px] hover:bg-accent disabled:opacity-50"
+                                        :disabled="savingConfig"
+                                        @click="pendingDisableDirectProxyConfirm = false">
+                                        {{ t('cloud_hub.storage.direct_proxy_disable_cancel_btn') }}
+                                    </button>
+                                </div>
+                            </div>
                         </div>
 
                         <!-- Overflow Threshold & B2 S3-Compatible Credentials -->
@@ -615,14 +645,8 @@
     const overflowActive = ref(false);
     const hasSavedSecret = ref(false);
     const savedEnabled = ref(false);
-    const b2DirectProxyEnabled = ref(false);
-    const b2DirectProxyBasePath = ref('/api/storage/b2/');
-    const copiedDirectProxyUrl = ref(false);
-
-    const b2DirectProxyUrl = computed(() => {
-        const origin = typeof window !== 'undefined' ? window.location.origin : '';
-        return `${origin}${b2DirectProxyBasePath.value}`;
-    });
+    const formUseWorkerDirectProxy = ref(true);
+    const pendingDisableDirectProxyConfirm = ref(false);
 
     const formEnabled = ref(false);
     const formThresholdGb = ref(9);
@@ -769,14 +793,12 @@
         r2Usage.value = data.r2 ?? null;
         b2Usage.value = data.b2 ?? null;
         overflowActive.value = Boolean(data.overflowActive);
-        b2DirectProxyEnabled.value = Boolean(data.b2DirectProxy?.enabled);
-        if (typeof data.b2DirectProxy?.basePath === 'string' && data.b2DirectProxy.basePath) {
-            b2DirectProxyBasePath.value = data.b2DirectProxy.basePath;
-        }
         const ext = data.externalStorage;
         if (ext) {
             savedEnabled.value = Boolean(ext.enabled);
             formEnabled.value = Boolean(ext.enabled);
+            formUseWorkerDirectProxy.value = ext.useWorkerDirectProxy !== false;
+            pendingDisableDirectProxyConfirm.value = false;
             formEndpoint.value = ext.endpoint || '';
             formBucket.value = ext.bucket || '';
             formRegion.value = ext.region || '';
@@ -802,20 +824,55 @@
         }
     }
 
-    async function copyDirectProxyUrl() {
-        try {
-            await navigator.clipboard.writeText(b2DirectProxyUrl.value);
-            copiedDirectProxyUrl.value = true;
-            setTimeout(() => {
-                copiedDirectProxyUrl.value = false;
-            }, 2000);
-        } catch {
-            // Clipboard permission unavailable
+    async function persistWorkerDirectProxySetting(nextVal) {
+        if (!savedEnabled.value) {
+            formUseWorkerDirectProxy.value = nextVal;
+            pendingDisableDirectProxyConfirm.value = false;
+            return;
         }
+        if (savingConfig.value) return;
+        const prevVal = formUseWorkerDirectProxy.value;
+        formUseWorkerDirectProxy.value = nextVal;
+        pendingDisableDirectProxyConfirm.value = false;
+        savingConfig.value = true;
+        statusError.value = '';
+        statusNotice.value = '';
+        try {
+            const data = await cloudFetch('/api/storage/config', {
+                method: 'PUT',
+                json: { useWorkerDirectProxy: nextVal }
+            });
+            applyStatusPayload(data);
+            const msg = t('cloud_hub.storage.saved_toast');
+            statusNotice.value = msg;
+            toast.success(msg);
+        } catch (err) {
+            formUseWorkerDirectProxy.value = prevVal;
+            statusError.value = err?.message || String(err);
+            toast.error(statusError.value);
+        } finally {
+            savingConfig.value = false;
+        }
+    }
+
+    function onToggleWorkerDirectProxy(nextEnabled) {
+        const wantEnable = Boolean(nextEnabled);
+        if (!wantEnable) {
+            // Require explicit secondary confirmation before switching to official direct B2 egress.
+            pendingDisableDirectProxyConfirm.value = true;
+            return;
+        }
+        pendingDisableDirectProxyConfirm.value = false;
+        persistWorkerDirectProxySetting(true);
+    }
+
+    async function confirmDisableWorkerDirectProxy() {
+        await persistWorkerDirectProxySetting(false);
     }
 
     async function onToggleExtraStorage(nextEnabled) {
         formEnabled.value = Boolean(nextEnabled);
+        pendingDisableDirectProxyConfirm.value = false;
         statusError.value = '';
         statusNotice.value = '';
         // When collapsing a previously enabled config, persist disabled state immediately
@@ -853,6 +910,7 @@
                 method: 'PUT',
                 json: {
                     enabled: formEnabled.value,
+                    useWorkerDirectProxy: formUseWorkerDirectProxy.value,
                     r2OverflowThresholdGb: Number(formThresholdGb.value) || 9,
                     endpoint: formEndpoint.value.trim(),
                     bucket: formBucket.value.trim(),

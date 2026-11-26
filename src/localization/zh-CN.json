@@ -3837,10 +3837,12 @@
             "testing": "测试中...",
             "saved_toast": "存储设置已保存。",
             "test_ok": "连接成功（{ms} ms）· 已用 {size}（{count} 个文件）。",
-            "direct_proxy_label": "Workers 内置直连中转",
-            "direct_proxy_active": "已自动启用",
-            "direct_proxy_copy": "复制前缀",
-            "direct_proxy_copied": "已复制"
+            "direct_proxy_label": "Workers 中转直连",
+            "direct_proxy_active": "免流量中转",
+            "direct_proxy_official": "官方直连",
+            "direct_proxy_disable_confirm_desc": "关闭后使用官方直连会收取流量费用，确认关闭 Workers 中转直连并改用 Backblaze B2 官方直连？",
+            "direct_proxy_disable_confirm_btn": "确认关闭",
+            "direct_proxy_disable_cancel_btn": "取消"
         },
         "settings": {
             "sync_interval_label": "云端同步间隔（网页端与后台动态）",

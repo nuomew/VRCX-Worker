@@ -13,7 +13,9 @@ import type { Env } from '../env';
 import {
     B2_KEY_PREFIX_TAG,
     buildSafeDirectProxyResponse,
+    createPresignedB2Url,
     deleteStoredObject,
+    loadExternalStorageConfig,
     proxyB2DirectFetch,
     readStoredObject,
     resolveActiveB2Credentials,
@@ -1544,20 +1546,32 @@ export async function handleAgentWebRoutes(request: Request, env: Env, url: URL)
             );
         }
 
-        // B2-stored screenshots stream directly through the built-in Cloudflare Workers B2 proxy
-        // (Bandwidth Alliance free egress + Range 3x retry + ETag/304 + HEAD support).
+        // B2-stored screenshots either stream through the built-in Cloudflare Workers direct proxy
+        // (default, Bandwidth Alliance free egress) or redirect via a short-lived official presigned URL
+        // when the user explicitly turns off Workers proxy mode.
         if (row.r2_thumb_key.startsWith(B2_KEY_PREFIX_TAG)) {
             const logicalKey = row.r2_thumb_key.slice(B2_KEY_PREFIX_TAG.length);
-            const creds = await resolveActiveB2Credentials(env, undefined, { allowDisabled: true });
+            const extCfg = await loadExternalStorageConfig(env);
+            const creds = await resolveActiveB2Credentials(env, extCfg, { allowDisabled: true });
             if (!creds) {
                 return Response.json(
                     { ok: false, error: { code: 'NOT_FOUND', message: 'Thumbnail blob missing' } },
                     { status: 404 }
                 );
             }
-            const upstreamRes = await proxyB2DirectFetch(creds, logicalKey, request, {
-                method: request.method === 'HEAD' ? 'HEAD' : 'GET'
-            });
+            const method = request.method === 'HEAD' ? 'HEAD' : 'GET';
+            if (extCfg.useWorkerDirectProxy === false) {
+                const directUrl = await createPresignedB2Url(creds, logicalKey, { method, expiresSeconds: 300 });
+                return new Response(null, {
+                    status: 302,
+                    headers: {
+                        Location: directUrl,
+                        'Cache-Control': 'private, no-store',
+                        'X-VRCX-Storage-Via': 'b2-official-direct'
+                    }
+                });
+            }
+            const upstreamRes = await proxyB2DirectFetch(creds, logicalKey, request, { method });
             if (upstreamRes.status === 404) {
                 await upstreamRes.body?.cancel().catch(() => {});
                 return Response.json(

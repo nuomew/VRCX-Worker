@@ -25,6 +25,7 @@ const textEncoder = new TextEncoder();
 
 export interface StoredExternalStorageConfig {
     enabled: boolean;
+    useWorkerDirectProxy: boolean;
     provider: 'backblaze_b2';
     endpoint: string;
     region: string;
@@ -39,6 +40,7 @@ export interface StoredExternalStorageConfig {
 
 export interface PublicExternalStorageConfig {
     enabled: boolean;
+    useWorkerDirectProxy: boolean;
     provider: 'backblaze_b2';
     endpoint: string;
     region: string;
@@ -89,6 +91,7 @@ export interface B2ListedObject {
 export function defaultExternalStorageConfig(): StoredExternalStorageConfig {
     return {
         enabled: false,
+        useWorkerDirectProxy: true,
         provider: 'backblaze_b2',
         endpoint: '',
         region: '',
@@ -105,6 +108,7 @@ export function defaultExternalStorageConfig(): StoredExternalStorageConfig {
 export function toPublicExternalStorageConfig(cfg: StoredExternalStorageConfig): PublicExternalStorageConfig {
     return {
         enabled: Boolean(cfg.enabled),
+        useWorkerDirectProxy: cfg.useWorkerDirectProxy !== false,
         provider: 'backblaze_b2',
         endpoint: cfg.endpoint,
         region: cfg.region,
@@ -215,6 +219,7 @@ export async function loadExternalStorageConfig(env: Env): Promise<StoredExterna
         if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return fallback;
         return {
             enabled: parsed.enabled === true,
+            useWorkerDirectProxy: parsed.useWorkerDirectProxy !== false,
             provider: 'backblaze_b2',
             endpoint: typeof parsed.endpoint === 'string' ? parsed.endpoint : '',
             region: typeof parsed.region === 'string' ? parsed.region : '',
@@ -626,6 +631,67 @@ export function buildB2DirectObjectTarget(
         host,
         canonicalUri
     };
+}
+
+/**
+ * Creates a short-lived AWS Signature Version 4 query-presigned Backblaze B2 official direct URL.
+ * Used only when the user explicitly disables Cloudflare Workers proxy mode (accepting official B2 egress billing).
+ */
+export async function createPresignedB2Url(
+    creds: ResolvedB2Credentials,
+    logicalKey: string,
+    opts: {
+        method?: 'GET' | 'HEAD';
+        expiresSeconds?: number;
+        responseContentDisposition?: string;
+        now?: Date;
+    } = {}
+): Promise<string> {
+    const method: 'GET' | 'HEAD' = opts.method === 'HEAD' ? 'HEAD' : 'GET';
+    const expiresSeconds = Math.min(Math.max(Math.floor(opts.expiresSeconds ?? 300), 60), 3600);
+    const target = buildB2DirectObjectTarget(creds, logicalKey);
+    const { amzDate, dateStamp } = formatAmzDate(opts.now ?? new Date());
+    const credentialScope = `${dateStamp}/${creds.region}/s3/aws4_request`;
+
+    const queryPairs: Array<[string, string]> = [
+        ['X-Amz-Algorithm', 'AWS4-HMAC-SHA256'],
+        ['X-Amz-Credential', `${creds.accessKeyId}/${credentialScope}`],
+        ['X-Amz-Date', amzDate],
+        ['X-Amz-Expires', String(expiresSeconds)],
+        ['X-Amz-SignedHeaders', 'host']
+    ];
+    if (opts.responseContentDisposition) {
+        queryPairs.push(['response-content-disposition', opts.responseContentDisposition]);
+    }
+
+    const encodedPairs = queryPairs
+        .map(([k, v]) => [rfc3986Encode(k), rfc3986Encode(v)] as const)
+        .sort(([aK, aV], [bK, bV]) => (aK === bK ? aV.localeCompare(bV) : aK.localeCompare(bK)));
+    const canonicalQueryString = encodedPairs.map(([k, v]) => `${k}=${v}`).join('&');
+
+    const canonicalRequest = [
+        method,
+        target.canonicalUri,
+        canonicalQueryString,
+        `host:${target.host}\n`,
+        'host',
+        'UNSIGNED-PAYLOAD'
+    ].join('\n');
+
+    const stringToSign = [
+        'AWS4-HMAC-SHA256',
+        amzDate,
+        credentialScope,
+        await sha256Hex(canonicalRequest)
+    ].join('\n');
+
+    const kDate = await hmacRaw(`AWS4${creds.secretAccessKey}`, dateStamp);
+    const kRegion = await hmacRaw(kDate, creds.region);
+    const kService = await hmacRaw(kRegion, 's3');
+    const kSigning = await hmacRaw(kService, 'aws4_request');
+    const signature = toHex(await hmacRaw(kSigning, stringToSign));
+
+    return `${target.url}?${canonicalQueryString}&X-Amz-Signature=${signature}`;
 }
 
 /**

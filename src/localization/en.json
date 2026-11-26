@@ -3839,10 +3839,12 @@
             "testing": "Testing...",
             "saved_toast": "Storage settings saved.",
             "test_ok": "Connected ({ms} ms) · {size} across {count} objects.",
-            "direct_proxy_label": "Built-in Workers Direct Proxy",
-            "direct_proxy_active": "Auto-Enabled",
-            "direct_proxy_copy": "Copy Prefix",
-            "direct_proxy_copied": "Copied"
+            "direct_proxy_label": "Workers Direct Proxy",
+            "direct_proxy_active": "Free-Egress Proxy",
+            "direct_proxy_official": "Official Direct",
+            "direct_proxy_disable_confirm_desc": "Disabling this switches to Backblaze B2 official direct links, which incur egress traffic charges. Confirm switching to official direct?",
+            "direct_proxy_disable_confirm_btn": "Confirm Disable",
+            "direct_proxy_disable_cancel_btn": "Cancel"
         },
         "settings": {
             "sync_interval_label": "Cloud Sync Interval (Web & Background Feed)",

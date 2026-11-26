@@ -3502,10 +3502,12 @@
             "testing": "測試中...",
             "saved_toast": "儲存設定已儲存。",
             "test_ok": "連線成功（{ms} ms）· 已用 {size}（{count} 個檔案）。",
-            "direct_proxy_label": "Workers 內建直連中轉",
-            "direct_proxy_active": "已自動啟用",
-            "direct_proxy_copy": "複製前綴",
-            "direct_proxy_copied": "已複製"
+            "direct_proxy_label": "Workers 中轉直連",
+            "direct_proxy_active": "免流量中轉",
+            "direct_proxy_official": "官方直連",
+            "direct_proxy_disable_confirm_desc": "關閉後使用官方直連會收取流量費用，確認關閉 Workers 中轉直連並改用 Backblaze B2 官方直連？",
+            "direct_proxy_disable_confirm_btn": "確認關閉",
+            "direct_proxy_disable_cancel_btn": "取消"
         },
         "settings": {
             "sync_interval_label": "雲端同步間隔（網頁端與背景動態）",

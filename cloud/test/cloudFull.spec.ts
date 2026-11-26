@@ -7287,6 +7287,60 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
             expect(htmlRes.headers.get('Content-Disposition')).toContain('attachment');
             expect(htmlRes.headers.get('Content-Security-Policy')).toContain('sandbox');
 
+            // 8. Turning off Workers Direct Proxy switches B2 reads to short-lived official Backblaze B2 presigned 302 redirects
+            const officialModeRes = await exports.default.fetch('http://example.com/api/storage/config', {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+                body: JSON.stringify({ useWorkerDirectProxy: false })
+            });
+            expect(officialModeRes.status).toBe(200);
+            const officialModeJson = (await officialModeRes.json()) as {
+                data: {
+                    externalStorage: { enabled: boolean; useWorkerDirectProxy: boolean };
+                    b2DirectProxy: { enabled: boolean; useWorkerDirectProxy: boolean };
+                };
+            };
+            expect(officialModeJson.data.externalStorage.enabled).toBe(true);
+            expect(officialModeJson.data.externalStorage.useWorkerDirectProxy).toBe(false);
+            expect(officialModeJson.data.b2DirectProxy.enabled).toBe(false);
+            expect(
+                (await exports.default.fetch(`http://example.com/api/storage/b2/${shotLogicalKey}`)).status
+            ).toBe(404);
+
+            const shotOfficialRes = await exports.default.fetch(
+                'http://example.com/api/media/screenshots/shot_b2_overflow_01',
+                { redirect: 'manual' }
+            );
+            expect(shotOfficialRes.status).toBe(302);
+            expect(shotOfficialRes.headers.get('X-VRCX-Storage-Via')).toBe('b2-official-direct');
+            const shotLoc = new URL(shotOfficialRes.headers.get('Location') ?? '');
+            expect(shotLoc.hostname).toBe(b2VirtualHost);
+            expect(shotLoc.searchParams.get('X-Amz-Algorithm')).toBe('AWS4-HMAC-SHA256');
+            expect(shotLoc.searchParams.get('X-Amz-Expires')).toBe('300');
+            expect(shotLoc.searchParams.get('X-Amz-SignedHeaders')).toBe('host');
+            expect(shotLoc.searchParams.get('X-Amz-Signature')).toMatch(/^[0-9a-f]{64}$/);
+
+            const backupOfficialRes = await exports.default.fetch(
+                `http://example.com/api/admin/cleanup/backups/download?key=${encodeURIComponent(b2CleanJson.data.backupKey)}`,
+                { redirect: 'manual' }
+            );
+            expect(backupOfficialRes.status).toBe(302);
+            const backupLoc = new URL(backupOfficialRes.headers.get('Location') ?? '');
+            expect(backupLoc.hostname).toBe(b2VirtualHost);
+            expect(backupLoc.searchParams.get('response-content-disposition')).toContain('attachment; filename=');
+            expect(backupLoc.searchParams.get('X-Amz-Signature')).toMatch(/^[0-9a-f]{64}$/);
+
+            // Re-enable Workers direct proxy before testing full disable fallback
+            expect(
+                (
+                    await exports.default.fetch('http://example.com/api/storage/config', {
+                        method: 'PUT',
+                        headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+                        body: JSON.stringify({ useWorkerDirectProxy: true })
+                    })
+                ).status
+            ).toBe(200);
+
             // Disabling B2 immediately disables /api/storage/b2/* direct proxy while preserving historical screenshot read
             const disableRes = await exports.default.fetch('http://example.com/api/storage/config', {
                 method: 'PUT',

@@ -4,6 +4,7 @@ import type { Env } from '../env';
 import {
     B2_KEY_PREFIX_TAG,
     buildSafeDirectProxyResponse,
+    createPresignedB2Url,
     listB2Objects,
     loadExternalStorageConfig,
     measureR2Usage,
@@ -493,16 +494,32 @@ export async function handleDbCleanupRoutes(
         const fileName = logicalKey.slice(CLEANUP_BACKUP_PREFIX.length);
 
         if (isB2Key) {
-            const creds = await resolveActiveB2Credentials(env, undefined, { allowDisabled: true });
+            const extCfg = await loadExternalStorageConfig(env);
+            const creds = await resolveActiveB2Credentials(env, extCfg, { allowDisabled: true });
             if (!creds) {
                 return Response.json(
                     { ok: false, error: { code: 'NOT_FOUND', message: 'Backup archive not found' } },
                     { status: 404 }
                 );
             }
-            const upstreamRes = await proxyB2DirectFetch(creds, logicalKey, request, {
-                method: request.method === 'HEAD' ? 'HEAD' : 'GET'
-            });
+            const method = request.method === 'HEAD' ? 'HEAD' : 'GET';
+            if (extCfg.useWorkerDirectProxy === false) {
+                const safeName = fileName.replace(/["\\\r\n/]/g, '_');
+                const directUrl = await createPresignedB2Url(creds, logicalKey, {
+                    method,
+                    expiresSeconds: 300,
+                    responseContentDisposition: `attachment; filename="${safeName}"`
+                });
+                return new Response(null, {
+                    status: 302,
+                    headers: {
+                        Location: directUrl,
+                        'Cache-Control': 'private, no-store',
+                        'X-VRCX-Storage-Via': 'b2-official-direct'
+                    }
+                });
+            }
+            const upstreamRes = await proxyB2DirectFetch(creds, logicalKey, request, { method });
             if (upstreamRes.status === 404) {
                 await upstreamRes.body?.cancel().catch(() => {});
                 return Response.json(

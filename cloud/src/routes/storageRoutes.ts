@@ -75,7 +75,8 @@ export async function handleStorageRoutes(request: Request, env: Env, url: URL):
                     externalStorage: toPublicExternalStorageConfig(cfg),
                     overflowActive,
                     b2DirectProxy: {
-                        enabled: Boolean(cfg.enabled && b2Creds),
+                        enabled: Boolean(cfg.enabled && cfg.useWorkerDirectProxy && b2Creds),
+                        useWorkerDirectProxy: cfg.useWorkerDirectProxy !== false,
                         basePath: B2_DIRECT_PROXY_BASE_PATH
                     }
                 }
@@ -94,7 +95,11 @@ export async function handleStorageRoutes(request: Request, env: Env, url: URL):
         }
 
         const existing = await loadExternalStorageConfig(env);
-        const enabled = body.enabled === true;
+        const enabled = body.enabled !== undefined ? body.enabled === true : existing.enabled;
+        const useWorkerDirectProxy =
+            typeof body.useWorkerDirectProxy === 'boolean'
+                ? body.useWorkerDirectProxy
+                : existing.useWorkerDirectProxy !== false;
 
         // Parse threshold (accepts either bytes or GB)
         let thresholdBytes = existing.r2OverflowThresholdBytes;
@@ -190,6 +195,7 @@ export async function handleStorageRoutes(request: Request, env: Env, url: URL):
 
         const nextConfig: StoredExternalStorageConfig = {
             enabled,
+            useWorkerDirectProxy,
             provider: 'backblaze_b2',
             endpoint: normalizedEndpoint,
             region: resolvedRegion,
@@ -221,7 +227,8 @@ export async function handleStorageRoutes(request: Request, env: Env, url: URL):
                         nextConfig.enabled && b2Creds && (!r2.bound || r2.usedBytes >= nextConfig.r2OverflowThresholdBytes)
                     ),
                     b2DirectProxy: {
-                        enabled: Boolean(nextConfig.enabled && b2Creds),
+                        enabled: Boolean(nextConfig.enabled && nextConfig.useWorkerDirectProxy && b2Creds),
+                        useWorkerDirectProxy: nextConfig.useWorkerDirectProxy !== false,
                         basePath: B2_DIRECT_PROXY_BASE_PATH
                     }
                 }
@@ -357,7 +364,14 @@ export async function handleStorageRoutes(request: Request, env: Env, url: URL):
             );
         }
 
-        const creds = await resolveActiveB2Credentials(env);
+        const extCfg = await loadExternalStorageConfig(env);
+        if (!extCfg.enabled || !extCfg.useWorkerDirectProxy) {
+            return Response.json(
+                { ok: false, error: { code: 'B2_PROXY_DISABLED', message: 'Workers direct proxy for Backblaze B2 is disabled' } },
+                { status: 404 }
+            );
+        }
+        const creds = await resolveActiveB2Credentials(env, extCfg);
         if (!creds) {
             return Response.json(
                 { ok: false, error: { code: 'B2_NOT_ENABLED', message: 'Backblaze B2 extra storage is not enabled' } },
