@@ -41,6 +41,7 @@ export interface ChatTranslatorCloudConfig {
     oscListenEnabled: boolean;
     oscListenPort: number;
     oscForwardToVrchat: boolean;
+    translateEnabled: boolean;
     sourceLang: string;
     targetLang: string;
     displayMode: string;
@@ -57,6 +58,7 @@ export const DEFAULT_CHAT_TRANSLATOR_CONFIG: Readonly<ChatTranslatorCloudConfig>
     oscListenEnabled: false,
     oscListenPort: DEFAULT_OSC_LISTEN_PORT,
     oscForwardToVrchat: true,
+    translateEnabled: false,
     sourceLang: 'auto',
     targetLang: 'en',
     displayMode: 'translated_and_source',
@@ -168,6 +170,8 @@ export function normalizeChatTranslatorConfig(
             oscListenEnabled,
             oscListenPort: listenPort,
             oscForwardToVrchat,
+            translateEnabled:
+                typeof obj.translateEnabled === 'boolean' ? obj.translateEnabled : base.translateEnabled,
             sourceLang: normalizeLangCode(obj.sourceLang, base.sourceLang),
             targetLang: normalizeLangCode(obj.targetLang, base.targetLang),
             displayMode,

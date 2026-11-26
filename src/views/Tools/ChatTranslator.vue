@@ -77,9 +77,9 @@
                 </Button>
 
                 <Button
-                    :variant="showOscSettings ? 'secondary' : 'outline'"
+                    variant="outline"
                     size="sm"
-                    @click="showOscSettings = !showOscSettings">
+                    @click="isOscSettingsDialogVisible = true">
                     <SlidersHorizontal class="size-4" />
                     <span>{{ t('view.tools.chat_translator.osc_settings_btn') }}</span>
                 </Button>
@@ -107,102 +107,94 @@
             </div>
         </div>
 
-        <!-- Translation & Display Mode Bar -->
-        <div class="shrink-0 mb-3 rounded-lg border border-border bg-card/60 p-3 space-y-2.5">
-            <div class="flex flex-wrap items-center gap-2">
-                <!-- Source Language -->
-                <div class="flex items-center gap-1.5">
-                    <span class="text-xs text-muted-foreground">{{ t('view.tools.chat_translator.source_lang') }}</span>
-                    <select
-                        v-model="prefs.sourceLang"
-                        :aria-label="t('view.tools.chat_translator.source_lang')"
-                        class="h-8 rounded-md border border-input bg-background px-2 text-xs text-foreground dark:[color-scheme:dark]"
-                        @change="persistPrefs">
-                        <option class="bg-card text-foreground" value="auto">
-                            {{ t('view.tools.chat_translator.lang_auto') }}
-                        </option>
-                        <option
-                            v-for="lang in CHAT_TRANSLATOR_LANGUAGES"
-                            :key="lang.code"
-                            class="bg-card text-foreground"
-                            :value="lang.code">
-                            {{ lang.label }}
-                        </option>
-                    </select>
-                </div>
+        <!-- Compact Translation Toggle Bar (Translation OFF by default; sends original text when off or unconfigured) -->
+        <div class="shrink-0 mb-3 rounded-lg border border-border bg-card/60 px-3 py-2">
+            <div class="flex flex-wrap items-center gap-2.5 text-xs">
+                <label class="inline-flex items-center gap-1.5 cursor-pointer select-none font-medium text-foreground">
+                    <input
+                        v-model="prefs.translateEnabled"
+                        type="checkbox"
+                        class="accent-primary rounded"
+                        @change="persistPrefs" />
+                    <span>{{ t('view.tools.chat_translator.translate_enabled_label') }}</span>
+                </label>
 
-                <!-- Swap Languages -->
-                <Button
-                    type="button"
-                    variant="ghost"
-                    size="icon-sm"
-                    :disabled="prefs.sourceLang === 'auto'"
-                    :title="t('view.tools.chat_translator.swap_languages')"
-                    :ariaLabel="t('view.tools.chat_translator.swap_languages')"
-                    @click="swapLanguages">
-                    <ArrowLeftRight class="size-3.5" />
-                </Button>
+                <template v-if="prefs.translateEnabled">
+                    <!-- Source Language -->
+                    <div class="flex items-center gap-1.5">
+                        <span class="text-muted-foreground">{{ t('view.tools.chat_translator.source_lang') }}</span>
+                        <select
+                            v-model="prefs.sourceLang"
+                            :aria-label="t('view.tools.chat_translator.source_lang')"
+                            class="h-8 rounded-md border border-input bg-background px-2 text-xs text-foreground dark:[color-scheme:dark]"
+                            @change="persistPrefs">
+                            <option class="bg-card text-foreground" value="auto">
+                                {{ t('view.tools.chat_translator.lang_auto') }}
+                            </option>
+                            <option
+                                v-for="lang in CHAT_TRANSLATOR_LANGUAGES"
+                                :key="lang.code"
+                                class="bg-card text-foreground"
+                                :value="lang.code">
+                                {{ lang.label }}
+                            </option>
+                        </select>
+                    </div>
 
-                <!-- Target Language -->
-                <div class="flex items-center gap-1.5">
-                    <span class="text-xs text-muted-foreground">{{ t('view.tools.chat_translator.target_lang') }}</span>
-                    <select
-                        v-model="prefs.targetLang"
-                        :aria-label="t('view.tools.chat_translator.target_lang')"
-                        class="h-8 rounded-md border border-input bg-background px-2 text-xs text-foreground dark:[color-scheme:dark]"
-                        @change="persistPrefs">
-                        <option
-                            v-for="lang in CHAT_TRANSLATOR_LANGUAGES"
-                            :key="lang.code"
-                            class="bg-card text-foreground"
-                            :value="lang.code">
-                            {{ lang.label }}
-                        </option>
-                    </select>
-                </div>
+                    <!-- Swap Languages -->
+                    <Button
+                        type="button"
+                        variant="ghost"
+                        size="icon-sm"
+                        :disabled="prefs.sourceLang === 'auto'"
+                        :title="t('view.tools.chat_translator.swap_languages')"
+                        :ariaLabel="t('view.tools.chat_translator.swap_languages')"
+                        @click="swapLanguages">
+                        <ArrowLeftRight class="size-3.5" />
+                    </Button>
 
-                <!-- Chatbox Format -->
-                <div class="flex items-center gap-1.5">
-                    <span class="text-xs text-muted-foreground">{{ t('view.tools.chat_translator.display_mode') }}</span>
-                    <select
-                        v-model="prefs.displayMode"
-                        :aria-label="t('view.tools.chat_translator.display_mode')"
-                        class="h-8 rounded-md border border-input bg-background px-2 text-xs text-foreground dark:[color-scheme:dark]"
-                        @change="persistPrefs">
-                        <option class="bg-card text-foreground" value="translated_only">
-                            {{ t('view.tools.chat_translator.mode_translated_only') }}
-                        </option>
-                        <option class="bg-card text-foreground" value="translated_and_source">
-                            {{ t('view.tools.chat_translator.mode_translated_and_source') }}
-                        </option>
-                        <option class="bg-card text-foreground" value="source_and_translated">
-                            {{ t('view.tools.chat_translator.mode_source_and_translated') }}
-                        </option>
-                        <option class="bg-card text-foreground" value="source_only">
-                            {{ t('view.tools.chat_translator.mode_source_only') }}
-                        </option>
-                    </select>
-                </div>
+                    <!-- Target Language -->
+                    <div class="flex items-center gap-1.5">
+                        <span class="text-muted-foreground">{{ t('view.tools.chat_translator.target_lang') }}</span>
+                        <select
+                            v-model="prefs.targetLang"
+                            :aria-label="t('view.tools.chat_translator.target_lang')"
+                            class="h-8 rounded-md border border-input bg-background px-2 text-xs text-foreground dark:[color-scheme:dark]"
+                            @change="persistPrefs">
+                            <option
+                                v-for="lang in CHAT_TRANSLATOR_LANGUAGES"
+                                :key="lang.code"
+                                class="bg-card text-foreground"
+                                :value="lang.code">
+                                {{ lang.label }}
+                            </option>
+                        </select>
+                    </div>
 
-                <!-- Quick Toggles -->
-                <div class="flex items-center gap-3 ml-auto flex-wrap text-xs">
-                    <label class="inline-flex items-center gap-1.5 cursor-pointer select-none">
-                        <input
-                            v-model="prefs.immediate"
-                            type="checkbox"
-                            class="accent-primary rounded"
-                            @change="persistPrefs" />
-                        <span>{{ t('view.tools.chat_translator.osc_immediate') }}</span>
-                    </label>
-                    <label class="inline-flex items-center gap-1.5 cursor-pointer select-none">
-                        <input
-                            v-model="prefs.playSfx"
-                            type="checkbox"
-                            class="accent-primary rounded"
-                            @change="persistPrefs" />
-                        <span>{{ t('view.tools.chat_translator.osc_play_sfx') }}</span>
-                    </label>
-                    <label class="inline-flex items-center gap-1.5 cursor-pointer select-none">
+                    <!-- Chatbox Format -->
+                    <div class="flex items-center gap-1.5">
+                        <span class="text-muted-foreground">{{ t('view.tools.chat_translator.display_mode') }}</span>
+                        <select
+                            v-model="prefs.displayMode"
+                            :aria-label="t('view.tools.chat_translator.display_mode')"
+                            class="h-8 rounded-md border border-input bg-background px-2 text-xs text-foreground dark:[color-scheme:dark]"
+                            @change="persistPrefs">
+                            <option class="bg-card text-foreground" value="translated_only">
+                                {{ t('view.tools.chat_translator.mode_translated_only') }}
+                            </option>
+                            <option class="bg-card text-foreground" value="translated_and_source">
+                                {{ t('view.tools.chat_translator.mode_translated_and_source') }}
+                            </option>
+                            <option class="bg-card text-foreground" value="source_and_translated">
+                                {{ t('view.tools.chat_translator.mode_source_and_translated') }}
+                            </option>
+                            <option class="bg-card text-foreground" value="source_only">
+                                {{ t('view.tools.chat_translator.mode_source_only') }}
+                            </option>
+                        </select>
+                    </div>
+
+                    <label class="inline-flex items-center gap-1.5 cursor-pointer select-none ml-auto">
                         <input
                             v-model="prefs.autoTranslateDesktop"
                             type="checkbox"
@@ -210,155 +202,19 @@
                             @change="persistPrefs" />
                         <span>{{ t('view.tools.chat_translator.auto_translate_desktop') }}</span>
                     </label>
-                </div>
-            </div>
 
-            <!-- Collapsible Cloud-Managed OSC & Companion Bridge Panel (Zero Local Agent Settings) -->
-            <div
-                v-if="showOscSettings"
-                class="pt-2.5 border-t border-border/70 grid grid-cols-1 md:grid-cols-3 gap-3 text-xs">
-                <!-- Column 1: Master Switch & Target Device -->
-                <div class="space-y-2">
-                    <label class="inline-flex items-center gap-2 cursor-pointer select-none font-medium text-foreground">
-                        <input
-                            v-model="prefs.oscEnabled"
-                            type="checkbox"
-                            class="accent-primary rounded"
-                            @change="persistPrefs" />
-                        <span>{{ t('view.tools.chat_translator.osc_enabled_label') }}</span>
-                    </label>
-                    <div class="space-y-1">
-                        <div class="text-muted-foreground font-medium">
-                            {{ t('view.tools.chat_translator.target_device_label') }}
-                        </div>
-                        <select
-                            v-model="prefs.targetDeviceId"
-                            :aria-label="t('view.tools.chat_translator.target_device_label')"
-                            class="h-8 w-full rounded-md border border-input bg-background px-2 text-xs text-foreground dark:[color-scheme:dark]"
-                            @change="persistPrefs">
-                            <option class="bg-card text-foreground" value="">
-                                {{ t('view.tools.chat_translator.target_device_auto') }}
-                            </option>
-                            <option
-                                v-for="dev in devices"
-                                :key="dev.deviceId"
-                                class="bg-card text-foreground"
-                                :value="dev.deviceId">
-                                {{ dev.deviceName }} ({{ dev.online ? t('view.tools.chat_translator.online_short') : t('view.tools.chat_translator.offline_short') }})
-                            </option>
-                        </select>
-                    </div>
-                    <label class="inline-flex items-center gap-1.5 cursor-pointer select-none">
-                        <input
-                            v-model="prefs.syncTyping"
-                            type="checkbox"
-                            class="accent-primary rounded"
-                            @change="persistPrefs" />
-                        <span>{{ t('view.tools.chat_translator.sync_typing') }}</span>
-                    </label>
-                </div>
-
-                <!-- Column 2: Cloud-Controlled Ports & Desktop Relay -->
-                <div class="space-y-2">
-                    <div class="space-y-1">
-                        <div class="text-muted-foreground font-medium">
-                            {{ t('view.tools.chat_translator.osc_port_label') }}
-                        </div>
-                        <div class="flex items-center gap-1.5">
-                            <span class="font-mono text-muted-foreground">127.0.0.1 :</span>
-                            <input
-                                v-model.number="prefs.oscPort"
-                                type="number"
-                                min="1024"
-                                max="65535"
-                                class="h-8 w-24 rounded-md border border-input bg-background px-2 text-xs font-mono text-foreground"
-                                @change="handleOscPortChange" />
-                        </div>
-                    </div>
-
-                    <div class="space-y-1.5 pt-0.5">
-                        <label class="inline-flex items-center gap-1.5 cursor-pointer select-none font-medium text-foreground">
-                            <input
-                                v-model="prefs.oscListenEnabled"
-                                type="checkbox"
-                                class="accent-primary rounded"
-                                @change="persistPrefs" />
-                            <span>{{ t('view.tools.chat_translator.osc_listen_enabled_label') }}</span>
-                        </label>
-                        <div class="flex items-center gap-2 flex-wrap">
-                            <span class="text-muted-foreground">{{ t('view.tools.chat_translator.osc_listen_port_label') }}</span>
-                            <input
-                                v-model.number="prefs.oscListenPort"
-                                type="number"
-                                min="1024"
-                                max="65535"
-                                class="h-7 w-20 rounded-md border border-input bg-background px-2 text-xs font-mono text-foreground"
-                                @change="handleOscListenPortChange" />
-                            <label class="inline-flex items-center gap-1.5 cursor-pointer select-none">
-                                <input
-                                    v-model="prefs.oscForwardToVrchat"
-                                    type="checkbox"
-                                    class="accent-primary rounded"
-                                    @change="persistPrefs" />
-                                <span>{{ t('view.tools.chat_translator.osc_forward_vrc_label') }}</span>
-                            </label>
-                        </div>
-                        <div v-if="hasPortConflict" class="text-[11px] text-destructive font-medium">
-                            {{ t('view.tools.chat_translator.osc_port_conflict') }}
-                        </div>
-                    </div>
-                </div>
-
-                <!-- Column 3: Live Cloud-Synced Relay & Dedicated DB Status -->
-                <div class="rounded-md border border-border/70 bg-muted/30 px-2.5 py-2 space-y-1.5">
-                    <div class="flex items-center justify-between gap-2 font-medium flex-wrap">
-                        <span>{{ t('view.tools.chat_translator.desktop_relay_title') }}</span>
-                        <Badge variant="outline" class="text-[10px] font-mono">
-                            {{
-                                activeDevice?.osc?.listenEnabled
-                                    ? `127.0.0.1:${activeDevice.osc.listenPort}${activeDevice.osc.forwardToVrchat ? ` → ${activeDevice.osc.sendPort}` : ''}`
-                                    : prefs.oscListenEnabled
-                                      ? t('view.tools.chat_translator.relay_standby')
-                                      : t('view.tools.chat_translator.relay_disabled_badge')
-                            }}
-                        </Badge>
-                    </div>
-                    <p class="text-[11px] leading-relaxed text-muted-foreground">
-                        {{ t('view.tools.chat_translator.desktop_relay_hint') }}
-                    </p>
-                    <p class="text-[11px] leading-relaxed text-muted-foreground/90">
-                        {{ t('view.tools.chat_translator.cloud_control_note') }}
-                    </p>
-                    <div
-                        v-if="activeDevice?.osc?.listenError"
-                        class="rounded border border-destructive/40 bg-destructive/10 px-2 py-1 text-[11px] text-destructive break-words">
-                        {{ t('view.tools.chat_translator.relay_bind_error_prefix') }} {{ activeDevice.osc.listenError }}
-                    </div>
-                </div>
-            </div>
-
-            <!-- Inline Notice when Translation API is Disabled / Unconfigured in Translate Mode -->
-            <div
-                v-if="needsTranslationConfigNotice"
-                class="flex items-center justify-between gap-2 rounded-md border border-amber-500/35 bg-amber-500/10 px-3 py-1.5 text-xs text-amber-700 dark:text-amber-300 flex-wrap">
-                <span>{{ t('view.tools.chat_translator.translation_not_ready_hint') }}</span>
-                <div class="flex items-center gap-1.5">
-                    <Button
-                        v-if="!translationApi"
-                        size="sm"
-                        variant="outline"
-                        class="h-7 px-2.5 text-xs"
-                        @click="enableTranslationApiQuick">
-                        {{ t('view.tools.chat_translator.enable_translation_api') }}
-                    </Button>
-                    <Button
-                        size="sm"
-                        variant="secondary"
-                        class="h-7 px-2.5 text-xs"
+                    <button
+                        v-if="!isTranslationConfigured"
+                        type="button"
+                        class="text-[11px] text-muted-foreground hover:text-foreground underline underline-offset-2"
                         @click="isTranslationApiDialogVisible = true">
-                        {{ t('view.tools.chat_translator.configure_translation_api') }}
-                    </Button>
-                </div>
+                        {{ t('view.tools.chat_translator.translate_unconfigured_fallback') }}
+                    </button>
+                </template>
+
+                <span v-else class="text-muted-foreground">
+                    {{ t('view.tools.chat_translator.translate_off_hint') }}
+                </span>
             </div>
         </div>
 
@@ -577,7 +433,7 @@
 
                 <div class="flex items-center gap-2">
                     <Button
-                        v-if="prefs.displayMode !== 'source_only'"
+                        v-if="shouldTranslateOnSend"
                         type="button"
                         size="sm"
                         variant="outline"
@@ -597,15 +453,177 @@
                         <Send v-else class="size-4" />
                         <span>
                             {{
-                                prefs.displayMode === 'source_only'
-                                    ? t('view.tools.chat_translator.send_direct_btn')
-                                    : t('view.tools.chat_translator.translate_and_send_btn')
+                                shouldTranslateOnSend
+                                    ? t('view.tools.chat_translator.translate_and_send_btn')
+                                    : t('view.tools.chat_translator.send_direct_btn')
                             }}
                         </span>
                     </Button>
                 </div>
             </div>
         </div>
+
+        <!-- Cloud OSC Settings Modal Dialog (Zero Local Agent Setup) -->
+        <Dialog :open="isOscSettingsDialogVisible" @update:open="isOscSettingsDialogVisible = $event">
+            <DialogContent class="sm:max-w-lg">
+                <DialogHeader>
+                    <DialogTitle>{{ t('view.tools.chat_translator.osc_dialog_title') }}</DialogTitle>
+                    <DialogDescription>
+                        {{ t('view.tools.chat_translator.osc_dialog_description') }}
+                    </DialogDescription>
+                </DialogHeader>
+
+                <div class="space-y-4 py-1 text-xs">
+                    <!-- Master Switch -->
+                    <label class="flex items-center gap-2 cursor-pointer select-none font-medium text-sm text-foreground">
+                        <input
+                            v-model="prefs.oscEnabled"
+                            type="checkbox"
+                            class="accent-primary rounded"
+                            @change="persistPrefs" />
+                        <span>{{ t('view.tools.chat_translator.osc_enabled_label') }}</span>
+                    </label>
+
+                    <!-- Target Companion & VRChat Send Port -->
+                    <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                        <div class="space-y-1">
+                            <div class="text-muted-foreground font-medium">
+                                {{ t('view.tools.chat_translator.target_device_label') }}
+                            </div>
+                            <select
+                                v-model="prefs.targetDeviceId"
+                                :aria-label="t('view.tools.chat_translator.target_device_label')"
+                                class="h-8 w-full rounded-md border border-input bg-background px-2 text-xs text-foreground dark:[color-scheme:dark]"
+                                @change="persistPrefs">
+                                <option class="bg-card text-foreground" value="">
+                                    {{ t('view.tools.chat_translator.target_device_auto') }}
+                                </option>
+                                <option
+                                    v-for="dev in devices"
+                                    :key="dev.deviceId"
+                                    class="bg-card text-foreground"
+                                    :value="dev.deviceId">
+                                    {{ dev.deviceName }} ({{ dev.online ? t('view.tools.chat_translator.online_short') : t('view.tools.chat_translator.offline_short') }})
+                                </option>
+                            </select>
+                        </div>
+
+                        <div class="space-y-1">
+                            <div class="text-muted-foreground font-medium">
+                                {{ t('view.tools.chat_translator.osc_port_label') }}
+                            </div>
+                            <div class="flex items-center gap-1.5">
+                                <span class="font-mono text-muted-foreground">127.0.0.1 :</span>
+                                <input
+                                    v-model.number="prefs.oscPort"
+                                    type="number"
+                                    min="1024"
+                                    max="65535"
+                                    class="h-8 w-24 rounded-md border border-input bg-background px-2 text-xs font-mono text-foreground"
+                                    @change="handleOscPortChange" />
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Chatbox Delivery Options -->
+                    <div class="space-y-1.5">
+                        <div class="text-muted-foreground font-medium">
+                            {{ t('view.tools.chat_translator.osc_send_options_label') }}
+                        </div>
+                        <div class="flex flex-wrap items-center gap-x-4 gap-y-2">
+                            <label class="inline-flex items-center gap-1.5 cursor-pointer select-none">
+                                <input
+                                    v-model="prefs.immediate"
+                                    type="checkbox"
+                                    class="accent-primary rounded"
+                                    @change="persistPrefs" />
+                                <span>{{ t('view.tools.chat_translator.osc_immediate') }}</span>
+                            </label>
+                            <label class="inline-flex items-center gap-1.5 cursor-pointer select-none">
+                                <input
+                                    v-model="prefs.playSfx"
+                                    type="checkbox"
+                                    class="accent-primary rounded"
+                                    @change="persistPrefs" />
+                                <span>{{ t('view.tools.chat_translator.osc_play_sfx') }}</span>
+                            </label>
+                            <label class="inline-flex items-center gap-1.5 cursor-pointer select-none">
+                                <input
+                                    v-model="prefs.syncTyping"
+                                    type="checkbox"
+                                    class="accent-primary rounded"
+                                    @change="persistPrefs" />
+                                <span>{{ t('view.tools.chat_translator.sync_typing') }}</span>
+                            </label>
+                        </div>
+                    </div>
+
+                    <!-- Desktop OSC Relay Listener Section -->
+                    <div class="rounded-lg border border-border/80 bg-muted/30 p-3 space-y-2">
+                        <div class="flex items-center justify-between gap-2 flex-wrap">
+                            <label class="inline-flex items-center gap-1.5 cursor-pointer select-none font-medium text-foreground">
+                                <input
+                                    v-model="prefs.oscListenEnabled"
+                                    type="checkbox"
+                                    class="accent-primary rounded"
+                                    @change="persistPrefs" />
+                                <span>{{ t('view.tools.chat_translator.osc_listen_enabled_label') }}</span>
+                            </label>
+                            <Badge variant="outline" class="text-[10px] font-mono">
+                                {{
+                                    activeDevice?.osc?.listenEnabled
+                                        ? `127.0.0.1:${activeDevice.osc.listenPort}${activeDevice.osc.forwardToVrchat ? ` → ${activeDevice.osc.sendPort}` : ''}`
+                                        : prefs.oscListenEnabled
+                                          ? t('view.tools.chat_translator.relay_standby')
+                                          : t('view.tools.chat_translator.relay_disabled_badge')
+                                }}
+                            </Badge>
+                        </div>
+
+                        <div class="flex items-center gap-3 flex-wrap">
+                            <div class="flex items-center gap-1.5">
+                                <span class="text-muted-foreground">{{ t('view.tools.chat_translator.osc_listen_port_label') }}</span>
+                                <input
+                                    v-model.number="prefs.oscListenPort"
+                                    type="number"
+                                    min="1024"
+                                    max="65535"
+                                    class="h-7 w-20 rounded-md border border-input bg-background px-2 text-xs font-mono text-foreground"
+                                    @change="handleOscListenPortChange" />
+                            </div>
+                            <label class="inline-flex items-center gap-1.5 cursor-pointer select-none">
+                                <input
+                                    v-model="prefs.oscForwardToVrchat"
+                                    type="checkbox"
+                                    class="accent-primary rounded"
+                                    @change="persistPrefs" />
+                                <span>{{ t('view.tools.chat_translator.osc_forward_vrc_label') }}</span>
+                            </label>
+                        </div>
+
+                        <div v-if="hasPortConflict" class="text-[11px] text-destructive font-medium">
+                            {{ t('view.tools.chat_translator.osc_port_conflict') }}
+                        </div>
+
+                        <p class="text-[11px] leading-relaxed text-muted-foreground">
+                            {{ t('view.tools.chat_translator.desktop_relay_hint') }}
+                        </p>
+
+                        <div
+                            v-if="activeDevice?.osc?.listenError"
+                            class="rounded border border-destructive/40 bg-destructive/10 px-2 py-1 text-[11px] text-destructive break-words">
+                            {{ t('view.tools.chat_translator.relay_bind_error_prefix') }} {{ activeDevice.osc.listenError }}
+                        </div>
+                    </div>
+                </div>
+
+                <DialogFooter>
+                    <Button variant="secondary" size="sm" @click="isOscSettingsDialogVisible = false">
+                        {{ t('view.tools.chat_translator.dialog_close') }}
+                    </Button>
+                </DialogFooter>
+            </DialogContent>
+        </Dialog>
 
         <!-- Reuse Native Translation API Settings Dialog -->
         <TranslationApiDialog v-model:is-translation-api-dialog-visible="isTranslationApiDialogVisible" />
@@ -633,6 +651,14 @@
 
     import { Badge } from '@/components/ui/badge';
     import { Button } from '@/components/ui/button';
+    import {
+        Dialog,
+        DialogContent,
+        DialogDescription,
+        DialogFooter,
+        DialogHeader,
+        DialogTitle
+    } from '@/components/ui/dialog';
     import { Spinner } from '@/components/ui/spinner';
     import {
         cloudFetch,
@@ -676,6 +702,7 @@
 
     const prefs = reactive({
         oscEnabled: true,
+        translateEnabled: false,
         sourceLang: 'auto',
         targetLang: 'en',
         displayMode: 'translated_and_source',
@@ -691,7 +718,7 @@
     });
 
     const isTranslationApiDialogVisible = ref(false);
-    const showOscSettings = ref(false);
+    const isOscSettingsDialogVisible = ref(false);
     const loadingMessages = ref(false);
     const clearingHistory = ref(false);
     const translatingDraft = ref(false);
@@ -762,8 +789,8 @@
         return Boolean(translationApiKey.value);
     });
 
-    const needsTranslationConfigNotice = computed(
-        () => prefs.displayMode !== 'source_only' && !isTranslationConfigured.value
+    const shouldTranslateOnSend = computed(
+        () => prefs.translateEnabled && prefs.displayMode !== 'source_only' && isTranslationConfigured.value
     );
 
     const translationEngineLabel = computed(() => {
@@ -799,6 +826,7 @@
             prefs.oscListenPort = normalizeOscPort(cfg.oscListenPort, DEFAULT_OSC_LISTEN_PORT);
         }
         if (typeof cfg.oscForwardToVrchat === 'boolean') prefs.oscForwardToVrchat = cfg.oscForwardToVrchat;
+        if (typeof cfg.translateEnabled === 'boolean') prefs.translateEnabled = cfg.translateEnabled;
         if (typeof cfg.sourceLang === 'string') prefs.sourceLang = cfg.sourceLang;
         if (typeof cfg.targetLang === 'string') prefs.targetLang = cfg.targetLang;
         if (typeof cfg.displayMode === 'string') prefs.displayMode = cfg.displayMode;
@@ -849,6 +877,7 @@
                     oscListenEnabled: prefs.oscListenEnabled,
                     oscListenPort: prefs.oscListenPort,
                     oscForwardToVrchat: prefs.oscForwardToVrchat,
+                    translateEnabled: prefs.translateEnabled,
                     sourceLang: prefs.sourceLang,
                     targetLang: prefs.targetLang,
                     displayMode: prefs.displayMode,
@@ -886,15 +915,6 @@
         prefs.sourceLang = prefs.targetLang;
         prefs.targetLang = prevSource;
         persistPrefs();
-    }
-
-    async function enableTranslationApiQuick() {
-        if (!translationApi.value) {
-            await advancedSettingsStore.setTranslationApi();
-        }
-        if (!isTranslationConfigured.value) {
-            isTranslationApiDialogVisible.value = true;
-        }
     }
 
     function scrollToBottom() {
@@ -971,7 +991,7 @@
     }
 
     async function maybeAutoTranslateDesktopMessage(msg) {
-        if (!prefs.autoTranslateDesktop || !isTranslationConfigured.value) return;
+        if (!prefs.translateEnabled || !prefs.autoTranslateDesktop || !isTranslationConfigured.value) return;
         if (!msg || msg.direction !== 'desktop_sync' || msg.translatedText || !msg.sourceText) return;
         if (autoTranslatedIds.has(msg.id) || translatingIds.has(msg.id)) return;
         autoTranslatedIds.add(msg.id);
@@ -1128,19 +1148,15 @@
             return;
         }
 
-        if (prefs.displayMode === 'source_only') {
+        // Send original text directly whenever translation is disabled, mode is source_only,
+        // or no translation API is configured (never block sending to require a translation API).
+        if (!shouldTranslateOnSend.value) {
             await dispatchChatToCloud({
                 sourceText: raw,
                 translatedText: '',
                 sentText: raw,
                 displayMode: 'source_only'
             });
-            return;
-        }
-
-        if (!isTranslationConfigured.value) {
-            toast.warning(t('view.tools.chat_translator.translation_not_ready_hint'));
-            isTranslationApiDialogVisible.value = true;
             return;
         }
 

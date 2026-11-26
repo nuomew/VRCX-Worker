@@ -7773,6 +7773,15 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
         ).all<{ name: string }>();
         expect(coreChatTable.results ?? []).toHaveLength(0);
 
+        // Default cloud config must have translation disabled by default
+        const defaultCfgRes = await exports.default.fetch('http://example.com/api/chat/config');
+        expect(defaultCfgRes.status).toBe(200);
+        const defaultCfgJson = (await defaultCfgRes.json()) as {
+            data: { config: { translateEnabled: boolean; oscEnabled: boolean } };
+        };
+        expect(defaultCfgJson.data.config.translateEnabled).toBe(false);
+        expect(defaultCfgJson.data.config.oscEnabled).toBe(true);
+
         // Self-loop port conflict rejected by PUT /api/chat/config
         const conflictCfgRes = await exports.default.fetch('http://example.com/api/chat/config', {
             method: 'PUT',

@@ -96,6 +96,20 @@ vi.mock('@/stores', () => ({
     })
 }));
 
+vi.mock('@/components/ui/dialog', () => ({
+    Dialog: {
+        name: 'Dialog',
+        props: ['open'],
+        emits: ['update:open'],
+        template: '<div v-if="open" class="mock-osc-dialog"><slot /></div>'
+    },
+    DialogContent: { template: '<div class="mock-osc-dialog-content"><slot /></div>' },
+    DialogHeader: { template: '<div><slot /></div>' },
+    DialogTitle: { template: '<h3><slot /></h3>' },
+    DialogDescription: { template: '<p><slot /></p>' },
+    DialogFooter: { template: '<div><slot /></div>' }
+}));
+
 vi.mock('@/views/Settings/dialogs/TranslationApiDialog.vue', () => ({
     default: {
         name: 'TranslationApiDialog',
@@ -196,7 +210,12 @@ describe('ChatTranslator.vue', () => {
         vi.unstubAllGlobals();
     });
 
-    test('loads synced messages and translates & sends a new web message to VRChat OSC', async () => {
+    test('defaults translation OFF and sends original text without requiring a translation API, even if translation is toggled ON unconfigured', async () => {
+        translationApi.value = false;
+        translationApiKey.value = '';
+        translationApiEndpoint.value = '';
+        translationApiModel.value = '';
+
         mocks.cloudFetch.mockImplementation(async (url, opts) => {
             if (url.startsWith('/api/chat/messages') && (!opts || !opts.method || opts.method === 'GET')) {
                 return {
@@ -207,6 +226,115 @@ describe('ChatTranslator.vue', () => {
                         oscListenEnabled: false,
                         oscListenPort: 9002,
                         oscForwardToVrchat: true,
+                        translateEnabled: false,
+                        sourceLang: 'auto',
+                        targetLang: 'en',
+                        displayMode: 'translated_and_source',
+                        immediate: true,
+                        playSfx: true,
+                        syncTyping: false,
+                        autoTranslateDesktop: false,
+                        targetDeviceId: ''
+                    },
+                    messages: [],
+                    devices: []
+                };
+            }
+            if (url === '/api/chat/config' && opts?.method === 'PUT') {
+                return { chatDbDedicated: true, pushedAgents: 0, config: opts.json };
+            }
+            if (url === '/api/chat/send' && opts?.method === 'POST') {
+                return {
+                    deliveryStatus: 'dispatched',
+                    message: {
+                        id: 'chat_orig_1',
+                        direction: 'web_to_vrc',
+                        sourceText: opts.json.sourceText,
+                        translatedText: '',
+                        sentText: opts.json.sentText,
+                        oscPort: 9000,
+                        status: 'dispatched',
+                        createdAt: '2026-11-26T10:00:00.000Z'
+                    }
+                };
+            }
+            return {};
+        });
+
+        const wrapper = mount(ChatTranslator);
+        await flushPromises();
+
+        // Translation is OFF by default and OSC dialog is closed (not expanded inline)
+        expect(wrapper.find('.mock-osc-dialog').exists()).toBe(false);
+        expect(wrapper.text()).toContain('view.tools.chat_translator.translate_off_hint');
+
+        const textarea = wrapper.find('textarea');
+        await textarea.setValue('直接发原文给 VRChat');
+        const sendBtn = wrapper
+            .findAll('button')
+            .find((b) => b.text().includes('view.tools.chat_translator.send_direct_btn'));
+        expect(sendBtn).toBeTruthy();
+        await sendBtn.trigger('click');
+        await flushPromises();
+
+        expect(mocks.translateText).not.toHaveBeenCalled();
+        expect(mocks.cloudFetch).toHaveBeenCalledWith(
+            '/api/chat/send',
+            expect.objectContaining({
+                method: 'POST',
+                json: expect.objectContaining({
+                    sourceText: '直接发原文给 VRChat',
+                    translatedText: '',
+                    sentText: '直接发原文给 VRChat',
+                    displayMode: 'source_only'
+                })
+            })
+        );
+
+        // Even if user enables translation without configuring an API, sending still sends original text cleanly
+        const translateCheckbox = wrapper
+            .findAll('label')
+            .find((l) => l.text().includes('view.tools.chat_translator.translate_enabled_label'))
+            ?.find('input[type="checkbox"]');
+        expect(translateCheckbox).toBeTruthy();
+        await translateCheckbox.setValue(true);
+        await flushPromises();
+
+        await textarea.setValue('未配置接口也发原文');
+        const directBtnAgain = wrapper
+            .findAll('button')
+            .find((b) => b.text().includes('view.tools.chat_translator.send_direct_btn'));
+        expect(directBtnAgain).toBeTruthy();
+        await directBtnAgain.trigger('click');
+        await flushPromises();
+
+        expect(mocks.translateText).not.toHaveBeenCalled();
+        expect(mocks.cloudFetch).toHaveBeenCalledWith(
+            '/api/chat/send',
+            expect.objectContaining({
+                method: 'POST',
+                json: expect.objectContaining({
+                    sentText: '未配置接口也发原文',
+                    displayMode: 'source_only'
+                })
+            })
+        );
+
+        wrapper.unmount();
+    });
+
+    test('loads synced messages, translates & sends when translation is enabled, and configures OSC in modal dialog', async () => {
+        mocks.cloudFetch.mockImplementation(async (url, opts) => {
+            if (url.startsWith('/api/chat/messages') && (!opts || !opts.method || opts.method === 'GET')) {
+                return {
+                    chatDbDedicated: true,
+                    config: {
+                        oscEnabled: true,
+                        oscSendPort: 9000,
+                        oscListenEnabled: false,
+                        oscListenPort: 9002,
+                        oscForwardToVrchat: true,
+                        translateEnabled: true,
                         sourceLang: 'auto',
                         targetLang: 'en',
                         displayMode: 'translated_and_source',
@@ -351,15 +479,18 @@ describe('ChatTranslator.vue', () => {
         expect(wrapper.text()).toContain('实时游戏打字消息');
         expect(wrapper.text()).toContain('view.tools.chat_translator.status_sent');
 
-        // Expanding Cloud OSC Settings and toggling Desktop OSC Relay saves directly to PUT /api/chat/config
+        // Clicking Cloud OSC Settings opens modal dialog (not inline expansion) and toggling relay saves to PUT /api/chat/config
+        expect(wrapper.find('.mock-osc-dialog').exists()).toBe(false);
         const oscSettingsBtn = wrapper
             .findAll('button')
             .find((b) => b.text().includes('view.tools.chat_translator.osc_settings_btn'));
         expect(oscSettingsBtn).toBeTruthy();
         await oscSettingsBtn.trigger('click');
         await flushPromises();
+        expect(wrapper.find('.mock-osc-dialog').exists()).toBe(true);
 
         const listenCheckbox = wrapper
+            .find('.mock-osc-dialog')
             .findAll('label')
             .find((l) => l.text().includes('view.tools.chat_translator.osc_listen_enabled_label'))
             ?.find('input[type="checkbox"]');
@@ -376,7 +507,8 @@ describe('ChatTranslator.vue', () => {
                     oscSendPort: 9000,
                     oscListenEnabled: true,
                     oscListenPort: 9002,
-                    oscForwardToVrchat: true
+                    oscForwardToVrchat: true,
+                    translateEnabled: true
                 })
             })
         );
