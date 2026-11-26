@@ -3060,7 +3060,7 @@ describe('WEB cloud adapter (stateless)', () => {
             import('../../localization/zh-TW.json')
         ]);
         const enAvatarKeys = Object.keys(enJson.default.view.tools.avatar).sort();
-        expect(enAvatarKeys).toHaveLength(29);
+        expect(enAvatarKeys).toHaveLength(28);
         expect(Object.keys(zhCnJson.default.view.tools.avatar).sort()).toEqual(enAvatarKeys);
         expect(Object.keys(zhTwJson.default.view.tools.avatar).sort()).toEqual(enAvatarKeys);
         expect(enJson.default.cloud_hub.storage.status_unsaved).toBeTruthy();

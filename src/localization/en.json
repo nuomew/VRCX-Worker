@@ -698,7 +698,6 @@
                 "searching": "Searching public avatars...",
                 "retry_btn": "Retry",
                 "empty_guide_title": "Search Public VRChat Avatars",
-                "empty_guide_desc": "Search public avatars by avatar ID (avtr_...), VRChat link, author name, author ID (usr_...), or avatar name. Click any card to open the full avatar detail dialog.",
                 "empty_filtered_page": "No avatars matched your current filter on this page. Click Next to keep searching.",
                 "result_summary": "Showing {count} public avatars (Page {page})",
                 "click_card_hint": "Click a card to view avatar details",

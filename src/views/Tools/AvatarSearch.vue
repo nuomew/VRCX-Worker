@@ -83,9 +83,6 @@
                 <div class="text-sm font-medium text-foreground">
                     {{ t('view.tools.avatar.empty_guide_title') }}
                 </div>
-                <p class="max-w-lg text-xs text-muted-foreground leading-relaxed">
-                    {{ t('view.tools.avatar.empty_guide_desc') }}
-                </p>
             </div>
 
             <!-- Loading State -->

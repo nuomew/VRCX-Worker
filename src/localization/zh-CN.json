@@ -698,7 +698,6 @@
                 "searching": "正在查询公开模型...",
                 "retry_btn": "重试",
                 "empty_guide_title": "查询公开 VRChat 模型",
-                "empty_guide_desc": "支持按模型 ID（avtr_...）、VRChat 链接、作者名字、作者 ID（usr_...）或模型名称查询公开模型，点击结果卡片可查看完整模型详情。",
                 "empty_filtered_page": "当前筛选条件下本页暂无匹配模型，可点击「下一页」继续查找。",
                 "result_summary": "本页共 {count} 个公开模型（第 {page} 页）",
                 "click_card_hint": "点击模型卡片查看完整详情",
