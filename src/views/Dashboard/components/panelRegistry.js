@@ -8,7 +8,10 @@ import FriendList from '../../FriendList/FriendList.vue';
 import FriendLog from '../../FriendLog/FriendLog.vue';
 import FriendsLocations from '../../FriendsLocations/FriendsLocations.vue';
 import GameLog from '../../GameLog/GameLog.vue';
+import HotWorlds from '../../Charts/components/HotWorlds.vue';
+import InstanceActivity from '../../Charts/components/InstanceActivity.vue';
 import Moderation from '../../Moderation/Moderation.vue';
+import MutualFriends from '../../Charts/components/MutualFriends.vue';
 import MyAvatars from '../../MyAvatars/MyAvatars.vue';
 import Notification from '../../Notifications/Notification.vue';
 import PlayerList from '../../PlayerList/PlayerList.vue';
@@ -29,9 +32,9 @@ export const panelComponentMap = {
     moderation: Moderation,
     notification: Notification,
     'my-avatars': MyAvatars,
-    'charts-instance': defineAsyncComponent(() => import('../../Charts/components/InstanceActivity.vue')),
-    'charts-mutual': defineAsyncComponent(() => import('../../Charts/components/MutualFriends.vue')),
-    'charts-hot-worlds': defineAsyncComponent(() => import('../../Charts/components/HotWorlds.vue')),
+    'charts-instance': InstanceActivity,
+    'charts-mutual': MutualFriends,
+    'charts-hot-worlds': HotWorlds,
     tools: Tools,
     'widget:feed': defineAsyncComponent(() => import('../widgets/FeedWidget.vue')),
     'widget:game-log': defineAsyncComponent(() => import('../widgets/GameLogWidget.vue')),

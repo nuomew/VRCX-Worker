@@ -14,10 +14,13 @@ import FriendsLocations from './../views/FriendsLocations/FriendsLocations.vue';
 import Dashboard from './../views/Dashboard/Dashboard.vue';
 import Gallery from './../views/Tools/Gallery.vue';
 import GameLog from './../views/GameLog/GameLog.vue';
+import HotWorlds from './../views/Charts/components/HotWorlds.vue';
+import InstanceActivity from './../views/Charts/components/InstanceActivity.vue';
 import Login from './../views/Login/Login.vue';
 import MainLayout from '../views/Layout/MainLayout.vue';
 import Blacklist from './../views/Moderation/Blacklist.vue';
 import Moderation from './../views/Moderation/Moderation.vue';
+import MutualFriends from './../views/Charts/components/MutualFriends.vue';
 import MyAvatars from './../views/MyAvatars/MyAvatars.vue';
 import Notification from './../views/Notifications/Notification.vue';
 import PlayerList from './../views/PlayerList/PlayerList.vue';
@@ -109,17 +112,17 @@ const routes = [
             {
                 path: 'charts/instance',
                 name: 'charts-instance',
-                component: () => import('./../views/Charts/components/InstanceActivity.vue')
+                component: InstanceActivity
             },
             {
                 path: 'charts/mutual',
                 name: 'charts-mutual',
-                component: () => import('./../views/Charts/components/MutualFriends.vue')
+                component: MutualFriends
             },
             {
                 path: 'charts/hot-worlds',
                 name: 'charts-hot-worlds',
-                component: () => import('./../views/Charts/components/HotWorlds.vue')
+                component: HotWorlds
             },
             { path: 'tools', name: 'tools', component: Tools },
             {
@@ -168,9 +171,78 @@ export const router = createRouter({
     routes
 });
 
+const CHUNK_RELOAD_GUARD_KEY = 'vrcx:chunk-reload-guard';
+const CHUNK_RELOAD_COOLDOWN_MS = 15000;
+
+/**
+ * Detects stale hashed dynamic chunk load errors after a new Web deployment.
+ *
+ * @param {unknown} error
+ * @returns {boolean}
+ */
+export function isChunkLoadError(error) {
+    const message = String(error?.message || error || '');
+    return (
+        message.includes('Failed to fetch dynamically imported module') ||
+        message.includes('Importing a module script failed') ||
+        message.includes('error loading dynamically imported module') ||
+        message.includes('Unable to preload CSS')
+    );
+}
+
+/**
+ * Reloads once with a short cooldown when a stale async chunk fails to load,
+ * preventing silent dead clicks after Cloudflare Workers redeploys.
+ *
+ * @param {string} [targetFullPath]
+ * @returns {boolean}
+ */
+export function recoverFromChunkLoadError(targetFullPath = '') {
+    if (typeof window === 'undefined') {
+        return false;
+    }
+    try {
+        const now = Date.now();
+        const raw = window.sessionStorage?.getItem(CHUNK_RELOAD_GUARD_KEY);
+        if (raw) {
+            const prev = JSON.parse(raw);
+            if (prev && now - Number(prev.ts || 0) < CHUNK_RELOAD_COOLDOWN_MS) {
+                return false;
+            }
+        }
+        window.sessionStorage?.setItem(CHUNK_RELOAD_GUARD_KEY, JSON.stringify({ ts: now, path: targetFullPath }));
+    } catch {
+        // Ignore storage restrictions and still attempt reload once.
+    }
+    if (targetFullPath && typeof window.location?.hash === 'string') {
+        const nextHash = targetFullPath.startsWith('#') ? targetFullPath : `#${targetFullPath}`;
+        if (window.location.hash !== nextHash) {
+            window.location.hash = nextHash;
+        }
+    }
+    window.location.reload();
+    return true;
+}
+
+let preloadErrorListenerAttached = false;
+
 export function initRouter(app) {
     app.use(router);
+    if (!preloadErrorListenerAttached && typeof window !== 'undefined') {
+        preloadErrorListenerAttached = true;
+        window.addEventListener('vite:preloadError', (event) => {
+            if (recoverFromChunkLoadError()) {
+                event.preventDefault();
+            }
+        });
+    }
 }
+
+router.onError((error, to) => {
+    if (isChunkLoadError(error)) {
+        recoverFromChunkLoadError(to?.fullPath || '');
+    }
+});
 
 router.beforeEach((to) => {
     if (to.path === '/social') {
