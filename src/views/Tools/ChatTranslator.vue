@@ -221,7 +221,7 @@
         <!-- Chat & Sync Conversation Feed -->
         <div
             ref="messageListRef"
-            class="flex-1 overflow-y-auto min-h-0 rounded-lg border border-border bg-card/30 p-3 space-y-2.5">
+            class="flex-1 overflow-y-auto min-h-0 rounded-xl border border-border/80 bg-muted/15 px-4 py-3.5 space-y-3">
             <!-- Initial Empty Guide + Quick Phrases -->
             <div
                 v-if="messages.length === 0 && !loadingMessages"
@@ -249,113 +249,123 @@
                 </div>
             </div>
 
-            <!-- Message Cards -->
+            <!-- Message Bubbles -->
             <div
                 v-for="msg in messages"
                 :key="msg.id"
-                class="flex"
-                :class="msg.direction === 'web_to_vrc' ? 'justify-end' : 'justify-start'">
+                class="group flex flex-col gap-1"
+                :class="msg.direction === 'web_to_vrc' ? 'items-end' : 'items-start'">
                 <div
-                    class="w-full max-w-[82%] rounded-xl border px-3.5 py-2.5 shadow-xs space-y-1.5"
-                    :class="
-                        msg.direction === 'web_to_vrc'
-                            ? 'border-primary/30 bg-primary/8'
-                            : 'border-border bg-card'
-                    ">
-                    <!-- Top Meta Row -->
-                    <div class="flex items-center justify-between gap-2 flex-wrap text-[11px] text-muted-foreground">
-                        <div class="flex items-center gap-1.5 flex-wrap">
-                            <Badge variant="secondary" class="text-[10px] font-normal px-1.5 py-0">
-                                {{
-                                    msg.direction === 'web_to_vrc'
-                                        ? t('view.tools.chat_translator.dir_web_to_vrc')
-                                        : t('view.tools.chat_translator.dir_desktop_sync')
-                                }}
-                            </Badge>
-                            <span v-if="msg.targetLang" class="font-mono text-[10px]">
-                                {{ getChatLanguageLabel(msg.sourceLang, t('view.tools.chat_translator.lang_auto')) }}
-                                →
-                                {{ getChatLanguageLabel(msg.targetLang) }}
-                            </span>
-                            <span class="font-mono text-[10px] opacity-80">
-                                OSC :{{ msg.oscPort || 9000 }}
-                            </span>
-                        </div>
-                        <div class="flex items-center gap-1.5">
-                            <span
-                                class="inline-flex items-center gap-1 rounded-full px-1.5 py-0.5 text-[10px] font-medium"
-                                :class="statusBadgeClass(msg.status)"
-                                :title="msg.errorMessage || ''">
-                                {{ statusBadgeLabel(msg.status) }}
-                            </span>
-                            <span class="tabular-nums opacity-80">{{ formatClock(msg.createdAt) }}</span>
-                        </div>
-                    </div>
-
-                    <!-- Primary Displayed Text -->
-                    <div class="text-sm text-foreground whitespace-pre-wrap break-words leading-relaxed">
-                        {{ msg.sentText || msg.translatedText || msg.sourceText }}
-                    </div>
-
-                    <!-- Secondary Parallel Source / Translation Line -->
+                    class="flex items-end gap-1.5 max-w-[88%] sm:max-w-[76%]"
+                    :class="msg.direction === 'web_to_vrc' ? 'flex-row' : 'flex-row-reverse'">
+                    <!-- Floating Compact Action Pill (appears on hover/focus on desktop) -->
                     <div
-                        v-if="showSecondarySource(msg)"
-                        class="text-xs text-muted-foreground whitespace-pre-wrap break-words border-t border-border/50 pt-1.5">
-                        <span class="font-medium mr-1">{{ t('view.tools.chat_translator.source_prefix') }}</span>
-                        {{ msg.sourceText }}
-                    </div>
-                    <div
-                        v-else-if="showSecondaryTranslation(msg)"
-                        class="text-xs text-primary whitespace-pre-wrap break-words border-t border-border/50 pt-1.5">
-                        <span class="font-medium mr-1">{{ t('view.tools.chat_translator.translated_prefix') }}</span>
-                        {{ msg.translatedText }}
-                    </div>
-
-                    <!-- Delivery Error Details -->
-                    <div v-if="msg.errorMessage" class="text-[11px] text-destructive">
-                        {{ msg.errorMessage }}
-                    </div>
-
-                    <!-- Per-Message Quick Actions -->
-                    <div class="flex items-center justify-end gap-1 pt-0.5">
-                        <Button
-                            size="sm"
-                            variant="ghost"
-                            class="h-6 px-2 text-[11px]"
+                        class="shrink-0 inline-flex items-center gap-0.5 rounded-full border border-border/70 bg-background/95 p-0.5 shadow-xs transition-opacity duration-150 sm:opacity-0 sm:group-hover:opacity-100 sm:group-focus-within:opacity-100">
+                        <button
+                            type="button"
+                            class="size-6 inline-flex items-center justify-center rounded-full text-muted-foreground hover:text-foreground hover:bg-muted transition-colors disabled:opacity-40"
                             :disabled="translatingIds.has(msg.id)"
+                            :title="t('view.tools.chat_translator.action_translate')"
+                            :aria-label="t('view.tools.chat_translator.action_translate')"
                             @click="translateExistingMessage(msg)">
                             <Spinner v-if="translatingIds.has(msg.id)" class="size-3" />
-                            <Languages v-else class="size-3" />
-                            <span>{{ t('view.tools.chat_translator.action_translate') }}</span>
-                        </Button>
-                        <Button
+                            <Languages v-else class="size-3.5" />
+                        </button>
+                        <button
                             v-if="isWebMode"
-                            size="sm"
-                            variant="ghost"
-                            class="h-6 px-2 text-[11px]"
+                            type="button"
+                            class="size-6 inline-flex items-center justify-center rounded-full text-muted-foreground hover:text-foreground hover:bg-muted transition-colors disabled:opacity-40"
                             :disabled="sending"
+                            :title="t('view.tools.chat_translator.action_resend')"
+                            :aria-label="t('view.tools.chat_translator.action_resend')"
                             @click="resendMessageToVrc(msg)">
-                            <Send class="size-3" />
-                            <span>{{ t('view.tools.chat_translator.action_resend') }}</span>
-                        </Button>
-                        <Button
-                            size="sm"
-                            variant="ghost"
-                            class="h-6 px-2 text-[11px]"
+                            <RotateCw class="size-3.5" />
+                        </button>
+                        <button
+                            type="button"
+                            class="size-6 inline-flex items-center justify-center rounded-full text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
+                            :title="t('view.tools.chat_translator.action_copy')"
+                            :aria-label="t('view.tools.chat_translator.action_copy')"
                             @click="copyMessageText(msg)">
-                            <Copy class="size-3" />
-                            <span>{{ t('view.tools.chat_translator.action_copy') }}</span>
-                        </Button>
-                        <Button
-                            size="sm"
-                            variant="ghost"
-                            class="h-6 px-1.5 text-[11px] text-muted-foreground hover:text-destructive"
+                            <Copy class="size-3.5" />
+                        </button>
+                        <button
+                            type="button"
+                            class="size-6 inline-flex items-center justify-center rounded-full text-muted-foreground hover:text-destructive hover:bg-destructive/10 transition-colors"
                             :title="t('view.tools.chat_translator.action_delete')"
-                            :ariaLabel="t('view.tools.chat_translator.action_delete')"
+                            :aria-label="t('view.tools.chat_translator.action_delete')"
                             @click="deleteSingleMessage(msg.id)">
-                            <X class="size-3" />
-                        </Button>
+                            <X class="size-3.5" />
+                        </button>
                     </div>
+
+                    <!-- Adaptive Chat Bubble -->
+                    <div
+                        class="w-fit min-w-0 max-w-full border px-3.5 py-2 shadow-xs transition-colors"
+                        :class="bubbleContainerClass(msg)">
+                        <!-- Primary Displayed Text -->
+                        <div class="text-[14px] text-foreground whitespace-pre-wrap [overflow-wrap:anywhere] leading-relaxed">
+                            {{ msg.sentText || msg.translatedText || msg.sourceText }}
+                        </div>
+
+                        <!-- Secondary Parallel Source / Translation Line -->
+                        <div
+                            v-if="showSecondarySource(msg)"
+                            class="mt-1.5 pt-1.5 border-t border-foreground/10 text-xs text-muted-foreground whitespace-pre-wrap break-words leading-relaxed">
+                            <span class="opacity-75 mr-1">{{ t('view.tools.chat_translator.source_prefix') }}</span>
+                            <span>{{ msg.sourceText }}</span>
+                        </div>
+                        <div
+                            v-else-if="showSecondaryTranslation(msg)"
+                            class="mt-1.5 pt-1.5 border-t border-foreground/10 text-xs text-primary whitespace-pre-wrap break-words leading-relaxed">
+                            <span
+                                v-if="msg.targetLang"
+                                class="inline-block mr-1.5 rounded bg-primary/12 px-1 py-0.5 text-[10px] font-medium align-baseline">
+                                {{ getChatLanguageLabel(msg.targetLang) }}
+                            </span>
+                            <span>{{ msg.translatedText }}</span>
+                        </div>
+
+                        <!-- Delivery Error Details -->
+                        <div
+                            v-if="msg.errorMessage"
+                            class="mt-1.5 pt-1.5 border-t border-destructive/20 flex items-center gap-1.5 text-[11px] text-destructive">
+                            <AlertCircle class="size-3 shrink-0" />
+                            <span class="break-words">{{ msg.errorMessage }}</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Compact Subtle Meta Footer (outside bubble) -->
+                <div
+                    class="flex items-center gap-1.5 px-1 text-[11px] text-muted-foreground/80 select-none"
+                    :class="msg.direction === 'web_to_vrc' ? 'flex-row-reverse' : 'flex-row'"
+                    :title="formatMessageMetaTooltip(msg)">
+                    <span
+                        class="inline-flex items-center gap-1 font-medium"
+                        :class="statusTextClass(msg.status)">
+                        <CheckCheck v-if="msg.status === 'sent'" class="size-3" />
+                        <Check v-else-if="msg.status === 'dispatched'" class="size-3" />
+                        <Monitor v-else-if="msg.status === 'synced'" class="size-3" />
+                        <AlertCircle v-else-if="msg.status === 'failed'" class="size-3" />
+                        <Clock v-else class="size-3" />
+                        <span>{{ statusBadgeLabel(msg.status) }}</span>
+                    </span>
+
+                    <span class="opacity-40">·</span>
+                    <span class="tabular-nums opacity-80">{{ formatClockShort(msg.createdAt) }}</span>
+
+                    <template v-if="msg.targetLang">
+                        <span class="opacity-40">·</span>
+                        <span class="text-[10px] opacity-80">
+                            {{ getChatLanguageLabel(msg.targetLang) }}
+                        </span>
+                    </template>
+
+                    <template v-if="msg.oscPort && msg.oscPort !== DEFAULT_OSC_SEND_PORT">
+                        <span class="opacity-40">·</span>
+                        <span class="font-mono text-[10px] opacity-75">:{{ msg.oscPort }}</span>
+                    </template>
                 </div>
             </div>
         </div>
@@ -632,12 +642,18 @@
 
 <script setup>
     import {
+        AlertCircle,
         ArrowLeft,
         ArrowLeftRight,
+        Check,
+        CheckCheck,
+        Clock,
         Copy,
         Languages,
         MessageSquareText,
+        Monitor,
         RefreshCw,
+        RotateCw,
         Send,
         SlidersHorizontal,
         Trash2,
@@ -1310,20 +1326,32 @@
         return primary !== msg.translatedText && !primary.includes(msg.translatedText);
     }
 
-    function statusBadgeClass(status) {
+    function bubbleContainerClass(msg) {
+        if (msg?.status === 'failed') {
+            return msg.direction === 'web_to_vrc'
+                ? 'rounded-2xl rounded-br-sm border-destructive/45 bg-destructive/10'
+                : 'rounded-2xl rounded-bl-sm border-destructive/45 bg-destructive/10';
+        }
+        if (msg?.direction === 'web_to_vrc') {
+            return 'rounded-2xl rounded-br-sm border-primary/25 bg-primary/12 dark:bg-primary/15';
+        }
+        return 'rounded-2xl rounded-bl-sm border-border/80 bg-card';
+    }
+
+    function statusTextClass(status) {
         if (status === 'sent') {
-            return 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400';
+            return 'text-emerald-600 dark:text-emerald-400';
         }
         if (status === 'synced') {
-            return 'bg-sky-500/15 text-sky-600 dark:text-sky-400';
+            return 'text-sky-600 dark:text-sky-400';
         }
         if (status === 'dispatched') {
-            return 'bg-indigo-500/15 text-indigo-600 dark:text-indigo-400';
+            return 'text-indigo-600 dark:text-indigo-400';
         }
         if (status === 'failed') {
-            return 'bg-destructive/15 text-destructive';
+            return 'text-destructive';
         }
-        return 'bg-amber-500/15 text-amber-600 dark:text-amber-400';
+        return 'text-amber-600 dark:text-amber-400';
     }
 
     function statusBadgeLabel(status) {
@@ -1334,11 +1362,37 @@
         return t('view.tools.chat_translator.status_queued');
     }
 
-    function formatClock(iso) {
+    function formatClockShort(iso) {
+        if (!iso) return '';
+        const dt = new Date(iso);
+        if (Number.isNaN(dt.getTime())) return '';
+        return dt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    }
+
+    function formatClockFull(iso) {
         if (!iso) return '';
         const dt = new Date(iso);
         if (Number.isNaN(dt.getTime())) return '';
         return dt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    }
+
+    function formatMessageMetaTooltip(msg) {
+        const parts = [];
+        parts.push(
+            msg.direction === 'web_to_vrc'
+                ? t('view.tools.chat_translator.dir_web_to_vrc')
+                : t('view.tools.chat_translator.dir_desktop_sync')
+        );
+        if (msg.targetLang) {
+            parts.push(
+                `${getChatLanguageLabel(msg.sourceLang, t('view.tools.chat_translator.lang_auto'))} → ${getChatLanguageLabel(msg.targetLang)}`
+            );
+        }
+        parts.push(`OSC :${msg.oscPort || DEFAULT_OSC_SEND_PORT}`);
+        const fullClock = formatClockFull(msg.createdAt);
+        if (fullClock) parts.push(fullClock);
+        if (msg.errorMessage) parts.push(msg.errorMessage);
+        return parts.join(' · ');
     }
 
     function applyChatAgentStatusEvent(payload) {
