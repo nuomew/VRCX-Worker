@@ -3943,20 +3943,17 @@
             "cleared_toast": "已清空独立库 DB_LEGACY 中的所有老数据。",
             "export_section_title": "云端数据导出",
             "export_title": "导出云端数据为 ZIP 压缩包",
-            "export_desc": "将云端备注、收藏、好友变更、通知、游戏日志、动态与安全偏好一键打包为 ZIP 归档（含结构化 JSON 备份与适配原版桌面 VRCX 的 SQLite 还原脚本，不含密码、Cookie 或密钥）。",
             "export_btn": "导出云端数据 (.zip)",
             "exporting_btn": "正在导出...",
             "export_cancel_btn": "取消导出",
             "export_include_legacy_label": "同时合并独立老库（DB_LEGACY）中的历史数据",
             "export_account_prefix_label": "桌面账号前缀：",
             "export_account_prefix_placeholder": "自动识别（如 usr1a2b3c...）",
-            "export_account_prefix_hint": "用于生成原版桌面 VRCX 账号分表（已自动识别时无需修改）",
             "export_summary_loaded": "云端现网 {active} 条 · 独立老库 {legacy} 条",
             "export_progress_table": "正在拉取 {table}...（已拉取 {processed} / {total} 条）",
             "export_packaging": "正在打包 ZIP 文件...",
             "export_done_toast": "导出完成：共 {rows} 条数据，已保存为 {file}。",
-            "export_cancelled_toast": "已取消云端数据导出。",
-            "export_agent_tip": "提示：如需一键直接导出原版桌面可用的 VRCX.sqlite3 数据库文件，可在电脑右下角右键点击 VRCX.Agent（v1.12.1+）选择「导出数据」。"
+            "export_cancelled_toast": "已取消云端数据导出。"
         }
     }
 }

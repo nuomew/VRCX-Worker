@@ -1,8 +1,6 @@
 <template>
     <div class="space-y-3 text-xs">
-        <SettingsItem
-            :label="t('cloud_hub.migration.export_title')"
-            :description="t('cloud_hub.migration.export_desc')">
+        <SettingsItem :label="t('cloud_hub.migration.export_title')">
             <div class="flex flex-wrap items-center gap-2">
                 <Button size="sm" :disabled="exporting" @click="startZipExport">
                     {{
@@ -54,9 +52,6 @@
                     :disabled="exporting"
                     :placeholder="t('cloud_hub.migration.export_account_prefix_placeholder')"
                     class="w-64 rounded-md border border-input bg-background px-2.5 py-1 font-mono text-xs text-foreground" />
-                <span class="text-[11px] text-muted-foreground">
-                    {{ t('cloud_hub.migration.export_account_prefix_hint') }}
-                </span>
             </div>
 
             <div v-if="exporting" class="space-y-1.5 pt-1">
@@ -80,10 +75,6 @@
                     </template>
                 </div>
             </div>
-
-            <p class="text-[11px] text-muted-foreground leading-relaxed">
-                {{ t('cloud_hub.migration.export_agent_tip') }}
-            </p>
 
             <p v-if="exportError" class="text-[11px] text-destructive">{{ exportError }}</p>
         </div>

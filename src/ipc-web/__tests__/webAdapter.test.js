@@ -2825,7 +2825,7 @@ describe('WEB cloud adapter (stateless)', () => {
                 .filter((k) => k.startsWith('export'))
                 .sort();
         const enExportKeys = exportKeys(enJson);
-        expect(enExportKeys.length).toBeGreaterThanOrEqual(16);
+        expect(enExportKeys.length).toBeGreaterThanOrEqual(13);
         expect(exportKeys(zhCnJson)).toEqual(enExportKeys);
         expect(exportKeys(zhTwJson)).toEqual(enExportKeys);
     });
