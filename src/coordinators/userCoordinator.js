@@ -514,7 +514,8 @@ export function showUserDialog(userId) {
                 if (locationStore.lastLocation.playerList.has(D.ref.id)) {
                     inCurrentWorld = true;
                 }
-                if (userId !== currentUser.id && watchState.isFriendsLoaded) {
+                const isWebModeDialog = typeof WEB !== 'undefined' && WEB;
+                if (userId !== currentUser.id && (watchState.isFriendsLoaded || isWebModeDialog)) {
                     database.getUserStats(D.ref, inCurrentWorld).then(async (ref1) => {
                         if (ref1.userId === D.id) {
                             D.lastSeen = ref1.lastSeen;

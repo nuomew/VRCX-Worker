@@ -390,30 +390,36 @@ function fetchWorldStatsCached(worldId) {
     return req;
 }
 
-function fetchUserStatsCached(userId) {
+function fetchUserStatsCached(userId, displayName = '') {
     const empty = { joinCount: 0, timeSpent: 0, lastSeen: '', instances: [], recentEvents: [] };
     if (!userId) return Promise.resolve(empty);
-    const cached = userStatsCache.get(userId);
+    const cleanName = typeof displayName === 'string' ? displayName.trim() : '';
+    const cacheKey = cleanName ? `${userId}|${cleanName}` : userId;
+    const cached = userStatsCache.get(cacheKey);
     if (cached && cached.expiresAt > Date.now()) {
         return Promise.resolve(cached.data);
     }
-    const existing = userStatsInflight.get(userId);
+    const existing = userStatsInflight.get(cacheKey);
     if (existing) return existing;
-    const req = cloudFetch(`/api/gamelog/stats?kind=user&userId=${encodeURIComponent(userId)}`)
+    const params = new URLSearchParams({ kind: 'user', userId });
+    if (cleanName) {
+        params.set('displayName', cleanName);
+    }
+    const req = cloudFetch(`/api/gamelog/stats?${params.toString()}`)
         .then((data) => {
             const safe = data || empty;
             if (userStatsCache.size >= 200) {
                 const firstKey = userStatsCache.keys().next().value;
                 if (firstKey !== undefined) userStatsCache.delete(firstKey);
             }
-            userStatsCache.set(userId, { expiresAt: Date.now() + STATS_CACHE_TTL_MS, data: safe });
+            userStatsCache.set(cacheKey, { expiresAt: Date.now() + STATS_CACHE_TTL_MS, data: safe });
             return safe;
         })
         .catch(() => empty)
         .finally(() => {
-            userStatsInflight.delete(userId);
+            userStatsInflight.delete(cacheKey);
         });
-    userStatsInflight.set(userId, req);
+    userStatsInflight.set(cacheKey, req);
     return req;
 }
 
@@ -1731,7 +1737,8 @@ export function createCloudDatabase(dbVars) {
         },
         async getUserStats(input, inCurrentWorld = false) {
             const userId = typeof input === 'string' ? input : input?.id || input?.userId || '';
-            const s = await fetchUserStatsCached(userId);
+            const displayName = typeof input === 'object' && input ? input.displayName || '' : '';
+            const s = await fetchUserStatsCached(userId, displayName);
             const prevNames = new Map();
             if (Array.isArray(s.previousDisplayNames)) {
                 for (const pair of s.previousDisplayNames) {

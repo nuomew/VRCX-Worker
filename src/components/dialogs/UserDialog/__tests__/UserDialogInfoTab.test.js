@@ -209,7 +209,9 @@ function mountComponent(overrides = {}) {
             stubs: {
                 Location: true,
                 Timer: true,
-                TooltipWrapper: true,
+                TooltipWrapper: {
+                    template: '<div class="tooltip-wrapper-stub"><slot /></div>'
+                },
                 AvatarInfo: true
             }
         }
@@ -241,6 +243,66 @@ describe('UserDialogInfoTab.vue', () => {
 
             expect(wrapper.find('instance-action-bar-stub').exists()).toBe(true);
             expect(wrapper.find('spinner-stub').exists()).toBe(true);
+        });
+
+        test('hides empty local-log stat rows in Web mode while keeping online duration and any populated cloud/migrated stats', () => {
+            vi.stubGlobal('WEB', true);
+            try {
+                const emptyLocalWrapper = mountComponent({
+                    userDialog: {
+                        lastSeen: '',
+                        dateFriended: '',
+                        timeSpent: 0,
+                        joinCount: 0
+                    }
+                });
+                const cardHtml = emptyLocalWrapper.find('[data-vrcx-info-card]').html();
+                expect(emptyLocalWrapper.find('[data-vrcx-info-card]').exists()).toBe(true);
+                expect(cardHtml).toContain('dialog.user.info.online_for');
+                expect(cardHtml).not.toContain('dialog.user.info.last_seen');
+                expect(cardHtml).not.toContain('dialog.user.info.friended');
+                expect(cardHtml).not.toContain('dialog.user.info.time_together');
+                expect(cardHtml).not.toContain('dialog.user.info.join_count');
+
+                const populatedWrapper = mountComponent({
+                    userDialog: {
+                        lastSeen: '2026-11-26T10:00:00.000Z',
+                        dateFriended: '2026-10-01T10:00:00.000Z',
+                        timeSpent: 7200000,
+                        joinCount: 4
+                    }
+                });
+                const populatedHtml = populatedWrapper.find('[data-vrcx-info-card]').html();
+                expect(populatedHtml).toContain('dialog.user.info.online_for');
+                expect(populatedHtml).toContain('dialog.user.info.last_seen');
+                expect(populatedHtml).toContain('dialog.user.info.friended');
+                expect(populatedHtml).toContain('dialog.user.info.time_together');
+                expect(populatedHtml).toContain('dialog.user.info.join_count');
+
+                const allEmptyWrapper = mountComponent({
+                    userDialog: {
+                        ref: {
+                            id: 'usr_target',
+                            state: 'offline',
+                            $online_for: 0,
+                            $offline_for: 0,
+                            $active_for: 0,
+                            last_login: '2026-11-25T00:00:00.000Z',
+                            last_activity: '2026-11-25T00:00:00.000Z',
+                            date_joined: '2020-01-01',
+                            allowAvatarCopying: true,
+                            displayName: 'OfflineTarget'
+                        },
+                        lastSeen: '',
+                        dateFriended: '',
+                        timeSpent: 0,
+                        joinCount: 0
+                    }
+                });
+                expect(allEmptyWrapper.find('[data-vrcx-info-card]').exists()).toBe(false);
+            } finally {
+                vi.unstubAllGlobals();
+            }
         });
     });
 });

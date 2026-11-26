@@ -8230,5 +8230,55 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
         };
         expect(statsOfflineJson.data.lastPresenceType).toBe('Offline');
         expect(statsOfflineJson.data.lastPresenceAt).toBe('2026-11-26T06:00:00.000Z');
+
+        // 5. /api/gamelog/stats?kind=user and /api/gamelog/stats/users merge DB_LEGACY gamelog rows + displayName fallback
+        if (env.DB_LEGACY) {
+            await env.DB_LEGACY.batch([
+                env.DB_LEGACY.prepare(
+                    `INSERT INTO gamelog_join_leave (created_at, type, display_name, location, user_id, time)
+                     VALUES ('2025-12-01T10:00:00.000Z', 'OnPlayerJoined', 'ArcLegacyName', 'wrld_legacy_1:100', 'usr_pres_legacy', 1800000)`
+                ),
+                env.DB_LEGACY.prepare(
+                    `INSERT INTO gamelog_join_leave (created_at, type, display_name, location, user_id, time)
+                     VALUES ('2025-12-02T11:00:00.000Z', 'OnPlayerJoined', 'ArcLegacyName', 'wrld_legacy_2:200', '', 900000)`
+                ),
+                env.DB_LEGACY.prepare(
+                    `INSERT OR REPLACE INTO legacy_migration_state (state_key, payload_json, updated_at)
+                     VALUES ('imported_stats', ?, '2026-11-26T09:00:00.000Z')`
+                ).bind(JSON.stringify({ gamelog: 2 }))
+            ]);
+
+            const mergedUserStatsRes = await exports.default.fetch(
+                'http://example.com/api/gamelog/stats?kind=user&userId=usr_pres_legacy&displayName=ArcLegacyName'
+            );
+            expect(mergedUserStatsRes.status).toBe(200);
+            const mergedUserStatsJson = (await mergedUserStatsRes.json()) as {
+                data: { joinCount: number; timeSpent: number; lastSeen: string };
+            };
+            expect(mergedUserStatsJson.data.joinCount).toBe(2);
+            expect(mergedUserStatsJson.data.timeSpent).toBe(2700000);
+            expect(mergedUserStatsJson.data.lastSeen).toBe('2025-12-02T11:00:00.000Z');
+
+            const batchUsersStatsRes = await exports.default.fetch('http://example.com/api/gamelog/stats/users', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ userIds: ['usr_pres_legacy'] })
+            });
+            expect(batchUsersStatsRes.status).toBe(200);
+            const batchUsersStatsJson = (await batchUsersStatsRes.json()) as {
+                data: Array<{ userId: string; joinCount: number; timeSpent: number; lastSeen: string }>;
+            };
+            expect(batchUsersStatsJson.data[0]).toMatchObject({
+                userId: 'usr_pres_legacy',
+                joinCount: 1,
+                timeSpent: 1800000,
+                lastSeen: '2025-12-01T10:00:00.000Z'
+            });
+
+            await env.DB_LEGACY.batch([
+                env.DB_LEGACY.prepare("DELETE FROM gamelog_join_leave WHERE display_name = 'ArcLegacyName'"),
+                env.DB_LEGACY.prepare("DELETE FROM legacy_migration_state WHERE state_key = 'imported_stats'")
+            ]);
+        }
     });
 });

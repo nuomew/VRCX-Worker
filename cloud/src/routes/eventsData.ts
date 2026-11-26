@@ -1305,28 +1305,34 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
         if (userIds.length === 0) {
             return Response.json({ ok: true, data: [] });
         }
-        const out: Array<{
-            lastSeen: string;
-            userId: string;
-            timeSpent: number;
-            joinCount: number;
-            displayName: string;
-        }> = [];
-        // Chunk <= 40 per query to stay strictly below D1's 100 bind-parameter ceiling
-        for (let i = 0; i < userIds.length; i += 40) {
-            const chunk = userIds.slice(i, i + 40);
+        const legacyDb = getLegacyDb(env);
+        const legacyStats = legacyDb ? await getLegacyImportedStats(env) : null;
+        const hasLegacyGamelog = Boolean(legacyDb && (legacyStats?.gamelog ?? 0) > 0);
+        const mergedByUser = new Map<
+            string,
+            {
+                lastSeen: string;
+                userId: string;
+                timeSpent: number;
+                joinCount: number;
+                displayName: string;
+            }
+        >();
+
+        const queryUserStatsChunk = async (db: D1Database, chunk: string[]) => {
             const ph = chunk.map(() => '?').join(', ');
-            const res = await env.DB_GAMELOG.prepare(
-                `SELECT
-                    MAX(created_at) AS last_seen,
-                    user_id,
-                    COALESCE(SUM(time), 0) AS time_spent,
-                    COUNT(DISTINCT CASE WHEN location != '' THEN location END) AS join_count,
-                    MAX(display_name) AS display_name
-                 FROM gamelog_join_leave
-                 WHERE user_id IN (${ph})
-                 GROUP BY user_id`
-            )
+            const res = await db
+                .prepare(
+                    `SELECT
+                        MAX(created_at) AS last_seen,
+                        user_id,
+                        COALESCE(SUM(time), 0) AS time_spent,
+                        COUNT(DISTINCT CASE WHEN location != '' THEN location END) AS join_count,
+                        MAX(display_name) AS display_name
+                     FROM gamelog_join_leave
+                     WHERE user_id IN (${ph})
+                     GROUP BY user_id`
+                )
                 .bind(...chunk)
                 .all<{
                     last_seen: string;
@@ -1335,17 +1341,53 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
                     join_count: number;
                     display_name: string;
                 }>();
-            for (const r of res.results ?? []) {
-                out.push({
+            return res.results ?? [];
+        };
+
+        // Chunk <= 40 per query to stay strictly below D1's 100 bind-parameter ceiling
+        for (let i = 0; i < userIds.length; i += 40) {
+            const chunk = userIds.slice(i, i + 40);
+            const [activeRows, legacyRows] = await Promise.all([
+                queryUserStatsChunk(env.DB_GAMELOG, chunk),
+                hasLegacyGamelog && legacyDb ? queryUserStatsChunk(legacyDb, chunk).catch(() => []) : Promise.resolve([])
+            ]);
+            for (const r of activeRows) {
+                const uid = r.user_id || '';
+                if (!uid) continue;
+                mergedByUser.set(uid, {
                     lastSeen: r.last_seen || '',
-                    userId: r.user_id || '',
+                    userId: uid,
                     timeSpent: Number(r.time_spent ?? 0),
                     joinCount: Number(r.join_count ?? 0),
                     displayName: r.display_name || ''
                 });
             }
+            for (const r of legacyRows) {
+                const uid = r.user_id || '';
+                if (!uid) continue;
+                const prev = mergedByUser.get(uid);
+                if (!prev) {
+                    mergedByUser.set(uid, {
+                        lastSeen: r.last_seen || '',
+                        userId: uid,
+                        timeSpent: Number(r.time_spent ?? 0),
+                        joinCount: Number(r.join_count ?? 0),
+                        displayName: r.display_name || ''
+                    });
+                } else {
+                    const legacyLast = r.last_seen || '';
+                    if (legacyLast && (!prev.lastSeen || legacyLast > prev.lastSeen)) {
+                        prev.lastSeen = legacyLast;
+                    }
+                    prev.timeSpent += Number(r.time_spent ?? 0);
+                    prev.joinCount += Number(r.join_count ?? 0);
+                    if (!prev.displayName && r.display_name) {
+                        prev.displayName = r.display_name;
+                    }
+                }
+            }
         }
-        return Response.json({ ok: true, data: out });
+        return Response.json({ ok: true, data: Array.from(mergedByUser.values()) });
     }
 
     if (url.pathname === '/api/gamelog/sessions/events' && request.method === 'POST') {
@@ -1524,18 +1566,41 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
         }
 
         if (kind === 'user' && userId) {
-            const [[agg, lastSeen, recent], coreBatch, latestPresenceRow] = await Promise.all([
-                env.DB_GAMELOG.batch([
-                    env.DB_GAMELOG.prepare(
-                        "SELECT COUNT(DISTINCT CASE WHEN location != '' THEN location END) AS joinCount, COALESCE(SUM(time), 0) AS totalTime FROM gamelog_join_leave WHERE user_id = ?"
-                    ).bind(userId),
-                    env.DB_GAMELOG.prepare(
-                        'SELECT created_at, display_name, location FROM gamelog_join_leave WHERE user_id = ? ORDER BY created_at DESC, id DESC LIMIT 10'
-                    ).bind(userId),
-                    env.DB_GAMELOG.prepare(
-                        'SELECT id, created_at, type, display_name, location, user_id, time FROM gamelog_join_leave WHERE user_id = ? ORDER BY created_at DESC, id DESC LIMIT ?'
-                    ).bind(userId, Math.max(limit * 4, 250))
-                ]),
+            const displayNameParam = (url.searchParams.get('displayName') ?? '').trim();
+            const jlWhere = displayNameParam
+                ? "(user_id = ? OR (user_id = '' AND display_name = ?))"
+                : 'user_id = ?';
+            const jlBinds = displayNameParam ? [userId, displayNameParam] : [userId];
+            const recentLimit = Math.max(limit * 4, 250);
+
+            const legacyDb = getLegacyDb(env);
+            const legacyStats = legacyDb ? await getLegacyImportedStats(env) : null;
+            const hasLegacyGamelog = Boolean(legacyDb && (legacyStats?.gamelog ?? 0) > 0);
+
+            const buildUserGamelogBatch = (db: D1Database, negateIds: boolean) =>
+                db.batch([
+                    db
+                        .prepare(
+                            `SELECT COUNT(DISTINCT CASE WHEN location != '' THEN location END) AS joinCount, COALESCE(SUM(time), 0) AS totalTime FROM gamelog_join_leave WHERE ${jlWhere}`
+                        )
+                        .bind(...jlBinds),
+                    db
+                        .prepare(
+                            `SELECT created_at, display_name, location FROM gamelog_join_leave WHERE ${jlWhere} ORDER BY created_at DESC, id DESC LIMIT 10`
+                        )
+                        .bind(...jlBinds),
+                    db
+                        .prepare(
+                            `SELECT ${negateIds ? '-id AS id' : 'id'}, created_at, type, display_name, location, user_id, time FROM gamelog_join_leave WHERE ${jlWhere} ORDER BY created_at DESC, id DESC LIMIT ?`
+                        )
+                        .bind(...jlBinds, recentLimit)
+                ]);
+
+            const [activeGamelogBatch, legacyGamelogBatch, coreBatch, latestPresenceRow] = await Promise.all([
+                buildUserGamelogBatch(env.DB_GAMELOG, false),
+                hasLegacyGamelog && legacyDb
+                    ? buildUserGamelogBatch(legacyDb, true).catch(() => null)
+                    : Promise.resolve(null),
                 env.DB_CORE.batch([
                     env.DB_CORE.prepare(
                         "SELECT created_at, display_name, previous_display_name FROM friend_log_history WHERE user_id = ? AND type = 'DisplayName' ORDER BY created_at DESC, id DESC LIMIT 30"
@@ -1552,12 +1617,25 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
                     .first<{ created_at?: string; type?: string }>()
                     .catch(() => null)
             ]);
-            const aggRow = (agg?.results?.[0] ?? {}) as { joinCount?: number; totalTime?: number };
-            const seenRows = (lastSeen?.results ?? []) as Array<{
+            const [agg, lastSeen, recent] = activeGamelogBatch;
+            const activeAggRow = (agg?.results?.[0] ?? {}) as { joinCount?: number; totalTime?: number };
+            const legacyAggRow = (legacyGamelogBatch?.[0]?.results?.[0] ?? {}) as {
+                joinCount?: number;
+                totalTime?: number;
+            };
+            const activeSeenRows = (lastSeen?.results ?? []) as Array<{
                 created_at?: string;
                 display_name?: string;
                 location?: string;
             }>;
+            const legacySeenRows = (legacyGamelogBatch?.[1]?.results ?? []) as Array<{
+                created_at?: string;
+                display_name?: string;
+                location?: string;
+            }>;
+            const seenRows = [...activeSeenRows, ...legacySeenRows].sort((a, b) =>
+                String(b.created_at ?? '').localeCompare(String(a.created_at ?? ''))
+            );
             const lastRow = seenRows[0] ?? {};
             let secondLastSeen = '';
             if (lastRow.location) {
@@ -1567,19 +1645,77 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
                 if (diffSeenInWindow?.created_at) {
                     secondLastSeen = diffSeenInWindow.created_at;
                 } else {
-                    const olderSeenDiff = await env.DB_GAMELOG.prepare(
-                        "SELECT created_at FROM gamelog_join_leave WHERE user_id = ? AND location != ? AND location != '' ORDER BY created_at DESC, id DESC LIMIT 1"
-                    )
-                        .bind(userId, lastRow.location)
-                        .first<{ created_at?: string }>();
-                    secondLastSeen = olderSeenDiff?.created_at ?? '';
+                    const [activeOlderDiff, legacyOlderDiff] = await Promise.all([
+                        env.DB_GAMELOG.prepare(
+                            `SELECT created_at FROM gamelog_join_leave WHERE ${jlWhere} AND location != ? AND location != '' ORDER BY created_at DESC, id DESC LIMIT 1`
+                        )
+                            .bind(...jlBinds, lastRow.location)
+                            .first<{ created_at?: string }>(),
+                        hasLegacyGamelog && legacyDb
+                            ? legacyDb
+                                  .prepare(
+                                      `SELECT created_at FROM gamelog_join_leave WHERE ${jlWhere} AND location != ? AND location != '' ORDER BY created_at DESC, id DESC LIMIT 1`
+                                  )
+                                  .bind(...jlBinds, lastRow.location)
+                                  .first<{ created_at?: string }>()
+                                  .catch(() => null)
+                            : Promise.resolve(null)
+                    ]);
+                    const candidates = [activeOlderDiff?.created_at ?? '', legacyOlderDiff?.created_at ?? ''].filter(
+                        Boolean
+                    );
+                    candidates.sort((a, b) => b.localeCompare(a));
+                    secondLastSeen = candidates[0] ?? '';
                 }
             }
-            const recentDesc = (recent?.results ?? []) as Array<Record<string, unknown>>;
+            const activeRecent = (recent?.results ?? []) as Array<Record<string, unknown>>;
+            const legacyRecent = (legacyGamelogBatch?.[2]?.results ?? []) as Array<Record<string, unknown>>;
+            const seenRecentKeys = new Set<string>();
+            const recentDesc: Array<Record<string, unknown>> = [];
+            for (const row of [...activeRecent, ...legacyRecent]) {
+                const dedupKey = `${String(row.created_at ?? '')}|${String(row.type ?? '')}|${String(row.location ?? '')}|${String(row.user_id ?? '')}|${String(row.display_name ?? '')}`;
+                if (seenRecentKeys.has(dedupKey)) continue;
+                seenRecentKeys.add(dedupKey);
+                recentDesc.push(row);
+            }
+            recentDesc.sort((a, b) => {
+                const cmp = String(b.created_at ?? '').localeCompare(String(a.created_at ?? ''));
+                return cmp !== 0 ? cmp : Number(b.id ?? 0) - Number(a.id ?? 0);
+            });
             const rawEvents = [...recentDesc].sort((a, b) => {
                 const cmp = String(a.created_at ?? '').localeCompare(String(b.created_at ?? ''));
                 return cmp !== 0 ? cmp : Number(a.id ?? 0) - Number(b.id ?? 0);
             });
+
+            // Deduplicate distinct-location joinCount accurately when both active and legacy shards have rows.
+            let combinedJoinCount = Number(activeAggRow.joinCount ?? 0) + Number(legacyAggRow.joinCount ?? 0);
+            if (Number(activeAggRow.joinCount ?? 0) > 0 && Number(legacyAggRow.joinCount ?? 0) > 0 && legacyDb) {
+                const [activeLocsRes, legacyLocsRes] = await Promise.all([
+                    env.DB_GAMELOG.prepare(
+                        `SELECT DISTINCT location FROM gamelog_join_leave WHERE ${jlWhere} AND location != '' LIMIT 2000`
+                    )
+                        .bind(...jlBinds)
+                        .all<{ location?: string }>(),
+                    legacyDb
+                        .prepare(
+                            `SELECT DISTINCT location FROM gamelog_join_leave WHERE ${jlWhere} AND location != '' LIMIT 2000`
+                        )
+                        .bind(...jlBinds)
+                        .all<{ location?: string }>()
+                        .catch(() => ({ results: [] }))
+                ]);
+                const unionLocs = new Set<string>();
+                for (const r of activeLocsRes.results ?? []) {
+                    if (r.location) unionLocs.add(r.location);
+                }
+                for (const r of legacyLocsRes.results ?? []) {
+                    if (r.location) unionLocs.add(r.location);
+                }
+                if (unionLocs.size > 0) {
+                    combinedJoinCount = unionLocs.size;
+                }
+            }
+            const combinedAggTotalTime = Number(activeAggRow.totalTime ?? 0) + Number(legacyAggRow.totalTime ?? 0);
 
             const nameHistRows = ((coreBatch?.[0]?.results ?? []) as Array<{
                 created_at?: string;
@@ -1633,6 +1769,28 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
                     .all<{ location: string; world_name: string; group_name: string }>();
                 for (const m of metaRes.results ?? []) {
                     locMeta.set(m.location, { worldName: m.world_name || '', groupName: m.group_name || '' });
+                }
+            }
+            if (hasLegacyGamelog && legacyDb) {
+                const unresolvedLocs = uniqueLocs.filter((loc) => !locMeta.get(loc)?.worldName);
+                for (let i = 0; i < unresolvedLocs.length; i += 25) {
+                    const chunk = unresolvedLocs.slice(i, i + 25);
+                    const ph = chunk.map(() => '?').join(', ');
+                    const metaRes = await legacyDb
+                        .prepare(
+                            `SELECT location, MAX(world_name) AS world_name, MAX(group_name) AS group_name
+                             FROM gamelog_location
+                             WHERE location IN (${ph})
+                             GROUP BY location`
+                        )
+                        .bind(...chunk)
+                        .all<{ location: string; world_name: string; group_name: string }>()
+                        .catch(() => ({ results: [] }));
+                    for (const m of metaRes.results ?? []) {
+                        if (!locMeta.has(m.location) || !locMeta.get(m.location)?.worldName) {
+                            locMeta.set(m.location, { worldName: m.world_name || '', groupName: m.group_name || '' });
+                        }
+                    }
                 }
             }
 
@@ -1704,7 +1862,7 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
                 }
             }
 
-            const totalTime = Math.max(Number(aggRow.totalTime ?? 0), reconstructedTotalTime);
+            const totalTime = Math.max(combinedAggTotalTime, reconstructedTotalTime);
             const formattedInstances = instances
                 .slice()
                 .reverse()
@@ -1721,7 +1879,7 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
             return Response.json({
                 ok: true,
                 data: {
-                    joinCount: aggRow.joinCount ?? 0,
+                    joinCount: combinedJoinCount,
                     timeSpent: totalTime,
                     lastSeen: lastRow.created_at ?? '',
                     secondLastSeen,
