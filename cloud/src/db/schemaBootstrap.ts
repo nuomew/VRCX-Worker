@@ -6,6 +6,7 @@ let initPromise: Promise<void> | null = null;
 // Static DDL mirrored from cloud/migrations/*/0001_init.sql.
 // Uses a schema_meta version sentinel so upgrades from Phase 0 auto-add Phase 1 tables idempotently.
 const SCHEMA_VERSION = 'v7-unique-screenshot-filename';
+const LEGACY_SCHEMA_VERSION = 'v2-compact-1000-drop-dup-idx';
 
 const CORE_STATEMENTS: readonly string[] = [
     `CREATE TABLE IF NOT EXISTS schema_meta (
@@ -349,7 +350,17 @@ const GAMELOG_STATEMENTS: readonly string[] = [
         location TEXT NOT NULL DEFAULT '',
         UNIQUE (created_at, message)
     )`,
-    `CREATE INDEX IF NOT EXISTS idx_gamelog_ext_user_id ON gamelog_external (user_id, id DESC)`
+    `CREATE INDEX IF NOT EXISTS idx_gamelog_ext_user_id ON gamelog_external (user_id, id DESC)`,
+    `CREATE TABLE IF NOT EXISTS gamelog_archive_chunks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chunk_key TEXT NOT NULL UNIQUE,
+        gamelog_kind TEXT NOT NULL,
+        min_created_at TEXT NOT NULL,
+        max_created_at TEXT NOT NULL,
+        row_count INTEGER NOT NULL DEFAULT 0,
+        payload_json TEXT NOT NULL
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_gamelog_archive_chunks_kind_max ON gamelog_archive_chunks (gamelog_kind, max_created_at DESC)`
 ];
 
 const FEED_STATEMENTS: readonly string[] = [
@@ -411,7 +422,17 @@ const FEED_STATEMENTS: readonly string[] = [
         is_open_tail INTEGER NOT NULL DEFAULT 0,
         source_revision TEXT NOT NULL DEFAULT ''
     )`,
-    `CREATE INDEX IF NOT EXISTS idx_activity_sessions_user_start ON activity_sessions_v2 (user_id, start_at DESC)`
+    `CREATE INDEX IF NOT EXISTS idx_activity_sessions_user_start ON activity_sessions_v2 (user_id, start_at DESC)`,
+    `CREATE TABLE IF NOT EXISTS feed_archive_chunks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chunk_key TEXT NOT NULL UNIQUE,
+        feed_kind TEXT NOT NULL,
+        min_created_at TEXT NOT NULL,
+        max_created_at TEXT NOT NULL,
+        row_count INTEGER NOT NULL DEFAULT 0,
+        payload_json TEXT NOT NULL
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_feed_archive_chunks_kind_max ON feed_archive_chunks (feed_kind, max_created_at DESC)`
 ];
 
 const CACHE_STATEMENTS: readonly string[] = [
@@ -573,7 +594,7 @@ const LEGACY_STATEMENTS: readonly string[] = [
         UNIQUE (created_at, type, user_id, display_name)
     )`,
     `CREATE INDEX IF NOT EXISTS idx_legacy_friend_log_history_user ON friend_log_history (user_id, id DESC)`,
-    `CREATE INDEX IF NOT EXISTS idx_legacy_friend_log_history_created ON friend_log_history (created_at DESC)`,
+    `DROP INDEX IF EXISTS idx_legacy_friend_log_history_created`,
     `CREATE TABLE IF NOT EXISTS notifications (
         id TEXT PRIMARY KEY,
         created_at TEXT NOT NULL,
@@ -635,7 +656,7 @@ const LEGACY_STATEMENTS: readonly string[] = [
     )`,
     `CREATE INDEX IF NOT EXISTS idx_legacy_gamelog_loc_world_id ON gamelog_location (world_id, id DESC)`,
     `CREATE INDEX IF NOT EXISTS idx_legacy_gamelog_loc_location ON gamelog_location (location, id DESC)`,
-    `CREATE INDEX IF NOT EXISTS idx_legacy_gamelog_loc_created ON gamelog_location (created_at DESC)`,
+    `DROP INDEX IF EXISTS idx_legacy_gamelog_loc_created`,
     `CREATE TABLE IF NOT EXISTS gamelog_join_leave (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         created_at TEXT NOT NULL,
@@ -648,7 +669,7 @@ const LEGACY_STATEMENTS: readonly string[] = [
     )`,
     `CREATE INDEX IF NOT EXISTS idx_legacy_gamelog_jl_user_id ON gamelog_join_leave (user_id, id DESC)`,
     `CREATE INDEX IF NOT EXISTS idx_legacy_gamelog_jl_location ON gamelog_join_leave (location, id DESC)`,
-    `CREATE INDEX IF NOT EXISTS idx_legacy_gamelog_jl_created ON gamelog_join_leave (created_at DESC)`,
+    `DROP INDEX IF EXISTS idx_legacy_gamelog_jl_created`,
     `CREATE TABLE IF NOT EXISTS gamelog_portal_spawn (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         created_at TEXT NOT NULL,
@@ -703,7 +724,7 @@ const LEGACY_STATEMENTS: readonly string[] = [
         UNIQUE (created_at, user_id, location)
     )`,
     `CREATE INDEX IF NOT EXISTS idx_legacy_feed_gps_user_id ON feed_gps (user_id, id DESC)`,
-    `CREATE INDEX IF NOT EXISTS idx_legacy_feed_gps_created ON feed_gps (created_at DESC)`,
+    `DROP INDEX IF EXISTS idx_legacy_feed_gps_created`,
     `CREATE TABLE IF NOT EXISTS feed_online_offline (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         created_at TEXT NOT NULL,
@@ -717,7 +738,7 @@ const LEGACY_STATEMENTS: readonly string[] = [
         UNIQUE (created_at, user_id, type)
     )`,
     `CREATE INDEX IF NOT EXISTS idx_legacy_feed_oo_user_id ON feed_online_offline (user_id, id DESC)`,
-    `CREATE INDEX IF NOT EXISTS idx_legacy_feed_oo_created ON feed_online_offline (created_at DESC)`,
+    `DROP INDEX IF EXISTS idx_legacy_feed_oo_created`,
     `CREATE TABLE IF NOT EXISTS feed_status (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         created_at TEXT NOT NULL,
@@ -730,7 +751,7 @@ const LEGACY_STATEMENTS: readonly string[] = [
         UNIQUE (created_at, user_id, status, status_description)
     )`,
     `CREATE INDEX IF NOT EXISTS idx_legacy_feed_status_user_id ON feed_status (user_id, id DESC)`,
-    `CREATE INDEX IF NOT EXISTS idx_legacy_feed_status_created ON feed_status (created_at DESC)`,
+    `DROP INDEX IF EXISTS idx_legacy_feed_status_created`,
     `CREATE TABLE IF NOT EXISTS feed_bio (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         created_at TEXT NOT NULL,
@@ -743,7 +764,7 @@ const LEGACY_STATEMENTS: readonly string[] = [
         UNIQUE (created_at, user_id, bio)
     )`,
     `CREATE INDEX IF NOT EXISTS idx_legacy_feed_bio_user_id ON feed_bio (user_id, id DESC)`,
-    `CREATE INDEX IF NOT EXISTS idx_legacy_feed_bio_created ON feed_bio (created_at DESC)`,
+    `DROP INDEX IF EXISTS idx_legacy_feed_bio_created`,
     `CREATE TABLE IF NOT EXISTS legacy_feed_chunks (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         chunk_key TEXT NOT NULL UNIQUE,
@@ -860,6 +881,32 @@ async function initShardIfNeeded(
     }
 }
 
+async function initLegacyIfNeeded(db: D1Database): Promise<void> {
+    try {
+        const row = await db
+            .prepare("SELECT payload_json FROM legacy_migration_state WHERE state_key = 'schema_version' LIMIT 1")
+            .first<{ payload_json?: string }>();
+        if (row?.payload_json === LEGACY_SCHEMA_VERSION) {
+            return;
+        }
+    } catch {
+        // legacy_migration_state does not exist yet
+    }
+    for (let i = 0; i < LEGACY_STATEMENTS.length; i += 20) {
+        await db.batch(LEGACY_STATEMENTS.slice(i, i + 20).map((sql) => db.prepare(sql)));
+    }
+    await db
+        .prepare(
+            `INSERT INTO legacy_migration_state (state_key, payload_json, updated_at)
+             VALUES ('schema_version', ?, ?)
+             ON CONFLICT(state_key) DO UPDATE SET
+                payload_json = excluded.payload_json,
+                updated_at = excluded.updated_at`
+        )
+        .bind(LEGACY_SCHEMA_VERSION, new Date().toISOString())
+        .run();
+}
+
 /**
  * Ensures all sharded D1 databases (core, gamelog, feed, dedicated cache, and dedicated legacy)
  * have their latest schema applied idempotently.
@@ -871,13 +918,13 @@ export async function ensureSchemaReady(env: Env): Promise<void> {
     if (!initPromise) {
         const tasks: Array<Promise<void>> = [
             initCoreIfNeeded(env.DB_CORE),
-            initShardIfNeeded(env.DB_GAMELOG, 'idx_gamelog_ext_user_id', GAMELOG_STATEMENTS, 'index'),
-            initShardIfNeeded(env.DB_FEED, 'activity_sessions_v2', FEED_STATEMENTS, 'table'),
+            initShardIfNeeded(env.DB_GAMELOG, 'idx_gamelog_archive_chunks_kind_max', GAMELOG_STATEMENTS, 'index'),
+            initShardIfNeeded(env.DB_FEED, 'idx_feed_archive_chunks_kind_max', FEED_STATEMENTS, 'index'),
             initShardIfNeeded(getCacheDb(env), 'cloud_rss_snapshot', CACHE_STATEMENTS, 'table'),
             initShardIfNeeded(getChatDb(env), 'cloud_chat_config', CHAT_STATEMENTS, 'table')
         ];
         if (env.DB_LEGACY) {
-            tasks.push(initShardIfNeeded(env.DB_LEGACY, 'idx_legacy_feed_chunks_kind_max', LEGACY_STATEMENTS, 'index'));
+            tasks.push(initLegacyIfNeeded(env.DB_LEGACY));
         }
         initPromise = Promise.all(tasks)
             .then(() => {

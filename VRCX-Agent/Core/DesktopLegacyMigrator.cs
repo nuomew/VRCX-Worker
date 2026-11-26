@@ -137,6 +137,10 @@ public static class DesktopLegacyMigrator
     public const int DefaultConcurrency = 2;
     private const int BatchRowsLimit = 240;
     private const int MaxBatchPayloadBytes = 180 * 1024;
+    // Historical Feed rows are stored as compact JSON tuple chunks (1 D1 row per chunk),
+    // safely packing up to 1000 rows / 512 KiB per upload batch (well below D1's 1 MB cell limit).
+    private const int FeedBatchRowsLimit = 1000;
+    private const int FeedMaxBatchPayloadBytes = 512 * 1024;
     private const int MaxSingleFieldChars = 16384;
     private const int MaxBatchRetryAttempts = 3;
     private const int SampleHalfRows = 200;
@@ -880,7 +884,9 @@ public static class DesktopLegacyMigrator
                         cmd.CommandText = $"SELECT rowid AS __vrcx_rowid, * FROM \"{physicalTable}\" {whereSql} ORDER BY rowid ASC";
                     }
 
-                    var buffer = new List<Dictionary<string, object?>>(BatchRowsLimit);
+                    int effectiveBatchRowsLimit = rawCategory == "feed" ? FeedBatchRowsLimit : BatchRowsLimit;
+                    int effectiveMaxBatchPayloadBytes = rawCategory == "feed" ? FeedMaxBatchPayloadBytes : MaxBatchPayloadBytes;
+                    var buffer = new List<Dictionary<string, object?>>(effectiveBatchRowsLimit);
                     int bufferBytes = 256;
                     string bufferLastCreatedAt = existingCursor?.CreatedAt ?? string.Empty;
                     long bufferLastRowId = existingCursor?.RowId ?? 0;
@@ -1060,18 +1066,18 @@ public static class DesktopLegacyMigrator
                             string rowCreatedAt = useCreatedAtDesc ? GetColStr(reader, ord, "created_at") : string.Empty;
 
                             int itemBytes = Encoding.UTF8.GetByteCount(JsonConvert.SerializeObject(mapped)) + 2;
-                            if (itemBytes > MaxBatchPayloadBytes)
+                            if (itemBytes > effectiveMaxBatchPayloadBytes)
                             {
                                 ClampOversizedStringFields(mapped, MaxSingleFieldChars);
                                 itemBytes = Encoding.UTF8.GetByteCount(JsonConvert.SerializeObject(mapped)) + 2;
-                                if (itemBytes > MaxBatchPayloadBytes)
+                                if (itemBytes > effectiveMaxBatchPayloadBytes)
                                 {
                                     ClampOversizedStringFields(mapped, 4096);
                                     itemBytes = Encoding.UTF8.GetByteCount(JsonConvert.SerializeObject(mapped)) + 2;
                                 }
                             }
 
-                            if (buffer.Count >= BatchRowsLimit || (buffer.Count > 0 && bufferBytes + itemBytes > MaxBatchPayloadBytes))
+                            if (buffer.Count >= effectiveBatchRowsLimit || (buffer.Count > 0 && bufferBytes + itemBytes > effectiveMaxBatchPayloadBytes))
                             {
                                 anyValidRowSent = true;
                                 if (await FlushBatchAsync(isFinalTableBatch: false).ConfigureAwait(false))

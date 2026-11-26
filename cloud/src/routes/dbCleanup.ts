@@ -1,4 +1,10 @@
 import { randomHex } from '../crypto/vault';
+import {
+    DEFAULT_COMPACT_RETENTION_DAYS,
+    MAX_COMPACT_RETENTION_DAYS,
+    MIN_COMPACT_RETENTION_DAYS,
+    runAllDatabasesCompaction
+} from '../db/compactArchive';
 import { getLegacyDb } from '../db/schemaBootstrap';
 import type { Env } from '../env';
 import {
@@ -89,7 +95,13 @@ const CLEANUP_TABLES: readonly CleanupTableSpec[] = [
         counterKey: 'gamelog_external',
         legacyCategory: 'gamelog'
     },
-    // DB_FEED (4 feed tables + completed activity_sessions_v2)
+    {
+        shard: 'gamelog',
+        table: 'gamelog_archive_chunks',
+        whereSql: 'max_created_at < ?',
+        cutoffKind: 'iso'
+    },
+    // DB_FEED (4 feed tables + compact archive chunks + completed activity_sessions_v2)
     {
         shard: 'feed',
         table: 'feed_gps',
@@ -121,6 +133,12 @@ const CLEANUP_TABLES: readonly CleanupTableSpec[] = [
         cutoffKind: 'iso',
         counterKey: 'feed_bio',
         legacyCategory: 'feed'
+    },
+    {
+        shard: 'feed',
+        table: 'feed_archive_chunks',
+        whereSql: 'max_created_at < ?',
+        cutoffKind: 'iso'
     },
     {
         shard: 'feed',
@@ -302,6 +320,46 @@ export async function handleDbCleanupRoutes(
     env: Env,
     url: URL
 ): Promise<Response | null> {
+    if (url.pathname === '/api/admin/storage/compact' && request.method === 'POST') {
+        const rawBody = await request.json().catch(() => ({}));
+        const body = isPlainObject(rawBody) ? rawBody : {};
+        let retentionDays = DEFAULT_COMPACT_RETENTION_DAYS;
+        if (body.retentionDays !== undefined && body.retentionDays !== null && body.retentionDays !== '') {
+            const parsed = Number(body.retentionDays);
+            if (
+                !Number.isInteger(parsed) ||
+                parsed < MIN_COMPACT_RETENTION_DAYS ||
+                parsed > MAX_COMPACT_RETENTION_DAYS
+            ) {
+                return Response.json(
+                    {
+                        ok: false,
+                        error: {
+                            code: 'INVALID_RETENTION_DAYS',
+                            message: `retentionDays must be an integer between ${MIN_COMPACT_RETENTION_DAYS} and ${MAX_COMPACT_RETENTION_DAYS}`
+                        }
+                    },
+                    { status: 400 }
+                );
+            }
+            retentionDays = parsed;
+        }
+        const includeLegacy = body.includeLegacy !== false;
+        const maxChunksPerTable =
+            typeof body.maxChunksPerTable === 'number' && Number.isFinite(body.maxChunksPerTable)
+                ? Math.min(Math.max(Math.floor(body.maxChunksPerTable), 1), 20)
+                : 8;
+        const report = await runAllDatabasesCompaction(env, {
+            retentionDays,
+            maxChunksPerTable,
+            includeLegacy
+        });
+        return Response.json(
+            { ok: true, data: report },
+            { headers: { 'Cache-Control': 'no-store' } }
+        );
+    }
+
     if (url.pathname === '/api/admin/cleanup/preview' && request.method === 'GET') {
         const months = parseCleanupMonths(url.searchParams.get('months') ?? '6');
         if (months === null) {

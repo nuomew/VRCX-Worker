@@ -482,6 +482,32 @@ export async function pruneExpiredVrcCache(env: Env, nowMs = Date.now()): Promis
 }
 
 /**
+ * Deletes expired rows and trims oldest-expiring entries past `maxRows` so DB_CACHE stays bounded.
+ */
+export async function pruneVrcCacheBounded(env: Env, maxRows = 2500, nowMs = Date.now()): Promise<number> {
+    const db = getCacheDb(env);
+    const expiredRes = await db.prepare('DELETE FROM vrc_api_cache WHERE expires_at <= ?').bind(nowMs).run();
+    let deleted = Math.max(0, Number(expiredRes.meta?.changes ?? 0));
+    const safeCap = Math.max(100, Math.floor(maxRows));
+    const countRow = await db.prepare('SELECT COUNT(*) AS cnt FROM vrc_api_cache').first<{ cnt?: number }>();
+    const remaining = Math.max(0, Number(countRow?.cnt ?? 0));
+    if (remaining > safeCap) {
+        const overflow = remaining - safeCap;
+        const trimRes = await db
+            .prepare(
+                `DELETE FROM vrc_api_cache
+                 WHERE cache_key IN (
+                     SELECT cache_key FROM vrc_api_cache ORDER BY expires_at ASC LIMIT ?
+                 )`
+            )
+            .bind(overflow)
+            .run();
+        deleted += Math.max(0, Number(trimRes.meta?.changes ?? 0));
+    }
+    return deleted;
+}
+
+/**
  * Purges all cached VRChat API responses and RSS snapshots on logout or account switch
  * so another VRChat account can never read stale cached friend/favorite/notification payloads.
  */

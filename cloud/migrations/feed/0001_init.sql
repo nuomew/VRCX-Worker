@@ -64,3 +64,15 @@ CREATE TABLE IF NOT EXISTS activity_sessions_v2 (
     source_revision TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_activity_sessions_user_start ON activity_sessions_v2 (user_id, start_at DESC);
+
+-- Compact chunked cold archive for historical Feed rows (>30d, up to 1000 rows / <=512 KiB per chunk row)
+CREATE TABLE IF NOT EXISTS feed_archive_chunks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chunk_key TEXT NOT NULL UNIQUE,
+    feed_kind TEXT NOT NULL,
+    min_created_at TEXT NOT NULL,
+    max_created_at TEXT NOT NULL,
+    row_count INTEGER NOT NULL DEFAULT 0,
+    payload_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_feed_archive_chunks_kind_max ON feed_archive_chunks (feed_kind, max_created_at DESC);

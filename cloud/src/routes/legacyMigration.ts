@@ -1,5 +1,21 @@
 import { preAuthenticateAgent, verifyAgentBodyHmac } from '../auth/auth';
 import { randomHex } from '../crypto/vault';
+import {
+    CHUNK_KIND_TO_FEED_TABLE,
+    CHUNK_KIND_TO_GAMELOG_TABLE,
+    COMPACT_CHUNK_MAX_BYTES,
+    COMPACT_CHUNK_MAX_ROWS,
+    COMPACT_EXPORT_CHUNK_OFFSET,
+    computeCompactChunkKey,
+    decodeFeedChunkForExport,
+    decodeFeedChunkRows,
+    decodeGameLogChunkForExport,
+    FEED_TABLE_TO_CHUNK_KIND,
+    type FeedChunkKind,
+    GAMELOG_TABLE_TO_CHUNK_KIND,
+    type GameLogChunkKind,
+    splitTuplesIntoCompactChunks
+} from '../db/compactArchive';
 import { getLegacyDb } from '../db/schemaBootstrap';
 import type { Env } from '../env';
 import {
@@ -15,11 +31,13 @@ import {
     upsertEntityWorldsBatch
 } from './coreData';
 
+export { decodeFeedChunkRows as decodeLegacyFeedChunkRows };
+
 export const LEGACY_DB_FREE_LIMIT_BYTES = 500 * 1024 * 1024;
 export const LEGACY_DB_SOFT_STOP_BYTES = 480 * 1024 * 1024;
 const MAX_INVENTORY_BODY_BYTES = 128 * 1024;
 const MAX_BATCH_BODY_BYTES = 4 * 1024 * 1024;
-const MAX_BATCH_ITEMS = 300;
+const MAX_BATCH_ITEMS = 1000;
 export const MIN_MIGRATION_CONCURRENCY = 1;
 export const MAX_MIGRATION_CONCURRENCY = 8;
 export const DEFAULT_MIGRATION_CONCURRENCY = 2;
@@ -72,7 +90,7 @@ const CLOUD_EXPORT_TABLES = [
 
 type CloudExportTableMeta = (typeof CLOUD_EXPORT_TABLES)[number];
 const CLOUD_EXPORT_TABLE_MAP = new Map<string, CloudExportTableMeta>(CLOUD_EXPORT_TABLES.map((t) => [t.name, t]));
-const MAX_EXPORT_PAGE_LIMIT = 500;
+const MAX_EXPORT_PAGE_LIMIT = 1000;
 
 function deriveUpstreamUserPrefix(userId: string): string {
     const cleaned = userId.replace(/-/g, '').replace(/_/g, '').trim();
@@ -182,12 +200,30 @@ async function handleCloudExportQuery(env: Env, url: URL): Promise<Response> {
         const gamelogTables = nonConfigTables.filter((t) => t.activeShard === 'gamelog');
         const feedTables = nonConfigTables.filter((t) => t.activeShard === 'feed');
 
-        const [coreCounts, gamelogCounts, feedCounts, legacyCountsBatch, legacyFeedChunkCountsRes] = await Promise.all([
+        const [
+            coreCounts,
+            gamelogCounts,
+            feedCounts,
+            activeFeedChunkCountsRes,
+            activeGamelogChunkCountsRes,
+            legacyCountsBatch,
+            legacyFeedChunkCountsRes
+        ] = await Promise.all([
             env.DB_CORE.batch(coreTables.map((t) => env.DB_CORE.prepare(`SELECT COUNT(*) AS cnt FROM ${t.name}`))),
             env.DB_GAMELOG.batch(
                 gamelogTables.map((t) => env.DB_GAMELOG.prepare(`SELECT COUNT(*) AS cnt FROM ${t.name}`))
             ),
             env.DB_FEED.batch(feedTables.map((t) => env.DB_FEED.prepare(`SELECT COUNT(*) AS cnt FROM ${t.name}`))),
+            env.DB_FEED.prepare(
+                'SELECT feed_kind, COALESCE(SUM(row_count), 0) AS cnt FROM feed_archive_chunks GROUP BY feed_kind'
+            )
+                .all<{ feed_kind: string; cnt: number }>()
+                .catch(() => ({ results: [] as Array<{ feed_kind: string; cnt: number }> })),
+            env.DB_GAMELOG.prepare(
+                'SELECT gamelog_kind, COALESCE(SUM(row_count), 0) AS cnt FROM gamelog_archive_chunks GROUP BY gamelog_kind'
+            )
+                .all<{ gamelog_kind: string; cnt: number }>()
+                .catch(() => ({ results: [] as Array<{ gamelog_kind: string; cnt: number }> })),
             legacyDb
                 ? legacyDb
                       .batch(nonConfigTables.map((t) => legacyDb.prepare(`SELECT COUNT(*) AS cnt FROM ${t.name}`)))
@@ -216,6 +252,18 @@ async function handleCloudExportQuery(env: Env, url: URL): Promise<Response> {
             const first = (feedCounts[i]?.results?.[0] ?? null) as { cnt?: number } | null;
             activeCountMap.set(t.name, Number(first?.cnt ?? 0));
         });
+        for (const row of activeFeedChunkCountsRes.results ?? []) {
+            const feedTable = CHUNK_KIND_TO_FEED_TABLE[row.feed_kind as FeedChunkKind];
+            if (feedTable) {
+                activeCountMap.set(feedTable, (activeCountMap.get(feedTable) ?? 0) + Number(row.cnt ?? 0));
+            }
+        }
+        for (const row of activeGamelogChunkCountsRes.results ?? []) {
+            const glTable = CHUNK_KIND_TO_GAMELOG_TABLE[row.gamelog_kind as GameLogChunkKind];
+            if (glTable) {
+                activeCountMap.set(glTable, (activeCountMap.get(glTable) ?? 0) + Number(row.cnt ?? 0));
+            }
+        }
 
         const legacyCountMap = new Map<string, number>([['configs', legacyConfigs.length]]);
         nonConfigTables.forEach((t, i) => {
@@ -223,7 +271,7 @@ async function handleCloudExportQuery(env: Env, url: URL): Promise<Response> {
             legacyCountMap.set(t.name, Number(first?.cnt ?? 0));
         });
         for (const row of legacyFeedChunkCountsRes.results ?? []) {
-            const feedTable = CHUNK_KIND_TO_FEED_TABLE[row.feed_kind as LegacyFeedChunkKind];
+            const feedTable = CHUNK_KIND_TO_FEED_TABLE[row.feed_kind as FeedChunkKind];
             if (feedTable) {
                 legacyCountMap.set(feedTable, (legacyCountMap.get(feedTable) ?? 0) + Number(row.cnt ?? 0));
             }
@@ -320,18 +368,48 @@ async function handleCloudExportQuery(env: Env, url: URL): Promise<Response> {
     }
 
     const targetDb = source === 'legacy' ? legacyDb! : getActiveShardDb(env, meta.activeShard);
-    const feedChunkKind = source === 'legacy' ? FEED_TABLE_TO_CHUNK_KIND[tableName] : undefined;
+    const archiveSpec:
+        | {
+              archiveTable: 'legacy_feed_chunks' | 'feed_archive_chunks' | 'gamelog_archive_chunks';
+              kindCol: 'feed_kind' | 'gamelog_kind';
+              kindVal: string;
+              decode: (payloadJson: string) => Array<Record<string, unknown>>;
+          }
+        | null =
+        source === 'legacy' && FEED_TABLE_TO_CHUNK_KIND[tableName]
+            ? {
+                  archiveTable: 'legacy_feed_chunks',
+                  kindCol: 'feed_kind',
+                  kindVal: FEED_TABLE_TO_CHUNK_KIND[tableName]!,
+                  decode: (p) => decodeFeedChunkForExport(FEED_TABLE_TO_CHUNK_KIND[tableName]!, p)
+              }
+            : source === 'active' && FEED_TABLE_TO_CHUNK_KIND[tableName]
+              ? {
+                    archiveTable: 'feed_archive_chunks',
+                    kindCol: 'feed_kind',
+                    kindVal: FEED_TABLE_TO_CHUNK_KIND[tableName]!,
+                    decode: (p) => decodeFeedChunkForExport(FEED_TABLE_TO_CHUNK_KIND[tableName]!, p)
+                }
+              : source === 'active' && GAMELOG_TABLE_TO_CHUNK_KIND[tableName]
+                ? {
+                      archiveTable: 'gamelog_archive_chunks',
+                      kindCol: 'gamelog_kind',
+                      kindVal: GAMELOG_TABLE_TO_CHUNK_KIND[tableName]!,
+                      decode: (p) => decodeGameLogChunkForExport(GAMELOG_TABLE_TO_CHUNK_KIND[tableName]!, p)
+                  }
+                : null;
 
-    const readFeedChunkExportResponse = async (chunkAfterId: number): Promise<Response> => {
+    const readArchiveChunkExportResponse = async (chunkAfterId: number): Promise<Response> => {
+        const spec = archiveSpec!;
         const chunkRes = await targetDb
             .prepare(
                 `SELECT id, row_count, payload_json
-                 FROM legacy_feed_chunks
-                 WHERE feed_kind = ? AND id > ?
+                 FROM ${spec.archiveTable}
+                 WHERE ${spec.kindCol} = ? AND id > ?
                  ORDER BY id ASC
                  LIMIT 3`
             )
-            .bind(feedChunkKind!, chunkAfterId)
+            .bind(spec.kindVal, chunkAfterId)
             .all<{ id: number; row_count: number; payload_json: string }>()
             .catch(() => ({ results: [] as Array<{ id: number; row_count: number; payload_json: string }> }));
         const chunks = chunkRes.results ?? [];
@@ -342,7 +420,7 @@ async function handleCloudExportQuery(env: Env, url: URL): Promise<Response> {
             if (consumedCount > 0 && chunkRows.length + Number(chunk.row_count || 0) > limit) {
                 break;
             }
-            const unpacked = decodeLegacyFeedChunkForExport(feedChunkKind!, chunk.payload_json);
+            const unpacked = spec.decode(chunk.payload_json);
             for (const r of unpacked) chunkRows.push(r);
             lastChunkId = Number(chunk.id);
             consumedCount++;
@@ -350,8 +428,8 @@ async function handleCloudExportQuery(env: Env, url: URL): Promise<Response> {
         let hasMoreChunks = consumedCount < chunks.length;
         if (!hasMoreChunks && consumedCount > 0) {
             const moreProbe = await targetDb
-                .prepare('SELECT id FROM legacy_feed_chunks WHERE feed_kind = ? AND id > ? LIMIT 1')
-                .bind(feedChunkKind!, lastChunkId)
+                .prepare(`SELECT id FROM ${spec.archiveTable} WHERE ${spec.kindCol} = ? AND id > ? LIMIT 1`)
+                .bind(spec.kindVal, lastChunkId)
                 .first<{ id: number }>()
                 .catch(() => null);
             hasMoreChunks = Boolean(moreProbe);
@@ -363,7 +441,7 @@ async function handleCloudExportQuery(env: Env, url: URL): Promise<Response> {
                     table: tableName,
                     source,
                     rows: chunkRows,
-                    nextAfterRowId: LEGACY_FEED_EXPORT_CHUNK_OFFSET + lastChunkId,
+                    nextAfterRowId: COMPACT_EXPORT_CHUNK_OFFSET + lastChunkId,
                     hasMore: hasMoreChunks
                 }
             },
@@ -371,8 +449,8 @@ async function handleCloudExportQuery(env: Env, url: URL): Promise<Response> {
         );
     };
 
-    if (feedChunkKind && afterRowId >= LEGACY_FEED_EXPORT_CHUNK_OFFSET) {
-        return readFeedChunkExportResponse(afterRowId - LEGACY_FEED_EXPORT_CHUNK_OFFSET);
+    if (archiveSpec && afterRowId >= COMPACT_EXPORT_CHUNK_OFFSET) {
+        return readArchiveChunkExportResponse(afterRowId - COMPACT_EXPORT_CHUNK_OFFSET);
     }
 
     const res = await targetDb
@@ -392,19 +470,19 @@ async function handleCloudExportQuery(env: Env, url: URL): Promise<Response> {
         return clean;
     });
 
-    if (!hasMore && feedChunkKind) {
+    if (!hasMore && archiveSpec) {
         if (rows.length === 0) {
-            // Single-row legacy feed table is empty (or exhausted); serve chunked rows directly on this page
+            // Single-row table is empty (or exhausted); serve chunked rows directly on this page
             // so paginators that stop on `rows.length === 0` never miss compact archive records.
-            return readFeedChunkExportResponse(0);
+            return readArchiveChunkExportResponse(0);
         }
         const chunkExists = await targetDb
-            .prepare('SELECT id FROM legacy_feed_chunks WHERE feed_kind = ? LIMIT 1')
-            .bind(feedChunkKind)
+            .prepare(`SELECT id FROM ${archiveSpec.archiveTable} WHERE ${archiveSpec.kindCol} = ? LIMIT 1`)
+            .bind(archiveSpec.kindVal)
             .first<{ id: number }>()
             .catch(() => null);
         if (chunkExists) {
-            nextAfterRowId = LEGACY_FEED_EXPORT_CHUNK_OFFSET;
+            nextAfterRowId = COMPACT_EXPORT_CHUNK_OFFSET;
             hasMore = true;
         }
     }
@@ -434,23 +512,8 @@ const STATE_KEY_IMPORTED_STATS = 'imported_stats';
 const STATE_KEY_SCAN_REQUEST = 'scan_request';
 const STATE_KEY_SETTINGS = 'settings';
 const STATE_KEY_CURSORS = 'cursors';
-const LEGACY_FEED_EXPORT_CHUNK_OFFSET = 1_000_000_000;
 
-export type LegacyFeedChunkKind = 'gps' | 'oo' | 'status' | 'bio';
-
-const FEED_TABLE_TO_CHUNK_KIND: Record<string, LegacyFeedChunkKind> = {
-    feed_gps: 'gps',
-    feed_online_offline: 'oo',
-    feed_status: 'status',
-    feed_bio: 'bio'
-};
-
-const CHUNK_KIND_TO_FEED_TABLE: Record<LegacyFeedChunkKind, string> = {
-    gps: 'feed_gps',
-    oo: 'feed_online_offline',
-    status: 'feed_status',
-    bio: 'feed_bio'
-};
+export type LegacyFeedChunkKind = FeedChunkKind;
 
 const LEGACY_LOGICAL_TABLES_BY_CATEGORY: Record<LegacyCategory, readonly string[]> = {
     memos_notes: ['memos', 'world_memos', 'avatar_memos', 'notes'],
@@ -641,168 +704,6 @@ function pushMultiRowInsert(
         }
         stmts.push(legacyDb.prepare(`${sqlPrefix} VALUES ${placeholders}`).bind(...params));
     }
-}
-
-async function computeFeedChunkKey(feedKind: LegacyFeedChunkKind, payloadJson: string): Promise<string> {
-    const data = new TextEncoder().encode(`${feedKind}:${payloadJson}`);
-    const digest = await crypto.subtle.digest('SHA-256', data);
-    const bytes = new Uint8Array(digest);
-    let hex = '';
-    for (let i = 0; i < 12; i++) {
-        hex += bytes[i]!.toString(16).padStart(2, '0');
-    }
-    return `${feedKind}_${hex}`;
-}
-
-function safeParseStringArray(raw: unknown): string[] {
-    if (Array.isArray(raw)) return raw.map((x) => String(x ?? ''));
-    if (typeof raw !== 'string' || !raw.trim()) return [];
-    try {
-        const parsed = JSON.parse(raw) as unknown;
-        return Array.isArray(parsed) ? parsed.map((x) => String(x ?? '')) : [];
-    } catch {
-        return [];
-    }
-}
-
-/**
- * Unpacks one compact `legacy_feed_chunks` row back into normalized Feed API items
- * compatible with `eventsData.ts` (`/api/feed`, `/api/feed/query`).
- */
-export function decodeLegacyFeedChunkRows(
-    chunkId: number,
-    feedKind: string,
-    payloadJson: string
-): Array<Record<string, unknown>> {
-    let tuples: unknown;
-    try {
-        tuples = JSON.parse(payloadJson);
-    } catch {
-        return [];
-    }
-    if (!Array.isArray(tuples)) return [];
-    const out: Array<Record<string, unknown>> = [];
-    const baseNegId = Math.max(1, Math.floor(Number(chunkId) || 1)) * 1000;
-    for (let i = 0; i < tuples.length; i++) {
-        const t = tuples[i];
-        if (!Array.isArray(t)) continue;
-        const rowId = -(baseNegId + i + 1);
-        if (feedKind === 'gps') {
-            out.push({
-                rowId,
-                created_at: String(t[0] ?? ''),
-                type: 'GPS',
-                userId: String(t[1] ?? ''),
-                displayName: String(t[2] ?? ''),
-                location: String(t[3] ?? ''),
-                worldName: String(t[4] ?? ''),
-                previousLocation: String(t[5] ?? ''),
-                time: Number(t[6] ?? 0) || 0,
-                groupName: String(t[7] ?? '')
-            });
-        } else if (feedKind === 'oo') {
-            out.push({
-                rowId,
-                created_at: String(t[0] ?? ''),
-                type: String(t[3] ?? 'Online'),
-                userId: String(t[1] ?? ''),
-                displayName: String(t[2] ?? ''),
-                location: String(t[4] ?? ''),
-                worldName: String(t[5] ?? ''),
-                time: Number(t[6] ?? 0) || 0,
-                groupName: String(t[7] ?? '')
-            });
-        } else if (feedKind === 'status') {
-            out.push({
-                rowId,
-                created_at: String(t[0] ?? ''),
-                type: 'Status',
-                userId: String(t[1] ?? ''),
-                displayName: String(t[2] ?? ''),
-                status: String(t[3] ?? ''),
-                statusDescription: String(t[4] ?? ''),
-                previousStatus: String(t[5] ?? ''),
-                previousStatusDescription: String(t[6] ?? '')
-            });
-        } else if (feedKind === 'bio') {
-            out.push({
-                rowId,
-                created_at: String(t[0] ?? ''),
-                type: 'Bio',
-                userId: String(t[1] ?? ''),
-                displayName: String(t[2] ?? ''),
-                bio: String(t[3] ?? ''),
-                previousBio: String(t[4] ?? ''),
-                bioLinks: safeParseStringArray(t[5]),
-                previousBioLinks: safeParseStringArray(t[6])
-            });
-        }
-    }
-    return out;
-}
-
-/**
- * Unpacks one `legacy_feed_chunks` row into raw upstream SQLite column format for cloud ZIP/SQLite export.
- */
-function decodeLegacyFeedChunkForExport(
-    feedKind: LegacyFeedChunkKind,
-    payloadJson: string
-): Array<Record<string, unknown>> {
-    let tuples: unknown;
-    try {
-        tuples = JSON.parse(payloadJson);
-    } catch {
-        return [];
-    }
-    if (!Array.isArray(tuples)) return [];
-    const out: Array<Record<string, unknown>> = [];
-    for (const t of tuples) {
-        if (!Array.isArray(t)) continue;
-        if (feedKind === 'gps') {
-            out.push({
-                created_at: String(t[0] ?? ''),
-                user_id: String(t[1] ?? ''),
-                display_name: String(t[2] ?? ''),
-                location: String(t[3] ?? ''),
-                world_name: String(t[4] ?? ''),
-                previous_location: String(t[5] ?? ''),
-                time: Number(t[6] ?? 0) || 0,
-                group_name: String(t[7] ?? '')
-            });
-        } else if (feedKind === 'oo') {
-            out.push({
-                created_at: String(t[0] ?? ''),
-                user_id: String(t[1] ?? ''),
-                display_name: String(t[2] ?? ''),
-                type: String(t[3] ?? 'Online'),
-                location: String(t[4] ?? ''),
-                world_name: String(t[5] ?? ''),
-                time: Number(t[6] ?? 0) || 0,
-                group_name: String(t[7] ?? '')
-            });
-        } else if (feedKind === 'status') {
-            out.push({
-                created_at: String(t[0] ?? ''),
-                user_id: String(t[1] ?? ''),
-                display_name: String(t[2] ?? ''),
-                status: String(t[3] ?? ''),
-                status_description: String(t[4] ?? ''),
-                previous_status: String(t[5] ?? ''),
-                previous_status_description: String(t[6] ?? '')
-            });
-        } else if (feedKind === 'bio') {
-            out.push({
-                created_at: String(t[0] ?? ''),
-                user_id: String(t[1] ?? ''),
-                display_name: String(t[2] ?? ''),
-                bio: String(t[3] ?? ''),
-                previous_bio: String(t[4] ?? ''),
-                bio_links: typeof t[5] === 'string' ? t[5] : JSON.stringify(safeParseStringArray(t[5])),
-                previous_bio_links: typeof t[6] === 'string' ? t[6] : JSON.stringify(safeParseStringArray(t[6]))
-            });
-        }
-    }
-    return out;
 }
 
 function isD1DailyWriteQuotaError(err: unknown): boolean {
@@ -1339,7 +1240,8 @@ async function ingestLegacyCategoryBatch(
                     userId,
                     Math.max(0, asFiniteInt(raw.time, 0))
                 ]);
-                if (userId && displayName) userEntities.set(userId, displayName);
+                // Intentionally skip FTS5 entity_users dictionary writes for historical stranger join/leave rows
+                // to cut D1 rows_written and index bloat by ~50% while preserving indexed user_id stats queries.
             } else if (type === 'PortalSpawn') {
                 const displayName = asStr(raw.displayName ?? raw.display_name, 256);
                 const userId = asStr(raw.userId ?? raw.user_id, 128);
@@ -1357,7 +1259,6 @@ async function ingestLegacyCategoryBatch(
                             asStr(raw.worldName ?? raw.world_name, 512)
                         )
                 );
-                if (userId && displayName) userEntities.set(userId, displayName);
             } else if (type === 'VideoPlay') {
                 stmts.push(
                     legacyDb
@@ -1489,8 +1390,8 @@ async function ingestLegacyCategoryBatch(
         gamelogJoinLeaveRows
     );
 
-    // Plan A: Pack migrated Feed batches into compact chunk rows (1 row per ~240 Feed records)
-    // to cut D1 rows_written by >99% so multi-year Feed archives fit comfortably inside Free-tier daily quotas.
+    // Plan A: Pack migrated Feed batches into compact chunk rows (up to 1000 rows / <=512 KiB per D1 row)
+    // to cut D1 rows_written by >99.5% so multi-year Feed archives fit effortlessly inside Free-tier daily quotas.
     const feedChunkBatches: Array<{ kind: LegacyFeedChunkKind; rows: unknown[][] }> = [
         { kind: 'gps', rows: feedGpsRows },
         { kind: 'oo', rows: feedOnlineOfflineRows },
@@ -1501,25 +1402,32 @@ async function ingestLegacyCategoryBatch(
     const chunkLogicalCounts: number[] = [];
     for (const bucket of feedChunkBatches) {
         if (bucket.rows.length === 0) continue;
-        let minCreated = String(bucket.rows[0]![0] ?? '');
-        let maxCreated = minCreated;
-        for (const r of bucket.rows) {
-            const ts = String(r[0] ?? '');
-            if (ts && (!minCreated || ts < minCreated)) minCreated = ts;
-            if (ts && (!maxCreated || ts > maxCreated)) maxCreated = ts;
-        }
-        const payloadJson = JSON.stringify(bucket.rows);
-        const chunkKey = await computeFeedChunkKey(bucket.kind, payloadJson);
-        chunkStmts.push(
-            legacyDb
-                .prepare(
-                    `INSERT OR IGNORE INTO legacy_feed_chunks
-                     (chunk_key, feed_kind, min_created_at, max_created_at, row_count, payload_json)
-                     VALUES (?, ?, ?, ?, ?, ?)`
-                )
-                .bind(chunkKey, bucket.kind, minCreated || nowIso, maxCreated || nowIso, bucket.rows.length, payloadJson)
+        const slices = splitTuplesIntoCompactChunks(
+            bucket.rows,
+            nowIso,
+            COMPACT_CHUNK_MAX_ROWS,
+            COMPACT_CHUNK_MAX_BYTES
         );
-        chunkLogicalCounts.push(bucket.rows.length);
+        for (const slice of slices) {
+            const chunkKey = await computeCompactChunkKey(bucket.kind, slice.payloadJson);
+            chunkStmts.push(
+                legacyDb
+                    .prepare(
+                        `INSERT OR IGNORE INTO legacy_feed_chunks
+                         (chunk_key, feed_kind, min_created_at, max_created_at, row_count, payload_json)
+                         VALUES (?, ?, ?, ?, ?, ?)`
+                    )
+                    .bind(
+                        chunkKey,
+                        bucket.kind,
+                        slice.minCreatedAt,
+                        slice.maxCreatedAt,
+                        slice.rows.length,
+                        slice.payloadJson
+                    )
+            );
+            chunkLogicalCounts.push(slice.rows.length);
+        }
     }
 
     let inserted = 0;

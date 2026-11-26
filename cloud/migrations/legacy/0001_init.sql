@@ -168,7 +168,6 @@ CREATE TABLE IF NOT EXISTS friend_log_history (
     UNIQUE (created_at, type, user_id, display_name)
 );
 CREATE INDEX IF NOT EXISTS idx_legacy_friend_log_history_user ON friend_log_history (user_id, id DESC);
-CREATE INDEX IF NOT EXISTS idx_legacy_friend_log_history_created ON friend_log_history (created_at DESC);
 
 CREATE TABLE IF NOT EXISTS notifications (
     id TEXT PRIMARY KEY,
@@ -236,7 +235,6 @@ CREATE TABLE IF NOT EXISTS gamelog_location (
 );
 CREATE INDEX IF NOT EXISTS idx_legacy_gamelog_loc_world_id ON gamelog_location (world_id, id DESC);
 CREATE INDEX IF NOT EXISTS idx_legacy_gamelog_loc_location ON gamelog_location (location, id DESC);
-CREATE INDEX IF NOT EXISTS idx_legacy_gamelog_loc_created ON gamelog_location (created_at DESC);
 
 CREATE TABLE IF NOT EXISTS gamelog_join_leave (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -250,7 +248,6 @@ CREATE TABLE IF NOT EXISTS gamelog_join_leave (
 );
 CREATE INDEX IF NOT EXISTS idx_legacy_gamelog_jl_user_id ON gamelog_join_leave (user_id, id DESC);
 CREATE INDEX IF NOT EXISTS idx_legacy_gamelog_jl_location ON gamelog_join_leave (location, id DESC);
-CREATE INDEX IF NOT EXISTS idx_legacy_gamelog_jl_created ON gamelog_join_leave (created_at DESC);
 
 CREATE TABLE IF NOT EXISTS gamelog_portal_spawn (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -311,7 +308,6 @@ CREATE TABLE IF NOT EXISTS feed_gps (
     UNIQUE (created_at, user_id, location)
 );
 CREATE INDEX IF NOT EXISTS idx_legacy_feed_gps_user_id ON feed_gps (user_id, id DESC);
-CREATE INDEX IF NOT EXISTS idx_legacy_feed_gps_created ON feed_gps (created_at DESC);
 
 CREATE TABLE IF NOT EXISTS feed_online_offline (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -326,7 +322,6 @@ CREATE TABLE IF NOT EXISTS feed_online_offline (
     UNIQUE (created_at, user_id, type)
 );
 CREATE INDEX IF NOT EXISTS idx_legacy_feed_oo_user_id ON feed_online_offline (user_id, id DESC);
-CREATE INDEX IF NOT EXISTS idx_legacy_feed_oo_created ON feed_online_offline (created_at DESC);
 
 CREATE TABLE IF NOT EXISTS feed_status (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -340,7 +335,6 @@ CREATE TABLE IF NOT EXISTS feed_status (
     UNIQUE (created_at, user_id, status, status_description)
 );
 CREATE INDEX IF NOT EXISTS idx_legacy_feed_status_user_id ON feed_status (user_id, id DESC);
-CREATE INDEX IF NOT EXISTS idx_legacy_feed_status_created ON feed_status (created_at DESC);
 
 CREATE TABLE IF NOT EXISTS feed_bio (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -354,9 +348,8 @@ CREATE TABLE IF NOT EXISTS feed_bio (
     UNIQUE (created_at, user_id, bio)
 );
 CREATE INDEX IF NOT EXISTS idx_legacy_feed_bio_user_id ON feed_bio (user_id, id DESC);
-CREATE INDEX IF NOT EXISTS idx_legacy_feed_bio_created ON feed_bio (created_at DESC);
 
--- Compact chunked archive for migrated historical Feed rows (~240 rows per chunk row,
+-- Compact chunked archive for migrated historical Feed rows (up to 1000 rows / <=512 KiB per chunk row,
 -- cutting Cloudflare D1 rows_written by >99% while staying transparent to queries and exports).
 CREATE TABLE IF NOT EXISTS legacy_feed_chunks (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

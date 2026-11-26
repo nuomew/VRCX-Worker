@@ -8684,4 +8684,218 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
             ]).catch(() => {});
         }
     });
+
+    it('compacts active DB_FEED, DB_GAMELOG, DB_LEGACY, DB_CORE, and DB_CACHE into 1000-row chunks while keeping queries, hot-worlds, exports, and cleanup transparent', async () => {
+        const legacyDb = env.DB_LEGACY!;
+        const cacheDb = env.DB_CACHE ?? env.DB_CORE;
+        const oldIso1 = new Date(Date.now() - 45 * 86_400_000).toISOString();
+        const oldIso2 = new Date(Date.now() - 44 * 86_400_000).toISOString();
+        const recentIso = new Date(Date.now() - 2 * 86_400_000).toISOString();
+        const expiredCmdIso = new Date(Date.now() - 10 * 86_400_000).toISOString();
+
+        try {
+            // 0. Verify redundant *_created indexes in DB_LEGACY were dropped on schema init
+            const dupLegacyIdx = await legacyDb
+                .prepare(
+                    `SELECT name FROM sqlite_master
+                     WHERE type = 'index'
+                       AND name IN (
+                           'idx_legacy_friend_log_history_created',
+                           'idx_legacy_gamelog_loc_created',
+                           'idx_legacy_gamelog_jl_created',
+                           'idx_legacy_feed_gps_created',
+                           'idx_legacy_feed_oo_created',
+                           'idx_legacy_feed_status_created',
+                           'idx_legacy_feed_bio_created'
+                       )`
+                )
+                .all<{ name: string }>();
+            expect(dupLegacyIdx.results ?? []).toHaveLength(0);
+
+            // 1. Seed cold (>30d) + hot (<30d) rows across DB_FEED, DB_GAMELOG, DB_LEGACY, DB_CORE, DB_CACHE
+            await env.DB_FEED.batch([
+                env.DB_FEED.prepare(
+                    `INSERT OR IGNORE INTO feed_gps (created_at, user_id, display_name, location, world_name, previous_location, time, group_name)
+                     VALUES (?, 'usr_cmp_a', 'CompactAlice', 'wrld_cmp_cold:100', 'Cold Compact World', '', 900, '')`
+                ).bind(oldIso1),
+                env.DB_FEED.prepare(
+                    `INSERT OR IGNORE INTO feed_gps (created_at, user_id, display_name, location, world_name, previous_location, time, group_name)
+                     VALUES (?, 'usr_cmp_b', 'CompactBob', 'wrld_cmp_cold:100', 'Cold Compact World', '', 600, '')`
+                ).bind(oldIso2),
+                env.DB_FEED.prepare(
+                    `INSERT OR IGNORE INTO feed_gps (created_at, user_id, display_name, location, world_name, previous_location, time, group_name)
+                     VALUES (?, 'usr_cmp_a', 'CompactAlice', 'wrld_cmp_hot:200', 'Hot Recent World', '', 300, '')`
+                ).bind(recentIso)
+            ]);
+            await env.DB_GAMELOG.batch([
+                env.DB_GAMELOG.prepare(
+                    'INSERT OR IGNORE INTO gamelog_event (created_at, data) VALUES (?, ?)'
+                ).bind(oldIso1, 'CompactOldEvent'),
+                env.DB_GAMELOG.prepare(
+                    'INSERT OR IGNORE INTO gamelog_event (created_at, data) VALUES (?, ?)'
+                ).bind(recentIso, 'CompactHotEvent'),
+                env.DB_GAMELOG.prepare(
+                    `INSERT OR IGNORE INTO gamelog_video_play (created_at, video_url, video_name, video_id, location, display_name, user_id)
+                     VALUES (?, 'https://youtu.be/cmp_vid_1', 'Compact Cold Video', 'cmp_vid_1', 'wrld_cmp_cold:100', 'CompactAlice', 'usr_cmp_a')`
+                ).bind(oldIso2)
+            ]);
+            await legacyDb
+                .prepare(
+                    `INSERT OR IGNORE INTO feed_gps (created_at, user_id, display_name, location, world_name, previous_location, time, group_name)
+                     VALUES (?, 'usr_cmp_legacy', 'LegacySingle', 'wrld_cmp_legacy:1', 'Legacy Single World', '', 120, '')`
+                )
+                .bind(oldIso1)
+                .run();
+            await env.DB_CORE.prepare(
+                `INSERT OR REPLACE INTO cloud_commands (cmd_id, target_device_id, action, payload_json, status, result_json, created_at, expires_at, finished_at)
+                 VALUES ('cmd_cmp_expired', 'dev_cmp', 'sync_now', '{}', 'succeeded', '{}', ?, ?, ?)`
+            )
+                .bind(expiredCmdIso, expiredCmdIso, expiredCmdIso)
+                .run();
+            await cacheDb
+                .prepare(
+                    `INSERT OR REPLACE INTO vrc_api_cache (cache_key, tier, status, body_text, updated_at, expires_at)
+                     VALUES ('https://api.vrchat.cloud/api/1/worlds/wrld_cmp_expired', 'world', 200, '{}', ?, ?)`
+                )
+                .bind(expiredCmdIso, Date.now() - 60_000)
+                .run();
+
+            // 2. Run POST /api/admin/storage/compact with default 30-day retention
+            const compactRes = await exports.default.fetch('http://example.com/api/admin/storage/compact', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+                body: JSON.stringify({ retentionDays: 30, includeLegacy: true })
+            });
+            expect(compactRes.status).toBe(200);
+            const compactJson = (await compactRes.json()) as {
+                data: {
+                    feedPackedRows: number;
+                    feedChunksCreated: number;
+                    gamelogPackedRows: number;
+                    gamelogChunksCreated: number;
+                    legacyFeedPackedRows: number;
+                    corePrunedRows: number;
+                    cachePrunedRows: number;
+                };
+            };
+            expect(compactJson.data.feedPackedRows).toBeGreaterThanOrEqual(2);
+            expect(compactJson.data.feedChunksCreated).toBeGreaterThanOrEqual(1);
+            expect(compactJson.data.gamelogPackedRows).toBeGreaterThanOrEqual(2);
+            expect(compactJson.data.gamelogChunksCreated).toBeGreaterThanOrEqual(2);
+            expect(compactJson.data.legacyFeedPackedRows).toBeGreaterThanOrEqual(1);
+            expect(compactJson.data.corePrunedRows).toBeGreaterThanOrEqual(1);
+            expect(compactJson.data.cachePrunedRows).toBeGreaterThanOrEqual(1);
+
+            // Cold rows moved out of hot single-row tables; recent hot rows stay untouched
+            expect(
+                (
+                    await env.DB_FEED.prepare("SELECT COUNT(*) AS cnt FROM feed_gps WHERE location = 'wrld_cmp_cold:100'").first<{
+                        cnt: number;
+                    }>()
+                )?.cnt
+            ).toBe(0);
+            expect(
+                (
+                    await env.DB_FEED.prepare("SELECT COUNT(*) AS cnt FROM feed_gps WHERE location = 'wrld_cmp_hot:200'").first<{
+                        cnt: number;
+                    }>()
+                )?.cnt
+            ).toBe(1);
+            expect(
+                (
+                    await env.DB_GAMELOG.prepare("SELECT COUNT(*) AS cnt FROM gamelog_event WHERE data = 'CompactOldEvent'").first<{
+                        cnt: number;
+                    }>()
+                )?.cnt
+            ).toBe(0);
+            expect(
+                (
+                    await env.DB_GAMELOG.prepare("SELECT COUNT(*) AS cnt FROM gamelog_event WHERE data = 'CompactHotEvent'").first<{
+                        cnt: number;
+                    }>()
+                )?.cnt
+            ).toBe(1);
+            expect(
+                (
+                    await legacyDb.prepare("SELECT COUNT(*) AS cnt FROM feed_gps WHERE user_id = 'usr_cmp_legacy'").first<{
+                        cnt: number;
+                    }>()
+                )?.cnt
+            ).toBe(0);
+
+            // 3. Transparent reads: /api/feed/query, /api/feed/hot-worlds?days=90, and /api/gamelog/query still surface archived rows
+            const feedQueryRes = await exports.default.fetch('http://example.com/api/feed/query', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+                body: JSON.stringify({
+                    types: ['GPS'],
+                    vipList: ['usr_cmp_a', 'usr_cmp_b'],
+                    limit: 20
+                })
+            });
+            const feedQueryJson = (await feedQueryRes.json()) as {
+                data: Array<{ worldName?: string }>;
+            };
+            expect(feedQueryJson.data.some((r) => r.worldName === 'Cold Compact World')).toBe(true);
+            expect(feedQueryJson.data.some((r) => r.worldName === 'Hot Recent World')).toBe(true);
+
+            const hotWorldsRes = await exports.default.fetch('http://example.com/api/feed/hot-worlds?days=90&limit=20');
+            const hotWorldsJson = (await hotWorldsRes.json()) as {
+                data: Array<{ worldId: string; worldName: string; visitCount: number; uniqueFriends: number }>;
+            };
+            const coldWorldStat = hotWorldsJson.data.find((w) => w.worldId === 'wrld_cmp_cold');
+            expect(coldWorldStat?.worldName).toBe('Cold Compact World');
+            expect(coldWorldStat?.visitCount).toBe(2);
+            expect(coldWorldStat?.uniqueFriends).toBe(2);
+
+            const glQueryRes = await exports.default.fetch('http://example.com/api/gamelog/query', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+                body: JSON.stringify({ types: ['Event', 'VideoPlay'], limit: 50 })
+            });
+            const glQueryJson = (await glQueryRes.json()) as {
+                data: Array<{ type: string; data?: string; videoName?: string }>;
+            };
+            expect(glQueryJson.data.some((r) => r.type === 'Event' && r.data === 'CompactOldEvent')).toBe(true);
+            expect(glQueryJson.data.some((r) => r.type === 'VideoPlay' && r.videoName === 'Compact Cold Video')).toBe(true);
+
+            // 4. Transparent export: active summary & paginated export seamlessly include feed_archive_chunks & gamelog_archive_chunks
+            const expSummaryRes = await exports.default.fetch(
+                'http://example.com/api/migration/export?scope=summary&includeLegacy=1'
+            );
+            const expSummaryJson = (await expSummaryRes.json()) as {
+                data: { tables: Array<{ name: string; activeCount: number; legacyCount: number }> };
+            };
+            expect(expSummaryJson.data.tables.find((t) => t.name === 'feed_gps')!.activeCount).toBeGreaterThanOrEqual(3);
+            expect(expSummaryJson.data.tables.find((t) => t.name === 'gamelog_event')!.activeCount).toBeGreaterThanOrEqual(2);
+
+            const expEventRes = await exports.default.fetch(
+                'http://example.com/api/migration/export?table=gamelog_event&source=active&afterRowId=0&limit=500'
+            );
+            const expEventJson = (await expEventRes.json()) as {
+                data: { rows: Array<{ data?: string }>; nextAfterRowId: number; hasMore: boolean };
+            };
+            const exportedEvents = [...expEventJson.data.rows];
+            if (expEventJson.data.hasMore) {
+                const expEventRes2 = await exports.default.fetch(
+                    `http://example.com/api/migration/export?table=gamelog_event&source=active&afterRowId=${expEventJson.data.nextAfterRowId}&limit=500`
+                );
+                const expEventJson2 = (await expEventRes2.json()) as { data: { rows: Array<{ data?: string }> } };
+                exportedEvents.push(...expEventJson2.data.rows);
+            }
+            expect(exportedEvents.some((r) => r.data === 'CompactOldEvent')).toBe(true);
+            expect(exportedEvents.some((r) => r.data === 'CompactHotEvent')).toBe(true);
+        } finally {
+            await env.DB_FEED.batch([
+                env.DB_FEED.prepare("DELETE FROM feed_gps WHERE user_id IN ('usr_cmp_a', 'usr_cmp_b')"),
+                env.DB_FEED.prepare('DELETE FROM feed_archive_chunks')
+            ]).catch(() => {});
+            await env.DB_GAMELOG.batch([
+                env.DB_GAMELOG.prepare("DELETE FROM gamelog_event WHERE data IN ('CompactOldEvent', 'CompactHotEvent')"),
+                env.DB_GAMELOG.prepare("DELETE FROM gamelog_video_play WHERE video_id = 'cmp_vid_1'"),
+                env.DB_GAMELOG.prepare('DELETE FROM gamelog_archive_chunks')
+            ]).catch(() => {});
+            await legacyDb.prepare('DELETE FROM legacy_feed_chunks').run().catch(() => {});
+        }
+    });
 });

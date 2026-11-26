@@ -4001,7 +4001,13 @@
             "direct_proxy_disable_cancel_btn": "Cancel",
             "b2_pricing_hint_prefix": "Register an account and create a B2 bucket at ",
             "b2_pricing_hint_suffix": " (first 10 GB free; storage pricing is $6.95 / TB / month).",
-            "status_unsaved": "Unsaved"
+            "status_unsaved": "Unsaved",
+            "compact_heading": "Database Row Compaction",
+            "compact_desc": "Packs historical Feed & event logs older than 30 days (up to 1,000 rows per row) and prunes expired caches/commands. Queries and exports stay 100% intact.",
+            "compact_btn": "Compact Databases",
+            "compacting_btn": "Compacting...",
+            "compact_done_toast": "Compacted {packed} rows into {chunks} chunks and pruned {pruned} expired rows.",
+            "compact_noop_toast": "All databases are already compact; no older rows needed packing."
         },
         "settings": {
             "restoring_session": "Restoring session...",

@@ -3999,7 +3999,13 @@
             "direct_proxy_disable_cancel_btn": "取消",
             "b2_pricing_hint_prefix": "可在 Backblaze 官网注册账户并创建 B2 存储桶：",
             "b2_pricing_hint_suffix": "（前 10 GB 免费，超出后存储费用约为 6.95 美元 / TB / 月）。",
-            "status_unsaved": "未保存"
+            "status_unsaved": "未保存",
+            "compact_heading": "数据库分块压缩瘦身",
+            "compact_desc": "将超过 30 天的现网动态、事件日志及老库单行动态按每 1,000 条打包为 1 行，并清理过期缓存与历史命令（所有查询、热世界统计与导出完全无损兼容；后台每天也会自动执行）。",
+            "compact_btn": "立即压缩优化",
+            "compacting_btn": "压缩中...",
+            "compact_done_toast": "压缩完成：已将 {packed} 条记录打包为 {chunks} 个紧凑分块，并清理 {pruned} 条过期记录。",
+            "compact_noop_toast": "所有数据库均已处于紧凑状态，暂无需要打包的旧数据。"
         },
         "settings": {
             "restoring_session": "正在恢复会话...",

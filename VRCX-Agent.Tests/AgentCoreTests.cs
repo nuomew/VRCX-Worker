@@ -2775,7 +2775,7 @@ INSERT INTO {acctPrefix}_friend_log_history (created_at, type, user_id, display_
                 ["concurrency"] = 9
             }).Ok);
 
-            // 7. Concurrent migration (concurrency=4) uploads batches in parallel, retries transient 503 once, and finalizes categoryDone after drain
+            // 7. Concurrent migration (concurrency=4) packs Feed up to 1000 rows/batch, uploads in parallel, retries transient 503 once, and finalizes categoryDone after drain
             using (var connBulk = new SqliteConnection($"Data Source={dbPath}"))
             {
                 connBulk.Open();
@@ -2784,9 +2784,12 @@ INSERT INTO {acctPrefix}_friend_log_history (created_at, type, user_id, display_
                 cmdIns.CommandText = $"INSERT INTO \"{acctPrefix}_feed_gps\" (created_at, user_id, display_name, location, world_name, previous_location, time, group_name) VALUES ($ts, $uid, 'Pal', 'wrld_x:1', 'WorldX', '', 60, '')";
                 var pTs = cmdIns.Parameters.Add("$ts", SqliteType.Text);
                 var pUid = cmdIns.Parameters.Add("$uid", SqliteType.Text);
-                for (int i = 0; i < 600; i++)
+                for (int i = 0; i < 2500; i++)
                 {
-                    pTs.Value = $"2024-04-01T00:{(i / 60):D2}:{(i % 60):D2}Z";
+                    int hour = i / 3600;
+                    int min = (i / 60) % 60;
+                    int sec = i % 60;
+                    pTs.Value = $"2024-04-01T{hour:D2}:{min:D2}:{sec:D2}Z";
                     pUid.Value = $"usr_bulk_{i}";
                     cmdIns.ExecuteNonQuery();
                 }
@@ -2851,10 +2854,10 @@ INSERT INTO {acctPrefix}_friend_log_history (created_at, type, user_id, display_
                 CancellationToken.None,
                 concurrency: 4);
             Assert.True(completedConc);
-            Assert.True(concBatches >= 3);
+            Assert.Equal(3, concBatches); // 2501 rows packed at 1000 rows/batch = 3 batches (1000 + 1000 + 501)
             Assert.True(maxInFlight >= 2, $"Expected parallel in-flight batches >= 2, observed {maxInFlight}");
             Assert.Equal(1, categoryDoneCount);
-            Assert.True(totalConcurrentItems >= 600);
+            Assert.Equal(2501, totalConcurrentItems);
 
             // 8. Server shouldStop=true halts migration immediately without sending remaining categories
             int stopCalls = 0;
@@ -2957,14 +2960,14 @@ INSERT INTO {acctPrefix}_friend_log_history (created_at, type, user_id, display_
             // Completed `memos` table must be skipped; unfinished `notes` still uploads
             Assert.DoesNotContain("Old desktop memo", resumeAllJson);
             Assert.Contains("Met in JP shrine", resumeAllJson);
-            // Total feed_gps rows = 601; resuming after the 250th newest row must upload strictly the remaining 351 rows
-            Assert.Equal(351, resumedFeedItems.Count);
+            // Total feed_gps rows = 2501; resuming after the 250th newest row must upload strictly the remaining 2251 rows
+            Assert.Equal(2251, resumedFeedItems.Count);
             Assert.DoesNotContain("2025-01-05T08:00:00Z", resumedFeedItems);
-            // Final feed_gps cursorUpdate seals completed=true with accumulated rowsDone = 601
+            // Final feed_gps cursorUpdate seals completed=true with accumulated rowsDone = 2501
             Assert.Contains(resumePayloads, p =>
                 p["cursorUpdate"]?["table"]?.Value<string>() == "feed_gps" &&
                 p["cursorUpdate"]?["completed"]?.Value<bool>() == true &&
-                p["cursorUpdate"]?["rowsDone"]?.Value<long>() == 601);
+                p["cursorUpdate"]?["rowsDone"]?.Value<long>() == 2501);
         }
         finally
         {

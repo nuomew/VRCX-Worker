@@ -1,4 +1,5 @@
 import { authenticateAgent, authenticateWeb, handleAuthRoutes, isSameOriginRequest } from './auth/auth';
+import { maybeRunDailyAutoCompaction } from './db/compactArchive';
 import { ensureSchemaReady } from './db/schemaBootstrap';
 import type { Env } from './env';
 import { AgentHubDO } from './hub/AgentHubDO';
@@ -268,6 +269,7 @@ export default {
         const task = (async () => {
             await ensureSchemaReady(env);
             await runBackgroundFeedSync(env, { trigger: 'cron' });
+            await maybeRunDailyAutoCompaction(env);
         })();
         ctx.waitUntil(task);
         await task;

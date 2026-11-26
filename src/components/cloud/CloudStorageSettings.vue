@@ -24,6 +24,33 @@
                     </div>
                 </div>
 
+                <!-- Database Row Compaction (1000-row Cold Chunks + Cache/Control Pruning) -->
+                <div class="rounded-lg border border-border bg-card/60 p-4 space-y-2.5">
+                    <div class="flex flex-wrap items-center justify-between gap-2">
+                        <div class="space-y-0.5">
+                            <div class="font-medium text-sm text-foreground">
+                                {{ t('cloud_hub.storage.compact_heading') }}
+                            </div>
+                            <div class="text-[11px] text-muted-foreground">
+                                {{ t('cloud_hub.storage.compact_desc') }}
+                            </div>
+                        </div>
+                        <Button
+                            size="sm"
+                            variant="outline"
+                            :disabled="compactingDb || cleaningDb"
+                            @click="runDatabaseCompaction">
+                            {{
+                                compactingDb
+                                    ? t('cloud_hub.storage.compacting_btn')
+                                    : t('cloud_hub.storage.compact_btn')
+                            }}
+                        </Button>
+                    </div>
+                    <p v-if="compactNotice" class="text-[11px] text-primary">{{ compactNotice }}</p>
+                    <p v-if="compactError" class="text-[11px] text-destructive">{{ compactError }}</p>
+                </div>
+
                 <!-- Database Age-Based Cleanup (Direct Delete / Backup to R2 / Backup to B2) -->
                 <div class="rounded-lg border border-border bg-card/60 p-4 space-y-3">
                     <div class="flex flex-wrap items-center justify-between gap-2">
@@ -638,6 +665,9 @@
     const pendingCleanupMode = ref('');
     const pendingCleanupTarget = ref('auto');
     const cleaningDb = ref(false);
+    const compactingDb = ref(false);
+    const compactNotice = ref('');
+    const compactError = ref('');
     const cleanupNotice = ref('');
     const cleanupError = ref('');
     const cleanupBackups = ref([]);
@@ -719,6 +749,47 @@
 
     async function refreshDatabaseSection() {
         await Promise.all([loadQuota(), loadCleanupPreview(), loadCleanupBackups()]);
+    }
+
+    async function runDatabaseCompaction() {
+        if (compactingDb.value || cleaningDb.value) return;
+        compactingDb.value = true;
+        compactNotice.value = '';
+        compactError.value = '';
+        try {
+            let totalPacked = 0;
+            let totalChunks = 0;
+            let totalPruned = 0;
+            for (let round = 0; round < 10; round++) {
+                const res = await cloudFetch('/api/admin/storage/compact', {
+                    method: 'POST',
+                    json: { retentionDays: 30, includeLegacy: true, maxChunksPerTable: 8 }
+                });
+                totalPacked += Number(res?.totalPackedRows || 0);
+                totalChunks +=
+                    Number(res?.feedChunksCreated || 0) +
+                    Number(res?.gamelogChunksCreated || 0) +
+                    Number(res?.legacyFeedChunksCreated || 0);
+                totalPruned += Number(res?.totalPrunedRows || 0);
+                if (!res?.hasMore) break;
+            }
+            if (totalPacked > 0 || totalPruned > 0) {
+                compactNotice.value = t('cloud_hub.storage.compact_done_toast', {
+                    packed: totalPacked.toLocaleString(),
+                    chunks: totalChunks.toLocaleString(),
+                    pruned: totalPruned.toLocaleString()
+                });
+            } else {
+                compactNotice.value = t('cloud_hub.storage.compact_noop_toast');
+            }
+            toast.success(compactNotice.value);
+            await refreshDatabaseSection();
+        } catch (err) {
+            compactError.value = err?.message || String(err);
+            toast.error(compactError.value);
+        } finally {
+            compactingDb.value = false;
+        }
     }
 
     function requestCleanupConfirm(mode, target = 'auto') {

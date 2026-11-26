@@ -1,3 +1,4 @@
+import { decodeFeedChunkRows, decodeGameLogChunkRows } from '../db/compactArchive';
 import { getLegacyDb } from '../db/schemaBootstrap';
 import type { Env } from '../env';
 import { buildSafeTrigramMatch, escapeSqlLikePattern, searchGameLogByEntity } from '../search/entityFts';
@@ -11,7 +12,7 @@ import {
     upsertEntityUsersBatch,
     upsertEntityWorldsBatch
 } from './coreData';
-import { decodeLegacyFeedChunkRows, getLegacyImportedStats } from './legacyMigration';
+import { getLegacyImportedStats } from './legacyMigration';
 
 const MAX_LIMIT = 100;
 
@@ -809,6 +810,41 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
                 const rid = Number(row.rowId ?? 0);
                 if (Number.isFinite(rid) && rid > 0) {
                     row.rowId = -rid;
+                }
+            }
+        } else if (normalized.length < limit) {
+            // Merge compact cold archive chunks from DB_GAMELOG (portal/video/event/external >30d)
+            const chunkKinds: string[] = [];
+            if (wantPortal) chunkKinds.push('portal');
+            if (wantVideo) chunkKinds.push('video');
+            if (wantEvent) chunkKinds.push('event');
+            if (wantExternal) chunkKinds.push('external');
+            if (chunkKinds.length > 0) {
+                try {
+                    const kindPh = chunkKinds.map(() => '?').join(', ');
+                    const chunkRes = await db
+                        .prepare(
+                            `SELECT id, gamelog_kind, payload_json
+                             FROM gamelog_archive_chunks
+                             WHERE gamelog_kind IN (${kindPh})
+                             ORDER BY max_created_at DESC, id DESC
+                             LIMIT ?`
+                        )
+                        .bind(...chunkKinds, hasVip ? 12 : 6)
+                        .all<{ id: number; gamelog_kind: string; payload_json: string }>();
+                    const vipSet = hasVip ? new Set(cleanVips) : null;
+                    for (const c of chunkRes.results ?? []) {
+                        const unpacked = decodeGameLogChunkRows(c.id, c.gamelog_kind, c.payload_json);
+                        for (const entry of unpacked) {
+                            const entryType = String(entry.type ?? '');
+                            if (hasTypeFilter && !typeSet.has(entryType)) continue;
+                            if (vipSet && !vipSet.has(String(entry.userId ?? ''))) continue;
+                            normalized.push(entry);
+                        }
+                    }
+                    normalized.sort((a, b) => String(b.created_at ?? '').localeCompare(String(a.created_at ?? '')));
+                } catch {
+                    // Graceful fallback if gamelog_archive_chunks has not been initialized yet
                 }
             }
         }
@@ -2626,14 +2662,20 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
                     row.rowId = -rid;
                 }
             }
+        }
 
-            // Also read compact archived chunks from legacy_feed_chunks (Plan A: >99% D1 write savings)
+        // Read compact archived chunks transparently:
+        // - DB_LEGACY: `legacy_feed_chunks` (always queried)
+        // - Active DB_FEED: `feed_archive_chunks` (queried when hot single-row rows < limit or date/VIP filtered)
+        const shouldReadFeedChunks = negateRowIds || items.length < limit || hasDateBound || hasVip;
+        if (shouldReadFeedChunks) {
             const chunkKinds: string[] = [];
             if (wantGps) chunkKinds.push('gps');
             if (wantOnline || wantOffline) chunkKinds.push('oo');
             if (wantStatus) chunkKinds.push('status');
             if (wantBio) chunkKinds.push('bio');
             if (chunkKinds.length > 0) {
+                const archiveTable = negateRowIds ? 'legacy_feed_chunks' : 'feed_archive_chunks';
                 try {
                     const kindPh = chunkKinds.map(() => '?').join(', ');
                     const chunkConds: string[] = [`feed_kind IN (${kindPh})`];
@@ -2646,11 +2688,11 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
                         chunkConds.push('min_created_at <= ?');
                         chunkBinds.push(cleanDateTo);
                     }
-                    const chunkLimit = hasVip ? 16 : Math.min(12, Math.max(4, Math.ceil(limit / 80) + 2));
+                    const chunkLimit = hasVip ? 16 : Math.min(12, Math.max(4, Math.ceil(limit / 100) + 2));
                     const chunkRes = await db
                         .prepare(
                             `SELECT id, feed_kind, payload_json
-                             FROM legacy_feed_chunks
+                             FROM ${archiveTable}
                              WHERE ${chunkConds.join(' AND ')}
                              ORDER BY max_created_at DESC, id DESC
                              LIMIT ?`
@@ -2659,7 +2701,9 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
                         .all<{ id: number; feed_kind: string; payload_json: string }>();
                     const vipSet = hasVip ? new Set(vipIds) : null;
                     for (const c of chunkRes.results ?? []) {
-                        const unpacked = decodeLegacyFeedChunkRows(c.id, c.feed_kind, c.payload_json);
+                        const unpacked = decodeFeedChunkRows(c.id, c.feed_kind, c.payload_json, {
+                            negateRowIds
+                        });
                         for (const entry of unpacked) {
                             const entryType = String(entry.type ?? '');
                             if (!useAll && !typeSet.has(entryType)) continue;
@@ -2671,7 +2715,7 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
                         }
                     }
                 } catch {
-                    // Graceful fallback if legacy_feed_chunks has not been initialized yet
+                    // Graceful fallback if compact chunk archive table has not been initialized yet
                 }
             }
         }
@@ -3083,8 +3127,106 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
                 new_friends: number;
             }>();
 
-        const rows = res.results ?? [];
-        const missingNameIds = rows.filter((r) => !r.world_name).map((r) => r.world_id);
+        const hotRows = res.results ?? [];
+        const worldAgg = new Map<
+            string,
+            {
+                worldId: string;
+                worldName: string;
+                visitCount: number;
+                baseUniqueFriends: number;
+                extraUsers: Set<string>;
+                lastVisited: string;
+                oldFriends: number;
+                newFriends: number;
+                extraOldUsers: Set<string>;
+                extraNewUsers: Set<string>;
+            }
+        >();
+        for (const r of hotRows) {
+            worldAgg.set(r.world_id, {
+                worldId: r.world_id,
+                worldName: (r.world_name || '').trim(),
+                visitCount: Number(r.visit_count ?? 0),
+                baseUniqueFriends: Number(r.unique_friends ?? 0),
+                extraUsers: new Set<string>(),
+                lastVisited: r.last_visited || '',
+                oldFriends: Number(r.old_friends ?? 0),
+                newFriends: Number(r.new_friends ?? 0),
+                extraOldUsers: new Set<string>(),
+                extraNewUsers: new Set<string>()
+            });
+        }
+
+        // Merge compact cold GPS archive chunks when querying beyond the 30-day hot window (or when hot rows are sparse)
+        if (days > 30 || hotRows.length < limit) {
+            try {
+                const archiveRes = await env.DB_FEED.prepare(
+                    `SELECT id, payload_json
+                     FROM feed_archive_chunks
+                     WHERE feed_kind = 'gps' AND max_created_at >= ?
+                     ORDER BY max_created_at DESC, id DESC
+                     LIMIT 24`
+                )
+                    .bind(sinceIso)
+                    .all<{ id: number; payload_json: string }>();
+                for (const c of archiveRes.results ?? []) {
+                    const unpacked = decodeFeedChunkRows(c.id, 'gps', c.payload_json, { negateRowIds: false });
+                    for (const entry of unpacked) {
+                        const createdAt = String(entry.created_at ?? '');
+                        if (!createdAt || createdAt < sinceIso) continue;
+                        const loc = String(entry.location ?? '');
+                        if (!loc.startsWith('wrld_')) continue;
+                        const colon = loc.indexOf(':');
+                        if (colon <= 0) continue;
+                        const wid = loc.slice(0, colon);
+                        const uid = String(entry.userId ?? '');
+                        const wname = String(entry.worldName ?? '').trim();
+                        let slot = worldAgg.get(wid);
+                        if (!slot) {
+                            slot = {
+                                worldId: wid,
+                                worldName: wname,
+                                visitCount: 0,
+                                baseUniqueFriends: 0,
+                                extraUsers: new Set<string>(),
+                                lastVisited: createdAt,
+                                oldFriends: 0,
+                                newFriends: 0,
+                                extraOldUsers: new Set<string>(),
+                                extraNewUsers: new Set<string>()
+                            };
+                            worldAgg.set(wid, slot);
+                        }
+                        slot.visitCount++;
+                        if (!slot.worldName && wname) slot.worldName = wname;
+                        if (createdAt > slot.lastVisited) slot.lastVisited = createdAt;
+                        if (uid) {
+                            slot.extraUsers.add(uid);
+                            if (createdAt < halfIso) slot.extraOldUsers.add(uid);
+                            else slot.extraNewUsers.add(uid);
+                        }
+                    }
+                }
+            } catch {
+                // Non-fatal if feed_archive_chunks is absent
+            }
+        }
+
+        const mergedRows = Array.from(worldAgg.values())
+            .map((s) => ({
+                world_id: s.worldId,
+                world_name: s.worldName,
+                visit_count: s.visitCount,
+                unique_friends: s.baseUniqueFriends > 0 ? Math.max(s.baseUniqueFriends, s.extraUsers.size) : s.extraUsers.size,
+                last_visited: s.lastVisited,
+                old_friends: s.oldFriends + s.extraOldUsers.size,
+                new_friends: s.newFriends + s.extraNewUsers.size
+            }))
+            .sort((a, b) => b.unique_friends - a.unique_friends || b.visit_count - a.visit_count)
+            .slice(0, Math.min(limit + 10, 60));
+
+        const missingNameIds = mergedRows.filter((r) => !r.world_name).map((r) => r.world_id);
         const fallbackNames = new Map<string, string>();
         if (missingNameIds.length > 0) {
             for (let i = 0; i < missingNameIds.length; i += 20) {
@@ -3102,7 +3244,7 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
         }
 
         const out = [];
-        for (const r of rows) {
+        for (const r of mergedRows) {
             const worldName = (r.world_name || fallbackNames.get(r.world_id) || '').trim();
             if (!worldName) continue;
             const oldFriends = Number(r.old_friends ?? 0);
@@ -3150,12 +3292,54 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
             .bind(sinceIso, locationPrefix, `${locationPrefix}\uffff`)
             .all<{ user_id: string; display_name: string; visit_count: number; last_visit: string }>();
 
-        const out = (res.results ?? []).map((r) => ({
-            userId: r.user_id,
-            displayName: r.display_name || r.user_id,
-            visitCount: Number(r.visit_count ?? 0),
-            lastVisit: r.last_visit || ''
-        }));
+        const userAgg = new Map<string, { userId: string; displayName: string; visitCount: number; lastVisit: string }>();
+        for (const r of res.results ?? []) {
+            userAgg.set(r.user_id, {
+                userId: r.user_id,
+                displayName: r.display_name || r.user_id,
+                visitCount: Number(r.visit_count ?? 0),
+                lastVisit: r.last_visit || ''
+            });
+        }
+        if (days > 30 || userAgg.size === 0) {
+            try {
+                const archiveRes = await env.DB_FEED.prepare(
+                    `SELECT id, payload_json
+                     FROM feed_archive_chunks
+                     WHERE feed_kind = 'gps' AND max_created_at >= ?
+                     ORDER BY max_created_at DESC, id DESC
+                     LIMIT 24`
+                )
+                    .bind(sinceIso)
+                    .all<{ id: number; payload_json: string }>();
+                for (const c of archiveRes.results ?? []) {
+                    const unpacked = decodeFeedChunkRows(c.id, 'gps', c.payload_json, { negateRowIds: false });
+                    for (const entry of unpacked) {
+                        const createdAt = String(entry.created_at ?? '');
+                        if (!createdAt || createdAt < sinceIso) continue;
+                        const loc = String(entry.location ?? '');
+                        if (!loc.startsWith(locationPrefix)) continue;
+                        const uid = String(entry.userId ?? '');
+                        if (!uid) continue;
+                        const dname = String(entry.displayName ?? '') || uid;
+                        const prev = userAgg.get(uid);
+                        if (!prev) {
+                            userAgg.set(uid, { userId: uid, displayName: dname, visitCount: 1, lastVisit: createdAt });
+                        } else {
+                            prev.visitCount++;
+                            if (createdAt > prev.lastVisit) prev.lastVisit = createdAt;
+                            if (!prev.displayName && dname) prev.displayName = dname;
+                        }
+                    }
+                }
+            } catch {
+                // Non-fatal
+            }
+        }
+
+        const out = Array.from(userAgg.values())
+            .sort((a, b) => b.visitCount - a.visitCount)
+            .slice(0, 100);
         return Response.json({ ok: true, data: out });
     }
 
