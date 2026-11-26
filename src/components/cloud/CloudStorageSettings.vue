@@ -367,15 +367,11 @@
                                 secure.backblaze.com
                             </a>
                         </div>
-                        <label class="inline-flex items-center gap-2 select-none cursor-pointer text-foreground">
-                            <input
-                                v-model="formEnabled"
-                                type="checkbox"
-                                class="rounded border-input"
-                                :disabled="savingConfig"
-                                @change="onToggleExtraStorage" />
-                            <span class="font-medium">{{ t('cloud_hub.storage.enable_extra_label') }}</span>
-                        </label>
+                        <Switch
+                            :model-value="formEnabled"
+                            :disabled="savingConfig"
+                            :aria-label="t('cloud_hub.storage.enable_extra_label')"
+                            @update:model-value="onToggleExtraStorage" />
                     </div>
 
                     <template v-if="formEnabled">
@@ -579,6 +575,7 @@
     import { useI18n } from 'vue-i18n';
     import { toast } from 'vue-sonner';
     import { Button } from '@/components/ui/button';
+    import { Switch } from '@/components/ui/switch';
     import SettingsGroup from '@/views/Settings/components/SettingsGroup.vue';
     import { cloudFetch } from '@/ipc-web/apiClient';
     import { cloudState } from '@/ipc-web/cloudState';
@@ -817,7 +814,8 @@
         }
     }
 
-    async function onToggleExtraStorage() {
+    async function onToggleExtraStorage(nextEnabled) {
+        formEnabled.value = Boolean(nextEnabled);
         statusError.value = '';
         statusNotice.value = '';
         // When collapsing a previously enabled config, persist disabled state immediately
