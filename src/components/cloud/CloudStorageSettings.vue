@@ -360,13 +360,6 @@
                                         : t('cloud_hub.storage.status_disabled')
                                 }}
                             </span>
-                            <a
-                                href="https://secure.backblaze.com"
-                                target="_blank"
-                                rel="noopener noreferrer"
-                                class="text-[11px] text-primary hover:underline">
-                                secure.backblaze.com
-                            </a>
                         </div>
                         <Switch
                             :model-value="formEnabled"
