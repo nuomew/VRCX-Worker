@@ -2713,7 +2713,41 @@ INSERT INTO {acctPrefix}_friend_log_history (created_at, type, user_id, display_
             Assert.DoesNotContain("authcookie_secret_xyz", allSentJson);
             Assert.DoesNotContain("127.0.0.1:7890", allSentJson);
 
-            // 5. Server shouldStop=true halts migration immediately without sending remaining categories
+            // 5. Oversized (>256 KiB) single row in configs is clamped below 180 KiB payload ceiling instead of causing HTTP 413
+            using (var connBig = new SqliteConnection($"Data Source={dbPath}"))
+            {
+                connBig.Open();
+                using var cmdBig = connBig.CreateCommand();
+                cmdBig.CommandText = "INSERT INTO configs VALUES ('VRCX_hugeLegacyJson', $val)";
+                cmdBig.Parameters.AddWithValue("$val", new string('A', 320 * 1024));
+                cmdBig.ExecuteNonQuery();
+            }
+
+            int maxBatchBytes = 0;
+            using var bigHttp = new HttpClient(new StubHttpHandler(async req =>
+            {
+                string body = req.Content != null ? await req.Content.ReadAsStringAsync() : "{}";
+                maxBatchBytes = Math.Max(maxBatchBytes, Encoding.UTF8.GetByteCount(body));
+                return new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent(
+                        "{\"ok\":true,\"data\":{\"inserted\":1,\"skipped\":0,\"legacyDbBytes\":65536,\"shouldStop\":false}}",
+                        Encoding.UTF8,
+                        "application/json")
+                };
+            }));
+            var (completedBig, _, _) = await DesktopLegacyMigrator.RunMigrationAsync(
+                cfg,
+                dbPath,
+                "mig_big_003",
+                acctPrefix,
+                new[] { "settings" },
+                new HttpSyncClient(bigHttp),
+                CancellationToken.None);
+            Assert.True(completedBig);
+            Assert.True(maxBatchBytes > 0 && maxBatchBytes <= 180 * 1024, $"Expected clamped batch <= 180 KiB, got {maxBatchBytes}");
+
+            // 6. Server shouldStop=true halts migration immediately without sending remaining categories
             int stopCalls = 0;
             using var stopHttp = new HttpClient(new StubHttpHandler(_ =>
             {

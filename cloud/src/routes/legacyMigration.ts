@@ -18,7 +18,7 @@ import {
 export const LEGACY_DB_FREE_LIMIT_BYTES = 500 * 1024 * 1024;
 export const LEGACY_DB_SOFT_STOP_BYTES = 480 * 1024 * 1024;
 const MAX_INVENTORY_BODY_BYTES = 128 * 1024;
-const MAX_BATCH_BODY_BYTES = 256 * 1024;
+const MAX_BATCH_BODY_BYTES = 4 * 1024 * 1024;
 const MAX_BATCH_ITEMS = 120;
 
 export const LEGACY_CATEGORIES = [
@@ -1174,7 +1174,7 @@ export async function handleLegacyMigrationAgentRoutes(
             rawText = await readRequestTextBounded(
                 request,
                 MAX_BATCH_BODY_BYTES,
-                'Migration batch exceeds 256 KiB limit'
+                'Migration batch exceeds 4 MiB limit'
             );
         } catch (err) {
             if (err instanceof PayloadTooLargeError) {

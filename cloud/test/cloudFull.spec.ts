@@ -6048,12 +6048,13 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
                 [
                     { kind: 'config', key: 'VRCX_themeMode', value: 'light' },
                     { kind: 'config', key: 'VRCX_fontSize', value: '15' },
-                    { kind: 'config', key: 'VRCX_savedCredentials', value: 'LEAK_SECRET_SHOULD_STRIP' }
+                    { kind: 'config', key: 'VRCX_savedCredentials', value: 'LEAK_SECRET_SHOULD_STRIP' },
+                    { kind: 'config', key: 'VRCX_largeLegacyBlob', value: 'X'.repeat(320 * 1024) }
                 ],
                 true,
                 false
             );
-            expect(bSettings.data.inserted).toBe(2); // savedCredentials stripped by cloud defense-in-depth
+            expect(bSettings.data.inserted).toBe(3); // savedCredentials stripped; >256 KiB single-item batch accepted & truncated cleanly
 
             // 5. Verify strict database isolation: active DB_GAMELOG & DB_FEED contain zero legacy shrine rows
             const activeGamelogRow = await env.DB_GAMELOG.prepare(

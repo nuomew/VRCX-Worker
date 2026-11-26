@@ -95,6 +95,7 @@ public static class DesktopLegacyMigrator
     private static readonly Logger Log = LogManager.GetCurrentClassLogger();
     private const int BatchRowsLimit = 80;
     private const int MaxBatchPayloadBytes = 180 * 1024;
+    private const int MaxSingleFieldChars = 16384;
     private const int SampleHalfRows = 200;
 
     public static readonly IReadOnlyList<string> AllowedCategories = new[]
@@ -507,6 +508,23 @@ public static class DesktopLegacyMigrator
         return map;
     }
 
+    private static void ClampOversizedStringFields(Dictionary<string, object?> item, int maxChars)
+    {
+        if (maxChars <= 0 || item.Count == 0) return;
+        foreach (string key in item.Keys.ToList())
+        {
+            if (item[key] is string s && s.Length > maxChars)
+            {
+                int cut = maxChars;
+                if (cut > 0 && char.IsHighSurrogate(s[cut - 1]))
+                {
+                    cut--;
+                }
+                item[key] = s.Substring(0, cut);
+            }
+        }
+    }
+
     /// <summary>
     /// Streams selected categories from the read-only desktop VRCX database in bounded batches
     /// into the dedicated cloud DB_LEGACY database, respecting cancellation and server quota stop signals.
@@ -571,6 +589,16 @@ public static class DesktopLegacyMigrator
                 async Task<bool> EnqueueItemAsync(Dictionary<string, object?> item)
                 {
                     int itemBytes = Encoding.UTF8.GetByteCount(JsonConvert.SerializeObject(item)) + 2;
+                    if (itemBytes > MaxBatchPayloadBytes)
+                    {
+                        ClampOversizedStringFields(item, MaxSingleFieldChars);
+                        itemBytes = Encoding.UTF8.GetByteCount(JsonConvert.SerializeObject(item)) + 2;
+                        if (itemBytes > MaxBatchPayloadBytes)
+                        {
+                            ClampOversizedStringFields(item, 4096);
+                            itemBytes = Encoding.UTF8.GetByteCount(JsonConvert.SerializeObject(item)) + 2;
+                        }
+                    }
                     if (buffer.Count >= BatchRowsLimit || (buffer.Count > 0 && bufferBytes + itemBytes > MaxBatchPayloadBytes))
                     {
                         if (await FlushBufferAsync(categoryDone: false).ConfigureAwait(false))
