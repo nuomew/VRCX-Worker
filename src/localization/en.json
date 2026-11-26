@@ -3836,8 +3836,8 @@
         },
         "storage": {
             "tab_label": "Storage",
-            "db_section_title": "Cloud Databases (D1 Usage & Cleanup)",
-            "section_title": "Object Storage (R2 & Backblaze B2)",
+            "db_section_title": "Cloud Databases",
+            "section_title": "Object Storage",
             "r2_title": "Cloudflare R2",
             "status_bound": "Bound",
             "status_unbound": "Not Bound",

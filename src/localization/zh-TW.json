@@ -3499,8 +3499,8 @@
         },
         "storage": {
             "tab_label": "儲存",
-            "db_section_title": "雲端資料庫（D1 空間與清理）",
-            "section_title": "物件儲存（R2 與 Backblaze B2）",
+            "db_section_title": "雲端資料庫",
+            "section_title": "物件儲存",
             "r2_title": "Cloudflare R2 儲存",
             "status_bound": "已繫結",
             "status_unbound": "未繫結",
