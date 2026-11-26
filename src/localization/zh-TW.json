@@ -823,7 +823,7 @@
                 "copy_failed": "複製失敗",
                 "delete_failed": "刪除記錄失敗",
                 "loading_more": "正在載入更早記錄…",
-                "scroll_load_more": "捲動到底部自動載入更早記錄",
+                "scroll_load_more": "向上捲動載入更早記錄",
                 "no_more_messages": "已載入全部聊天記錄"
             },
             "other": {

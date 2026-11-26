@@ -625,10 +625,10 @@ describe('ChatTranslator.vue', () => {
         wrapper.unmount();
     });
 
-    test('loads only latest 20 messages initially, displays YYYY-MM-DD HH:mm timestamps, and auto-loads older pages on scroll to bottom', async () => {
+    test('loads latest 20 messages oldest-to-newest (latest at bottom), displays YYYY-MM-DD HH:mm timestamps, and auto-loads older pages when scrolling up', async () => {
         const requestedUrls = [];
         const page1 = Array.from({ length: 20 }, (_, i) => {
-            const idx = 25 - i; // 25 down to 6 (newest first)
+            const idx = 25 - i; // 25 down to 6 (API returns newest first)
             const minute = String(idx).padStart(2, '0');
             return {
                 id: `msg_${String(idx).padStart(2, '0')}`,
@@ -684,18 +684,25 @@ describe('ChatTranslator.vue', () => {
         const wrapper = mount(ChatTranslator);
         await flushPromises();
 
-        // Initial load requests limit=20 only and renders detailed YYYY-MM-DD HH:mm date-time
+        // Initial load requests limit=20 only, orders older messages at top and latest message at bottom
         expect(requestedUrls).toEqual(['/api/chat/messages?limit=20']);
-        expect(wrapper.findAll('[data-msg-side]')).toHaveLength(20);
-        expect(wrapper.text()).toContain('消息 #25');
+        const initialRows = wrapper.findAll('[data-msg-side]');
+        expect(initialRows).toHaveLength(20);
+        expect(initialRows[0].text()).toContain('消息 #6');
+        expect(initialRows[19].text()).toContain('消息 #25');
         expect(wrapper.text()).not.toContain('消息 #5');
         expect(wrapper.text()).toMatch(/\d{4}-\d{2}-\d{2} \d{2}:\d{2}/);
+        expect(wrapper.find('[data-load-more-sentinel="top"]').exists()).toBe(true);
 
-        // Simulate scrolling to the bottom of the message list -> auto-loads page 2 with cursor
+        // Simulate scrolling up to the top of the message list -> auto-loads earlier page 2 above existing messages
         const feedEl = wrapper.find('.overflow-y-auto');
-        Object.defineProperty(feedEl.element, 'scrollHeight', { value: 1200, configurable: true });
+        Object.defineProperty(feedEl.element, 'scrollHeight', {
+            get: () => feedEl.element.querySelectorAll('[data-msg-side]').length * 60,
+            configurable: true
+        });
         Object.defineProperty(feedEl.element, 'clientHeight', { value: 400, configurable: true });
-        Object.defineProperty(feedEl.element, 'scrollTop', { value: 760, configurable: true });
+        feedEl.element.scrollTop = 20;
+
         await feedEl.trigger('scroll');
         await flushPromises();
 
@@ -703,10 +710,36 @@ describe('ChatTranslator.vue', () => {
         expect(requestedUrls[1]).toContain('limit=20');
         expect(requestedUrls[1]).toContain(`before=${encodeURIComponent(page1[19].createdAt)}`);
         expect(requestedUrls[1]).toContain('beforeId=msg_06');
-        expect(wrapper.findAll('[data-msg-side]')).toHaveLength(25);
-        expect(wrapper.text()).toContain('消息 #5');
-        expect(wrapper.text()).toContain('消息 #1');
+        const allRows = wrapper.findAll('[data-msg-side]');
+        expect(allRows).toHaveLength(25);
+        expect(allRows[0].text()).toContain('消息 #1');
+        expect(allRows[24].text()).toContain('消息 #25');
+        // Reading anchor preserved: previous scrollTop (20) + prepended 5 rows * 60px (300) = 320
+        expect(feedEl.element.scrollTop).toBe(320);
         expect(wrapper.text()).toContain('view.tools.chat_translator.no_more_messages');
+
+        // New real-time incoming message appends at the bottom (last item)
+        for (const fn of mocks.chatListeners) {
+            fn({
+                type: 'chat.message',
+                payload: {
+                    message: {
+                        id: 'msg_26',
+                        direction: 'web_to_vrc',
+                        sourceText: '消息 #26',
+                        translatedText: '',
+                        sentText: '消息 #26',
+                        oscPort: 9000,
+                        status: 'sent',
+                        createdAt: '2026-11-26T10:26:00.000Z'
+                    }
+                }
+            });
+        }
+        await flushPromises();
+        const updatedRows = wrapper.findAll('[data-msg-side]');
+        expect(updatedRows).toHaveLength(26);
+        expect(updatedRows[25].text()).toContain('消息 #26');
 
         wrapper.unmount();
     });

@@ -856,7 +856,7 @@
                 "copy_failed": "复制失败",
                 "delete_failed": "删除记录失败",
                 "loading_more": "正在加载更早记录…",
-                "scroll_load_more": "滚动到底部自动加载更早记录",
+                "scroll_load_more": "向上滚动加载更早记录",
                 "no_more_messages": "已加载全部聊天记录"
             },
             "marketplace": {

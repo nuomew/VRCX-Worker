@@ -218,7 +218,7 @@
             </div>
         </div>
 
-        <!-- Chat & Sync Conversation Feed (newest first; scrolling to bottom auto-loads earlier pages of 20) -->
+        <!-- Chat & Sync Conversation Feed (oldest at top, latest at bottom; scroll up to auto-load earlier pages of 20) -->
         <div
             ref="messageListRef"
             class="flex-1 overflow-y-auto min-h-0 rounded-xl border border-border/80 bg-muted/15 px-4 py-3.5 space-y-3"
@@ -248,6 +248,28 @@
                         {{ phrase }}
                     </button>
                 </div>
+            </div>
+
+            <!-- Infinite Scroll Top Sentinel (scroll up to auto-load earlier history) -->
+            <div
+                v-if="messages.length > 0 && isWebMode"
+                ref="loadMoreSentinelRef"
+                data-load-more-sentinel="top"
+                class="pb-2 pt-0.5 flex items-center justify-center gap-1.5 text-[11px] text-muted-foreground/75 select-none">
+                <template v-if="loadingMoreMessages">
+                    <Spinner class="size-3.5" />
+                    <span>{{ t('view.tools.chat_translator.loading_more') }}</span>
+                </template>
+                <button
+                    v-else-if="hasMoreMessages"
+                    type="button"
+                    class="hover:text-foreground transition-colors"
+                    @click="loadMoreMessages">
+                    {{ t('view.tools.chat_translator.scroll_load_more') }}
+                </button>
+                <span v-else class="opacity-70">
+                    {{ t('view.tools.chat_translator.no_more_messages') }}
+                </span>
             </div>
 
             <!-- Message Bubbles (self messages on the right, peer messages on the left) -->
@@ -379,23 +401,6 @@
                         <span class="font-mono text-[10px] opacity-75">:{{ msg.oscPort }}</span>
                     </template>
                 </div>
-            </div>
-
-            <!-- Infinite Scroll Footer Sentinel -->
-            <div
-                v-if="messages.length > 0 && isWebMode"
-                ref="loadMoreSentinelRef"
-                class="pt-2 pb-1 flex items-center justify-center gap-1.5 text-[11px] text-muted-foreground/75 select-none">
-                <template v-if="loadingMoreMessages">
-                    <Spinner class="size-3.5" />
-                    <span>{{ t('view.tools.chat_translator.loading_more') }}</span>
-                </template>
-                <span v-else-if="hasMoreMessages">
-                    {{ t('view.tools.chat_translator.scroll_load_more') }}
-                </span>
-                <span v-else class="opacity-70">
-                    {{ t('view.tools.chat_translator.no_more_messages') }}
-                </span>
             </div>
         </div>
 
@@ -816,6 +821,7 @@
     let configSavePending = false;
     let suppressRemoteConfigUntil = 0;
     let liveSyncActive = false;
+    let suppressTopLoad = false;
 
     const hasPortConflict = computed(
         () =>
@@ -1035,31 +1041,41 @@
         persistPrefs();
     }
 
-    function compareMessagesDesc(a, b) {
+    function compareMessagesAsc(a, b) {
         const ta = String(a?.createdAt || '');
         const tb = String(b?.createdAt || '');
-        if (ta !== tb) return tb.localeCompare(ta);
-        return String(b?.id || '').localeCompare(String(a?.id || ''));
+        if (ta !== tb) return ta < tb ? -1 : 1;
+        const ia = String(a?.id || '');
+        const ib = String(b?.id || '');
+        if (ia === ib) return 0;
+        return ia < ib ? -1 : 1;
     }
 
-    function scrollToTopIfNearTop() {
-        nextTick(() => {
-            const el = messageListRef.value;
-            if (el && el.scrollTop <= 120) {
-                el.scrollTop = 0;
-            }
-        });
+    function isNearBottom(el = messageListRef.value, threshold = 120) {
+        if (!el) return true;
+        return el.scrollHeight - el.scrollTop - el.clientHeight <= threshold;
     }
 
-    function upsertMessage(incoming) {
+    function scrollToBottomNow() {
+        const el = messageListRef.value;
+        if (el) {
+            el.scrollTop = el.scrollHeight;
+        }
+    }
+
+    function upsertMessage(incoming, { forceScroll = false } = {}) {
         if (!incoming || !incoming.id) return;
         const idx = messages.value.findIndex((m) => m.id === incoming.id);
         if (idx >= 0) {
             messages.value[idx] = { ...messages.value[idx], ...incoming };
         } else {
-            messages.value.unshift(incoming);
-            messages.value.sort(compareMessagesDesc);
-            scrollToTopIfNearTop();
+            // Sample scroll position before appending so newly added height doesn't falsely fail the check.
+            const shouldScroll = forceScroll || isNearBottom();
+            messages.value.push(incoming);
+            messages.value.sort(compareMessagesAsc);
+            if (shouldScroll) {
+                nextTick(() => scrollToBottomNow());
+            }
         }
         maybeAutoTranslateDesktopMessage(incoming);
     }
@@ -1067,18 +1083,30 @@
     async function fetchMessages({ showLoader = false, reset = false } = {}) {
         if (!isWebMode) return;
         const startSaveGen = configSaveGeneration;
+        const wasEmpty = messages.value.length === 0;
+        const wasNearBottom = isNearBottom();
+        const prevLatestId = messages.value.length > 0 ? messages.value[messages.value.length - 1]?.id || '' : '';
         if (showLoader) loadingMessages.value = true;
         try {
             const data = await cloudFetch(`/api/chat/messages?limit=${CHAT_PAGE_SIZE}`);
             if (Array.isArray(data?.messages)) {
-                const incoming = [...data.messages].sort(compareMessagesDesc);
-                if (reset || messages.value.length === 0) {
+                const incoming = [...data.messages].sort(compareMessagesAsc);
+                if (reset || wasEmpty) {
+                    // Prevent top-sentinel auto-load from firing while scrollTop is still at 0 before initial scroll-to-bottom.
+                    suppressTopLoad = true;
+                    teardownLoadMoreObserver();
                     messages.value = incoming;
                     hasMoreMessages.value = Boolean(data?.hasMore);
                     nextBefore.value = typeof data?.nextBefore === 'string' ? data.nextBefore : '';
                     nextBeforeId.value = typeof data?.nextBeforeId === 'string' ? data.nextBeforeId : '';
+                    await nextTick();
+                    scrollToBottomNow();
+                    suppressTopLoad = false;
+                    if (liveSyncActive) {
+                        setupLoadMoreObserver();
+                    }
                 } else {
-                    // Merge latest 20 items without discarding older pages already loaded via scroll.
+                    // Merge latest 20 items without discarding older pages already loaded via upward scroll.
                     const mergedMap = new Map();
                     for (const item of messages.value) {
                         if (item?.id) mergedMap.set(item.id, item);
@@ -1086,12 +1114,17 @@
                     for (const item of incoming) {
                         if (item?.id) mergedMap.set(item.id, { ...(mergedMap.get(item.id) || {}), ...item });
                     }
-                    const merged = Array.from(mergedMap.values()).sort(compareMessagesDesc);
+                    const merged = Array.from(mergedMap.values()).sort(compareMessagesAsc);
                     messages.value = merged;
                     if (!hasMoreMessages.value && Boolean(data?.hasMore) && merged.length <= CHAT_PAGE_SIZE) {
                         hasMoreMessages.value = true;
                         nextBefore.value = typeof data?.nextBefore === 'string' ? data.nextBefore : '';
                         nextBeforeId.value = typeof data?.nextBeforeId === 'string' ? data.nextBeforeId : '';
+                    }
+                    const newLatestId = merged.length > 0 ? merged[merged.length - 1]?.id || '' : '';
+                    if (wasNearBottom && newLatestId && newLatestId !== prevLatestId) {
+                        await nextTick();
+                        scrollToBottomNow();
                     }
                 }
                 for (const item of incoming) {
@@ -1116,6 +1149,7 @@
                 chatDbDedicated.value = data.chatDbDedicated;
             }
         } catch (err) {
+            suppressTopLoad = false;
             if (showLoader) {
                 toast.error(err?.message || t('view.tools.chat_translator.fetch_failed'));
             }
@@ -1125,10 +1159,16 @@
     }
 
     async function loadMoreMessages() {
-        if (!isWebMode || !hasMoreMessages.value || loadingMoreMessages.value || loadingMessages.value) {
+        if (
+            !isWebMode ||
+            suppressTopLoad ||
+            !hasMoreMessages.value ||
+            loadingMoreMessages.value ||
+            loadingMessages.value
+        ) {
             return;
         }
-        const oldest = messages.value.length > 0 ? messages.value[messages.value.length - 1] : null;
+        const oldest = messages.value.length > 0 ? messages.value[0] : null;
         const cursorBefore = nextBefore.value || oldest?.createdAt || '';
         const cursorBeforeId = nextBeforeId.value || oldest?.id || '';
         if (!cursorBefore) {
@@ -1150,11 +1190,22 @@
             const incoming = Array.isArray(data?.messages) ? data.messages : [];
             if (incoming.length > 0) {
                 const existingIds = new Set(messages.value.map((m) => m.id));
-                const appended = incoming.filter((item) => item?.id && !existingIds.has(item.id));
-                if (appended.length > 0) {
-                    messages.value = [...messages.value, ...appended].sort(compareMessagesDesc);
+                const prepended = incoming.filter((item) => item?.id && !existingIds.has(item.id));
+                if (prepended.length > 0) {
+                    const listEl = messageListRef.value;
+                    const prevScrollHeight = listEl ? listEl.scrollHeight : 0;
+                    const prevScrollTop = listEl ? listEl.scrollTop : 0;
+                    messages.value = [...prepended, ...messages.value].sort(compareMessagesAsc);
+                    await nextTick();
+                    // Preserve reading position after prepending earlier messages above the viewport.
+                    if (listEl) {
+                        const heightDelta = listEl.scrollHeight - prevScrollHeight;
+                        if (heightDelta > 0) {
+                            listEl.scrollTop = prevScrollTop + heightDelta;
+                        }
+                    }
                 }
-                for (const item of appended) {
+                for (const item of prepended) {
                     maybeAutoTranslateDesktopMessage(item);
                 }
             }
@@ -1170,18 +1221,27 @@
 
     function setupLoadMoreObserver() {
         teardownLoadMoreObserver();
-        if (typeof IntersectionObserver === 'undefined' || !messageListRef.value || !loadMoreSentinelRef.value) {
+        if (
+            suppressTopLoad ||
+            typeof IntersectionObserver === 'undefined' ||
+            !messageListRef.value ||
+            !loadMoreSentinelRef.value
+        ) {
             return;
         }
         loadMoreObserver = new IntersectionObserver(
             (entries) => {
+                const el = messageListRef.value;
+                if (!el || suppressTopLoad) return;
+                // Only auto-load via top sentinel when the container actually scrolls and user reached the top.
+                if (el.scrollHeight <= el.clientHeight || el.scrollTop > 80) return;
                 if (entries.some((entry) => entry.isIntersecting)) {
                     void loadMoreMessages();
                 }
             },
             {
                 root: messageListRef.value,
-                rootMargin: '0px 0px 80px 0px',
+                rootMargin: '80px 0px 0px 0px',
                 threshold: 0
             }
         );
@@ -1198,7 +1258,7 @@
     watch(
         () => loadMoreSentinelRef.value,
         (el) => {
-            if (el && liveSyncActive) {
+            if (el && liveSyncActive && !suppressTopLoad) {
                 setupLoadMoreObserver();
             } else {
                 teardownLoadMoreObserver();
@@ -1208,9 +1268,16 @@
 
     function handleMessageListScroll() {
         const el = messageListRef.value;
-        if (!el || !hasMoreMessages.value || loadingMoreMessages.value || loadingMessages.value) return;
-        const remainingPx = el.scrollHeight - el.scrollTop - el.clientHeight;
-        if (remainingPx <= 80) {
+        if (
+            !el ||
+            suppressTopLoad ||
+            !hasMoreMessages.value ||
+            loadingMoreMessages.value ||
+            loadingMessages.value
+        ) {
+            return;
+        }
+        if (el.scrollTop <= 80) {
             void loadMoreMessages();
         }
     }
@@ -1319,19 +1386,22 @@
         try {
             notifyTypingStopped();
             if (!isWebMode) {
-                upsertMessage({
-                    id: `local_${Date.now()}`,
-                    direction: 'web_to_vrc',
-                    sourceText,
-                    translatedText,
-                    sentText: sanitized.text,
-                    sourceLang: prefs.sourceLang,
-                    targetLang: displayMode === 'source_only' ? '' : prefs.targetLang,
-                    displayMode,
-                    oscPort: prefs.oscPort,
-                    status: 'synced',
-                    createdAt: new Date().toISOString()
-                });
+                upsertMessage(
+                    {
+                        id: `local_${Date.now()}`,
+                        direction: 'web_to_vrc',
+                        sourceText,
+                        translatedText,
+                        sentText: sanitized.text,
+                        sourceLang: prefs.sourceLang,
+                        targetLang: displayMode === 'source_only' ? '' : prefs.targetLang,
+                        displayMode,
+                        oscPort: prefs.oscPort,
+                        status: 'synced',
+                        createdAt: new Date().toISOString()
+                    },
+                    { forceScroll: true }
+                );
                 draftInput.value = '';
                 clearPreview();
                 return;
@@ -1355,7 +1425,7 @@
             });
 
             if (data?.message) {
-                upsertMessage(data.message);
+                upsertMessage(data.message, { forceScroll: true });
             }
             if (data?.deliveryStatus === 'failed') {
                 toast.warning(data?.message?.errorMessage || t('view.tools.chat_translator.agent_offline'));
@@ -1749,6 +1819,7 @@
 
     function stopLiveSync() {
         liveSyncActive = false;
+        suppressTopLoad = false;
         teardownLoadMoreObserver();
         if (pollTimer) {
             clearInterval(pollTimer);
