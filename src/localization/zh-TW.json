@@ -3497,7 +3497,7 @@
             "disabled_toast": "已關閉 2FA 驗證。"
         },
         "migration": {
-            "tab_label": "桌面遷移",
+            "tab_label": "遷移",
             "section_title": "桌面 VRCX 遷移",
             "title": "拉取原版桌面 VRCX 歷史資料",
             "fetch_desktop_btn": "從桌面取得",

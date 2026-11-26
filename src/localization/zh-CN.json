@@ -3832,7 +3832,7 @@
             "disabled_toast": "已关闭 2FA 验证。"
         },
         "migration": {
-            "tab_label": "桌面迁移",
+            "tab_label": "迁移",
             "section_title": "桌面 VRCX 迁移",
             "title": "拉取原版桌面 VRCX 历史数据",
             "fetch_desktop_btn": "从桌面获取",

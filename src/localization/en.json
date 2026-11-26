@@ -3834,7 +3834,7 @@
             "disabled_toast": "2FA has been disabled."
         },
         "migration": {
-            "tab_label": "Desktop Migration",
+            "tab_label": "Migration",
             "section_title": "Desktop VRCX Migration",
             "title": "Import Legacy Desktop VRCX Data",
             "fetch_desktop_btn": "Fetch from Desktop",
