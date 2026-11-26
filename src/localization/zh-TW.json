@@ -3500,7 +3500,6 @@
             "tab_label": "桌面遷移",
             "section_title": "原版桌面 VRCX 舊資料遷移",
             "title": "拉取原版桌面 VRCX 歷史資料",
-            "desc": "所有同步項預設關閉。點擊「從桌面取得」後，Windows 伴侶將以唯讀方式掃描本機原版 VRCX.sqlite3，顯示可遷移類別與預計佔用大小；勾選同步資料上限為 500 MB，且僅單獨存放於 DB_LEGACY 舊庫，雲端原有 4 個核心資料庫存放保持不變。",
             "fetch_desktop_btn": "從桌面取得",
             "scanning_btn": "請求中...",
             "refresh_btn": "重新整理狀態",

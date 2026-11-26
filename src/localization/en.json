@@ -3837,7 +3837,6 @@
             "tab_label": "Desktop Migration",
             "section_title": "Original Desktop VRCX Data Migration",
             "title": "Import Legacy Desktop VRCX Data",
-            "desc": "All sync categories are disabled by default. Click Fetch from Desktop to inspect your local VRCX.sqlite3 in read-only mode, check estimated database usage, and manually select up to 500 MB of legacy data to store strictly in the dedicated DB_LEGACY database (the 4 active cloud databases remain unchanged).",
             "fetch_desktop_btn": "Fetch from Desktop",
             "scanning_btn": "Requesting...",
             "refresh_btn": "Refresh",

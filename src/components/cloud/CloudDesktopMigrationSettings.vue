@@ -1,9 +1,7 @@
 <template>
     <div class="space-y-4 text-xs">
-        <!-- Intro & Primary "Fetch from Desktop" Action -->
-        <SettingsItem
-            :label="t('cloud_hub.migration.title')"
-            :description="t('cloud_hub.migration.desc')">
+        <!-- Primary "Fetch from Desktop" Action -->
+        <SettingsItem :label="t('cloud_hub.migration.title')">
             <div class="flex flex-wrap items-center gap-2">
                 <select
                     v-if="devices.length > 1"
