@@ -73,8 +73,8 @@
             </Button>
         </form>
 
-        <!-- Results / States -->
-        <div class="flex-1 overflow-y-auto min-h-0 pr-0.5">
+        <!-- Results / States (containerRef stays mounted so ResizeObserver knows grid width immediately) -->
+        <div ref="avatarSearchContainerRef" class="flex-1 overflow-y-auto min-h-0 pr-2">
             <!-- Initial Empty Guide -->
             <div
                 v-if="!hasSearched && !loading"
@@ -104,9 +104,9 @@
                 </Button>
             </div>
 
-            <!-- Public Avatar Cards Grid -->
+            <!-- Public Avatar Cards Grid (aligned with FavoritesAvatarItem compact horizontal cards) -->
             <template v-else-if="results.length > 0">
-                <div class="mb-2.5 flex flex-wrap items-center justify-between gap-2 px-0.5 text-xs text-muted-foreground">
+                <div class="mb-2 flex flex-wrap items-center justify-between gap-2 px-0.5 text-xs text-muted-foreground">
                     <span>
                         {{
                             t('view.tools.avatar.result_summary', {
@@ -118,118 +118,111 @@
                     <span class="text-[11px]">{{ t('view.tools.avatar.click_card_hint') }}</span>
                 </div>
 
-                <ItemGroup
-                    class="grid gap-3 pb-3"
-                    style="grid-template-columns: repeat(auto-fill, minmax(220px, 1fr))">
-                    <Item
-                        v-for="avatar in results"
-                        :key="avatar.id"
-                        variant="outline"
-                        size="sm"
-                        class="p-0 overflow-hidden cursor-pointer x-hover-card hover:bg-accent/40 hover:shadow-sm transition-colors"
-                        as-child>
-                        <div class="flex flex-col h-full overflow-hidden rounded-[inherit]" @click="openAvatarDetail(avatar)">
-                            <ItemHeader class="relative aspect-4/3 w-full overflow-hidden bg-muted">
-                                <img
-                                    v-if="(avatar.thumbnailImageUrl || avatar.imageUrl) && !brokenImages.has(avatar.id)"
-                                    :src="avatar.thumbnailImageUrl || avatar.imageUrl"
-                                    :alt="avatar.name"
-                                    loading="lazy"
-                                    decoding="async"
-                                    class="size-full object-cover transition-transform duration-200 hover:scale-[1.02]"
-                                    @error="markImageBroken(avatar.id)" />
-                                <div v-else class="flex size-full items-center justify-center bg-muted">
-                                    <Image class="size-8 text-muted-foreground/70" />
-                                </div>
-                                <div class="pointer-events-none absolute top-2 right-2 flex items-center gap-1">
-                                    <Badge
-                                        variant="secondary"
-                                        class="border-transparent bg-black/60 text-[10px] text-white backdrop-blur-xs">
-                                        {{ t('dialog.avatar.tags.public') }}
-                                    </Badge>
-                                    <Badge
-                                        v-if="avatar.performance?.hasImpostor"
-                                        variant="secondary"
-                                        class="border-transparent bg-black/60 text-[10px] text-white backdrop-blur-xs">
-                                        {{ t('dialog.avatar.tags.impostor') }}
-                                    </Badge>
-                                </div>
-                            </ItemHeader>
+                <div class="avatar-search-card-list" :style="avatarSearchGridStyle(results.length)">
+                    <ContextMenu v-for="avatar in results" :key="avatar.id">
+                        <ContextMenuTrigger as-child>
+                            <Item
+                                variant="outline"
+                                class="favorites-item cursor-pointer hover:bg-muted x-hover-list"
+                                :style="itemStyle"
+                                @click="openAvatarDetail(avatar)">
+                                <ItemMedia variant="image">
+                                    <Avatar class="rounded-sm size-full">
+                                        <AvatarImage
+                                            v-if="getSmallThumbnail(avatar)"
+                                            :src="getSmallThumbnail(avatar)"
+                                            :alt="avatar.name"
+                                            loading="lazy"
+                                            decoding="async"
+                                            fetchpriority="low"
+                                            class="rounded-sm object-cover" />
+                                        <AvatarFallback class="rounded-sm">
+                                            <Image class="size-4 text-muted-foreground" />
+                                        </AvatarFallback>
+                                    </Avatar>
+                                </ItemMedia>
 
-                            <ItemContent class="flex flex-1 flex-col gap-1.5 p-3 min-w-0">
-                                <TooltipWrapper side="top" :content="avatar.name">
-                                    <ItemTitle class="truncate w-full text-sm font-semibold text-foreground">
-                                        {{ avatar.name }}
+                                <ItemContent class="min-w-0">
+                                    <ItemTitle class="max-w-full" :title="avatar.name">
+                                        <span class="truncate">{{ avatar.name }}</span>
                                     </ItemTitle>
-                                </TooltipWrapper>
-
-                                <div class="flex items-center justify-between gap-1.5 text-xs text-muted-foreground min-w-0">
-                                    <button
-                                        v-if="avatar.authorId"
-                                        type="button"
-                                        class="truncate text-left font-mono hover:text-foreground hover:underline"
-                                        :title="avatar.authorName || avatar.authorId"
-                                        @click.stop="showUserDialog(avatar.authorId)">
-                                        {{ avatar.authorName || avatar.authorId }}
-                                    </button>
-                                    <span v-else class="truncate font-mono">
-                                        {{ avatar.authorName || '-' }}
-                                    </span>
-
-                                    <TooltipWrapper
-                                        v-if="avatar.authorName || avatar.authorId"
-                                        side="top"
-                                        :content="t('view.tools.avatar.filter_by_author_tooltip')">
-                                        <button
-                                            type="button"
-                                            class="shrink-0 rounded p-0.5 text-muted-foreground hover:bg-muted hover:text-foreground"
-                                            :aria-label="t('view.tools.avatar.filter_by_author_tooltip')"
-                                            @click.stop="searchByAuthor(avatar)">
-                                            <UserSearch class="size-3.5" />
-                                        </button>
-                                    </TooltipWrapper>
-                                </div>
-
-                                <!-- Platform & Performance Badges -->
-                                <div v-if="avatar.compatibility?.length" class="flex flex-wrap items-center gap-1 pt-0.5">
-                                    <Badge
-                                        v-if="avatar.compatibility.includes('pc')"
-                                        variant="outline"
-                                        class="h-5 gap-1 px-1.5 text-[10px] text-platform-pc border-platform-pc!">
-                                        <Monitor class="size-3 text-platform-pc" />
-                                        <span v-if="avatar.performance?.pcRating">
-                                            {{ formatPerformanceRating(avatar.performance.pcRating) }}
+                                    <ItemDescription
+                                        class="line-clamp-none flex items-center gap-1.5 text-xs min-w-0"
+                                        :title="avatar.authorName || avatar.authorId">
+                                        <span class="truncate">{{ avatar.authorName || avatar.authorId || '-' }}</span>
+                                        <span
+                                            v-if="avatar.compatibility?.length"
+                                            class="inline-flex items-center gap-1 shrink-0 opacity-80">
+                                            <Monitor
+                                                v-if="avatar.compatibility.includes('pc')"
+                                                class="size-3 text-platform-pc" />
+                                            <Smartphone
+                                                v-if="avatar.compatibility.includes('android')"
+                                                class="size-3 text-platform-quest" />
+                                            <Apple
+                                                v-if="avatar.compatibility.includes('ios')"
+                                                class="size-3 text-platform-ios" />
                                         </span>
-                                    </Badge>
-                                    <Badge
-                                        v-if="avatar.compatibility.includes('android')"
-                                        variant="outline"
-                                        class="h-5 gap-1 px-1.5 text-[10px] text-platform-quest border-platform-quest!">
-                                        <Smartphone class="size-3 text-platform-quest" />
-                                        <span v-if="avatar.performance?.androidRating">
-                                            {{ formatPerformanceRating(avatar.performance.androidRating) }}
-                                        </span>
-                                    </Badge>
-                                    <Badge
-                                        v-if="avatar.compatibility.includes('ios')"
-                                        variant="outline"
-                                        class="h-5 gap-1 px-1.5 text-[10px] text-platform-ios border-platform-ios">
-                                        <Apple class="size-3 text-platform-ios" />
-                                        <span v-if="avatar.performance?.iosRating">
-                                            {{ formatPerformanceRating(avatar.performance.iosRating) }}
-                                        </span>
-                                    </Badge>
-                                </div>
+                                    </ItemDescription>
+                                </ItemContent>
 
-                                <ItemDescription
-                                    v-if="avatar.description"
-                                    class="line-clamp-2 text-[11px] leading-relaxed text-muted-foreground pt-0.5">
-                                    {{ avatar.description }}
-                                </ItemDescription>
-                            </ItemContent>
-                        </div>
-                    </Item>
-                </ItemGroup>
+                                <ItemActions>
+                                    <DropdownMenu>
+                                        <DropdownMenuTrigger as-child>
+                                            <Button
+                                                size="icon-sm"
+                                                variant="ghost"
+                                                class="rounded-full"
+                                                :ariaLabel="t('nav_tooltip.manage')"
+                                                @click.stop>
+                                                <MoreHorizontal class="h-4 w-4" />
+                                            </Button>
+                                        </DropdownMenuTrigger>
+                                        <DropdownMenuContent align="end">
+                                            <DropdownMenuItem @click="openAvatarDetail(avatar)">
+                                                {{ t('common.actions.view_details') }}
+                                            </DropdownMenuItem>
+                                            <DropdownMenuItem
+                                                :disabled="currentUser.currentAvatar === avatar.id"
+                                                @click="handleSelectAvatar(avatar)">
+                                                {{ t('view.favorite.select_avatar_tooltip') }}
+                                            </DropdownMenuItem>
+                                            <DropdownMenuSeparator />
+                                            <DropdownMenuItem @click="handleOpenFavoriteDialog(avatar)">
+                                                {{ t('view.favorite.edit_favorite_tooltip') }}
+                                            </DropdownMenuItem>
+                                            <DropdownMenuItem
+                                                v-if="avatar.authorName || avatar.authorId"
+                                                @click="searchByAuthor(avatar)">
+                                                {{ t('view.tools.avatar.filter_by_author_tooltip') }}
+                                            </DropdownMenuItem>
+                                        </DropdownMenuContent>
+                                    </DropdownMenu>
+                                </ItemActions>
+                            </Item>
+                        </ContextMenuTrigger>
+
+                        <ContextMenuContent>
+                            <ContextMenuItem @click="openAvatarDetail(avatar)">
+                                {{ t('common.actions.view_details') }}
+                            </ContextMenuItem>
+                            <ContextMenuItem
+                                :disabled="currentUser.currentAvatar === avatar.id"
+                                @click="handleSelectAvatar(avatar)">
+                                {{ t('view.favorite.select_avatar_tooltip') }}
+                            </ContextMenuItem>
+                            <ContextMenuSeparator />
+                            <ContextMenuItem @click="handleOpenFavoriteDialog(avatar)">
+                                {{ t('view.favorite.edit_favorite_tooltip') }}
+                            </ContextMenuItem>
+                            <ContextMenuItem
+                                v-if="avatar.authorName || avatar.authorId"
+                                @click="searchByAuthor(avatar)">
+                                {{ t('view.tools.avatar.filter_by_author_tooltip') }}
+                            </ContextMenuItem>
+                        </ContextMenuContent>
+                    </ContextMenu>
+                </div>
             </template>
 
             <!-- No Match State -->
@@ -263,29 +256,74 @@
         ChevronRight,
         Image,
         Monitor,
+        MoreHorizontal,
         Search,
         Smartphone,
-        UserSearch,
         X
     } from 'lucide-vue-next';
     import { computed, onBeforeUnmount, ref } from 'vue';
+    import { storeToRefs } from 'pinia';
     import { useI18n } from 'vue-i18n';
     import { useRouter } from 'vue-router';
 
+    import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar';
     import { Badge } from '@/components/ui/badge';
     import { Button } from '@/components/ui/button';
+    import {
+        ContextMenu,
+        ContextMenuContent,
+        ContextMenuItem,
+        ContextMenuSeparator,
+        ContextMenuTrigger
+    } from '@/components/ui/context-menu';
     import { DataTableEmpty } from '@/components/ui/data-table';
-    import { Item, ItemContent, ItemDescription, ItemGroup, ItemHeader, ItemTitle } from '@/components/ui/item';
+    import {
+        DropdownMenu,
+        DropdownMenuContent,
+        DropdownMenuItem,
+        DropdownMenuSeparator,
+        DropdownMenuTrigger
+    } from '@/components/ui/dropdown-menu';
+    import { Item, ItemActions, ItemContent, ItemDescription, ItemMedia, ItemTitle } from '@/components/ui/item';
     import { Spinner } from '@/components/ui/spinner';
-    import { TooltipWrapper } from '@/components/ui/tooltip';
-    import { applyAvatar, showAvatarDialog } from '@/coordinators/avatarCoordinator';
-    import { showUserDialog } from '@/coordinators/userCoordinator';
+    import { applyAvatar, selectAvatarWithConfirmation, showAvatarDialog } from '@/coordinators/avatarCoordinator';
     import { searchPublicAvatars } from '@/ipc-web/publicAvatarSearch';
-    import { useAvatarStore } from '@/stores';
+    import { useAvatarStore, useFavoriteStore, useUserStore } from '@/stores';
+    import { useFavoritesCardScaling } from '@/views/Favorites/composables/useFavoritesCardScaling.js';
 
-    const { t, te } = useI18n();
+    const { t } = useI18n();
     const router = useRouter();
     const avatarStore = useAvatarStore();
+    const { showFavoriteDialog } = useFavoriteStore();
+    const { currentUser } = storeToRefs(useUserStore());
+
+    // Reuse the same card scaling & spacing preferences as Favorites -> Avatars for visual parity.
+    const { containerRef: avatarSearchContainerRef, gridStyle: avatarSearchGridStyle } = useFavoritesCardScaling({
+        configKey: 'VRCX_FavoritesAvatarCardScale',
+        spacingConfigKey: 'VRCX_FavoritesAvatarCardSpacing',
+        min: 0.6,
+        max: 1,
+        step: 0.01,
+        spacingMin: 0.5,
+        spacingMax: 1.5,
+        spacingStep: 0.05,
+        basePaddingY: 8,
+        basePaddingX: 10,
+        baseContentGap: 10,
+        baseActionGap: 8,
+        baseActionGroupGap: 6,
+        baseActionMargin: 8,
+        baseCheckboxMargin: 10
+    });
+
+    const itemStyle = {
+        padding: 'var(--favorites-card-padding-y, 8px) var(--favorites-card-padding-x, 10px)',
+        gap: 'var(--favorites-card-content-gap, 10px)',
+        minWidth: 'var(--favorites-card-min-width, 220px)',
+        maxWidth: 'var(--favorites-card-target-width, 220px)',
+        width: '100%',
+        fontSize: 'calc(0.875rem * var(--favorites-card-scale, 1))'
+    };
 
     const searchType = ref('all');
     const platformFilter = ref('all');
@@ -296,7 +334,6 @@
     const errorMessage = ref('');
     const canRetry = ref(false);
     const results = ref([]);
-    const brokenImages = ref(new Set());
 
     // Track exact upstream page cursor per displayed page so Previous/Next stay deterministic under client filters.
     const pageCursorHistory = ref([0]);
@@ -317,16 +354,31 @@
         router.push({ name: 'tools' });
     }
 
-    function markImageBroken(avatarId) {
-        const next = new Set(brokenImages.value);
-        next.add(avatarId);
-        brokenImages.value = next;
+    function getSmallThumbnail(avatar) {
+        const rawUrl = avatar?.thumbnailImageUrl || avatar?.imageUrl || '';
+        if (!rawUrl) return '';
+        if (rawUrl.includes('vrchat.cloud')) {
+            return rawUrl.replace('/256', '/128');
+        }
+        return rawUrl;
     }
 
-    function formatPerformanceRating(rating) {
-        if (!rating) return '';
-        const key = `dialog.avatar.tags.performanceRating.${String(rating).replace(/\s+/g, '')}`;
-        return te(key) ? t(key) : rating;
+    function hydrateAvatarCache(avatar) {
+        if (!avatar?.id || avatarStore.cachedAvatars.has(avatar.id)) return;
+        applyAvatar({
+            id: avatar.id,
+            name: avatar.name,
+            authorId: avatar.authorId,
+            authorName: avatar.authorName,
+            description: avatar.description,
+            imageUrl: avatar.imageUrl || avatar.thumbnailImageUrl,
+            thumbnailImageUrl: avatar.thumbnailImageUrl || avatar.imageUrl,
+            releaseStatus: 'public',
+            styles: avatar.styles,
+            tags: avatar.tags,
+            created_at: avatar.created_at,
+            updated_at: avatar.updated_at
+        });
     }
 
     async function executeSearchPage(targetPageIndex, upstreamCursor) {
@@ -348,12 +400,11 @@
                 searchType: searchType.value,
                 platform: platformFilter.value,
                 upstreamPage: upstreamCursor,
-                pageSize: 24,
+                pageSize: 40,
                 signal: controller.signal
             });
             if (activeAbort !== controller) return;
 
-            brokenImages.value = new Set();
             if (res.invalidAvatarId) {
                 results.value = [];
                 hasMore.value = false;
@@ -429,7 +480,6 @@
         pageIndex.value = 0;
         hasMore.value = false;
         nextUpstreamCursor.value = 0;
-        brokenImages.value = new Set();
     }
 
     function searchByAuthor(avatar) {
@@ -442,23 +492,20 @@
 
     function openAvatarDetail(avatar) {
         if (!avatar?.id) return;
-        if (!avatarStore.cachedAvatars.has(avatar.id)) {
-            applyAvatar({
-                id: avatar.id,
-                name: avatar.name,
-                authorId: avatar.authorId,
-                authorName: avatar.authorName,
-                description: avatar.description,
-                imageUrl: avatar.imageUrl || avatar.thumbnailImageUrl,
-                thumbnailImageUrl: avatar.thumbnailImageUrl || avatar.imageUrl,
-                releaseStatus: 'public',
-                styles: avatar.styles,
-                tags: avatar.tags,
-                created_at: avatar.created_at,
-                updated_at: avatar.updated_at
-            });
-        }
+        hydrateAvatarCache(avatar);
         showAvatarDialog(avatar.id);
+    }
+
+    function handleSelectAvatar(avatar) {
+        if (!avatar?.id) return;
+        hydrateAvatarCache(avatar);
+        selectAvatarWithConfirmation(avatar.id);
+    }
+
+    function handleOpenFavoriteDialog(avatar) {
+        if (!avatar?.id) return;
+        hydrateAvatarCache(avatar);
+        showFavoriteDialog('avatar', avatar.id);
     }
 
     function handleFilterChange() {
@@ -471,3 +518,25 @@
         activeAbort?.abort();
     });
 </script>
+
+<style scoped>
+    .avatar-search-card-list {
+        display: grid;
+        grid-template-columns: repeat(
+            var(--favorites-grid-columns, 1),
+            minmax(var(--favorites-card-min-width, 260px), var(--favorites-card-target-width, 1fr))
+        );
+        gap: var(--favorites-card-gap, 12px);
+        justify-content: start;
+        padding: 4px 2px 12px 2px;
+    }
+
+    .favorites-item :deep(img) {
+        filter: saturate(0.8) contrast(0.8);
+        transition: filter 0.2s ease;
+    }
+
+    .favorites-item:hover :deep(img) {
+        filter: saturate(1) contrast(1);
+    }
+</style>
