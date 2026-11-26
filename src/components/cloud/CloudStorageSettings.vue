@@ -372,168 +372,171 @@
                                 v-model="formEnabled"
                                 type="checkbox"
                                 class="rounded border-input"
-                                :disabled="savingConfig" />
+                                :disabled="savingConfig"
+                                @change="onToggleExtraStorage" />
                             <span class="font-medium">{{ t('cloud_hub.storage.enable_extra_label') }}</span>
                         </label>
                     </div>
 
-                    <!-- Backblaze B2 Usage Meter (shown when B2 is enabled / configured) -->
-                    <div
-                        v-if="b2Usage?.bound"
-                        class="rounded-md border border-border/70 bg-muted/30 p-3 space-y-2">
-                        <div class="flex flex-wrap items-baseline justify-between gap-2">
-                            <span class="font-medium text-foreground">{{ t('cloud_hub.storage.b2_usage_heading') }}</span>
-                            <span v-if="!b2Usage.error" class="font-mono text-[11px] text-muted-foreground">
-                                {{
-                                    t('cloud_hub.storage.usage_meta', {
-                                        percent: b2Usage.percent,
-                                        count: b2Usage.objectCount.toLocaleString()
-                                    })
-                                }}
-                            </span>
+                    <template v-if="formEnabled">
+                        <!-- Backblaze B2 Usage Meter (shown when B2 is enabled / configured) -->
+                        <div
+                            v-if="b2Usage?.bound"
+                            class="rounded-md border border-border/70 bg-muted/30 p-3 space-y-2">
+                            <div class="flex flex-wrap items-baseline justify-between gap-2">
+                                <span class="font-medium text-foreground">{{ t('cloud_hub.storage.b2_usage_heading') }}</span>
+                                <span v-if="!b2Usage.error" class="font-mono text-[11px] text-muted-foreground">
+                                    {{
+                                        t('cloud_hub.storage.usage_meta', {
+                                            percent: b2Usage.percent,
+                                            count: b2Usage.objectCount.toLocaleString()
+                                        })
+                                    }}
+                                </span>
+                            </div>
+                            <template v-if="b2Usage.error">
+                                <p class="text-[11px] text-destructive break-all">{{ b2Usage.error }}</p>
+                            </template>
+                            <template v-else>
+                                <div class="font-mono text-sm font-semibold text-foreground">
+                                    {{ formatBytes(b2Usage.usedBytes) }} / {{ formatBytes(b2Usage.freeLimitBytes) }}
+                                </div>
+                                <div class="h-2 w-full overflow-hidden rounded-full bg-muted">
+                                    <div
+                                        class="h-full rounded-full bg-primary transition-all duration-200"
+                                        :style="{ width: `${Math.min(100, b2Usage.percent)}%` }" />
+                                </div>
+                                <div class="flex flex-wrap gap-x-4 gap-y-1 font-mono text-[11px] text-muted-foreground">
+                                    <span>
+                                        {{
+                                            t('cloud_hub.storage.breakdown_screenshots', {
+                                                size: formatBytes(b2Usage.screenshotsBytes),
+                                                count: b2Usage.screenshotsCount.toLocaleString()
+                                            })
+                                        }}
+                                    </span>
+                                    <span>
+                                        {{
+                                            t('cloud_hub.storage.breakdown_backups', {
+                                                size: formatBytes(b2Usage.backupsBytes),
+                                                count: b2Usage.backupsCount.toLocaleString()
+                                            })
+                                        }}
+                                    </span>
+                                </div>
+                            </template>
                         </div>
-                        <template v-if="b2Usage.error">
-                            <p class="text-[11px] text-destructive break-all">{{ b2Usage.error }}</p>
-                        </template>
-                        <template v-else>
-                            <div class="font-mono text-sm font-semibold text-foreground">
-                                {{ formatBytes(b2Usage.usedBytes) }} / {{ formatBytes(b2Usage.freeLimitBytes) }}
-                            </div>
-                            <div class="h-2 w-full overflow-hidden rounded-full bg-muted">
-                                <div
-                                    class="h-full rounded-full bg-primary transition-all duration-200"
-                                    :style="{ width: `${Math.min(100, b2Usage.percent)}%` }" />
-                            </div>
-                            <div class="flex flex-wrap gap-x-4 gap-y-1 font-mono text-[11px] text-muted-foreground">
-                                <span>
-                                    {{
-                                        t('cloud_hub.storage.breakdown_screenshots', {
-                                            size: formatBytes(b2Usage.screenshotsBytes),
-                                            count: b2Usage.screenshotsCount.toLocaleString()
-                                        })
-                                    }}
-                                </span>
-                                <span>
-                                    {{
-                                        t('cloud_hub.storage.breakdown_backups', {
-                                            size: formatBytes(b2Usage.backupsBytes),
-                                            count: b2Usage.backupsCount.toLocaleString()
-                                        })
-                                    }}
-                                </span>
-                            </div>
-                        </template>
-                    </div>
 
-                    <!-- Overflow Threshold & B2 S3-Compatible Credentials -->
-                    <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
-                        <div class="space-y-1 sm:col-span-2">
-                            <label class="block text-[11px] font-medium text-muted-foreground">
-                                {{ t('cloud_hub.storage.threshold_label') }}
-                            </label>
-                            <div class="flex flex-wrap items-center gap-2">
+                        <!-- Overflow Threshold & B2 S3-Compatible Credentials -->
+                        <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                            <div class="space-y-1 sm:col-span-2">
+                                <label class="block text-[11px] font-medium text-muted-foreground">
+                                    {{ t('cloud_hub.storage.threshold_label') }}
+                                </label>
+                                <div class="flex flex-wrap items-center gap-2">
+                                    <input
+                                        v-model.number="formThresholdGb"
+                                        type="number"
+                                        min="0.1"
+                                        max="10"
+                                        step="0.5"
+                                        :disabled="savingConfig"
+                                        class="w-28 rounded-md border border-input bg-background px-2.5 py-1.5 font-mono text-xs text-foreground" />
+                                    <span class="text-muted-foreground">GB / 10 GB</span>
+                                </div>
+                            </div>
+
+                            <div class="space-y-1 sm:col-span-2">
+                                <label class="block text-[11px] font-medium text-muted-foreground">
+                                    {{ t('cloud_hub.storage.endpoint_label') }}
+                                </label>
                                 <input
-                                    v-model.number="formThresholdGb"
-                                    type="number"
-                                    min="0.1"
-                                    max="10"
-                                    step="0.5"
+                                    v-model="formEndpoint"
+                                    type="text"
+                                    placeholder="https://s3.us-west-004.backblazeb2.com"
                                     :disabled="savingConfig"
-                                    class="w-28 rounded-md border border-input bg-background px-2.5 py-1.5 font-mono text-xs text-foreground" />
-                                <span class="text-muted-foreground">GB / 10 GB</span>
+                                    class="w-full rounded-md border border-input bg-background px-2.5 py-1.5 font-mono text-xs text-foreground" />
+                            </div>
+
+                            <div class="space-y-1">
+                                <label class="block text-[11px] font-medium text-muted-foreground">
+                                    {{ t('cloud_hub.storage.bucket_label') }}
+                                </label>
+                                <input
+                                    v-model="formBucket"
+                                    type="text"
+                                    placeholder="vrcx-backup-bucket"
+                                    :disabled="savingConfig"
+                                    class="w-full rounded-md border border-input bg-background px-2.5 py-1.5 font-mono text-xs text-foreground" />
+                            </div>
+
+                            <div class="space-y-1">
+                                <label class="block text-[11px] font-medium text-muted-foreground">
+                                    {{ t('cloud_hub.storage.region_label') }}
+                                </label>
+                                <input
+                                    v-model="formRegion"
+                                    type="text"
+                                    :placeholder="t('cloud_hub.storage.region_placeholder')"
+                                    :disabled="savingConfig"
+                                    class="w-full rounded-md border border-input bg-background px-2.5 py-1.5 font-mono text-xs text-foreground" />
+                            </div>
+
+                            <div class="space-y-1">
+                                <label class="block text-[11px] font-medium text-muted-foreground">
+                                    {{ t('cloud_hub.storage.key_id_label') }}
+                                </label>
+                                <input
+                                    v-model="formAccessKeyId"
+                                    type="text"
+                                    autocomplete="off"
+                                    :disabled="savingConfig"
+                                    class="w-full rounded-md border border-input bg-background px-2.5 py-1.5 font-mono text-xs text-foreground" />
+                            </div>
+
+                            <div class="space-y-1">
+                                <label class="block text-[11px] font-medium text-muted-foreground">
+                                    {{ t('cloud_hub.storage.app_key_label') }}
+                                </label>
+                                <input
+                                    v-model="formSecretAccessKey"
+                                    type="password"
+                                    autocomplete="new-password"
+                                    :placeholder="
+                                        hasSavedSecret
+                                            ? t('cloud_hub.storage.app_key_saved_placeholder')
+                                            : t('cloud_hub.storage.app_key_placeholder')
+                                    "
+                                    :disabled="savingConfig"
+                                    class="w-full rounded-md border border-input bg-background px-2.5 py-1.5 font-mono text-xs text-foreground" />
+                            </div>
+
+                            <div class="space-y-1 sm:col-span-2">
+                                <label class="block text-[11px] font-medium text-muted-foreground">
+                                    {{ t('cloud_hub.storage.prefix_label') }}
+                                </label>
+                                <input
+                                    v-model="formKeyPrefix"
+                                    type="text"
+                                    placeholder="vrcx"
+                                    :disabled="savingConfig"
+                                    class="w-64 rounded-md border border-input bg-background px-2.5 py-1.5 font-mono text-xs text-foreground" />
                             </div>
                         </div>
 
-                        <div class="space-y-1 sm:col-span-2">
-                            <label class="block text-[11px] font-medium text-muted-foreground">
-                                {{ t('cloud_hub.storage.endpoint_label') }}
-                            </label>
-                            <input
-                                v-model="formEndpoint"
-                                type="text"
-                                placeholder="https://s3.us-west-004.backblazeb2.com"
-                                :disabled="savingConfig"
-                                class="w-full rounded-md border border-input bg-background px-2.5 py-1.5 font-mono text-xs text-foreground" />
+                        <div class="flex flex-wrap items-center gap-2 pt-1">
+                            <Button size="sm" :disabled="savingConfig" @click="saveConfig">
+                                {{ savingConfig ? t('cloud_hub.storage.saving') : t('cloud_hub.storage.save_btn') }}
+                            </Button>
+                            <Button
+                                size="sm"
+                                variant="outline"
+                                :disabled="testingB2 || savingConfig"
+                                @click="testB2Connection">
+                                {{ testingB2 ? t('cloud_hub.storage.testing') : t('cloud_hub.storage.test_btn') }}
+                            </Button>
                         </div>
-
-                        <div class="space-y-1">
-                            <label class="block text-[11px] font-medium text-muted-foreground">
-                                {{ t('cloud_hub.storage.bucket_label') }}
-                            </label>
-                            <input
-                                v-model="formBucket"
-                                type="text"
-                                placeholder="vrcx-backup-bucket"
-                                :disabled="savingConfig"
-                                class="w-full rounded-md border border-input bg-background px-2.5 py-1.5 font-mono text-xs text-foreground" />
-                        </div>
-
-                        <div class="space-y-1">
-                            <label class="block text-[11px] font-medium text-muted-foreground">
-                                {{ t('cloud_hub.storage.region_label') }}
-                            </label>
-                            <input
-                                v-model="formRegion"
-                                type="text"
-                                :placeholder="t('cloud_hub.storage.region_placeholder')"
-                                :disabled="savingConfig"
-                                class="w-full rounded-md border border-input bg-background px-2.5 py-1.5 font-mono text-xs text-foreground" />
-                        </div>
-
-                        <div class="space-y-1">
-                            <label class="block text-[11px] font-medium text-muted-foreground">
-                                {{ t('cloud_hub.storage.key_id_label') }}
-                            </label>
-                            <input
-                                v-model="formAccessKeyId"
-                                type="text"
-                                autocomplete="off"
-                                :disabled="savingConfig"
-                                class="w-full rounded-md border border-input bg-background px-2.5 py-1.5 font-mono text-xs text-foreground" />
-                        </div>
-
-                        <div class="space-y-1">
-                            <label class="block text-[11px] font-medium text-muted-foreground">
-                                {{ t('cloud_hub.storage.app_key_label') }}
-                            </label>
-                            <input
-                                v-model="formSecretAccessKey"
-                                type="password"
-                                autocomplete="new-password"
-                                :placeholder="
-                                    hasSavedSecret
-                                        ? t('cloud_hub.storage.app_key_saved_placeholder')
-                                        : t('cloud_hub.storage.app_key_placeholder')
-                                "
-                                :disabled="savingConfig"
-                                class="w-full rounded-md border border-input bg-background px-2.5 py-1.5 font-mono text-xs text-foreground" />
-                        </div>
-
-                        <div class="space-y-1 sm:col-span-2">
-                            <label class="block text-[11px] font-medium text-muted-foreground">
-                                {{ t('cloud_hub.storage.prefix_label') }}
-                            </label>
-                            <input
-                                v-model="formKeyPrefix"
-                                type="text"
-                                placeholder="vrcx"
-                                :disabled="savingConfig"
-                                class="w-64 rounded-md border border-input bg-background px-2.5 py-1.5 font-mono text-xs text-foreground" />
-                        </div>
-                    </div>
-
-                    <div class="flex flex-wrap items-center gap-2 pt-1">
-                        <Button size="sm" :disabled="savingConfig" @click="saveConfig">
-                            {{ savingConfig ? t('cloud_hub.storage.saving') : t('cloud_hub.storage.save_btn') }}
-                        </Button>
-                        <Button
-                            size="sm"
-                            variant="outline"
-                            :disabled="testingB2 || savingConfig"
-                            @click="testB2Connection">
-                            {{ testingB2 ? t('cloud_hub.storage.testing') : t('cloud_hub.storage.test_btn') }}
-                        </Button>
-                    </div>
+                    </template>
 
                     <p v-if="statusNotice" class="text-[11px] text-primary">{{ statusNotice }}</p>
                     <p v-if="statusError" class="text-[11px] text-destructive break-all">{{ statusError }}</p>
@@ -586,6 +589,7 @@
     const b2Usage = ref(null);
     const overflowActive = ref(false);
     const hasSavedSecret = ref(false);
+    const savedEnabled = ref(false);
 
     const formEnabled = ref(false);
     const formThresholdGb = ref(9);
@@ -734,6 +738,7 @@
         overflowActive.value = Boolean(data.overflowActive);
         const ext = data.externalStorage;
         if (ext) {
+            savedEnabled.value = Boolean(ext.enabled);
             formEnabled.value = Boolean(ext.enabled);
             formEndpoint.value = ext.endpoint || '';
             formBucket.value = ext.bucket || '';
@@ -757,6 +762,34 @@
             statusError.value = err?.message || String(err);
         } finally {
             loadingStatus.value = false;
+        }
+    }
+
+    async function onToggleExtraStorage() {
+        statusError.value = '';
+        statusNotice.value = '';
+        // When collapsing a previously enabled config, persist disabled state immediately
+        // while keeping saved encrypted B2 credentials intact on the server.
+        if (!formEnabled.value && savedEnabled.value) {
+            if (savingConfig.value) return;
+            savingConfig.value = true;
+            try {
+                const data = await cloudFetch('/api/storage/config', {
+                    method: 'PUT',
+                    json: { enabled: false }
+                });
+                applyStatusPayload(data);
+                const msg = t('cloud_hub.storage.saved_toast');
+                statusNotice.value = msg;
+                toast.success(msg);
+                await Promise.all([loadCleanupPreview(), loadCleanupBackups()]);
+            } catch (err) {
+                formEnabled.value = true;
+                statusError.value = err?.message || String(err);
+                toast.error(statusError.value);
+            } finally {
+                savingConfig.value = false;
+            }
         }
     }
 
