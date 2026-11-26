@@ -7,7 +7,15 @@
         <div class="w-full max-w-sm rounded-xl border border-border bg-card p-6 shadow-2xl space-y-4">
             <div class="space-y-1">
                 <h2 class="text-lg font-semibold text-foreground">
-                    {{ isStandalone2faGate ? t('cloud_hub.unlock.totp_only_title') : t('cloud_hub.unlock.title') }}
+                    {{
+                        isCombinedSecurityGate
+                            ? t('cloud_hub.unlock.combined_gate_title')
+                            : isStandaloneStaticPasscodeGate
+                              ? t('cloud_hub.unlock.static_passcode_only_title')
+                              : isStandalone2faGate
+                                ? t('cloud_hub.unlock.totp_only_title')
+                                : t('cloud_hub.unlock.title')
+                    }}
                 </h2>
                 <p class="text-xs text-muted-foreground">
                     <template v-if="cloudState.authCheckFailed">
@@ -15,6 +23,12 @@
                     </template>
                     <template v-else-if="cloudState.authMode === 'cloudflare_access' && !cloudState.primaryAuthenticated">
                         {{ t('cloud_hub.unlock.cf_access_desc') }}
+                    </template>
+                    <template v-else-if="isCombinedSecurityGate">
+                        {{ t('cloud_hub.unlock.combined_gate_desc') }}
+                    </template>
+                    <template v-else-if="isStandaloneStaticPasscodeGate">
+                        {{ t('cloud_hub.unlock.static_passcode_only_desc') }}
                     </template>
                     <template v-else-if="isStandalone2faGate">
                         {{ t('cloud_hub.unlock.totp_only_desc') }}
@@ -54,7 +68,7 @@
 
             <form v-else class="space-y-3" @submit.prevent="submitUnlock">
                 <input
-                    v-if="!isStandalone2faGate"
+                    v-if="!isStandaloneSecurityGate"
                     v-model="passcode"
                     type="password"
                     autocomplete="current-password"
@@ -62,7 +76,15 @@
                     class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm text-foreground"
                     required />
                 <input
-                    v-if="isStandalone2faGate || cloudState.requiresTotp"
+                    v-if="needsStaticPasscodeInput"
+                    v-model="staticPassphraseInput"
+                    type="password"
+                    autocomplete="current-password"
+                    :placeholder="t('cloud_hub.unlock.static_passcode_placeholder')"
+                    class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm text-foreground"
+                    required />
+                <input
+                    v-if="needsTotpInput"
                     v-model="totpCode"
                     type="text"
                     inputmode="numeric"
@@ -70,7 +92,7 @@
                     maxlength="6"
                     :placeholder="t('cloud_hub.unlock.totp_placeholder')"
                     class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm font-mono tracking-widest text-foreground"
-                    :class="isStandalone2faGate ? 'text-center text-base' : ''"
+                    :class="isStandalone2faGate && !needsStaticPasscodeInput ? 'text-center text-base' : ''"
                     required />
 
                 <div v-if="showTrustDurationPicker" class="space-y-1.5 pt-0.5">
@@ -113,7 +135,7 @@
                     {{
                         unlocking
                             ? t('cloud_hub.unlock.verifying')
-                            : isStandalone2faGate
+                            : isStandaloneSecurityGate
                               ? t('cloud_hub.unlock.totp_submit')
                               : t('cloud_hub.unlock.submit')
                     }}
@@ -534,6 +556,7 @@
     );
 
     const passcode = ref('');
+    const staticPassphraseInput = ref('');
     const totpCode = ref('');
     const unlockError = ref('');
     const unlocking = ref(false);
@@ -541,10 +564,38 @@
     const trustPresetSelection = ref('604800');
     const customTrustDays = ref(7);
 
-    const isStandalone2faGate = computed(() => Boolean(cloudState.totpGateEnabled && cloudState.primaryAuthenticated));
+    const needsStandalone2faGate = computed(() =>
+        Boolean(cloudState.primaryAuthenticated && cloudState.totpGateEnabled && !cloudState.totpVerified)
+    );
+    const needsStandaloneStaticPasscodeGate = computed(() =>
+        Boolean(
+            cloudState.primaryAuthenticated &&
+                cloudState.staticPasscodeGateEnabled &&
+                !cloudState.staticPasscodeVerified
+        )
+    );
+    const isCombinedSecurityGate = computed(
+        () => needsStandalone2faGate.value && needsStandaloneStaticPasscodeGate.value
+    );
+    const isStandaloneStaticPasscodeGate = computed(
+        () => needsStandaloneStaticPasscodeGate.value && !needsStandalone2faGate.value
+    );
+    const isStandalone2faGate = computed(
+        () => needsStandalone2faGate.value && !needsStandaloneStaticPasscodeGate.value
+    );
+    const isStandaloneSecurityGate = computed(
+        () => needsStandalone2faGate.value || needsStandaloneStaticPasscodeGate.value
+    );
+    const needsStaticPasscodeInput = computed(() => needsStandaloneStaticPasscodeGate.value);
+    const needsTotpInput = computed(() =>
+        Boolean(
+            needsStandalone2faGate.value ||
+                (!isStandaloneSecurityGate.value && cloudState.requiresTotp)
+        )
+    );
     const showTrustDurationPicker = computed(() =>
         Boolean(
-            isStandalone2faGate.value ||
+            isStandaloneSecurityGate.value ||
                 (cloudState.totpGateEnabled && !cloudState.envTotpConfigured && cloudState.authMode === 'passcode_session')
         )
     );
@@ -568,7 +619,10 @@
     }
 
     watch(
-        () => cloudState.default2faTrustSeconds,
+        () =>
+            isStandaloneStaticPasscodeGate.value
+                ? cloudState.staticPasscodeDefaultTrustSeconds
+                : cloudState.default2faTrustSeconds,
         (val) => {
             syncTrustSelectionFromSeconds(val);
         },
@@ -670,7 +724,37 @@
         unlocking.value = true;
         try {
             const cleanTotp = (totpCode.value || '').replace(/\s+/g, '');
-            if (isStandalone2faGate.value) {
+            if (needsStandaloneStaticPasscodeGate.value) {
+                const payload = {
+                    passphrase: staticPassphraseInput.value,
+                    trustSeconds: resolveSelectedTrustSeconds()
+                };
+                if (needsStandalone2faGate.value) {
+                    payload.code = cleanTotp;
+                }
+                const res = await cloudFetch('/api/auth/static-passcode/verify', {
+                    method: 'POST',
+                    json: payload
+                });
+                cloudState.staticPasscodeVerified = true;
+                cloudState.staticPasscodeTrustExpiresAt =
+                    typeof res?.trustExpiresAt === 'string' ? res.trustExpiresAt : '';
+                if (res?.totpVerified) {
+                    cloudState.totpVerified = true;
+                    cloudState.totpTrustExpiresAt =
+                        typeof res?.totpTrustExpiresAt === 'string' ? res.totpTrustExpiresAt : '';
+                }
+                if (res?.authenticated === false) {
+                    staticPassphraseInput.value = '';
+                    totpCode.value = '';
+                    await refreshCloudAuthAndBootstrap();
+                    return;
+                }
+                cloudState.authenticated = true;
+                window.location.reload();
+                return;
+            }
+            if (needsStandalone2faGate.value) {
                 const res = await cloudFetch('/api/auth/2fa/verify', {
                     method: 'POST',
                     json: {
@@ -678,9 +762,14 @@
                         trustSeconds: resolveSelectedTrustSeconds()
                     }
                 });
-                cloudState.authenticated = true;
                 cloudState.totpVerified = true;
                 cloudState.totpTrustExpiresAt = typeof res?.trustExpiresAt === 'string' ? res.trustExpiresAt : '';
+                if (res?.authenticated === false) {
+                    totpCode.value = '';
+                    await refreshCloudAuthAndBootstrap();
+                    return;
+                }
+                cloudState.authenticated = true;
                 window.location.reload();
                 return;
             }
@@ -697,6 +786,7 @@
             });
             if (res?.authenticated === false) {
                 passcode.value = '';
+                staticPassphraseInput.value = '';
                 totpCode.value = '';
                 await refreshCloudAuthAndBootstrap();
                 return;

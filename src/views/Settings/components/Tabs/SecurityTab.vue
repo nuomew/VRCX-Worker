@@ -3,6 +3,9 @@
         <SettingsGroup :title="t('cloud_hub.two_factor.section_title')">
             <CloudTwoFactorSettings />
         </SettingsGroup>
+        <SettingsGroup :title="t('cloud_hub.static_passcode.section_title')">
+            <CloudStaticPasscodeSettings />
+        </SettingsGroup>
     </div>
 </template>
 
@@ -15,5 +18,8 @@
     const { t } = useI18n();
     const CloudTwoFactorSettings = defineAsyncComponent(
         () => import('@/components/cloud/CloudTwoFactorSettings.vue')
+    );
+    const CloudStaticPasscodeSettings = defineAsyncComponent(
+        () => import('@/components/cloud/CloudStaticPasscodeSettings.vue')
     );
 </script>

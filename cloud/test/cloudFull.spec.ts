@@ -6143,4 +6143,273 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
             });
         }
     });
+
+    it('enforces configurable static passphrase gate (>=10 chars letters+digits, PBKDF2 hash, <=30d trust cookie, rate-limit, revoke-all, and combined 2FA)', async () => {
+        try {
+            // 1. Disabled by default
+            const initStatus = await exports.default.fetch('http://example.com/api/auth/static-passcode/status');
+            expect(initStatus.status).toBe(200);
+            expect(((await initStatus.json()) as { data: { enabled: boolean } }).data.enabled).toBe(false);
+
+            // 2. Weak passphrases (<10 chars, digits-only, letters-only, control chars, mismatch) MUST be rejected with 400
+            for (const bad of ['Abc123456', '1234567890', 'abcdefghij', 'Abcd12345\n']) {
+                const res = await exports.default.fetch('http://example.com/api/auth/static-passcode/enable', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+                    body: JSON.stringify({ passphrase: bad, confirmPassphrase: bad })
+                });
+                expect(res.status).toBe(400);
+            }
+            const mismatchRes = await exports.default.fetch('http://example.com/api/auth/static-passcode/enable', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+                body: JSON.stringify({ passphrase: 'Princess2026!', confirmPassphrase: 'Princess2027!' })
+            });
+            expect(mismatchRes.status).toBe(400);
+
+            // 3. Enable valid >=10-char letter+digit passphrase with clamped >30d trust -> capped at 30d & salted PBKDF2 stored (no plaintext)
+            const pass1 = 'Princess2026!';
+            const enableRes = await exports.default.fetch('http://example.com/api/auth/static-passcode/enable', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+                body: JSON.stringify({
+                    passphrase: pass1,
+                    confirmPassphrase: pass1,
+                    defaultTrustDays: 99
+                })
+            });
+            expect(enableRes.status).toBe(200);
+            const setCookie1 = enableRes.headers.get('Set-Cookie') ?? '';
+            expect(setCookie1).toContain('vrcx_cloud_passcode_gate=');
+            expect(setCookie1).toContain('HttpOnly');
+            expect(setCookie1).toContain('SameSite=Strict');
+            expect(setCookie1).toContain(`Max-Age=${30 * 86_400}`);
+            const browser1Cookie = setCookie1.split(';')[0]!;
+
+            const storedRow = await env.DB_CORE.prepare(
+                "SELECT payload_json FROM cloud_bg_sync_state WHERE state_key = 'cloud_static_passcode_config'"
+            ).first<{ payload_json: string }>();
+            expect(storedRow?.payload_json).toBeTruthy();
+            expect(storedRow!.payload_json).not.toContain(pass1);
+            const storedCfg = JSON.parse(storedRow!.payload_json) as { passcodeHash: string; trustEpoch: string };
+            expect(storedCfg.passcodeHash.startsWith('pbkdf2$100000$')).toBe(true);
+
+            // 4. Unverified browser is gated (401 on /api/bootstrap, /api/auth/me exposes staticPasscodeGateEnabled=true)
+            const unauthMe = (await (await exports.default.fetch('http://example.com/api/auth/me')).json()) as {
+                data: {
+                    authenticated: boolean;
+                    primaryAuthenticated: boolean;
+                    staticPasscodeGateEnabled: boolean;
+                    staticPasscodeVerified: boolean;
+                };
+            };
+            expect(unauthMe.data.authenticated).toBe(false);
+            expect(unauthMe.data.primaryAuthenticated).toBe(true);
+            expect(unauthMe.data.staticPasscodeGateEnabled).toBe(true);
+            expect(unauthMe.data.staticPasscodeVerified).toBe(false);
+
+            expect((await exports.default.fetch('http://example.com/api/bootstrap')).status).toBe(401);
+
+            // Forged cookie signed only with fallback master key MUST be rejected
+            const forgedSig = await sign2faTrustCookie(
+                getMasterKey(env),
+                storedCfg.trustEpoch,
+                'forged_static_1',
+                Math.floor(Date.now() / 1000) + 3600
+            );
+            expect(
+                (
+                    await exports.default.fetch('http://example.com/api/bootstrap', {
+                        headers: { Cookie: `vrcx_cloud_passcode_gate=${encodeURIComponent(forgedSig)}` }
+                    })
+                ).status
+            ).toBe(401);
+
+            // Trusted browser 1 passes
+            expect(
+                (
+                    await exports.default.fetch('http://example.com/api/bootstrap', {
+                        headers: { Cookie: browser1Cookie }
+                    })
+                ).status
+            ).toBe(200);
+
+            // 5. Second browser verifies with static passphrase + 3-day trust window
+            const verifyRes = await exports.default.fetch('http://example.com/api/auth/static-passcode/verify', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+                body: JSON.stringify({ passphrase: pass1, trustDays: 3 })
+            });
+            expect(verifyRes.status).toBe(200);
+            const setCookie2 = verifyRes.headers.get('Set-Cookie') ?? '';
+            expect(setCookie2).toContain(`Max-Age=${3 * 86_400}`);
+            const browser2Cookie = setCookie2.split(';')[0]!;
+            expect(
+                (
+                    await exports.default.fetch('http://example.com/api/bootstrap', {
+                        headers: { Cookie: browser2Cookie }
+                    })
+                ).status
+            ).toBe(200);
+
+            // 6. Rate-limit protection: 5 wrong passphrases lock out with 429
+            const attackerHeaders = {
+                'Content-Type': 'application/json',
+                Origin: 'http://example.com',
+                'CF-Connecting-IP': '198.51.100.77'
+            };
+            for (let i = 0; i < 5; i++) {
+                const failRes = await exports.default.fetch('http://example.com/api/auth/static-passcode/verify', {
+                    method: 'POST',
+                    headers: attackerHeaders,
+                    body: JSON.stringify({ passphrase: 'WrongPass9999' })
+                });
+                expect(failRes.status).toBe(401);
+            }
+            const lockedRes = await exports.default.fetch('http://example.com/api/auth/static-passcode/verify', {
+                method: 'POST',
+                headers: attackerHeaders,
+                body: JSON.stringify({ passphrase: 'WrongPass9999' })
+            });
+            expect(lockedRes.status).toBe(429);
+
+            // 7. Session-only trust settings (0s) omit Max-Age
+            const sessRes = await exports.default.fetch('http://example.com/api/auth/static-passcode/settings', {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json', Origin: 'http://example.com', Cookie: browser2Cookie },
+                body: JSON.stringify({ defaultTrustSeconds: 0, applyToCurrentBrowser: true })
+            });
+            expect(sessRes.status).toBe(200);
+            const sessHdr = sessRes.headers.get('Set-Cookie') ?? '';
+            expect(sessHdr).toContain('vrcx_cloud_passcode_gate=');
+            expect(sessHdr).not.toContain('Max-Age=');
+
+            // 8. Change passphrase rotates trustEpoch (revoking browser 2) and updates active hash
+            const pass2 = 'RoyalKnight2026';
+            const badChangeRes = await exports.default.fetch('http://example.com/api/auth/static-passcode/change', {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json', Origin: 'http://example.com', Cookie: browser1Cookie },
+                body: JSON.stringify({ currentPassphrase: 'WrongPass9999', newPassphrase: pass2 })
+            });
+            expect(badChangeRes.status).toBe(400);
+
+            const changeRes = await exports.default.fetch('http://example.com/api/auth/static-passcode/change', {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json', Origin: 'http://example.com', Cookie: browser1Cookie },
+                body: JSON.stringify({ currentPassphrase: pass1, newPassphrase: pass2, confirmPassphrase: pass2 })
+            });
+            expect(changeRes.status).toBe(200);
+            const rotatedCookie = (changeRes.headers.get('Set-Cookie') ?? '').split(';')[0]!;
+            expect(
+                (
+                    await exports.default.fetch('http://example.com/api/bootstrap', {
+                        headers: { Cookie: browser2Cookie }
+                    })
+                ).status
+            ).toBe(401);
+            expect(
+                (
+                    await exports.default.fetch('http://example.com/api/bootstrap', {
+                        headers: { Cookie: rotatedCookie }
+                    })
+                ).status
+            ).toBe(200);
+
+            // 9. Combined 2FA + Static Passphrase: single verify call unlocks both gates atomically
+            const setup2fa = (await (
+                await exports.default.fetch('http://example.com/api/auth/2fa/setup', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', Origin: 'http://example.com', Cookie: rotatedCookie },
+                    body: '{}'
+                })
+            ).json()) as { data: { setupToken: string; secret: string } };
+            const baseNow = Date.now();
+            const enableTotpCode = await generateTotpCode(setup2fa.data.secret, baseNow - 30_000);
+            const enable2faRes = await exports.default.fetch('http://example.com/api/auth/2fa/enable', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Origin: 'http://example.com', Cookie: rotatedCookie },
+                body: JSON.stringify({ setupToken: setup2fa.data.setupToken, code: enableTotpCode })
+            });
+            expect(enable2faRes.status).toBe(200);
+
+            // Cookie with ONLY static passphrase is still 401 now that 2FA is also enabled
+            expect(
+                (
+                    await exports.default.fetch('http://example.com/api/bootstrap', {
+                        headers: { Cookie: rotatedCookie }
+                    })
+                ).status
+            ).toBe(401);
+
+            // Combined verify with pass2 + valid 6-digit code issues both cookies and grants full access
+            const combinedCode = await generateTotpCode(setup2fa.data.secret, baseNow);
+            const combinedRes = await exports.default.fetch('http://example.com/api/auth/static-passcode/verify', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+                body: JSON.stringify({ passphrase: pass2, code: combinedCode, trustDays: 7 })
+            });
+            expect(combinedRes.status).toBe(200);
+            const combinedBody = (await combinedRes.json()) as {
+                data: { authenticated: boolean; totpVerified: boolean; staticPasscodeVerified: boolean };
+            };
+            expect(combinedBody.data.authenticated).toBe(true);
+            expect(combinedBody.data.totpVerified).toBe(true);
+            expect(combinedBody.data.staticPasscodeVerified).toBe(true);
+            const setCookies =
+                typeof combinedRes.headers.getSetCookie === 'function'
+                    ? combinedRes.headers.getSetCookie()
+                    : [combinedRes.headers.get('Set-Cookie') ?? ''];
+            const mergedCookieHeader = setCookies.map((c) => c.split(';')[0]).join('; ');
+            expect(mergedCookieHeader).toContain('vrcx_cloud_passcode_gate=');
+            expect(mergedCookieHeader).toContain('vrcx_cloud_2fa=');
+            expect(
+                (
+                    await exports.default.fetch('http://example.com/api/bootstrap', {
+                        headers: { Cookie: mergedCookieHeader }
+                    })
+                ).status
+            ).toBe(200);
+
+            // 10. Revoke-all & disable static passphrase (wrong passphrase rejected, right passphrase clears cookie)
+            const revokeRes = await exports.default.fetch('http://example.com/api/auth/static-passcode/revoke-all', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    Origin: 'http://example.com',
+                    Cookie: mergedCookieHeader
+                },
+                body: JSON.stringify({ keepCurrentBrowser: true })
+            });
+            expect(revokeRes.status).toBe(200);
+            const newStaticCookie = (revokeRes.headers.get('Set-Cookie') ?? '').split(';')[0]!;
+            const kept2faCookie = setCookies
+                .map((c) => c.split(';')[0]!)
+                .find((c) => c.startsWith('vrcx_cloud_2fa='))!;
+            const activeBothCookies = `${newStaticCookie}; ${kept2faCookie}`;
+
+            const badDisable = await exports.default.fetch('http://example.com/api/auth/static-passcode/disable', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Origin: 'http://example.com', Cookie: activeBothCookies },
+                body: JSON.stringify({ passphrase: pass1 })
+            });
+            expect(badDisable.status).toBe(400);
+
+            const disableStatic = await exports.default.fetch('http://example.com/api/auth/static-passcode/disable', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Origin: 'http://example.com', Cookie: activeBothCookies },
+                body: JSON.stringify({ passphrase: pass2 })
+            });
+            expect(disableStatic.status).toBe(200);
+            expect(disableStatic.headers.get('Set-Cookie') ?? '').toContain('Max-Age=0');
+        } finally {
+            await env.DB_CORE.batch([
+                env.DB_CORE.prepare(
+                    "DELETE FROM cloud_bg_sync_state WHERE state_key IN ('cloud_static_passcode_config', 'cloud_totp_config', 'cloud_totp_pending')"
+                ),
+                env.DB_CORE.prepare(
+                    "DELETE FROM cloud_auth_rate_limits WHERE bucket_key = 'totp_gate:last_step' OR bucket_key LIKE 'static_passcode_%' OR bucket_key LIKE 'totp_%'"
+                )
+            ]);
+        }
+    });
 });

@@ -58,6 +58,14 @@ export async function refreshCloudAuthAndBootstrap() {
         cloudState.default2faTrustSeconds = clamp2faTrustSeconds(authInfo.defaultTrustSeconds);
         cloudState.max2faTrustDays = Number(authInfo.maxTrustDays) || MAX_CLOUD_2FA_TRUST_DAYS;
         cloudState.totpTrustExpiresAt = typeof authInfo.trustExpiresAt === 'string' ? authInfo.trustExpiresAt : '';
+        cloudState.staticPasscodeGateEnabled = Boolean(authInfo.staticPasscodeGateEnabled);
+        cloudState.staticPasscodeVerified =
+            authInfo.staticPasscodeVerified !== undefined ? Boolean(authInfo.staticPasscodeVerified) : true;
+        cloudState.staticPasscodeDefaultTrustSeconds = clamp2faTrustSeconds(
+            authInfo.staticPasscodeDefaultTrustSeconds ?? authInfo.defaultTrustSeconds
+        );
+        cloudState.staticPasscodeTrustExpiresAt =
+            typeof authInfo.staticPasscodeTrustExpiresAt === 'string' ? authInfo.staticPasscodeTrustExpiresAt : '';
         cloudState.subject = authInfo.subject || '';
         cloudState.r2Enabled = Boolean(authInfo.r2Enabled);
         cloudState.cloudFallbackAllowed = authInfo.cloudFallbackAllowed !== false;

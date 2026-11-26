@@ -51,6 +51,30 @@ export function clamp2faTrustSeconds(raw, fallback = DEFAULT_CLOUD_2FA_TRUST_SEC
 }
 
 /**
+ * Validates that a static access passphrase meets minimum security rules:
+ * at least 10 characters, containing both ASCII letters and digits, with no control characters.
+ *
+ * @param {unknown} raw
+ * @returns {{ valid: boolean; minLengthOk: boolean; hasLetter: boolean; hasDigit: boolean; maxLengthOk: boolean; noControlChars: boolean }}
+ */
+export function validateStaticPassphraseFormat(raw) {
+    const str = typeof raw === 'string' ? raw : '';
+    const minLengthOk = str.length >= 10;
+    const maxLengthOk = str.length <= 128;
+    const hasLetter = /[A-Za-z]/.test(str);
+    const hasDigit = /[0-9]/.test(str);
+    const noControlChars = !/[\x00-\x1F\x7F]/.test(str);
+    return {
+        valid: minLengthOk && maxLengthOk && hasLetter && hasDigit && noControlChars,
+        minLengthOk,
+        hasLetter,
+        hasDigit,
+        maxLengthOk,
+        noControlChars
+    };
+}
+
+/**
  * Normalizes a user or server-supplied VRCX.Agent sync interval into [30, 3600] seconds (default 60s).
  *
  * @param {unknown} raw
@@ -96,6 +120,10 @@ export const cloudState = reactive({
     default2faTrustSeconds: DEFAULT_CLOUD_2FA_TRUST_SECONDS,
     max2faTrustDays: MAX_CLOUD_2FA_TRUST_DAYS,
     totpTrustExpiresAt: '',
+    staticPasscodeGateEnabled: false,
+    staticPasscodeVerified: true,
+    staticPasscodeDefaultTrustSeconds: DEFAULT_CLOUD_2FA_TRUST_SECONDS,
+    staticPasscodeTrustExpiresAt: '',
     subject: '',
     wsConnected: false,
     r2Enabled: false,

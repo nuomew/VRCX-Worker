@@ -2,12 +2,14 @@ import {
     decryptAesGcm,
     encryptAesGcm,
     generateTotpSecret,
+    hashPasscodePbkdf2,
     hmacSha256Hex,
     randomHex,
     sha256Hex,
     sign2faTrustCookie,
     signSessionCookie,
     timingSafeEqual,
+    validateStaticPassphrase,
     verify2faTrustCookie,
     verifyPasscode,
     verifySessionCookie,
@@ -17,11 +19,13 @@ import type { Env } from '../env';
 
 const SESSION_COOKIE_NAME = 'vrcx_cloud_session';
 const TOTP_TRUST_COOKIE_NAME = 'vrcx_cloud_2fa';
+const STATIC_PASSCODE_TRUST_COOKIE_NAME = 'vrcx_cloud_passcode_gate';
 const SESSION_TTL_SECONDS = 60 * 60 * 24 * 14; // 14 days
 const AGENT_REPLAY_WINDOW_SEC = 60;
 const STATE_KEY_REVOKED_SESSIONS = 'revoked_sessions';
 const STATE_KEY_CLOUD_TOTP = 'cloud_totp_config';
 const STATE_KEY_CLOUD_TOTP_PENDING = 'cloud_totp_pending';
+const STATE_KEY_CLOUD_STATIC_PASSCODE = 'cloud_static_passcode_config';
 const MAX_REVOKED_SESSIONS = 50;
 const ALLOWED_PUBLIC_THEME_MODES = new Set(['system', 'light', 'dark', 'midnight']);
 const ALLOWED_PUBLIC_THEME_COLORS = new Set([
@@ -96,12 +100,26 @@ export interface WebAuthResult {
     defaultTrustSeconds: number;
     maxTrustDays: number;
     trustExpiresAt: string;
+    staticPasscodeGateEnabled: boolean;
+    staticPasscodeVerified: boolean;
+    staticPasscodeDefaultTrustSeconds: number;
+    staticPasscodeTrustExpiresAt: string;
     subject: string;
 }
 
 interface StoredCloudTotpConfig {
     enabled: boolean;
     secretEnc: { ciphertextB64: string; ivB64: string };
+    cookieSignKey: string;
+    trustEpoch: string;
+    defaultTrustSeconds: number;
+    enabledAt: string;
+    updatedAt: string;
+}
+
+interface StoredCloudStaticPasscodeConfig {
+    enabled: boolean;
+    passcodeHash: string;
     cookieSignKey: string;
     trustEpoch: string;
     defaultTrustSeconds: number;
@@ -563,9 +581,64 @@ async function savePendingTotpSetup(env: Env, pending: StoredPendingTotpSetup): 
         .run();
 }
 
-function resolve2faCookieSignSecret(env: Env, cfg: StoredCloudTotpConfig): string {
+async function loadCloudStaticPasscodeConfig(env: Env): Promise<StoredCloudStaticPasscodeConfig | null> {
+    if (!env.DB_CORE) return null;
+    try {
+        const row = await env.DB_CORE.prepare(
+            'SELECT payload_json FROM cloud_bg_sync_state WHERE state_key = ? LIMIT 1'
+        )
+            .bind(STATE_KEY_CLOUD_STATIC_PASSCODE)
+            .first<{ payload_json?: string }>();
+        if (!row?.payload_json) return null;
+        const parsed = JSON.parse(row.payload_json) as Partial<StoredCloudStaticPasscodeConfig>;
+        if (
+            !parsed ||
+            parsed.enabled !== true ||
+            typeof parsed.passcodeHash !== 'string' ||
+            !parsed.passcodeHash.startsWith('pbkdf2$') ||
+            typeof parsed.cookieSignKey !== 'string' ||
+            !parsed.cookieSignKey ||
+            typeof parsed.trustEpoch !== 'string' ||
+            !parsed.trustEpoch
+        ) {
+            return null;
+        }
+        return {
+            enabled: true,
+            passcodeHash: parsed.passcodeHash,
+            cookieSignKey: parsed.cookieSignKey,
+            trustEpoch: parsed.trustEpoch,
+            defaultTrustSeconds: clamp2faTrustSeconds(parsed.defaultTrustSeconds, DEFAULT_2FA_TRUST_SECONDS),
+            enabledAt: typeof parsed.enabledAt === 'string' ? parsed.enabledAt : '',
+            updatedAt: typeof parsed.updatedAt === 'string' ? parsed.updatedAt : ''
+        };
+    } catch {
+        return null;
+    }
+}
+
+async function saveCloudStaticPasscodeConfig(env: Env, config: StoredCloudStaticPasscodeConfig): Promise<void> {
+    const nowIso = new Date().toISOString();
+    await env.DB_CORE.prepare(
+        `INSERT INTO cloud_bg_sync_state (state_key, payload_json, updated_at)
+         VALUES (?, ?, ?)
+         ON CONFLICT(state_key) DO UPDATE SET
+            payload_json = excluded.payload_json,
+            updated_at = excluded.updated_at`
+    )
+        .bind(STATE_KEY_CLOUD_STATIC_PASSCODE, JSON.stringify({ ...config, updatedAt: nowIso }), nowIso)
+        .run();
+}
+
+async function deleteCloudStaticPasscodeState(env: Env): Promise<void> {
+    await env.DB_CORE.prepare('DELETE FROM cloud_bg_sync_state WHERE state_key = ?')
+        .bind(STATE_KEY_CLOUD_STATIC_PASSCODE)
+        .run();
+}
+
+function resolve2faCookieSignSecret(env: Env, cfg: { cookieSignKey: string }): string {
     // Mix the instance-unique 256-bit random cookieSignKey with getMasterKey(env) so even
-    // zero-env open_setup deploys cannot have their 2FA trust cookies forged from source constants.
+    // zero-env open_setup deploys cannot have their trust cookies forged from source constants.
     return `${getMasterKey(env)}:${cfg.cookieSignKey}`;
 }
 
@@ -580,9 +653,10 @@ function buildClearCookieHeader(cookieName: string, isSecure: boolean): string {
     ].join('; ');
 }
 
-async function build2faTrustCookieHeader(
+async function buildGateTrustCookieHeader(
     env: Env,
-    cfg: StoredCloudTotpConfig,
+    cookieName: string,
+    cfg: { cookieSignKey: string; trustEpoch: string; defaultTrustSeconds: number },
     trustSeconds: number,
     isSecure: boolean
 ): Promise<{ setCookie: string; trustSeconds: number; sessionOnly: boolean; trustExpiresAt: string | null }> {
@@ -592,7 +666,7 @@ async function build2faTrustCookieHeader(
     const expEpochSec = sessionOnly ? nowSec + SESSION_ONLY_2FA_MAX_EXP_SECONDS : nowSec + clampedSeconds;
     const tokenId = randomHex(16);
     const signed = await sign2faTrustCookie(resolve2faCookieSignSecret(env, cfg), cfg.trustEpoch, tokenId, expEpochSec);
-    const parts = [`${TOTP_TRUST_COOKIE_NAME}=${encodeURIComponent(signed)}`, 'Path=/'];
+    const parts = [`${cookieName}=${encodeURIComponent(signed)}`, 'Path=/'];
     if (!sessionOnly) {
         parts.push(`Max-Age=${clampedSeconds}`);
     }
@@ -606,6 +680,24 @@ async function build2faTrustCookieHeader(
         sessionOnly,
         trustExpiresAt: sessionOnly ? null : new Date(expEpochSec * 1000).toISOString()
     };
+}
+
+async function build2faTrustCookieHeader(
+    env: Env,
+    cfg: StoredCloudTotpConfig,
+    trustSeconds: number,
+    isSecure: boolean
+): Promise<{ setCookie: string; trustSeconds: number; sessionOnly: boolean; trustExpiresAt: string | null }> {
+    return buildGateTrustCookieHeader(env, TOTP_TRUST_COOKIE_NAME, cfg, trustSeconds, isSecure);
+}
+
+async function buildStaticPasscodeTrustCookieHeader(
+    env: Env,
+    cfg: StoredCloudStaticPasscodeConfig,
+    trustSeconds: number,
+    isSecure: boolean
+): Promise<{ setCookie: string; trustSeconds: number; sessionOnly: boolean; trustExpiresAt: string | null }> {
+    return buildGateTrustCookieHeader(env, STATIC_PASSCODE_TRUST_COOKIE_NAME, cfg, trustSeconds, isSecure);
 }
 
 async function claimMonotonicTotpStep(env: Env, bucketKey: string, step: number): Promise<boolean> {
@@ -762,13 +854,20 @@ async function authenticatePrimaryWeb(
 export async function authenticateWeb(request: Request, env: Env): Promise<WebAuthResult> {
     const primary = await authenticatePrimaryWeb(request, env);
     const envTotpConfigured = Boolean(env.ADMIN_TOTP_SECRET?.trim());
-    const totpCfg = await loadCloudTotpConfig(env);
+    const [totpCfg, staticPasscodeCfg] = await Promise.all([
+        loadCloudTotpConfig(env),
+        loadCloudStaticPasscodeConfig(env)
+    ]);
     const totpGateEnabled = Boolean(totpCfg?.enabled);
+    const staticPasscodeGateEnabled = Boolean(staticPasscodeCfg?.enabled);
     const defaultTrustSeconds = totpCfg
         ? clamp2faTrustSeconds(totpCfg.defaultTrustSeconds, DEFAULT_2FA_TRUST_SECONDS)
         : DEFAULT_2FA_TRUST_SECONDS;
+    const staticPasscodeDefaultTrustSeconds = staticPasscodeCfg
+        ? clamp2faTrustSeconds(staticPasscodeCfg.defaultTrustSeconds, DEFAULT_2FA_TRUST_SECONDS)
+        : DEFAULT_2FA_TRUST_SECONDS;
 
-    if (!totpGateEnabled || primary.isBearerOverride) {
+    if ((!totpGateEnabled && !staticPasscodeGateEnabled) || primary.isBearerOverride) {
         return {
             authenticated: primary.primaryAuthenticated,
             primaryAuthenticated: primary.primaryAuthenticated,
@@ -780,42 +879,73 @@ export async function authenticateWeb(request: Request, env: Env): Promise<WebAu
             defaultTrustSeconds,
             maxTrustDays: MAX_2FA_TRUST_DAYS,
             trustExpiresAt: '',
+            staticPasscodeGateEnabled,
+            staticPasscodeVerified: true,
+            staticPasscodeDefaultTrustSeconds,
+            staticPasscodeTrustExpiresAt: '',
             subject: primary.subject
         };
     }
 
-    let totpVerified = false;
-    let trustExpiresAt = '';
     const cookies = parseCookies(request.headers.get('Cookie'));
-    const trustToken = cookies[TOTP_TRUST_COOKIE_NAME];
-    if (trustToken && totpCfg) {
-        const nowSec = Math.floor(Date.now() / 1000);
-        const verified = await verify2faTrustCookie(
-            resolve2faCookieSignSecret(env, totpCfg),
-            trustToken,
-            totpCfg.trustEpoch,
-            nowSec + MAX_2FA_TRUST_SECONDS + 60
-        );
-        if (verified.valid && verified.tokenId && !(await isSessionRevoked(env, verified.tokenId))) {
-            totpVerified = true;
-            if (verified.expEpochSec) {
-                trustExpiresAt = new Date(verified.expEpochSec * 1000).toISOString();
+    const nowSec = Math.floor(Date.now() / 1000);
+
+    let totpVerified = !totpGateEnabled;
+    let trustExpiresAt = '';
+    if (totpGateEnabled && totpCfg) {
+        const trustToken = cookies[TOTP_TRUST_COOKIE_NAME];
+        if (trustToken) {
+            const verified = await verify2faTrustCookie(
+                resolve2faCookieSignSecret(env, totpCfg),
+                trustToken,
+                totpCfg.trustEpoch,
+                nowSec + MAX_2FA_TRUST_SECONDS + 60
+            );
+            if (verified.valid && verified.tokenId && !(await isSessionRevoked(env, verified.tokenId))) {
+                totpVerified = true;
+                if (verified.expEpochSec) {
+                    trustExpiresAt = new Date(verified.expEpochSec * 1000).toISOString();
+                }
             }
         }
     }
 
-    const authenticated = primary.primaryAuthenticated && totpVerified;
+    let staticPasscodeVerified = !staticPasscodeGateEnabled;
+    let staticPasscodeTrustExpiresAt = '';
+    if (staticPasscodeGateEnabled && staticPasscodeCfg) {
+        const staticToken = cookies[STATIC_PASSCODE_TRUST_COOKIE_NAME];
+        if (staticToken) {
+            const verified = await verify2faTrustCookie(
+                resolve2faCookieSignSecret(env, staticPasscodeCfg),
+                staticToken,
+                staticPasscodeCfg.trustEpoch,
+                nowSec + MAX_2FA_TRUST_SECONDS + 60
+            );
+            if (verified.valid && verified.tokenId && !(await isSessionRevoked(env, verified.tokenId))) {
+                staticPasscodeVerified = true;
+                if (verified.expEpochSec) {
+                    staticPasscodeTrustExpiresAt = new Date(verified.expEpochSec * 1000).toISOString();
+                }
+            }
+        }
+    }
+
+    const authenticated = primary.primaryAuthenticated && totpVerified && staticPasscodeVerified;
     return {
         authenticated,
         primaryAuthenticated: primary.primaryAuthenticated,
         authMode: primary.authMode,
-        requiresTotp: true,
-        totpGateEnabled: true,
+        requiresTotp: totpGateEnabled || (envTotpConfigured && primary.authMode === 'passcode_session'),
+        totpGateEnabled,
         totpVerified,
         envTotpConfigured,
         defaultTrustSeconds,
         maxTrustDays: MAX_2FA_TRUST_DAYS,
         trustExpiresAt,
+        staticPasscodeGateEnabled,
+        staticPasscodeVerified,
+        staticPasscodeDefaultTrustSeconds,
+        staticPasscodeTrustExpiresAt,
         subject: authenticated ? primary.subject : ''
     };
 }
@@ -1060,6 +1190,10 @@ export async function handleAuthRoutes(request: Request, env: Env, url: URL): Pr
                     defaultTrustSeconds: result.defaultTrustSeconds,
                     maxTrustDays: result.maxTrustDays,
                     trustExpiresAt: result.trustExpiresAt,
+                    staticPasscodeGateEnabled: result.staticPasscodeGateEnabled,
+                    staticPasscodeVerified: result.staticPasscodeVerified,
+                    staticPasscodeDefaultTrustSeconds: result.staticPasscodeDefaultTrustSeconds,
+                    staticPasscodeTrustExpiresAt: result.staticPasscodeTrustExpiresAt,
                     subject: result.subject,
                     r2Enabled: Boolean(env.R2_MEDIA),
                     cloudFallbackAllowed: env.VRC_ALLOW_CLOUD_FALLBACK !== 'false',
@@ -1214,14 +1348,17 @@ export async function handleAuthRoutes(request: Request, env: Env, url: URL): Pr
             sessionOnly = built.sessionOnly;
         }
 
+        const staticPasscodeCfg = await loadCloudStaticPasscodeConfig(env);
         const stillNeedsCloud2fa = Boolean(cloudTotpCfg?.enabled && !useCloudTotpInLogin);
+        const stillNeedsStaticPasscode = Boolean(staticPasscodeCfg?.enabled);
         return Response.json(
             {
                 ok: true,
                 data: {
-                    authenticated: !stillNeedsCloud2fa,
+                    authenticated: !stillNeedsCloud2fa && !stillNeedsStaticPasscode,
                     authMode: 'passcode_session',
                     totpGateEnabled: Boolean(cloudTotpCfg?.enabled),
+                    staticPasscodeGateEnabled: stillNeedsStaticPasscode,
                     trustSeconds,
                     sessionOnly,
                     trustExpiresAt
@@ -1329,12 +1466,16 @@ export async function handleAuthRoutes(request: Request, env: Env, url: URL): Pr
 
         const requestedSeconds = resolveRequestedTrustSeconds(body, totpCfg.defaultTrustSeconds);
         const built = await build2faTrustCookieHeader(env, totpCfg, requestedSeconds, url.protocol === 'https:');
+        const currentAuthAfter2fa = await authenticateWeb(request, env);
+        const fullyAuthenticated = currentAuthAfter2fa.staticPasscodeVerified;
         return Response.json(
             {
                 ok: true,
                 data: {
-                    authenticated: true,
+                    authenticated: fullyAuthenticated,
                     totpGateEnabled: true,
+                    staticPasscodeGateEnabled: currentAuthAfter2fa.staticPasscodeGateEnabled,
+                    staticPasscodeVerified: currentAuthAfter2fa.staticPasscodeVerified,
                     trustSeconds: built.trustSeconds,
                     sessionOnly: built.sessionOnly,
                     trustExpiresAt: built.trustExpiresAt
@@ -1794,6 +1935,592 @@ export async function handleAuthRoutes(request: Request, env: Env, url: URL): Pr
         );
     }
 
+    // --- Static Passphrase Gate (/api/auth/static-passcode/*) ---
+    if (url.pathname === '/api/auth/static-passcode/verify' && request.method === 'POST') {
+        if (!isSameOriginRequest(request, url)) {
+            return Response.json(
+                { ok: false, error: { code: 'FORBIDDEN_ORIGIN', message: 'Cross-origin static passphrase request blocked' } },
+                { status: 403 }
+            );
+        }
+        const primary = await authenticatePrimaryWeb(request, env);
+        if (!primary.primaryAuthenticated) {
+            return Response.json(
+                { ok: false, error: { code: 'UNAUTHORIZED', message: 'Primary authentication required' } },
+                { status: 401 }
+            );
+        }
+
+        const staticCfg = await loadCloudStaticPasscodeConfig(env);
+        if (!staticCfg?.enabled) {
+            const currentAuth = await authenticateWeb(request, env);
+            return Response.json({
+                ok: true,
+                data: {
+                    authenticated: currentAuth.authenticated,
+                    staticPasscodeGateEnabled: false
+                }
+            });
+        }
+
+        const rateBucket = resolveClientRateBucket(request, 'static_passcode_verify');
+        const rateCheck = await checkAuthRateLimit(env, rateBucket);
+        if (rateCheck.blocked) {
+            return Response.json(
+                {
+                    ok: false,
+                    error: {
+                        code: 'RATE_LIMITED',
+                        message: `Too many failed attempts. Try again in ${rateCheck.retryAfterSec}s.`
+                    }
+                },
+                { status: 429, headers: { 'Retry-After': String(rateCheck.retryAfterSec) } }
+            );
+        }
+
+        const parsedBody = await readBoundedJsonBody<{
+            passphrase?: string;
+            passcode?: string;
+            code?: string;
+            totp?: string;
+            trustSeconds?: unknown;
+            trustDays?: unknown;
+        }>(request);
+        if (!parsedBody.ok) {
+            return parsedBody.response;
+        }
+        const body = parsedBody.data;
+        const candidatePassphrase =
+            typeof body.passphrase === 'string'
+                ? body.passphrase
+                : typeof body.passcode === 'string'
+                  ? body.passcode
+                  : '';
+        const candidateTotp =
+            typeof body.code === 'string' ? body.code : typeof body.totp === 'string' ? body.totp : '';
+
+        const currentAuth = await authenticateWeb(request, env);
+        const totpCfg = currentAuth.totpGateEnabled && !currentAuth.totpVerified ? await loadCloudTotpConfig(env) : null;
+        const verifyTotpTogether = Boolean(totpCfg?.enabled && candidateTotp.trim());
+
+        const passOk =
+            candidatePassphrase.length > 0 &&
+            candidatePassphrase.length <= 128 &&
+            (await verifyPasscode(staticCfg.passcodeHash, candidatePassphrase));
+
+        let totpOk = true;
+        let matchedTotpStep = 0;
+        if (verifyTotpTogether && totpCfg) {
+            try {
+                const secret = await decryptAesGcm(
+                    getMasterKey(env),
+                    totpCfg.secretEnc.ciphertextB64,
+                    totpCfg.secretEnc.ivB64
+                );
+                const stepCheck = await verifyTotpStep(secret, candidateTotp);
+                totpOk = stepCheck.valid;
+                matchedTotpStep = stepCheck.step;
+            } catch {
+                totpOk = false;
+            }
+        }
+
+        // Evaluate both factors before returning a uniform error to eliminate factor-verification oracles.
+        if (!passOk || !totpOk) {
+            await recordAuthFailure(env, rateBucket);
+            return Response.json(
+                {
+                    ok: false,
+                    error: {
+                        code: verifyTotpTogether ? 'INVALID_CREDENTIALS' : 'INVALID_STATIC_PASSCODE',
+                        message: verifyTotpTogether
+                            ? 'Invalid static passphrase or 6-digit verification code'
+                            : 'Invalid static passphrase'
+                    }
+                },
+                { status: 401 }
+            );
+        }
+
+        if (verifyTotpTogether && matchedTotpStep > 0) {
+            const claimed = await claimMonotonicTotpStep(env, 'totp_gate:last_step', matchedTotpStep);
+            if (!claimed) {
+                await recordAuthFailure(env, rateBucket);
+                return Response.json(
+                    {
+                        ok: false,
+                        error: {
+                            code: 'TOTP_CODE_REUSED',
+                            message: 'Verification code already used; wait for the next 6-digit code'
+                        }
+                    },
+                    { status: 401 }
+                );
+            }
+        }
+
+        await clearAuthRateLimit(env, rateBucket);
+
+        const isSecure = url.protocol === 'https:';
+        const requestedSeconds = resolveRequestedTrustSeconds(body, staticCfg.defaultTrustSeconds);
+        const builtStatic = await buildStaticPasscodeTrustCookieHeader(env, staticCfg, requestedSeconds, isSecure);
+        const headers = new Headers({ 'Cache-Control': 'no-store' });
+        headers.append('Set-Cookie', builtStatic.setCookie);
+
+        let totpVerifiedNow = currentAuth.totpVerified;
+        let totpTrustExpiresAt: string | null = currentAuth.trustExpiresAt || null;
+        if (verifyTotpTogether && totpCfg) {
+            const builtTotp = await build2faTrustCookieHeader(env, totpCfg, requestedSeconds, isSecure);
+            headers.append('Set-Cookie', builtTotp.setCookie);
+            totpVerifiedNow = true;
+            totpTrustExpiresAt = builtTotp.trustExpiresAt;
+        }
+
+        return Response.json(
+            {
+                ok: true,
+                data: {
+                    authenticated: totpVerifiedNow,
+                    staticPasscodeGateEnabled: true,
+                    staticPasscodeVerified: true,
+                    totpGateEnabled: currentAuth.totpGateEnabled,
+                    totpVerified: totpVerifiedNow,
+                    trustSeconds: builtStatic.trustSeconds,
+                    sessionOnly: builtStatic.sessionOnly,
+                    trustExpiresAt: builtStatic.trustExpiresAt,
+                    totpTrustExpiresAt
+                }
+            },
+            { headers }
+        );
+    }
+
+    if (url.pathname === '/api/auth/static-passcode/status' && request.method === 'GET') {
+        const auth = await authenticateWeb(request, env);
+        if (!auth.authenticated) {
+            return Response.json(
+                { ok: false, error: { code: 'UNAUTHORIZED', message: 'Authentication required' } },
+                { status: 401 }
+            );
+        }
+        const cfg = await loadCloudStaticPasscodeConfig(env);
+        return Response.json(
+            {
+                ok: true,
+                data: {
+                    enabled: Boolean(cfg?.enabled),
+                    defaultTrustSeconds: cfg
+                        ? clamp2faTrustSeconds(cfg.defaultTrustSeconds, DEFAULT_2FA_TRUST_SECONDS)
+                        : DEFAULT_2FA_TRUST_SECONDS,
+                    maxTrustDays: MAX_2FA_TRUST_DAYS,
+                    enabledAt: cfg?.enabledAt ?? '',
+                    updatedAt: cfg?.updatedAt ?? '',
+                    trustExpiresAt: auth.staticPasscodeTrustExpiresAt
+                }
+            },
+            { headers: { 'Cache-Control': 'no-store' } }
+        );
+    }
+
+    if (url.pathname === '/api/auth/static-passcode/enable' && request.method === 'POST') {
+        if (!isSameOriginRequest(request, url)) {
+            return Response.json(
+                { ok: false, error: { code: 'FORBIDDEN_ORIGIN', message: 'Cross-origin static passphrase request blocked' } },
+                { status: 403 }
+            );
+        }
+        const auth = await authenticateWeb(request, env);
+        if (!auth.authenticated) {
+            return Response.json(
+                { ok: false, error: { code: 'UNAUTHORIZED', message: 'Authentication required' } },
+                { status: 401 }
+            );
+        }
+        const existing = await loadCloudStaticPasscodeConfig(env);
+        if (existing?.enabled) {
+            return Response.json(
+                {
+                    ok: false,
+                    error: {
+                        code: 'ALREADY_ENABLED',
+                        message: 'Static passphrase is already enabled. Change or disable it instead.'
+                    }
+                },
+                { status: 409 }
+            );
+        }
+
+        const parsedBody = await readBoundedJsonBody<{
+            passphrase?: string;
+            confirmPassphrase?: string;
+            defaultTrustSeconds?: unknown;
+            defaultTrustDays?: unknown;
+        }>(request);
+        if (!parsedBody.ok) {
+            return parsedBody.response;
+        }
+        const body = parsedBody.data;
+        const passphrase = typeof body.passphrase === 'string' ? body.passphrase : '';
+        const validation = validateStaticPassphrase(passphrase);
+        if (!validation.valid) {
+            return Response.json(
+                { ok: false, error: { code: 'WEAK_STATIC_PASSCODE', message: validation.reason ?? 'Invalid static passphrase' } },
+                { status: 400 }
+            );
+        }
+        if (body.confirmPassphrase !== undefined && body.confirmPassphrase !== passphrase) {
+            return Response.json(
+                { ok: false, error: { code: 'PASSCODE_MISMATCH', message: 'Confirmation passphrase does not match' } },
+                { status: 400 }
+            );
+        }
+
+        const defaultTrustSeconds = resolveRequestedTrustSeconds(body, DEFAULT_2FA_TRUST_SECONDS);
+        const nowIso = new Date().toISOString();
+        const passcodeHash = await hashPasscodePbkdf2(passphrase);
+        const newConfig: StoredCloudStaticPasscodeConfig = {
+            enabled: true,
+            passcodeHash,
+            cookieSignKey: randomHex(32),
+            trustEpoch: randomHex(12),
+            defaultTrustSeconds,
+            enabledAt: nowIso,
+            updatedAt: nowIso
+        };
+        await saveCloudStaticPasscodeConfig(env, newConfig);
+
+        const built = await buildStaticPasscodeTrustCookieHeader(
+            env,
+            newConfig,
+            defaultTrustSeconds,
+            url.protocol === 'https:'
+        );
+        return Response.json(
+            {
+                ok: true,
+                data: {
+                    enabled: true,
+                    defaultTrustSeconds: newConfig.defaultTrustSeconds,
+                    maxTrustDays: MAX_2FA_TRUST_DAYS,
+                    enabledAt: newConfig.enabledAt,
+                    trustSeconds: built.trustSeconds,
+                    sessionOnly: built.sessionOnly,
+                    trustExpiresAt: built.trustExpiresAt
+                }
+            },
+            {
+                headers: {
+                    'Set-Cookie': built.setCookie,
+                    'Cache-Control': 'no-store'
+                }
+            }
+        );
+    }
+
+    if (url.pathname === '/api/auth/static-passcode/change' && request.method === 'PUT') {
+        if (!isSameOriginRequest(request, url)) {
+            return Response.json(
+                { ok: false, error: { code: 'FORBIDDEN_ORIGIN', message: 'Cross-origin static passphrase request blocked' } },
+                { status: 403 }
+            );
+        }
+        const auth = await authenticateWeb(request, env);
+        if (!auth.authenticated) {
+            return Response.json(
+                { ok: false, error: { code: 'UNAUTHORIZED', message: 'Authentication required' } },
+                { status: 401 }
+            );
+        }
+        const existing = await loadCloudStaticPasscodeConfig(env);
+        if (!existing?.enabled) {
+            return Response.json(
+                { ok: false, error: { code: 'NOT_ENABLED', message: 'Static passphrase is currently disabled' } },
+                { status: 400 }
+            );
+        }
+
+        const rateBucket = resolveClientRateBucket(request, 'static_passcode_manage');
+        const rateCheck = await checkAuthRateLimit(env, rateBucket);
+        if (rateCheck.blocked) {
+            return Response.json(
+                {
+                    ok: false,
+                    error: {
+                        code: 'RATE_LIMITED',
+                        message: `Too many failed attempts. Try again in ${rateCheck.retryAfterSec}s.`
+                    }
+                },
+                { status: 429, headers: { 'Retry-After': String(rateCheck.retryAfterSec) } }
+            );
+        }
+
+        const parsedBody = await readBoundedJsonBody<{
+            currentPassphrase?: string;
+            newPassphrase?: string;
+            confirmPassphrase?: string;
+        }>(request);
+        if (!parsedBody.ok) {
+            return parsedBody.response;
+        }
+        const body = parsedBody.data;
+        const currentPassphrase = typeof body.currentPassphrase === 'string' ? body.currentPassphrase : '';
+        const newPassphrase = typeof body.newPassphrase === 'string' ? body.newPassphrase : '';
+
+        const currentOk =
+            currentPassphrase.length > 0 &&
+            currentPassphrase.length <= 128 &&
+            (await verifyPasscode(existing.passcodeHash, currentPassphrase));
+        if (!currentOk) {
+            await recordAuthFailure(env, rateBucket);
+            return Response.json(
+                { ok: false, error: { code: 'INVALID_STATIC_PASSCODE', message: 'Current static passphrase is incorrect' } },
+                { status: 400 }
+            );
+        }
+
+        const validation = validateStaticPassphrase(newPassphrase);
+        if (!validation.valid) {
+            return Response.json(
+                { ok: false, error: { code: 'WEAK_STATIC_PASSCODE', message: validation.reason ?? 'Invalid new static passphrase' } },
+                { status: 400 }
+            );
+        }
+        if (body.confirmPassphrase !== undefined && body.confirmPassphrase !== newPassphrase) {
+            return Response.json(
+                { ok: false, error: { code: 'PASSCODE_MISMATCH', message: 'Confirmation passphrase does not match' } },
+                { status: 400 }
+            );
+        }
+
+        await clearAuthRateLimit(env, rateBucket);
+
+        const nextHash = await hashPasscodePbkdf2(newPassphrase);
+        const updated: StoredCloudStaticPasscodeConfig = {
+            ...existing,
+            passcodeHash: nextHash,
+            trustEpoch: randomHex(12)
+        };
+        await saveCloudStaticPasscodeConfig(env, updated);
+
+        const built = await buildStaticPasscodeTrustCookieHeader(
+            env,
+            updated,
+            updated.defaultTrustSeconds,
+            url.protocol === 'https:'
+        );
+        return Response.json(
+            {
+                ok: true,
+                data: {
+                    enabled: true,
+                    changed: true,
+                    trustExpiresAt: built.trustExpiresAt
+                }
+            },
+            {
+                headers: {
+                    'Set-Cookie': built.setCookie,
+                    'Cache-Control': 'no-store'
+                }
+            }
+        );
+    }
+
+    if (url.pathname === '/api/auth/static-passcode/settings' && request.method === 'PUT') {
+        if (!isSameOriginRequest(request, url)) {
+            return Response.json(
+                { ok: false, error: { code: 'FORBIDDEN_ORIGIN', message: 'Cross-origin static passphrase request blocked' } },
+                { status: 403 }
+            );
+        }
+        const auth = await authenticateWeb(request, env);
+        if (!auth.authenticated) {
+            return Response.json(
+                { ok: false, error: { code: 'UNAUTHORIZED', message: 'Authentication required' } },
+                { status: 401 }
+            );
+        }
+        const existing = await loadCloudStaticPasscodeConfig(env);
+        if (!existing?.enabled) {
+            return Response.json(
+                { ok: false, error: { code: 'NOT_ENABLED', message: 'Static passphrase is currently disabled' } },
+                { status: 400 }
+            );
+        }
+
+        const parsedBody = await readBoundedJsonBody<{
+            defaultTrustSeconds?: unknown;
+            defaultTrustDays?: unknown;
+            applyToCurrentBrowser?: unknown;
+        }>(request);
+        if (!parsedBody.ok) {
+            return parsedBody.response;
+        }
+        const body = parsedBody.data;
+        const nextTrustSeconds = resolveRequestedTrustSeconds(body, existing.defaultTrustSeconds);
+        const updated: StoredCloudStaticPasscodeConfig = {
+            ...existing,
+            defaultTrustSeconds: nextTrustSeconds
+        };
+        await saveCloudStaticPasscodeConfig(env, updated);
+
+        const headers = new Headers({ 'Cache-Control': 'no-store' });
+        let trustExpiresAt: string | null = auth.staticPasscodeTrustExpiresAt || null;
+        let sessionOnly = false;
+        if (body.applyToCurrentBrowser === true) {
+            const built = await buildStaticPasscodeTrustCookieHeader(
+                env,
+                updated,
+                nextTrustSeconds,
+                url.protocol === 'https:'
+            );
+            headers.append('Set-Cookie', built.setCookie);
+            trustExpiresAt = built.trustExpiresAt;
+            sessionOnly = built.sessionOnly;
+        }
+
+        return Response.json(
+            {
+                ok: true,
+                data: {
+                    enabled: true,
+                    defaultTrustSeconds: updated.defaultTrustSeconds,
+                    maxTrustDays: MAX_2FA_TRUST_DAYS,
+                    sessionOnly,
+                    trustExpiresAt
+                }
+            },
+            { headers }
+        );
+    }
+
+    if (url.pathname === '/api/auth/static-passcode/disable' && request.method === 'POST') {
+        if (!isSameOriginRequest(request, url)) {
+            return Response.json(
+                { ok: false, error: { code: 'FORBIDDEN_ORIGIN', message: 'Cross-origin static passphrase request blocked' } },
+                { status: 403 }
+            );
+        }
+        const auth = await authenticateWeb(request, env);
+        if (!auth.authenticated) {
+            return Response.json(
+                { ok: false, error: { code: 'UNAUTHORIZED', message: 'Authentication required' } },
+                { status: 401 }
+            );
+        }
+        const existing = await loadCloudStaticPasscodeConfig(env);
+        if (!existing?.enabled) {
+            return Response.json({ ok: true, data: { enabled: false } });
+        }
+
+        const rateBucket = resolveClientRateBucket(request, 'static_passcode_manage');
+        const rateCheck = await checkAuthRateLimit(env, rateBucket);
+        if (rateCheck.blocked) {
+            return Response.json(
+                {
+                    ok: false,
+                    error: {
+                        code: 'RATE_LIMITED',
+                        message: `Too many failed attempts. Try again in ${rateCheck.retryAfterSec}s.`
+                    }
+                },
+                { status: 429, headers: { 'Retry-After': String(rateCheck.retryAfterSec) } }
+            );
+        }
+
+        const parsedBody = await readBoundedJsonBody<{ passphrase?: string; passcode?: string }>(request);
+        if (!parsedBody.ok) {
+            return parsedBody.response;
+        }
+        const candidate =
+            typeof parsedBody.data.passphrase === 'string'
+                ? parsedBody.data.passphrase
+                : typeof parsedBody.data.passcode === 'string'
+                  ? parsedBody.data.passcode
+                  : '';
+        const ok = candidate.length > 0 && candidate.length <= 128 && (await verifyPasscode(existing.passcodeHash, candidate));
+        if (!ok) {
+            await recordAuthFailure(env, rateBucket);
+            return Response.json(
+                { ok: false, error: { code: 'INVALID_STATIC_PASSCODE', message: 'Invalid static passphrase' } },
+                { status: 400 }
+            );
+        }
+
+        await clearAuthRateLimit(env, rateBucket);
+        await deleteCloudStaticPasscodeState(env);
+
+        return Response.json(
+            { ok: true, data: { enabled: false } },
+            {
+                headers: {
+                    'Set-Cookie': buildClearCookieHeader(STATIC_PASSCODE_TRUST_COOKIE_NAME, url.protocol === 'https:'),
+                    'Cache-Control': 'no-store'
+                }
+            }
+        );
+    }
+
+    if (url.pathname === '/api/auth/static-passcode/revoke-all' && request.method === 'POST') {
+        if (!isSameOriginRequest(request, url)) {
+            return Response.json(
+                { ok: false, error: { code: 'FORBIDDEN_ORIGIN', message: 'Cross-origin static passphrase request blocked' } },
+                { status: 403 }
+            );
+        }
+        const auth = await authenticateWeb(request, env);
+        if (!auth.authenticated) {
+            return Response.json(
+                { ok: false, error: { code: 'UNAUTHORIZED', message: 'Authentication required' } },
+                { status: 401 }
+            );
+        }
+        const existing = await loadCloudStaticPasscodeConfig(env);
+        if (!existing?.enabled) {
+            return Response.json(
+                { ok: false, error: { code: 'NOT_ENABLED', message: 'Static passphrase is currently disabled' } },
+                { status: 400 }
+            );
+        }
+
+        const parsedBody = await readBoundedJsonBody<{ keepCurrentBrowser?: unknown }>(request);
+        if (!parsedBody.ok) {
+            return parsedBody.response;
+        }
+        const keepCurrentBrowser = parsedBody.data.keepCurrentBrowser === true;
+        const rotated: StoredCloudStaticPasscodeConfig = {
+            ...existing,
+            trustEpoch: randomHex(12)
+        };
+        await saveCloudStaticPasscodeConfig(env, rotated);
+
+        const isSecure = url.protocol === 'https:';
+        if (keepCurrentBrowser) {
+            const built = await buildStaticPasscodeTrustCookieHeader(env, rotated, rotated.defaultTrustSeconds, isSecure);
+            return Response.json(
+                {
+                    ok: true,
+                    data: {
+                        revokedAll: true,
+                        keepCurrentBrowser: true,
+                        trustExpiresAt: built.trustExpiresAt
+                    }
+                },
+                { headers: { 'Set-Cookie': built.setCookie, 'Cache-Control': 'no-store' } }
+            );
+        }
+
+        return Response.json(
+            { ok: true, data: { revokedAll: true, keepCurrentBrowser: false } },
+            {
+                headers: {
+                    'Set-Cookie': buildClearCookieHeader(STATIC_PASSCODE_TRUST_COOKIE_NAME, isSecure),
+                    'Cache-Control': 'no-store'
+                }
+            }
+        );
+    }
+
     if (url.pathname === '/api/auth/logout' && request.method === 'POST') {
         if (!isSameOriginRequest(request, url)) {
             return Response.json(
@@ -1836,10 +2563,34 @@ export async function handleAuthRoutes(request: Request, env: Env, url: URL): Pr
                 // Ignore invalid 2FA trust cookie during logout
             }
         }
+        const staticTrustToken = cookies[STATIC_PASSCODE_TRUST_COOKIE_NAME];
+        if (staticTrustToken) {
+            try {
+                const staticCfg = await loadCloudStaticPasscodeConfig(env);
+                if (staticCfg?.enabled) {
+                    const nowSec = Math.floor(Date.now() / 1000);
+                    const verifiedStatic = await verify2faTrustCookie(
+                        resolve2faCookieSignSecret(env, staticCfg),
+                        staticTrustToken,
+                        staticCfg.trustEpoch,
+                        nowSec + MAX_2FA_TRUST_SECONDS + 60
+                    );
+                    if (verifiedStatic.valid && verifiedStatic.tokenId) {
+                        const remaining = verifiedStatic.expEpochSec
+                            ? Math.max(60, verifiedStatic.expEpochSec - nowSec)
+                            : MAX_2FA_TRUST_SECONDS;
+                        await revokeSessionId(env, verifiedStatic.tokenId, remaining);
+                    }
+                }
+            } catch {
+                // Ignore invalid static passphrase trust cookie during logout
+            }
+        }
         const isSecure = url.protocol === 'https:';
         const headers = new Headers({ 'Cache-Control': 'no-store' });
         headers.append('Set-Cookie', buildClearCookieHeader(SESSION_COOKIE_NAME, isSecure));
         headers.append('Set-Cookie', buildClearCookieHeader(TOTP_TRUST_COOKIE_NAME, isSecure));
+        headers.append('Set-Cookie', buildClearCookieHeader(STATIC_PASSCODE_TRUST_COOKIE_NAME, isSecure));
         return Response.json({ ok: true }, { headers });
     }
 

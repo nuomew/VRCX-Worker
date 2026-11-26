@@ -18,7 +18,8 @@ import {
     getAggregatedGameState,
     getOnlineAgentIds,
     getPrimaryAgentState,
-    MAX_CLOUD_2FA_TRUST_SECONDS
+    MAX_CLOUD_2FA_TRUST_SECONDS,
+    validateStaticPassphraseFormat
 } from '../cloudState.js';
 import { cloudFetch, connectCloudHubWs, disconnectCloudHubWs } from '../apiClient.js';
 import { refreshCloudAuthAndBootstrap } from '../index.js';
@@ -2638,5 +2639,18 @@ describe('WEB cloud adapter (stateless)', () => {
         expect(enMigKeys.length).toBeGreaterThanOrEqual(70);
         expect(Object.keys(zhCnJson.default.cloud_hub.migration).sort()).toEqual(enMigKeys);
         expect(Object.keys(zhTwJson.default.cloud_hub.migration).sort()).toEqual(enMigKeys);
+
+        // 5. Static passphrase complexity validator (>=10 chars + letters + digits) & trilingual i18n parity
+        expect(validateStaticPassphraseFormat('Abc123456').valid).toBe(false); // 9 chars
+        expect(validateStaticPassphraseFormat('1234567890').valid).toBe(false); // digits only
+        expect(validateStaticPassphraseFormat('abcdefghij').valid).toBe(false); // letters only
+        expect(validateStaticPassphraseFormat('Abc123456\n').valid).toBe(false); // control char
+        expect(validateStaticPassphraseFormat('Princess2026!').valid).toBe(true);
+        expect(validateStaticPassphraseFormat('a1b2c3d4e5').valid).toBe(true);
+
+        const enStaticKeys = Object.keys(enJson.default.cloud_hub.static_passcode).sort();
+        expect(enStaticKeys.length).toBeGreaterThanOrEqual(25);
+        expect(Object.keys(zhCnJson.default.cloud_hub.static_passcode).sort()).toEqual(enStaticKeys);
+        expect(Object.keys(zhTwJson.default.cloud_hub.static_passcode).sort()).toEqual(enStaticKeys);
     });
 });

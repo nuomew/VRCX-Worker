@@ -91,6 +91,46 @@ export async function decryptAesGcm(masterSecret: string, ciphertextB64: string,
 }
 
 /**
+ * Validates that a static access passphrase has at least 10 characters,
+ * contains both at least one ASCII letter and one digit, and has no control characters.
+ */
+export function validateStaticPassphrase(raw: unknown): { valid: boolean; reason?: string } {
+    if (typeof raw !== 'string') {
+        return { valid: false, reason: 'Static passphrase must be a string' };
+    }
+    if (raw.length < 10) {
+        return { valid: false, reason: 'Static passphrase must be at least 10 characters long' };
+    }
+    if (raw.length > 128) {
+        return { valid: false, reason: 'Static passphrase must be at most 128 characters long' };
+    }
+    if (/[\x00-\x1F\x7F]/.test(raw)) {
+        return { valid: false, reason: 'Static passphrase cannot contain control characters' };
+    }
+    if (!/[A-Za-z]/.test(raw) || !/[0-9]/.test(raw)) {
+        return { valid: false, reason: 'Static passphrase must include both letters and numbers' };
+    }
+    return { valid: true };
+}
+
+/**
+ * Derives a salted PBKDF2-SHA256 hash formatted as `pbkdf2$<iterations>$<saltHex>$<hashHex>`
+ * compatible with `verifyPasscode` and Cloudflare Workers Web Crypto's 100,000-iteration ceiling.
+ */
+export async function hashPasscodePbkdf2(passphrase: string, iterations = 100_000): Promise<string> {
+    const safeIterations = Math.min(Math.max(Math.floor(iterations), 10_000), 100_000);
+    const saltBytes = new Uint8Array(16);
+    crypto.getRandomValues(saltBytes);
+    const baseKey = await crypto.subtle.importKey('raw', encoder.encode(passphrase), 'PBKDF2', false, ['deriveBits']);
+    const derived = await crypto.subtle.deriveBits(
+        { name: 'PBKDF2', salt: saltBytes as BufferSource, iterations: safeIterations, hash: 'SHA-256' },
+        baseKey,
+        256
+    );
+    return `pbkdf2$${safeIterations}$${bytesToHex(saltBytes)}$${bytesToHex(new Uint8Array(derived))}`;
+}
+
+/**
  * Verifies either a raw secret passcode or a PBKDF2-SHA256 hash formatted as:
  * `pbkdf2$<iterations>$<saltHex>$<hashHex>`
  */
