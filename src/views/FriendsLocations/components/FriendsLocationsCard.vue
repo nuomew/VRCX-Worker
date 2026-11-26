@@ -1,14 +1,32 @@
 <template>
     <UserContextMenu :user-id="friend.id" :state="friend.state" :location="friend.ref?.location">
         <Card
-            class="friend-card x-hover-card hover:bg-muted relative"
+            class="friend-card x-hover-card hover:bg-muted relative overflow-hidden"
+            :class="{ 'friend-card--has-world-bg': Boolean(worldBgUrl) }"
             :style="cardStyle"
             @click="showUserDialog(friend.id)">
+            <div
+                v-if="worldBgUrl"
+                class="friend-card__world-bg absolute inset-0 z-0 pointer-events-none select-none overflow-hidden rounded-[inherit]"
+                data-world-bg>
+                <img
+                    :src="worldBgUrl"
+                    alt=""
+                    loading="lazy"
+                    decoding="async"
+                    fetchpriority="low"
+                    class="friend-card__world-bg-img h-full w-full object-cover"
+                    @error="worldBgFailed = true" />
+                <div class="friend-card__world-bg-scrim absolute inset-0" />
+            </div>
             <ProfileEffect
                 :enabled="showCosmetics"
                 :profile-effect="friend.ref.profileEffect"
-                class="object-cover rounded-lg" />
-            <div class="friend-card__header grid items-center mb-1.75">
+                class="object-cover rounded-lg z-[1]" />
+            <span
+                class="friend-card__status-dot absolute z-[3] rounded-full pointer-events-none"
+                :class="statusDotClass"></span>
+            <div class="friend-card__header relative z-[2] grid items-center mb-1.75">
                 <div class="relative inline-block flex-none size-9 mr-2.5">
                     <Avatar class="size-full rounded-full">
                         <AvatarImage :src="userImage(friend.ref, true)" class="object-cover" />
@@ -18,16 +36,13 @@
                     </Avatar>
                     <IconFrame :enabled="showCosmetics" :icon-frame="friend.ref.iconFrame" />
                 </div>
-                <span
-                    class="friend-card__status-dot absolute rounded-full pointer-events-none"
-                    :class="statusDotClass"></span>
                 <div
                     class="friend-card__name relative font-semibold overflow-hidden text-ellipsis whitespace-nowrap"
                     :title="friend.name">
                     {{ friend.name }}
                 </div>
             </div>
-            <div class="friend-card__body grid">
+            <div class="friend-card__body relative z-[2] grid">
                 <div
                     class="friend-card__signature flex items-center overflow-hidden text-ellipsis whitespace-nowrap text-muted-foreground"
                     :title="friend.ref?.statusDescription">
@@ -57,15 +72,18 @@
     import ProfileEffect from '@/components/ProfileEffect.vue';
     import { Card } from '@/components/ui/card';
     import { Pencil, User } from 'lucide-vue-next';
-    import { computed } from 'vue';
+    import { computed, ref, watch } from 'vue';
 
     import { useUserDisplay } from '../../../composables/useUserDisplay';
+    import { parseLocation } from '../../../shared/utils';
+    import { useWorldStore } from '../../../stores';
 
     import Location from '../../../components/Location.vue';
     import UserContextMenu from '../../../components/UserContextMenu.vue';
     import { showUserDialog } from '../../../coordinators/userCoordinator';
 
     const { userImage, userStatusClass } = useUserDisplay();
+    const { cachedWorlds } = useWorldStore();
 
     const props = defineProps({
         friend: {
@@ -89,6 +107,42 @@
             default: 1
         }
     });
+
+    const worldBgFailed = ref(false);
+
+    const activeWorldId = computed(() => {
+        if (!props.displayInstanceInfo) {
+            return '';
+        }
+        const userRef = props.friend?.ref;
+        if (!userRef) {
+            return '';
+        }
+        const rawLocation = userRef.location === 'traveling' ? userRef.travelingToLocation : userRef.location;
+        if (!rawLocation || rawLocation === 'private' || rawLocation === 'offline' || rawLocation === 'traveling') {
+            return '';
+        }
+        const parsed = parseLocation(rawLocation);
+        if (!parsed.isRealInstance || parsed.isPrivate || parsed.isOffline || !parsed.worldId) {
+            return '';
+        }
+        return parsed.worldId;
+    });
+
+    const rawWorldBgUrl = computed(() => {
+        const wid = activeWorldId.value;
+        if (!wid) {
+            return '';
+        }
+        const worldRef = cachedWorlds.get(wid);
+        return worldRef?.thumbnailImageUrl || worldRef?.imageUrl || '';
+    });
+
+    watch(rawWorldBgUrl, () => {
+        worldBgFailed.value = false;
+    });
+
+    const worldBgUrl = computed(() => (worldBgFailed.value ? '' : rawWorldBgUrl.value));
 
     const cardStyle = computed(() => ({
         '--card-scale': props.cardScale,
@@ -140,6 +194,48 @@
         gap: calc(14px * var(--card-scale) * var(--card-spacing));
         max-width: var(--friend-card-target-width, 220px);
         min-width: var(--friend-card-min-width, 220px);
+    }
+
+    .friend-card__world-bg-img {
+        opacity: 0.28;
+        transition:
+            opacity 0.2s ease,
+            transform 0.25s ease;
+    }
+
+    :global(html.dark) .friend-card__world-bg-img,
+    :global(:root.dark) .friend-card__world-bg-img,
+    :global(:root[data-theme='dark']) .friend-card__world-bg-img {
+        opacity: 0.34;
+    }
+
+    .friend-card:hover .friend-card__world-bg-img {
+        opacity: 0.36;
+        transform: scale(1.03);
+    }
+
+    :global(html.dark) .friend-card:hover .friend-card__world-bg-img,
+    :global(:root.dark) .friend-card:hover .friend-card__world-bg-img,
+    :global(:root[data-theme='dark']) .friend-card:hover .friend-card__world-bg-img {
+        opacity: 0.42;
+    }
+
+    .friend-card__world-bg-scrim {
+        background: linear-gradient(
+            135deg,
+            color-mix(in oklch, var(--card) 68%, transparent) 0%,
+            color-mix(in oklch, var(--card) 32%, transparent) 100%
+        );
+    }
+
+    :global(html.dark) .friend-card__world-bg-scrim,
+    :global(:root.dark) .friend-card__world-bg-scrim,
+    :global(:root[data-theme='dark']) .friend-card__world-bg-scrim {
+        background: linear-gradient(
+            135deg,
+            color-mix(in oklch, var(--card) 66%, transparent) 0%,
+            color-mix(in oklch, var(--card) 28%, transparent) 100%
+        );
     }
 
     .friend-card__header {
