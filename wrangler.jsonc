@@ -55,15 +55,22 @@
             "new_sqlite_classes": ["AgentHubDO"]
         }
     ],
-    // R2 is disabled by default so first-time Git deploys succeed without an R2 subscription.
-    // To enable Cloud Gallery screenshot storage, create a private R2 bucket in the Cloudflare Dashboard
-    // and either bind it as `R2_MEDIA` there or uncomment below with your own `bucket_name`:
+    // R2 is not declared here by default so first-time Git deploys succeed without an R2 subscription.
+    // `keep_vars` + `unsafe.metadata.keep_bindings` preserve any existing Secrets, Dashboard vars, and
+    // manually-bound R2 buckets (e.g. `R2_MEDIA`) across every subsequent Git auto-deploy.
+    // You may also uncomment `r2_buckets` below to manage a specific bucket in Git:
     // "r2_buckets": [
     //     {
     //         "binding": "R2_MEDIA",
     //         "bucket_name": "vrcx-media"
     //     }
     // ],
+    "keep_vars": true,
+    "unsafe": {
+        "metadata": {
+            "keep_bindings": ["secret_text", "secret_key", "plain_text", "json", "r2_bucket"]
+        }
+    },
     // 1-minute cron tick gated inside scheduled() by user-configured syncIntervalSeconds (0 external fetch when idle/web active).
     "triggers": {
         "crons": ["* * * * *"]
