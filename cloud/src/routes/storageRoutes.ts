@@ -1,5 +1,6 @@
 import type { Env } from '../env';
 import {
+    buildSafeDirectProxyResponse,
     clampOverflowThresholdBytes,
     decryptB2Secret,
     encryptB2Secret,
@@ -10,6 +11,7 @@ import {
     measureB2Usage,
     measureR2Usage,
     normalizeKeyPrefix,
+    proxyB2DirectFetch,
     type ResolvedB2Credentials,
     resolveActiveB2Credentials,
     saveExternalStorageConfig,
@@ -18,8 +20,27 @@ import {
     validateBackblazeEndpoint
 } from '../storage/objectStorage';
 
+export const B2_DIRECT_PROXY_BASE_PATH = '/api/storage/b2/';
+
 function isPlainObject(val: unknown): val is Record<string, unknown> {
     return Boolean(val) && typeof val === 'object' && !Array.isArray(val);
+}
+
+function parseSafeB2ProxyObjectPath(rawPathSuffix: string): string | null {
+    let decoded: string;
+    try {
+        decoded = decodeURIComponent(rawPathSuffix);
+    } catch {
+        return null;
+    }
+    const cleaned = decoded.replace(/^\/+/, '').replace(/\/+$/, '');
+    if (!cleaned || cleaned.length > 1024) return null;
+    if (cleaned.includes('\\') || /[\x00-\x1f\x7f]/.test(cleaned)) return null;
+    const segments = cleaned.split('/');
+    for (const seg of segments) {
+        if (!seg || seg === '.' || seg === '..') return null;
+    }
+    return segments.join('/');
 }
 
 /**
@@ -52,7 +73,11 @@ export async function handleStorageRoutes(request: Request, env: Env, url: URL):
                     r2,
                     b2,
                     externalStorage: toPublicExternalStorageConfig(cfg),
-                    overflowActive
+                    overflowActive,
+                    b2DirectProxy: {
+                        enabled: Boolean(cfg.enabled && b2Creds),
+                        basePath: B2_DIRECT_PROXY_BASE_PATH
+                    }
                 }
             },
             { headers: { 'Cache-Control': 'no-store' } }
@@ -194,7 +219,11 @@ export async function handleStorageRoutes(request: Request, env: Env, url: URL):
                     externalStorage: toPublicExternalStorageConfig(nextConfig),
                     overflowActive: Boolean(
                         nextConfig.enabled && b2Creds && (!r2.bound || r2.usedBytes >= nextConfig.r2OverflowThresholdBytes)
-                    )
+                    ),
+                    b2DirectProxy: {
+                        enabled: Boolean(nextConfig.enabled && b2Creds),
+                        basePath: B2_DIRECT_PROXY_BASE_PATH
+                    }
                 }
             },
             { headers: { 'Cache-Control': 'no-store' } }
@@ -302,6 +331,66 @@ export async function handleStorageRoutes(request: Request, env: Env, url: URL):
                 { status: 502 }
             );
         }
+    }
+
+    // Built-in Backblaze B2 -> Cloudflare Workers Direct Proxy (Bandwidth Alliance free egress)
+    // Automatically active whenever Backblaze B2 extra storage is enabled with valid credentials in Settings -> Storage.
+    if (url.pathname === '/api/storage/b2' || url.pathname.startsWith(B2_DIRECT_PROXY_BASE_PATH)) {
+        const method = request.method.toUpperCase();
+        if (method !== 'GET' && method !== 'HEAD') {
+            return new Response(null, { status: 405, statusText: 'Method Not Allowed' });
+        }
+
+        // ALLOW_LIST_BUCKET = false: refuse empty root path listing
+        const rawSuffix = url.pathname.startsWith(B2_DIRECT_PROXY_BASE_PATH)
+            ? url.pathname.slice(B2_DIRECT_PROXY_BASE_PATH.length)
+            : '';
+        if (!rawSuffix || !rawSuffix.replace(/^\/+|\/+$/g, '')) {
+            return new Response(null, { status: 404, statusText: 'Not Found' });
+        }
+
+        const safeKey = parseSafeB2ProxyObjectPath(rawSuffix);
+        if (!safeKey) {
+            return Response.json(
+                { ok: false, error: { code: 'INVALID_OBJECT_KEY', message: 'Invalid Backblaze B2 object path' } },
+                { status: 400 }
+            );
+        }
+
+        const creds = await resolveActiveB2Credentials(env);
+        if (!creds) {
+            return Response.json(
+                { ok: false, error: { code: 'B2_NOT_ENABLED', message: 'Backblaze B2 extra storage is not enabled' } },
+                { status: 404 }
+            );
+        }
+
+        const upstreamRes = await proxyB2DirectFetch(creds, safeKey, request, { method });
+        if (upstreamRes.status === 404) {
+            await upstreamRes.body?.cancel().catch(() => {});
+            return new Response(null, { status: 404, statusText: 'Not Found' });
+        }
+        if (upstreamRes.status >= 400 && upstreamRes.status !== 416) {
+            const errText = await upstreamRes.text().catch(() => '');
+            return Response.json(
+                {
+                    ok: false,
+                    error: {
+                        code: 'B2_PROXY_ERROR',
+                        message: `Backblaze B2 returned HTTP ${upstreamRes.status}${errText ? `: ${errText.slice(0, 160)}` : ''}`
+                    }
+                },
+                { status: upstreamRes.status === 403 ? 403 : 502 }
+            );
+        }
+
+        const fileName = safeKey.split('/').pop() || 'file';
+        return buildSafeDirectProxyResponse(upstreamRes, {
+            method,
+            fileName,
+            cacheControl: 'private, max-age=86400',
+            storageProvider: 'b2'
+        });
     }
 
     return null;

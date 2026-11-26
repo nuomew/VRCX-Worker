@@ -268,10 +268,11 @@ export async function decryptB2Secret(env: Env, encrypted: string): Promise<stri
 
 export async function resolveActiveB2Credentials(
     env: Env,
-    cfgOverride?: StoredExternalStorageConfig
+    cfgOverride?: StoredExternalStorageConfig,
+    opts: { allowDisabled?: boolean } = {}
 ): Promise<ResolvedB2Credentials | null> {
     const cfg = cfgOverride ?? (await loadExternalStorageConfig(env));
-    if (!cfg.enabled || !cfg.endpoint || !cfg.bucket || !cfg.accessKeyId || !cfg.secretAccessKeyEnc) {
+    if ((!cfg.enabled && !opts.allowDisabled) || !cfg.endpoint || !cfg.bucket || !cfg.accessKeyId || !cfg.secretAccessKeyEnc) {
         return null;
     }
     const secretAccessKey = await decryptB2Secret(env, cfg.secretAccessKeyEnc);
@@ -545,6 +546,243 @@ export async function deleteB2Object(creds: ResolvedB2Credentials, logicalKey: s
         objectKey: logicalKey
     });
     await res.body?.cancel().catch(() => {});
+}
+
+// ---------- Built-in Backblaze B2 -> Cloudflare Workers Direct Proxy (Bandwidth Alliance) ----------
+
+const RANGE_RETRY_ATTEMPTS = 3;
+
+// Headers stripped before forwarding to B2 (matching official cloudflare-b2 proxy + cookie isolation)
+const PROXY_STRIPPED_HEADERS = new Set([
+    'x-forwarded-proto',
+    'x-real-ip',
+    'accept-encoding',
+    'authorization',
+    'cookie',
+    'host',
+    'connection',
+    'upgrade',
+    'proxy-authorization',
+    'origin',
+    'referer'
+]);
+
+// Headers excluded from AWS SigV4 SignedHeaders calculation (matching aws4fetch UNSIGNABLE_HEADERS)
+const AWS_UNSIGNABLE_HEADERS = new Set([
+    'authorization',
+    'content-type',
+    'content-length',
+    'user-agent',
+    'presigned-expires',
+    'expect',
+    'x-amzn-trace-id',
+    'range',
+    'connection'
+]);
+
+// Safe media types allowed inline on the same origin; executable/HTML/SVG types are forced to attachment + sandbox
+const SAFE_INLINE_MIME_TYPES = new Set([
+    'image/png',
+    'image/jpeg',
+    'image/webp',
+    'image/gif',
+    'image/avif',
+    'video/mp4',
+    'video/webm',
+    'audio/mpeg',
+    'audio/ogg',
+    'audio/wav',
+    'audio/webm'
+]);
+
+/**
+ * Resolves the virtual-host URL (`<bucket>.<endpoint>/<encodedKey>`) when bucket naming is TLS-wildcard safe
+ * (no dots in bucket name and standard `s3.<region>.backblazeb2.com` endpoint), matching Backblaze's official
+ * `cloudflare-b2` Worker pattern for Bandwidth Alliance free egress. Falls back to path-style for dotted buckets.
+ */
+export function buildB2DirectObjectTarget(
+    creds: ResolvedB2Credentials,
+    logicalKey: string
+): { url: string; host: string; canonicalUri: string } {
+    const epUrl = new URL(creds.endpoint);
+    const fullObjectKey = `${creds.keyPrefix}${logicalKey.replace(/^\/+/, '')}`;
+    const encodedKey = encodeS3Path(fullObjectKey);
+    const canVirtualHost = !creds.bucket.includes('.') && B2_S3_REGION_FROM_HOST_RE.test(epUrl.hostname);
+
+    if (canVirtualHost) {
+        const host = `${creds.bucket}.${epUrl.hostname}`;
+        const canonicalUri = `/${encodedKey}`;
+        return {
+            url: `https://${host}${canonicalUri}`,
+            host,
+            canonicalUri
+        };
+    }
+
+    const host = epUrl.host;
+    const canonicalUri = `/${rfc3986Encode(creds.bucket)}/${encodedKey}`;
+    return {
+        url: `https://${host}${canonicalUri}`,
+        host,
+        canonicalUri
+    };
+}
+
+/**
+ * Signs and proxies a GET/HEAD object request through Cloudflare Workers to Backblaze B2 using
+ * AWS Signature Version 4 (`UNSIGNED-PAYLOAD`), forwarding conditional/Range headers and applying
+ * Backblaze's official 3x Range retry whenever B2 omits `Content-Range` on a 2xx ranged response.
+ */
+export async function proxyB2DirectFetch(
+    creds: ResolvedB2Credentials,
+    logicalKey: string,
+    incomingRequest?: Request,
+    opts: { method?: 'GET' | 'HEAD'; now?: Date } = {}
+): Promise<Response> {
+    const rawMethod = (opts.method ?? incomingRequest?.method ?? 'GET').toUpperCase();
+    const method: 'GET' | 'HEAD' = rawMethod === 'HEAD' ? 'HEAD' : 'GET';
+    const target = buildB2DirectObjectTarget(creds, logicalKey);
+    const { amzDate, dateStamp } = formatAmzDate(opts.now ?? new Date());
+    const payloadHash = 'UNSIGNED-PAYLOAD';
+
+    const forwardHeaders = new Headers();
+    if (incomingRequest) {
+        for (const [rawName, val] of incomingRequest.headers.entries()) {
+            const name = rawName.toLowerCase();
+            if (name.startsWith('cf-') || PROXY_STRIPPED_HEADERS.has(name)) continue;
+            forwardHeaders.set(name, val);
+        }
+    }
+    forwardHeaders.set('x-amz-content-sha256', payloadHash);
+    forwardHeaders.set('x-amz-date', amzDate);
+
+    const signableNames = ['host', ...Array.from(forwardHeaders.keys()).map((k) => k.toLowerCase())]
+        .filter((h, idx, arr) => arr.indexOf(h) === idx && !AWS_UNSIGNABLE_HEADERS.has(h))
+        .sort();
+    const signedHeaders = signableNames.join(';');
+    const canonicalHeaders = signableNames
+        .map((h) => {
+            const rawVal = h === 'host' ? target.host : (forwardHeaders.get(h) ?? '');
+            return `${h}:${rawVal.trim().replace(/\s+/g, ' ')}\n`;
+        })
+        .join('');
+
+    const canonicalRequest = [method, target.canonicalUri, '', canonicalHeaders, signedHeaders, payloadHash].join('\n');
+    const credentialScope = `${dateStamp}/${creds.region}/s3/aws4_request`;
+    const stringToSign = [
+        'AWS4-HMAC-SHA256',
+        amzDate,
+        credentialScope,
+        await sha256Hex(canonicalRequest)
+    ].join('\n');
+
+    const kDate = await hmacRaw(`AWS4${creds.secretAccessKey}`, dateStamp);
+    const kRegion = await hmacRaw(kDate, creds.region);
+    const kService = await hmacRaw(kRegion, 's3');
+    const kSigning = await hmacRaw(kService, 'aws4_request');
+    const signature = toHex(await hmacRaw(kSigning, stringToSign));
+
+    forwardHeaders.set(
+        'Authorization',
+        `AWS4-HMAC-SHA256 Credential=${creds.accessKeyId}/${credentialScope}, SignedHeaders=${signedHeaders}, Signature=${signature}`
+    );
+
+    // Official cloudflare-b2 Range retry: B2 occasionally omits Content-Range on a 200 response for Range requests.
+    if (method === 'GET' && forwardHeaders.has('range')) {
+        let attempts = RANGE_RETRY_ATTEMPTS;
+        let response: Response | null = null;
+        do {
+            const controller = new AbortController();
+            response = await fetch(target.url, {
+                method,
+                headers: forwardHeaders,
+                signal: controller.signal
+            });
+            if (response.headers.has('content-range')) {
+                break;
+            }
+            if (response.ok) {
+                attempts -= 1;
+                if (attempts > 0) {
+                    controller.abort();
+                    await response.body?.cancel().catch(() => {});
+                }
+            } else {
+                break;
+            }
+        } while (attempts > 0);
+        return response!;
+    }
+
+    return fetch(target.url, {
+        method,
+        headers: forwardHeaders
+    });
+}
+
+/**
+ * Builds a hardened client response from a proxied B2/R2 response, preserving Range/206/304/ETag headers
+ * while neutralizing executable MIME types (HTML/SVG/JS) to prevent same-origin XSS.
+ */
+export function buildSafeDirectProxyResponse(
+    upstreamRes: Response,
+    opts: {
+        method?: string;
+        forceAttachment?: boolean;
+        fileName?: string;
+        cacheControl?: string;
+        storageProvider?: 'r2' | 'b2';
+    } = {}
+): Response {
+    const status = upstreamRes.status;
+    if (status === 304) {
+        const headers = new Headers();
+        for (const h of ['etag', 'last-modified', 'cache-control']) {
+            const v = upstreamRes.headers.get(h);
+            if (v) headers.set(h, v);
+        }
+        if (opts.cacheControl) headers.set('Cache-Control', opts.cacheControl);
+        headers.set('X-Content-Type-Options', 'nosniff');
+        if (opts.storageProvider) headers.set('X-VRCX-Storage-Via', `worker-direct-${opts.storageProvider}`);
+        return new Response(null, { status: 304, headers });
+    }
+
+    const headers = new Headers();
+    const rawType = (upstreamRes.headers.get('Content-Type') ?? '').split(';')[0]!.trim().toLowerCase();
+    const safeInline = !opts.forceAttachment && SAFE_INLINE_MIME_TYPES.has(rawType);
+
+    if (opts.forceAttachment) {
+        headers.set('Content-Type', rawType === 'application/gzip' ? 'application/gzip' : 'application/octet-stream');
+        const safeName = (opts.fileName ?? 'download.bin').replace(/["\\\r\n/]/g, '_');
+        headers.set('Content-Disposition', `attachment; filename="${safeName}"`);
+    } else if (safeInline) {
+        headers.set('Content-Type', rawType);
+        headers.set('Content-Disposition', 'inline');
+    } else {
+        headers.set('Content-Type', 'application/octet-stream');
+        const safeName = opts.fileName ? opts.fileName.replace(/["\\\r\n/]/g, '_') : '';
+        headers.set('Content-Disposition', safeName ? `attachment; filename="${safeName}"` : 'attachment');
+    }
+
+    for (const h of ['content-length', 'content-range', 'accept-ranges', 'etag', 'last-modified']) {
+        const val = upstreamRes.headers.get(h);
+        if (val) headers.set(h, val);
+    }
+    if (!headers.has('accept-ranges')) {
+        headers.set('Accept-Ranges', 'bytes');
+    }
+    headers.set('Cache-Control', opts.cacheControl ?? 'private, max-age=86400');
+    headers.set('X-Content-Type-Options', 'nosniff');
+    headers.set('Content-Security-Policy', "default-src 'none'; sandbox");
+    if (opts.storageProvider) {
+        headers.set('X-VRCX-Storage-Via', `worker-direct-${opts.storageProvider}`);
+    }
+
+    const isHead = (opts.method ?? '').toUpperCase() === 'HEAD';
+    return new Response(isHead ? null : upstreamRes.body, {
+        status,
+        headers
+    });
 }
 
 // ---------- Usage Cache & Measurement (R2 + Backblaze B2) ----------
@@ -867,7 +1105,7 @@ export async function readStoredObject(
     if (!storedKey) return null;
     if (storedKey.startsWith(B2_KEY_PREFIX_TAG)) {
         const logicalKey = storedKey.slice(B2_KEY_PREFIX_TAG.length);
-        const creds = await resolveActiveB2Credentials(env);
+        const creds = await resolveActiveB2Credentials(env, undefined, { allowDisabled: true });
         if (!creds) return null;
         const obj = await getB2Object(creds, logicalKey);
         if (!obj) return null;

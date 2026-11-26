@@ -427,6 +427,34 @@
                             </template>
                         </div>
 
+                        <!-- Built-in Cloudflare Workers Direct Proxy Status (auto-enabled once B2 is configured) -->
+                        <div
+                            v-if="b2DirectProxyEnabled"
+                            class="flex flex-wrap items-center justify-between gap-2 rounded-md border border-primary/25 bg-primary/5 px-3 py-2">
+                            <div class="min-w-0 flex flex-wrap items-center gap-2">
+                                <span class="font-medium text-foreground">
+                                    {{ t('cloud_hub.storage.direct_proxy_label') }}
+                                </span>
+                                <span
+                                    class="rounded bg-status-online/15 px-1.5 py-0.5 text-[10px] font-medium text-foreground">
+                                    {{ t('cloud_hub.storage.direct_proxy_active') }}
+                                </span>
+                                <code class="truncate font-mono text-[11px] text-muted-foreground">{{
+                                    b2DirectProxyUrl
+                                }}</code>
+                            </div>
+                            <button
+                                type="button"
+                                class="shrink-0 rounded border border-border px-2 py-0.5 text-[11px] font-medium text-foreground hover:bg-accent"
+                                @click="copyDirectProxyUrl">
+                                {{
+                                    copiedDirectProxyUrl
+                                        ? t('cloud_hub.storage.direct_proxy_copied')
+                                        : t('cloud_hub.storage.direct_proxy_copy')
+                                }}
+                            </button>
+                        </div>
+
                         <!-- Overflow Threshold & B2 S3-Compatible Credentials -->
                         <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
                             <div class="space-y-1 sm:col-span-2">
@@ -590,6 +618,14 @@
     const overflowActive = ref(false);
     const hasSavedSecret = ref(false);
     const savedEnabled = ref(false);
+    const b2DirectProxyEnabled = ref(false);
+    const b2DirectProxyBasePath = ref('/api/storage/b2/');
+    const copiedDirectProxyUrl = ref(false);
+
+    const b2DirectProxyUrl = computed(() => {
+        const origin = typeof window !== 'undefined' ? window.location.origin : '';
+        return `${origin}${b2DirectProxyBasePath.value}`;
+    });
 
     const formEnabled = ref(false);
     const formThresholdGb = ref(9);
@@ -736,6 +772,10 @@
         r2Usage.value = data.r2 ?? null;
         b2Usage.value = data.b2 ?? null;
         overflowActive.value = Boolean(data.overflowActive);
+        b2DirectProxyEnabled.value = Boolean(data.b2DirectProxy?.enabled);
+        if (typeof data.b2DirectProxy?.basePath === 'string' && data.b2DirectProxy.basePath) {
+            b2DirectProxyBasePath.value = data.b2DirectProxy.basePath;
+        }
         const ext = data.externalStorage;
         if (ext) {
             savedEnabled.value = Boolean(ext.enabled);
@@ -762,6 +802,18 @@
             statusError.value = err?.message || String(err);
         } finally {
             loadingStatus.value = false;
+        }
+    }
+
+    async function copyDirectProxyUrl() {
+        try {
+            await navigator.clipboard.writeText(b2DirectProxyUrl.value);
+            copiedDirectProxyUrl.value = true;
+            setTimeout(() => {
+                copiedDirectProxyUrl.value = false;
+            }, 2000);
+        } catch {
+            // Clipboard permission unavailable
         }
     }
 

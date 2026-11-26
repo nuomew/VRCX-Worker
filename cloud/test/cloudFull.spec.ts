@@ -6900,14 +6900,21 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
         const originalFetch = globalThis.fetch;
         const b2Host = 's3.us-west-004.backblazeb2.com';
         const b2Bucket = 'vrcx-test-b2';
+        const b2VirtualHost = `${b2Bucket}.${b2Host}`;
         let createdDeviceId = '';
+        let virtualHostHits = 0;
+        let rangeFetchAttempts = 0;
+        let simulateMissingContentRangeOnce = false;
 
         const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
             const targetUrl = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
             const parsed = new URL(targetUrl);
-            if (parsed.hostname !== b2Host) {
+            const isVirtualHost = parsed.hostname === b2VirtualHost;
+            const isPathHost = parsed.hostname === b2Host;
+            if (!isVirtualHost && !isPathHost) {
                 return originalFetch(input, init);
             }
+            if (isVirtualHost) virtualHostHits++;
 
             // Verify every Backblaze B2 S3 request carries a valid AWS SigV4 Authorization header
             const headers = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined));
@@ -6915,13 +6922,22 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
             expect(authHeader.startsWith('AWS4-HMAC-SHA256 Credential=004testkeyid/')).toBe(true);
             expect(authHeader).toContain('/us-west-004/s3/aws4_request');
             expect(headers.get('x-amz-date')).toMatch(/^\d{8}T\d{6}Z$/);
-            expect(headers.get('x-amz-content-sha256')).toMatch(/^[0-9a-f]{64}$/);
+            const shaHeader = headers.get('x-amz-content-sha256') ?? '';
+            expect(shaHeader === 'UNSIGNED-PAYLOAD' || /^[0-9a-f]{64}$/.test(shaHeader)).toBe(true);
+
+            // Stripped / unsignable Cloudflare & client headers must never leak into B2 signature
+            expect(headers.has('cf-connecting-ip')).toBe(false);
+            expect(headers.has('x-real-ip')).toBe(false);
+            expect(authHeader).not.toContain(';range');
+            expect(authHeader).not.toContain('range;');
 
             const method = (init?.method ?? (input instanceof Request ? input.method : 'GET')).toUpperCase();
             const bucketPrefix = `/${b2Bucket}`;
-            const rawKey = parsed.pathname.startsWith(`${bucketPrefix}/`)
-                ? decodeURIComponent(parsed.pathname.slice(bucketPrefix.length + 1))
-                : '';
+            const rawKey = isVirtualHost
+                ? decodeURIComponent(parsed.pathname.replace(/^\/+/, ''))
+                : parsed.pathname.startsWith(`${bucketPrefix}/`)
+                  ? decodeURIComponent(parsed.pathname.slice(bucketPrefix.length + 1))
+                  : '';
 
             if (method === 'GET' && parsed.searchParams.get('list-type') === '2') {
                 const prefix = parsed.searchParams.get('prefix') ?? '';
@@ -6949,12 +6965,44 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
                 return new Response('', { status: 200 });
             }
 
-            if (method === 'GET' && rawKey) {
+            if ((method === 'GET' || method === 'HEAD') && rawKey) {
                 const found = b2Store.get(rawKey);
                 if (!found) return new Response('NotFound', { status: 404 });
-                return new Response(found.bytes as BodyInit, {
+                const rangeHeader = headers.get('range');
+                if (method === 'GET' && rangeHeader) {
+                    rangeFetchAttempts++;
+                    if (simulateMissingContentRangeOnce && rangeFetchAttempts === 1) {
+                        // Simulate Backblaze B2 occasionally omitting Content-Range on a 200 response
+                        return new Response(found.bytes as BodyInit, {
+                            status: 200,
+                            headers: { 'Content-Type': found.contentType }
+                        });
+                    }
+                    const m = rangeHeader.match(/^bytes=(\d+)-(\d+)$/);
+                    if (m) {
+                        const start = Number(m[1]);
+                        const end = Math.min(Number(m[2]), found.bytes.byteLength - 1);
+                        const slice = found.bytes.slice(start, end + 1);
+                        return new Response(slice as BodyInit, {
+                            status: 206,
+                            headers: {
+                                'Content-Type': found.contentType,
+                                'Content-Length': String(slice.byteLength),
+                                'Content-Range': `bytes ${start}-${end}/${found.bytes.byteLength}`,
+                                'Accept-Ranges': 'bytes',
+                                ETag: '"b2-etag-1"'
+                            }
+                        });
+                    }
+                }
+                return new Response(method === 'HEAD' ? null : (found.bytes as BodyInit), {
                     status: 200,
-                    headers: { 'Content-Type': found.contentType }
+                    headers: {
+                        'Content-Type': found.contentType,
+                        'Content-Length': String(found.bytes.byteLength),
+                        'Accept-Ranges': 'bytes',
+                        ETag: '"b2-etag-1"'
+                    }
                 });
             }
 
@@ -6984,6 +7032,10 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
             expect(initJson.data.externalStorage.enabled).toBe(false);
             expect(initJson.data.b2.bound).toBe(false);
             expect(initJson.data.overflowActive).toBe(false);
+
+            // Built-in Workers direct proxy stays disabled (404) while B2 extra storage is OFF
+            const disabledProxyRes = await exports.default.fetch('http://example.com/api/storage/b2/screenshots/any.png');
+            expect(disabledProxyRes.status).toBe(404);
 
             // 2. Reject SSRF / non-Backblaze endpoints (400)
             for (const badEndpoint of [
@@ -7176,6 +7228,80 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
             expect(statusAfter.data.b2.screenshotsCount).toBe(1);
             expect(statusAfter.data.b2.backupsCount).toBe(1);
             expect(statusAfter.data.b2.usedBytes).toBeGreaterThan(fakePng.byteLength);
+
+            // 7. Built-in Backblaze B2 -> Cloudflare Workers Direct Proxy (/api/storage/b2/*)
+            // Enforce ALLOW_LIST_BUCKET=false (404), GET/HEAD only (405), and path traversal block (400)
+            expect((await exports.default.fetch('http://example.com/api/storage/b2/')).status).toBe(404);
+            expect(
+                (
+                    await exports.default.fetch('http://example.com/api/storage/b2/screenshots/test.png', {
+                        method: 'POST',
+                        headers: { Origin: 'http://example.com' }
+                    })
+                ).status
+            ).toBe(405);
+            expect(
+                (await exports.default.fetch('http://example.com/api/storage/b2/screenshots/%2e%2e%2fsecret.txt')).status
+            ).toBe(400);
+
+            // Virtual-host GET/HEAD + Range 3x retry recovery + Cloudflare header stripping
+            const shotLogicalKey = uploadJson.data.r2ThumbKey.slice('b2:'.length);
+            const headRes = await exports.default.fetch(
+                `http://example.com/api/storage/b2/${shotLogicalKey}`,
+                { method: 'HEAD' }
+            );
+            expect(headRes.status).toBe(200);
+            expect(headRes.headers.get('Content-Type')).toBe('image/png');
+            expect(headRes.headers.get('Content-Length')).toBe(String(fakePng.byteLength));
+            expect(headRes.headers.get('X-VRCX-Storage-Via')).toBe('worker-direct-b2');
+            expect(virtualHostHits).toBeGreaterThan(0);
+
+            simulateMissingContentRangeOnce = true;
+            rangeFetchAttempts = 0;
+            const rangeRes = await exports.default.fetch(
+                `http://example.com/api/storage/b2/${shotLogicalKey}`,
+                {
+                    method: 'GET',
+                    headers: {
+                        Range: 'bytes=0-3',
+                        'CF-Connecting-IP': '1.2.3.4',
+                        'X-Real-IP': '1.2.3.4'
+                    }
+                }
+            );
+            expect(rangeRes.status).toBe(206);
+            expect(rangeFetchAttempts).toBe(2); // Retried after missing Content-Range on attempt 1
+            expect(rangeRes.headers.get('Content-Range')).toBe(`bytes 0-3/${fakePng.byteLength}`);
+            expect(new Uint8Array(await rangeRes.arrayBuffer())).toEqual(fakePng.slice(0, 4));
+            simulateMissingContentRangeOnce = false;
+
+            // Same-origin XSS defense: HTML stored in B2 is forced to attachment + sandbox CSP
+            b2Store.set('vrcx-pfx/docs/xss.html', {
+                bytes: new TextEncoder().encode('<script>alert(1)</script>'),
+                contentType: 'text/html; charset=utf-8',
+                lastModified: new Date().toISOString()
+            });
+            const htmlRes = await exports.default.fetch('http://example.com/api/storage/b2/docs/xss.html');
+            expect(htmlRes.status).toBe(200);
+            expect(htmlRes.headers.get('Content-Type')).toBe('application/octet-stream');
+            expect(htmlRes.headers.get('Content-Disposition')).toContain('attachment');
+            expect(htmlRes.headers.get('Content-Security-Policy')).toContain('sandbox');
+
+            // Disabling B2 immediately disables /api/storage/b2/* direct proxy while preserving historical screenshot read
+            const disableRes = await exports.default.fetch('http://example.com/api/storage/config', {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+                body: JSON.stringify({ enabled: false })
+            });
+            expect(disableRes.status).toBe(200);
+            expect(
+                (await exports.default.fetch(`http://example.com/api/storage/b2/${shotLogicalKey}`)).status
+            ).toBe(404);
+            const historicalReadRes = await exports.default.fetch(
+                'http://example.com/api/media/screenshots/shot_b2_overflow_01'
+            );
+            expect(historicalReadRes.status).toBe(200);
+            expect(new Uint8Array(await historicalReadRes.arrayBuffer())).toEqual(fakePng);
         } finally {
             fetchSpy.mockRestore();
             if (createdDeviceId) {

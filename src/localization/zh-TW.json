@@ -3501,7 +3501,11 @@
             "test_btn": "測試連線",
             "testing": "測試中...",
             "saved_toast": "儲存設定已儲存。",
-            "test_ok": "連線成功（{ms} ms）· 已用 {size}（{count} 個檔案）。"
+            "test_ok": "連線成功（{ms} ms）· 已用 {size}（{count} 個檔案）。",
+            "direct_proxy_label": "Workers 內建直連中轉",
+            "direct_proxy_active": "已自動啟用",
+            "direct_proxy_copy": "複製前綴",
+            "direct_proxy_copied": "已複製"
         },
         "settings": {
             "sync_interval_label": "雲端同步間隔（網頁端與背景動態）",

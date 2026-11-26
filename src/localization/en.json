@@ -3838,7 +3838,11 @@
             "test_btn": "Test Connection",
             "testing": "Testing...",
             "saved_toast": "Storage settings saved.",
-            "test_ok": "Connected ({ms} ms) · {size} across {count} objects."
+            "test_ok": "Connected ({ms} ms) · {size} across {count} objects.",
+            "direct_proxy_label": "Built-in Workers Direct Proxy",
+            "direct_proxy_active": "Auto-Enabled",
+            "direct_proxy_copy": "Copy Prefix",
+            "direct_proxy_copied": "Copied"
         },
         "settings": {
             "sync_interval_label": "Cloud Sync Interval (Web & Background Feed)",

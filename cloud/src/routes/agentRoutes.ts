@@ -10,7 +10,15 @@ import {
 } from '../auth/auth';
 import { encryptAesGcm, randomHex, sha256Hex } from '../crypto/vault';
 import type { Env } from '../env';
-import { deleteStoredObject, readStoredObject, storeObjectWithOverflow } from '../storage/objectStorage';
+import {
+    B2_KEY_PREFIX_TAG,
+    buildSafeDirectProxyResponse,
+    deleteStoredObject,
+    proxyB2DirectFetch,
+    readStoredObject,
+    resolveActiveB2Credentials,
+    storeObjectWithOverflow
+} from '../storage/objectStorage';
 import {
     accrueCloudUptime,
     clampQueryLimit,
@@ -1524,7 +1532,7 @@ export async function handleAgentWebRoutes(request: Request, env: Env, url: URL)
     }
 
     const mediaReadMatch = url.pathname.match(/^\/api\/media\/screenshots\/([A-Za-z0-9_-]{8,64})$/);
-    if (mediaReadMatch && request.method === 'GET') {
+    if (mediaReadMatch && (request.method === 'GET' || request.method === 'HEAD')) {
         const id = mediaReadMatch[1]!;
         const row = await env.DB_CORE.prepare('SELECT r2_thumb_key FROM cloud_screenshots WHERE id = ? LIMIT 1')
             .bind(id)
@@ -1535,6 +1543,42 @@ export async function handleAgentWebRoutes(request: Request, env: Env, url: URL)
                 { status: 404 }
             );
         }
+
+        // B2-stored screenshots stream directly through the built-in Cloudflare Workers B2 proxy
+        // (Bandwidth Alliance free egress + Range 3x retry + ETag/304 + HEAD support).
+        if (row.r2_thumb_key.startsWith(B2_KEY_PREFIX_TAG)) {
+            const logicalKey = row.r2_thumb_key.slice(B2_KEY_PREFIX_TAG.length);
+            const creds = await resolveActiveB2Credentials(env, undefined, { allowDisabled: true });
+            if (!creds) {
+                return Response.json(
+                    { ok: false, error: { code: 'NOT_FOUND', message: 'Thumbnail blob missing' } },
+                    { status: 404 }
+                );
+            }
+            const upstreamRes = await proxyB2DirectFetch(creds, logicalKey, request, {
+                method: request.method === 'HEAD' ? 'HEAD' : 'GET'
+            });
+            if (upstreamRes.status === 404) {
+                await upstreamRes.body?.cancel().catch(() => {});
+                return Response.json(
+                    { ok: false, error: { code: 'NOT_FOUND', message: 'Thumbnail blob missing' } },
+                    { status: 404 }
+                );
+            }
+            if (upstreamRes.status >= 400 && upstreamRes.status !== 416) {
+                await upstreamRes.body?.cancel().catch(() => {});
+                return Response.json(
+                    { ok: false, error: { code: 'B2_PROXY_ERROR', message: `Backblaze B2 HTTP ${upstreamRes.status}` } },
+                    { status: 502 }
+                );
+            }
+            return buildSafeDirectProxyResponse(upstreamRes, {
+                method: request.method,
+                cacheControl: 'private, max-age=604800, immutable',
+                storageProvider: 'b2'
+            });
+        }
+
         const obj = await readStoredObject(env, row.r2_thumb_key);
         if (!obj) {
             return Response.json(
@@ -1554,7 +1598,7 @@ export async function handleAgentWebRoutes(request: Request, env: Env, url: URL)
         headers.set('X-Content-Type-Options', 'nosniff');
         headers.set('Content-Security-Policy', "default-src 'none'; sandbox");
         headers.set('Cache-Control', 'private, max-age=604800, immutable');
-        return new Response(obj.body, { status: 200, headers });
+        return new Response(request.method === 'HEAD' ? null : obj.body, { status: 200, headers });
     }
 
     return null;

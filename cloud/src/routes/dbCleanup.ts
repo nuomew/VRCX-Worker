@@ -3,9 +3,11 @@ import { getLegacyDb } from '../db/schemaBootstrap';
 import type { Env } from '../env';
 import {
     B2_KEY_PREFIX_TAG,
+    buildSafeDirectProxyResponse,
     listB2Objects,
     loadExternalStorageConfig,
     measureR2Usage,
+    proxyB2DirectFetch,
     readStoredObject,
     resolveActiveB2Credentials,
     storeObjectWithOverflow
@@ -475,7 +477,10 @@ export async function handleDbCleanupRoutes(
         );
     }
 
-    if (url.pathname === '/api/admin/cleanup/backups/download' && request.method === 'GET') {
+    if (
+        url.pathname === '/api/admin/cleanup/backups/download' &&
+        (request.method === 'GET' || request.method === 'HEAD')
+    ) {
         const key = (url.searchParams.get('key') ?? '').trim();
         if (!SAFE_BACKUP_KEY_RE.test(key)) {
             return Response.json(
@@ -484,7 +489,44 @@ export async function handleDbCleanupRoutes(
             );
         }
         const isB2Key = key.startsWith(B2_KEY_PREFIX_TAG);
-        if (!isB2Key && !env.R2_MEDIA) {
+        const logicalKey = isB2Key ? key.slice(B2_KEY_PREFIX_TAG.length) : key;
+        const fileName = logicalKey.slice(CLEANUP_BACKUP_PREFIX.length);
+
+        if (isB2Key) {
+            const creds = await resolveActiveB2Credentials(env, undefined, { allowDisabled: true });
+            if (!creds) {
+                return Response.json(
+                    { ok: false, error: { code: 'NOT_FOUND', message: 'Backup archive not found' } },
+                    { status: 404 }
+                );
+            }
+            const upstreamRes = await proxyB2DirectFetch(creds, logicalKey, request, {
+                method: request.method === 'HEAD' ? 'HEAD' : 'GET'
+            });
+            if (upstreamRes.status === 404) {
+                await upstreamRes.body?.cancel().catch(() => {});
+                return Response.json(
+                    { ok: false, error: { code: 'NOT_FOUND', message: 'Backup archive not found' } },
+                    { status: 404 }
+                );
+            }
+            if (upstreamRes.status >= 400 && upstreamRes.status !== 416) {
+                await upstreamRes.body?.cancel().catch(() => {});
+                return Response.json(
+                    { ok: false, error: { code: 'B2_PROXY_ERROR', message: `Backblaze B2 HTTP ${upstreamRes.status}` } },
+                    { status: 502 }
+                );
+            }
+            return buildSafeDirectProxyResponse(upstreamRes, {
+                method: request.method,
+                forceAttachment: true,
+                fileName,
+                cacheControl: 'private, no-store',
+                storageProvider: 'b2'
+            });
+        }
+
+        if (!env.R2_MEDIA) {
             return Response.json(
                 { ok: false, error: { code: 'R2_NOT_BOUND', message: 'R2_MEDIA bucket is not bound' } },
                 { status: 503 }
@@ -497,9 +539,7 @@ export async function handleDbCleanupRoutes(
                 { status: 404 }
             );
         }
-        const logicalKey = isB2Key ? key.slice(B2_KEY_PREFIX_TAG.length) : key;
-        const fileName = logicalKey.slice(CLEANUP_BACKUP_PREFIX.length);
-        return new Response(obj.body, {
+        return new Response(request.method === 'HEAD' ? null : obj.body, {
             status: 200,
             headers: {
                 'Content-Type': 'application/gzip',

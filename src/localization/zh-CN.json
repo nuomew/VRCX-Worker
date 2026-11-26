@@ -3836,7 +3836,11 @@
             "test_btn": "测试连接",
             "testing": "测试中...",
             "saved_toast": "存储设置已保存。",
-            "test_ok": "连接成功（{ms} ms）· 已用 {size}（{count} 个文件）。"
+            "test_ok": "连接成功（{ms} ms）· 已用 {size}（{count} 个文件）。",
+            "direct_proxy_label": "Workers 内置直连中转",
+            "direct_proxy_active": "已自动启用",
+            "direct_proxy_copy": "复制前缀",
+            "direct_proxy_copied": "已复制"
         },
         "settings": {
             "sync_interval_label": "云端同步间隔（网页端与后台动态）",
