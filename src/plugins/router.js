@@ -16,6 +16,7 @@ import Gallery from './../views/Tools/Gallery.vue';
 import GameLog from './../views/GameLog/GameLog.vue';
 import Login from './../views/Login/Login.vue';
 import MainLayout from '../views/Layout/MainLayout.vue';
+import Blacklist from './../views/Moderation/Blacklist.vue';
 import Moderation from './../views/Moderation/Moderation.vue';
 import MyAvatars from './../views/MyAvatars/MyAvatars.vue';
 import Notification from './../views/Notifications/Notification.vue';
@@ -79,6 +80,11 @@ const routes = [
                 path: 'social/moderation',
                 name: 'moderation',
                 component: Moderation
+            },
+            {
+                path: 'social/blacklist',
+                name: 'blacklist',
+                component: Blacklist
             },
             {
                 path: 'my-avatars',

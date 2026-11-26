@@ -53,8 +53,8 @@ export const useModerationStore = defineStore('Moderation', () => {
         const { ref } = args;
 
         let hasModeration = false;
-        for (const ref of cachedPlayerModerations.values()) {
-            if (ref.targetUserId === ref.targetUserId) {
+        for (const entry of cachedPlayerModerations.values()) {
+            if (entry.targetUserId === ref.targetUserId) {
                 hasModeration = true;
                 break;
             }

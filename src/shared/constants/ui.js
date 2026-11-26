@@ -79,6 +79,13 @@ const navDefinitions = [
         routeName: 'moderation'
     },
     {
+        key: 'blacklist',
+        icon: 'ri-forbid-2-line',
+        tooltip: 'nav_tooltip.blacklist',
+        labelKey: 'nav_tooltip.blacklist',
+        routeName: 'blacklist'
+    },
+    {
         key: 'notification',
         icon: 'ri-notification-2-line',
         tooltip: 'nav_tooltip.notification',

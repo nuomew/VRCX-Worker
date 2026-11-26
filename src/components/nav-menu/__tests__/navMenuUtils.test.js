@@ -251,6 +251,40 @@ describe('sanitizeLayout', () => {
         expect(chartsFolder.items).toEqual(['charts-instance', 'charts-mutual', 'charts-hot-worlds']);
     });
 
+    test('places newly added blacklist item inside existing default-folder-social unless hidden', () => {
+        const defsWithSocial = [
+            ...testDefinitions,
+            { key: 'friend-log', routeName: 'friend-log' },
+            { key: 'friend-list', routeName: 'friend-list' },
+            { key: 'moderation', routeName: 'moderation' },
+            { key: 'blacklist', routeName: 'blacklist' }
+        ];
+        const defMap = new Map(defsWithSocial.map((d) => [d.key, d]));
+        const legacyLayout = [
+            {
+                type: 'folder',
+                id: 'default-folder-social',
+                nameKey: 'nav_tooltip.social',
+                items: ['friend-log', 'friend-list', 'moderation']
+            }
+        ];
+
+        const merged = sanitizeLayout(legacyLayout, [], defMap, defsWithSocial, mockT, mockGenerateFolderId);
+        const socialFolder = merged.find((e) => e.type === 'folder' && e.id === 'default-folder-social');
+        expect(socialFolder?.items).toEqual(['friend-log', 'friend-list', 'moderation', 'blacklist']);
+
+        const hiddenMerged = sanitizeLayout(
+            legacyLayout,
+            ['blacklist'],
+            defMap,
+            defsWithSocial,
+            mockT,
+            mockGenerateFolderId
+        );
+        const hiddenSocialFolder = hiddenMerged.find((e) => e.type === 'folder' && e.id === 'default-folder-social');
+        expect(hiddenSocialFolder?.items).toEqual(['friend-log', 'friend-list', 'moderation']);
+    });
+
     test('skips empty folders', () => {
         const layout = [
             {

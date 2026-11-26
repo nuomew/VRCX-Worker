@@ -116,6 +116,16 @@ export function sanitizeLayout(layout, hiddenKeys, definitionMap, allDefinitions
                     return;
                 }
             }
+            if (item.key === 'blacklist') {
+                const socialFolder = normalized.find(
+                    (entry) => entry.type === 'folder' && entry.id === 'default-folder-social'
+                );
+                if (socialFolder && Array.isArray(socialFolder.items)) {
+                    socialFolder.items.push(item.key);
+                    usedKeys.add(item.key);
+                    return;
+                }
+            }
             appendItemEntry(item.key);
         }
     });
