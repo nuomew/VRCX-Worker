@@ -1,13 +1,22 @@
 import { randomHex } from '../crypto/vault';
 import { getLegacyDb } from '../db/schemaBootstrap';
 import type { Env } from '../env';
+import {
+    B2_KEY_PREFIX_TAG,
+    listB2Objects,
+    loadExternalStorageConfig,
+    measureR2Usage,
+    readStoredObject,
+    resolveActiveB2Credentials,
+    storeObjectWithOverflow
+} from '../storage/objectStorage';
 import { incrementCountersBatch } from './coreData';
 
 export const MIN_CLEANUP_MONTHS = 1;
 export const MAX_CLEANUP_MONTHS = 120;
 export const CLEANUP_BACKUP_PREFIX = 'backups/db-cleanup/';
 
-const SAFE_BACKUP_KEY_RE = /^backups\/db-cleanup\/[A-Za-z0-9._-]+\.json\.gz$/;
+const SAFE_BACKUP_KEY_RE = /^(?:b2:)?backups\/db-cleanup\/[A-Za-z0-9._-]+\.json\.gz$/;
 const DEFAULT_BACKUP_BATCH_LIMIT_PER_TABLE = 1500;
 const MAX_BACKUP_BATCH_LIMIT_PER_TABLE = 3000;
 
@@ -364,6 +373,12 @@ export async function handleDbCleanupRoutes(
         }
 
         const totalRows = shards.core + shards.gamelog + shards.feed + shards.legacy;
+        const extCfg = await loadExternalStorageConfig(env);
+        const b2Creds = extCfg.enabled ? await resolveActiveB2Credentials(env, extCfg) : null;
+        const r2Usage = b2Creds && env.R2_MEDIA ? await measureR2Usage(env, { forceRefresh: false }) : null;
+        const overflowActive = Boolean(
+            b2Creds && (!env.R2_MEDIA || (r2Usage && r2Usage.usedBytes >= extCfg.r2OverflowThresholdBytes))
+        );
 
         return Response.json(
             {
@@ -374,6 +389,8 @@ export async function handleDbCleanupRoutes(
                     includeLegacy: Boolean(legacyDb),
                     legacyDbBound: Boolean(getLegacyDb(env)),
                     r2Enabled: Boolean(env.R2_MEDIA),
+                    b2Enabled: Boolean(b2Creds),
+                    overflowActive,
                     totalRows,
                     shards,
                     tables
@@ -384,43 +401,81 @@ export async function handleDbCleanupRoutes(
     }
 
     if (url.pathname === '/api/admin/cleanup/backups' && request.method === 'GET') {
-        if (!env.R2_MEDIA) {
-            return Response.json(
-                { ok: true, data: { r2Enabled: false, backups: [] } },
-                { headers: { 'Cache-Control': 'no-store' } }
-            );
-        }
-        const listed = await env.R2_MEDIA.list({
-            prefix: CLEANUP_BACKUP_PREFIX,
-            limit: 25,
-            include: ['customMetadata']
-        });
-        const backups = (listed.objects ?? [])
-            .filter((obj) => SAFE_BACKUP_KEY_RE.test(obj.key))
-            .sort((a, b) => b.uploaded.getTime() - a.uploaded.getTime())
-            .slice(0, 20)
-            .map((obj) => ({
-                key: obj.key,
-                fileName: obj.key.slice(CLEANUP_BACKUP_PREFIX.length),
-                bytes: obj.size,
-                uploadedAt: obj.uploaded.toISOString(),
-                months: Number(obj.customMetadata?.months ?? 0) || 0,
-                cutoffIso: obj.customMetadata?.cutoffIso ?? '',
-                totalRows: Number(obj.customMetadata?.totalRows ?? 0) || 0
-            }));
+        const extCfg = await loadExternalStorageConfig(env);
+        const b2Creds = extCfg.enabled ? await resolveActiveB2Credentials(env, extCfg) : null;
+
+        type BackupItem = {
+            key: string;
+            provider: 'r2' | 'b2';
+            fileName: string;
+            bytes: number;
+            uploadedAt: string;
+            months: number;
+            cutoffIso: string;
+            totalRows: number;
+        };
+
+        const [r2Items, b2Items] = await Promise.all([
+            env.R2_MEDIA
+                ? env.R2_MEDIA.list({
+                      prefix: CLEANUP_BACKUP_PREFIX,
+                      limit: 25,
+                      include: ['customMetadata']
+                  })
+                      .then((listed): BackupItem[] =>
+                          (listed.objects ?? [])
+                              .filter((obj) => SAFE_BACKUP_KEY_RE.test(obj.key))
+                              .map((obj) => ({
+                                  key: obj.key,
+                                  provider: 'r2',
+                                  fileName: obj.key.slice(CLEANUP_BACKUP_PREFIX.length),
+                                  bytes: obj.size,
+                                  uploadedAt: obj.uploaded.toISOString(),
+                                  months: Number(obj.customMetadata?.months ?? 0) || 0,
+                                  cutoffIso: obj.customMetadata?.cutoffIso ?? '',
+                                  totalRows: Number(obj.customMetadata?.totalRows ?? 0) || 0
+                              }))
+                      )
+                      .catch((): BackupItem[] => [])
+                : Promise.resolve<BackupItem[]>([]),
+            b2Creds
+                ? listB2Objects(b2Creds, CLEANUP_BACKUP_PREFIX, 2)
+                      .then(({ objects }): BackupItem[] =>
+                          objects
+                              .filter((obj) => SAFE_BACKUP_KEY_RE.test(obj.key))
+                              .map((obj) => ({
+                                  key: `${B2_KEY_PREFIX_TAG}${obj.key}`,
+                                  provider: 'b2',
+                                  fileName: obj.key.slice(CLEANUP_BACKUP_PREFIX.length),
+                                  bytes: obj.size,
+                                  uploadedAt: obj.lastModified || '',
+                                  months: 0,
+                                  cutoffIso: '',
+                                  totalRows: 0
+                              }))
+                      )
+                      .catch((): BackupItem[] => [])
+                : Promise.resolve<BackupItem[]>([])
+        ]);
+
+        const backups = [...r2Items, ...b2Items]
+            .sort((a, b) => Date.parse(b.uploadedAt || '0') - Date.parse(a.uploadedAt || '0'))
+            .slice(0, 30);
+
         return Response.json(
-            { ok: true, data: { r2Enabled: true, backups } },
+            {
+                ok: true,
+                data: {
+                    r2Enabled: Boolean(env.R2_MEDIA),
+                    b2Enabled: Boolean(b2Creds),
+                    backups
+                }
+            },
             { headers: { 'Cache-Control': 'no-store' } }
         );
     }
 
     if (url.pathname === '/api/admin/cleanup/backups/download' && request.method === 'GET') {
-        if (!env.R2_MEDIA) {
-            return Response.json(
-                { ok: false, error: { code: 'R2_NOT_BOUND', message: 'R2_MEDIA bucket is not bound' } },
-                { status: 503 }
-            );
-        }
         const key = (url.searchParams.get('key') ?? '').trim();
         if (!SAFE_BACKUP_KEY_RE.test(key)) {
             return Response.json(
@@ -428,14 +483,22 @@ export async function handleDbCleanupRoutes(
                 { status: 400 }
             );
         }
-        const obj = await env.R2_MEDIA.get(key);
+        const isB2Key = key.startsWith(B2_KEY_PREFIX_TAG);
+        if (!isB2Key && !env.R2_MEDIA) {
+            return Response.json(
+                { ok: false, error: { code: 'R2_NOT_BOUND', message: 'R2_MEDIA bucket is not bound' } },
+                { status: 503 }
+            );
+        }
+        const obj = await readStoredObject(env, key);
         if (!obj) {
             return Response.json(
                 { ok: false, error: { code: 'NOT_FOUND', message: 'Backup archive not found' } },
                 { status: 404 }
             );
         }
-        const fileName = key.slice(CLEANUP_BACKUP_PREFIX.length);
+        const logicalKey = isB2Key ? key.slice(B2_KEY_PREFIX_TAG.length) : key;
+        const fileName = logicalKey.slice(CLEANUP_BACKUP_PREFIX.length);
         return new Response(obj.body, {
             status: 200,
             headers: {
@@ -478,17 +541,38 @@ export async function handleDbCleanupRoutes(
             );
         }
 
-        if (mode === 'backup_and_delete' && !env.R2_MEDIA) {
-            return Response.json(
-                {
-                    ok: false,
-                    error: {
-                        code: 'R2_NOT_BOUND',
-                        message: 'R2_MEDIA bucket is not bound. Bind R2_MEDIA before using Backup & Cleanup.'
-                    }
-                },
-                { status: 503 }
-            );
+        const rawTarget = typeof rawBody.backupTarget === 'string' ? rawBody.backupTarget.trim().toLowerCase() : 'auto';
+        const backupTarget: 'auto' | 'r2' | 'b2' =
+            rawTarget === 'r2' || rawTarget === 'b2' ? rawTarget : 'auto';
+
+        if (mode === 'backup_and_delete') {
+            const extCfg = await loadExternalStorageConfig(env);
+            const b2Creds = extCfg.enabled ? await resolveActiveB2Credentials(env, extCfg) : null;
+            if (backupTarget === 'b2' && !b2Creds) {
+                return Response.json(
+                    {
+                        ok: false,
+                        error: {
+                            code: 'B2_NOT_CONFIGURED',
+                            message: 'Backblaze B2 extra storage is disabled or not configured.'
+                        }
+                    },
+                    { status: 503 }
+                );
+            }
+            if (backupTarget !== 'b2' && !env.R2_MEDIA && !b2Creds) {
+                return Response.json(
+                    {
+                        ok: false,
+                        error: {
+                            code: 'R2_NOT_BOUND',
+                            message:
+                                'Neither R2_MEDIA nor Backblaze B2 extra storage is configured. Bind R2_MEDIA or enable Backblaze B2 first.'
+                        }
+                    },
+                    { status: 503 }
+                );
+            }
         }
 
         const includeLegacy = rawBody.includeLegacy === true;
@@ -726,8 +810,10 @@ export async function handleDbCleanupRoutes(
         let backupKey = '';
         let backupFileName = '';
         let backupBytes = 0;
+        let backupProvider: 'r2' | 'b2' | null = null;
+        let overflowed = false;
 
-        // Upload gzip backup to R2 strictly BEFORE executing any DELETE statements
+        // Upload gzip backup to R2 or Backblaze B2 strictly BEFORE executing any DELETE statements
         if (backedUpRows > 0) {
             const archivePayload = {
                 format: 'vrcx-worker-db-cleanup-backup-v1',
@@ -741,21 +827,32 @@ export async function handleDbCleanupRoutes(
             };
             const gzipBytes = await gzipUtf8(JSON.stringify(archivePayload));
             const built = buildBackupKey(cutoffIso, now);
-            backupKey = built.key;
-            backupFileName = built.fileName;
-            backupBytes = gzipBytes.byteLength;
-
-            await env.R2_MEDIA!.put(backupKey, gzipBytes, {
-                httpMetadata: {
-                    contentType: 'application/gzip'
-                },
-                customMetadata: {
+            const storeRes = await storeObjectWithOverflow(env, built.key, gzipBytes, 'application/gzip', {
+                target: backupTarget,
+                metadata: {
                     months: String(months),
                     cutoffIso,
                     totalRows: String(backedUpRows),
                     backedUpAt: now.toISOString()
                 }
             });
+            if (!storeRes.stored || !storeRes.provider) {
+                return Response.json(
+                    {
+                        ok: false,
+                        error: {
+                            code: 'BACKUP_STORAGE_UNAVAILABLE',
+                            message: 'Target backup storage is unavailable; no database rows were deleted.'
+                        }
+                    },
+                    { status: 503 }
+                );
+            }
+            backupKey = storeRes.storedKey;
+            backupFileName = built.fileName;
+            backupBytes = gzipBytes.byteLength;
+            backupProvider = storeRes.provider;
+            overflowed = storeRes.overflowed;
         }
 
         // Now delete ONLY the exact rowid <= maxRid slices backed up above
@@ -829,6 +926,8 @@ export async function handleDbCleanupRoutes(
                     backupKey,
                     backupFileName,
                     backupBytes,
+                    backupProvider,
+                    overflowed,
                     hasMore,
                     perShardDeleted
                 }

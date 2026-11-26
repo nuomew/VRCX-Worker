@@ -6894,4 +6894,300 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
                 .run();
         }
     });
+
+    it('monitors R2 & Backblaze B2 usage, defaults extra storage OFF, overflows screenshots to B2 past threshold, and backs up DB cleanup to B2', async () => {
+        const b2Store = new Map<string, { bytes: Uint8Array; contentType: string; lastModified: string }>();
+        const originalFetch = globalThis.fetch;
+        const b2Host = 's3.us-west-004.backblazeb2.com';
+        const b2Bucket = 'vrcx-test-b2';
+        let createdDeviceId = '';
+
+        const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+            const targetUrl = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+            const parsed = new URL(targetUrl);
+            if (parsed.hostname !== b2Host) {
+                return originalFetch(input, init);
+            }
+
+            // Verify every Backblaze B2 S3 request carries a valid AWS SigV4 Authorization header
+            const headers = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined));
+            const authHeader = headers.get('Authorization') ?? '';
+            expect(authHeader.startsWith('AWS4-HMAC-SHA256 Credential=004testkeyid/')).toBe(true);
+            expect(authHeader).toContain('/us-west-004/s3/aws4_request');
+            expect(headers.get('x-amz-date')).toMatch(/^\d{8}T\d{6}Z$/);
+            expect(headers.get('x-amz-content-sha256')).toMatch(/^[0-9a-f]{64}$/);
+
+            const method = (init?.method ?? (input instanceof Request ? input.method : 'GET')).toUpperCase();
+            const bucketPrefix = `/${b2Bucket}`;
+            const rawKey = parsed.pathname.startsWith(`${bucketPrefix}/`)
+                ? decodeURIComponent(parsed.pathname.slice(bucketPrefix.length + 1))
+                : '';
+
+            if (method === 'GET' && parsed.searchParams.get('list-type') === '2') {
+                const prefix = parsed.searchParams.get('prefix') ?? '';
+                const items = Array.from(b2Store.entries())
+                    .filter(([k]) => !prefix || k.startsWith(prefix))
+                    .map(
+                        ([k, v]) =>
+                            `<Contents><Key>${k}</Key><Size>${v.bytes.byteLength}</Size><LastModified>${v.lastModified}</LastModified></Contents>`
+                    )
+                    .join('');
+                const xml = `<?xml version="1.0" encoding="UTF-8"?><ListBucketResult><IsTruncated>false</IsTruncated>${items}</ListBucketResult>`;
+                return new Response(xml, { status: 200, headers: { 'Content-Type': 'application/xml' } });
+            }
+
+            if (method === 'PUT' && rawKey) {
+                const bodyBytes =
+                    init?.body instanceof Uint8Array
+                        ? new Uint8Array(init.body)
+                        : new Uint8Array(await new Response(init?.body ?? null).arrayBuffer());
+                b2Store.set(rawKey, {
+                    bytes: bodyBytes,
+                    contentType: headers.get('content-type') ?? 'application/octet-stream',
+                    lastModified: new Date().toISOString()
+                });
+                return new Response('', { status: 200 });
+            }
+
+            if (method === 'GET' && rawKey) {
+                const found = b2Store.get(rawKey);
+                if (!found) return new Response('NotFound', { status: 404 });
+                return new Response(found.bytes as BodyInit, {
+                    status: 200,
+                    headers: { 'Content-Type': found.contentType }
+                });
+            }
+
+            if (method === 'DELETE' && rawKey) {
+                b2Store.delete(rawKey);
+                return new Response('', { status: 204 });
+            }
+
+            return new Response('BadRequest', { status: 400 });
+        });
+
+        try {
+            // 1. Default state: R2 is measured, Backblaze B2 extra storage defaults to OFF
+            const initRes = await exports.default.fetch('http://example.com/api/storage/status?refresh=1');
+            expect(initRes.status).toBe(200);
+            const initJson = (await initRes.json()) as {
+                ok: boolean;
+                data: {
+                    r2: { bound: boolean; freeLimitBytes: number };
+                    b2: { bound: boolean };
+                    externalStorage: { enabled: boolean; hasSecretKey: boolean };
+                    overflowActive: boolean;
+                };
+            };
+            expect(initJson.data.r2.bound).toBe(true);
+            expect(initJson.data.r2.freeLimitBytes).toBe(10 * 1024 * 1024 * 1024);
+            expect(initJson.data.externalStorage.enabled).toBe(false);
+            expect(initJson.data.b2.bound).toBe(false);
+            expect(initJson.data.overflowActive).toBe(false);
+
+            // 2. Reject SSRF / non-Backblaze endpoints (400)
+            for (const badEndpoint of [
+                'https://169.254.169.254',
+                'https://evil.example.com',
+                'http://s3.us-west-004.backblazeb2.com'
+            ]) {
+                const badRes = await exports.default.fetch('http://example.com/api/storage/config', {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+                    body: JSON.stringify({
+                        enabled: true,
+                        endpoint: badEndpoint,
+                        bucket: b2Bucket,
+                        accessKeyId: '004testkeyid',
+                        secretAccessKey: 'K004SecretKeyValue'
+                    })
+                });
+                expect(badRes.status).toBe(400);
+            }
+
+            // 3. Test connection + save encrypted Backblaze B2 credentials (never stored or returned in plaintext)
+            const b2Secret = 'K004SuperSecretAppKey_9988';
+            const testRes = await exports.default.fetch('http://example.com/api/storage/test', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+                body: JSON.stringify({
+                    endpoint: `https://${b2Host}`,
+                    bucket: b2Bucket,
+                    keyPrefix: 'vrcx-pfx',
+                    accessKeyId: '004testkeyid',
+                    secretAccessKey: b2Secret
+                })
+            });
+            expect(testRes.status).toBe(200);
+            expect(((await testRes.json()) as { data: { connected: boolean } }).data.connected).toBe(true);
+
+            const saveRes = await exports.default.fetch('http://example.com/api/storage/config', {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+                body: JSON.stringify({
+                    enabled: true,
+                    endpoint: `https://${b2Host}`,
+                    bucket: b2Bucket,
+                    keyPrefix: 'vrcx-pfx',
+                    accessKeyId: '004testkeyid',
+                    secretAccessKey: b2Secret,
+                    r2OverflowThresholdBytes: 100 * 1024 * 1024 // 100 MiB threshold
+                })
+            });
+            expect(saveRes.status).toBe(200);
+            const saveText = await saveRes.text();
+            expect(saveText).not.toContain(b2Secret);
+            const saveJson = JSON.parse(saveText) as {
+                data: { externalStorage: { enabled: boolean; region: string; hasSecretKey: boolean } };
+            };
+            expect(saveJson.data.externalStorage.enabled).toBe(true);
+            expect(saveJson.data.externalStorage.region).toBe('us-west-004');
+            expect(saveJson.data.externalStorage.hasSecretKey).toBe(true);
+
+            const storedRow = await env.DB_CORE.prepare(
+                "SELECT payload_json FROM cloud_bg_sync_state WHERE state_key = 'cloud_external_storage_config'"
+            ).first<{ payload_json: string }>();
+            expect(storedRow?.payload_json).toBeTruthy();
+            expect(storedRow!.payload_json).not.toContain(b2Secret);
+
+            // 4. Simulate R2 usage crossing threshold -> new screenshot uploads automatically overflow into Backblaze B2 and stream back seamlessly
+            const nowIso = new Date().toISOString();
+            await env.DB_CORE.prepare(
+                `INSERT INTO cloud_bg_sync_state (state_key, payload_json, updated_at)
+                 VALUES ('cloud_storage_usage_cache', ?, ?)
+                 ON CONFLICT(state_key) DO UPDATE SET payload_json = excluded.payload_json, updated_at = excluded.updated_at`
+            )
+                .bind(
+                    JSON.stringify({
+                        r2: {
+                            bound: true,
+                            usedBytes: 105 * 1024 * 1024, // 105 MiB >= 100 MiB threshold
+                            objectCount: 50,
+                            freeLimitBytes: 10 * 1024 * 1024 * 1024,
+                            percent: 1.03,
+                            screenshotsBytes: 105 * 1024 * 1024,
+                            screenshotsCount: 50,
+                            backupsBytes: 0,
+                            backupsCount: 0,
+                            truncated: false,
+                            checkedAt: nowIso
+                        }
+                    }),
+                    nowIso
+                )
+                .run();
+
+            const keyRes = await exports.default.fetch('http://example.com/api/agent/sync-key', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+                body: JSON.stringify({ deviceName: 'B2-Overflow-PC' })
+            });
+            const { syncKey, deviceId } = ((await keyRes.json()) as { data: { syncKey: string; deviceId: string } }).data;
+            createdDeviceId = deviceId;
+
+            const fakePng = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3, 4]);
+            const uploadRes = await exports.default.fetch(
+                'http://example.com/api/agent/media/screenshots/shot_b2_overflow_01',
+                {
+                    method: 'PUT',
+                    headers: {
+                        Authorization: `Bearer ${syncKey}`,
+                        'Content-Type': 'image/png'
+                    },
+                    body: fakePng
+                }
+            );
+            expect(uploadRes.status).toBe(200);
+            const uploadJson = (await uploadRes.json()) as {
+                data: { r2Stored: boolean; r2ThumbKey: string; storageProvider: string; overflowed: boolean };
+            };
+            expect(uploadJson.data.r2Stored).toBe(true);
+            expect(uploadJson.data.storageProvider).toBe('b2');
+            expect(uploadJson.data.overflowed).toBe(true);
+            expect(uploadJson.data.r2ThumbKey.startsWith('b2:screenshots/')).toBe(true);
+
+            // Reading the overflowed screenshot through /api/media/screenshots/:id streams transparently from B2
+            const readShotRes = await exports.default.fetch(
+                'http://example.com/api/media/screenshots/shot_b2_overflow_01'
+            );
+            expect(readShotRes.status).toBe(200);
+            expect(readShotRes.headers.get('Content-Type')).toBe('image/png');
+            expect(new Uint8Array(await readShotRes.arrayBuffer())).toEqual(fakePng);
+
+            // 5. DB cleanup directly backs up to Backblaze B2, appears in combined backup list, and downloads cleanly
+            const oldIso = new Date(Date.now() - 400 * 86_400_000).toISOString();
+            await env.DB_GAMELOG.prepare(
+                'INSERT OR IGNORE INTO gamelog_location (created_at, location, world_id, world_name, time, group_name) VALUES (?, ?, ?, ?, ?, ?)'
+            )
+                .bind(oldIso, 'wrld_b2_cleanup:1', 'wrld_b2_cleanup', 'B2 Archive Shrine', 900, '')
+                .run();
+
+            const b2CleanRes = await exports.default.fetch('http://example.com/api/admin/cleanup', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+                body: JSON.stringify({ months: 6, mode: 'backup_and_delete', backupTarget: 'b2', includeLegacy: false })
+            });
+            expect(b2CleanRes.status).toBe(200);
+            const b2CleanJson = (await b2CleanRes.json()) as {
+                data: { deletedRows: number; backupProvider: string; backupKey: string };
+            };
+            expect(b2CleanJson.data.deletedRows).toBeGreaterThanOrEqual(1);
+            expect(b2CleanJson.data.backupProvider).toBe('b2');
+            expect(b2CleanJson.data.backupKey.startsWith('b2:backups/db-cleanup/')).toBe(true);
+
+            const backupsRes = await exports.default.fetch('http://example.com/api/admin/cleanup/backups');
+            expect(backupsRes.status).toBe(200);
+            const backupsJson = (await backupsRes.json()) as {
+                data: { b2Enabled: boolean; backups: Array<{ key: string; provider: string }> };
+            };
+            expect(backupsJson.data.b2Enabled).toBe(true);
+            expect(
+                backupsJson.data.backups.some((b) => b.key === b2CleanJson.data.backupKey && b.provider === 'b2')
+            ).toBe(true);
+
+            const b2DlRes = await exports.default.fetch(
+                `http://example.com/api/admin/cleanup/backups/download?key=${encodeURIComponent(b2CleanJson.data.backupKey)}`
+            );
+            expect(b2DlRes.status).toBe(200);
+            const b2JsonText = await new Response(
+                b2DlRes.body!.pipeThrough(new DecompressionStream('gzip'))
+            ).text();
+            const b2Archive = JSON.parse(b2JsonText) as {
+                active: { gamelog_location?: Array<{ world_id: string }> };
+            };
+            expect(b2Archive.active.gamelog_location?.some((r) => r.world_id === 'wrld_b2_cleanup')).toBe(true);
+
+            // 6. Refresh storage status shows live B2 used bytes & breakdown (photos + DB backups)
+            const statusAfter = (await (
+                await exports.default.fetch('http://example.com/api/storage/status?refresh=1')
+            ).json()) as {
+                data: {
+                    b2: {
+                        bound: boolean;
+                        usedBytes: number;
+                        objectCount: number;
+                        screenshotsCount: number;
+                        backupsCount: number;
+                    };
+                };
+            };
+            expect(statusAfter.data.b2.bound).toBe(true);
+            expect(statusAfter.data.b2.objectCount).toBe(2);
+            expect(statusAfter.data.b2.screenshotsCount).toBe(1);
+            expect(statusAfter.data.b2.backupsCount).toBe(1);
+            expect(statusAfter.data.b2.usedBytes).toBeGreaterThan(fakePng.byteLength);
+        } finally {
+            fetchSpy.mockRestore();
+            if (createdDeviceId) {
+                await env.DB_CORE.prepare('DELETE FROM cloud_devices WHERE device_id = ?').bind(createdDeviceId).run();
+            }
+            await env.DB_CORE.batch([
+                env.DB_CORE.prepare(
+                    "DELETE FROM cloud_bg_sync_state WHERE state_key IN ('cloud_external_storage_config', 'cloud_storage_usage_cache')"
+                ),
+                env.DB_CORE.prepare("DELETE FROM cloud_screenshots WHERE id = 'shot_b2_overflow_01'")
+            ]);
+            await env.DB_GAMELOG.prepare("DELETE FROM gamelog_location WHERE world_id = 'wrld_b2_cleanup'").run();
+        }
+    });
 });

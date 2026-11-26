@@ -14,6 +14,9 @@
                 <template #desktop_migration>
                     <DesktopMigrationTab v-if="isWeb" />
                 </template>
+                <template #storage>
+                    <StorageTab v-if="isWeb" />
+                </template>
                 <template #interface>
                     <InterfaceTab />
                 </template>
@@ -56,6 +59,7 @@
 
     const SecurityTab = defineAsyncComponent(() => import('./components/Tabs/SecurityTab.vue'));
     const DesktopMigrationTab = defineAsyncComponent(() => import('./components/Tabs/DesktopMigrationTab.vue'));
+    const StorageTab = defineAsyncComponent(() => import('./components/Tabs/StorageTab.vue'));
 
     const { t } = useI18n();
     const isWeb = typeof WEB !== 'undefined' && WEB;
@@ -65,7 +69,8 @@
             ...(isWeb
                 ? [
                       { value: 'security', label: t('cloud_hub.two_factor.tab_label') },
-                      { value: 'desktop_migration', label: t('cloud_hub.migration.tab_label') }
+                      { value: 'desktop_migration', label: t('cloud_hub.migration.tab_label') },
+                      { value: 'storage', label: t('cloud_hub.storage.tab_label') }
                   ]
                 : []),
             { value: 'interface', label: t('view.settings.category.interface') },

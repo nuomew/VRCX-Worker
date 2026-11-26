@@ -10,6 +10,7 @@ import {
 } from '../auth/auth';
 import { encryptAesGcm, randomHex, sha256Hex } from '../crypto/vault';
 import type { Env } from '../env';
+import { deleteStoredObject, readStoredObject, storeObjectWithOverflow } from '../storage/objectStorage';
 import {
     accrueCloudUptime,
     clampQueryLimit,
@@ -703,11 +704,23 @@ export async function handleAgentPublicRoutes(request: Request, env: Env, url: U
                   .first<{ id: string; r2_thumb_key: string }>();
 
         if (existing) {
-            if (!existing.r2_thumb_key && env.R2_MEDIA && bytes.byteLength > 0) {
-                const backfillKey = `screenshots/${ym}/${existing.id}.${ext}`;
-                await env.R2_MEDIA.put(backfillKey, bytes, {
-                    httpMetadata: { contentType }
+            if (!existing.r2_thumb_key && bytes.byteLength > 0) {
+                const logicalBackfillKey = `screenshots/${ym}/${existing.id}.${ext}`;
+                const storeRes = await storeObjectWithOverflow(env, logicalBackfillKey, bytes, contentType, {
+                    target: 'auto'
                 });
+                if (!storeRes.stored) {
+                    return Response.json({
+                        ok: true,
+                        data: {
+                            id: existing.id,
+                            duplicate: true,
+                            r2Stored: false,
+                            r2ThumbKey: ''
+                        }
+                    });
+                }
+                const backfillKey = storeRes.storedKey;
                 let updRes: D1Result;
                 try {
                     updRes = await env.DB_CORE.prepare(
@@ -716,7 +729,7 @@ export async function handleAgentPublicRoutes(request: Request, env: Env, url: U
                         .bind(backfillKey, bytes.byteLength, existing.id)
                         .run();
                 } catch (err) {
-                    await env.R2_MEDIA.delete(backfillKey).catch(() => {});
+                    await deleteStoredObject(env, backfillKey);
                     throw err;
                 }
                 if ((updRes.meta?.changes ?? 0) === 1) {
@@ -726,7 +739,9 @@ export async function handleAgentPublicRoutes(request: Request, env: Env, url: U
                             id: existing.id,
                             duplicate: false,
                             r2Stored: true,
-                            r2ThumbKey: backfillKey
+                            r2ThumbKey: backfillKey,
+                            storageProvider: storeRes.provider,
+                            overflowed: storeRes.overflowed
                         }
                     });
                 }
@@ -736,7 +751,7 @@ export async function handleAgentPublicRoutes(request: Request, env: Env, url: U
                     .bind(existing.id)
                     .first<{ r2_thumb_key: string }>();
                 if (refreshed?.r2_thumb_key !== backfillKey) {
-                    await env.R2_MEDIA.delete(backfillKey).catch(() => {});
+                    await deleteStoredObject(env, backfillKey);
                 }
                 return Response.json({
                     ok: true,
@@ -760,13 +775,20 @@ export async function handleAgentPublicRoutes(request: Request, env: Env, url: U
         }
 
         let r2Key = '';
+        let storageProvider: 'r2' | 'b2' | null = null;
+        let overflowed = false;
 
         const effectiveFilename = localFilename || `${screenshotId}.png`;
-        if (env.R2_MEDIA && bytes.byteLength > 0) {
-            r2Key = `screenshots/${ym}/${screenshotId}.${ext}`;
-            await env.R2_MEDIA.put(r2Key, bytes, {
-                httpMetadata: { contentType }
+        if (bytes.byteLength > 0) {
+            const logicalKey = `screenshots/${ym}/${screenshotId}.${ext}`;
+            const storeRes = await storeObjectWithOverflow(env, logicalKey, bytes, contentType, {
+                target: 'auto'
             });
+            if (storeRes.stored) {
+                r2Key = storeRes.storedKey;
+                storageProvider = storeRes.provider;
+                overflowed = storeRes.overflowed;
+            }
         }
 
         let insertRes: D1Result;
@@ -792,8 +814,8 @@ export async function handleAgentPublicRoutes(request: Request, env: Env, url: U
                 )
                 .run();
         } catch (err) {
-            if (r2Key && env.R2_MEDIA) {
-                await env.R2_MEDIA.delete(r2Key).catch(() => {});
+            if (r2Key) {
+                await deleteStoredObject(env, r2Key);
             }
             throw err;
         }
@@ -804,8 +826,8 @@ export async function handleAgentPublicRoutes(request: Request, env: Env, url: U
             )
                 .bind(screenshotId, effectiveFilename)
                 .first<{ id: string; r2_thumb_key: string }>();
-            if (r2Key && env.R2_MEDIA && winner?.r2_thumb_key !== r2Key) {
-                await env.R2_MEDIA.delete(r2Key).catch(() => {});
+            if (r2Key && winner?.r2_thumb_key !== r2Key) {
+                await deleteStoredObject(env, r2Key);
             }
             return Response.json({
                 ok: true,
@@ -820,7 +842,14 @@ export async function handleAgentPublicRoutes(request: Request, env: Env, url: U
 
         return Response.json({
             ok: true,
-            data: { id: screenshotId, duplicate: false, r2Stored: Boolean(r2Key), r2ThumbKey: r2Key }
+            data: {
+                id: screenshotId,
+                duplicate: false,
+                r2Stored: Boolean(r2Key),
+                r2ThumbKey: r2Key,
+                storageProvider,
+                overflowed
+            }
         });
     }
 
@@ -1497,12 +1526,6 @@ export async function handleAgentWebRoutes(request: Request, env: Env, url: URL)
     const mediaReadMatch = url.pathname.match(/^\/api\/media\/screenshots\/([A-Za-z0-9_-]{8,64})$/);
     if (mediaReadMatch && request.method === 'GET') {
         const id = mediaReadMatch[1]!;
-        if (!env.R2_MEDIA) {
-            return Response.json(
-                { ok: false, error: { code: 'R2_NOT_CONFIGURED', message: 'R2 media bucket is not enabled' } },
-                { status: 404 }
-            );
-        }
         const row = await env.DB_CORE.prepare('SELECT r2_thumb_key FROM cloud_screenshots WHERE id = ? LIMIT 1')
             .bind(id)
             .first<{ r2_thumb_key: string }>();
@@ -1512,7 +1535,7 @@ export async function handleAgentWebRoutes(request: Request, env: Env, url: URL)
                 { status: 404 }
             );
         }
-        const obj = await env.R2_MEDIA.get(row.r2_thumb_key);
+        const obj = await readStoredObject(env, row.r2_thumb_key);
         if (!obj) {
             return Response.json(
                 { ok: false, error: { code: 'NOT_FOUND', message: 'Thumbnail blob missing' } },
@@ -1520,8 +1543,7 @@ export async function handleAgentWebRoutes(request: Request, env: Env, url: URL)
             );
         }
         const headers = new Headers();
-        obj.writeHttpMetadata(headers);
-        const servedType = (headers.get('Content-Type') ?? '').split(';')[0]!.trim().toLowerCase();
+        const servedType = (obj.contentType ?? '').split(';')[0]!.trim().toLowerCase();
         if (servedType === 'image/png' || servedType === 'image/jpeg' || servedType === 'image/webp') {
             headers.set('Content-Type', servedType);
             headers.set('Content-Disposition', 'inline');

@@ -581,7 +581,7 @@
                                 type="button"
                                 class="rounded-md border border-destructive/40 px-3 py-1.5 font-medium text-destructive hover:bg-destructive/10 disabled:opacity-50"
                                 :disabled="cleaningDb || !cleanupPreview || cleanupPreview.totalRows === 0"
-                                @click="requestCleanupConfirm('delete')">
+                                @click="requestCleanupConfirm('delete', 'auto')">
                                 {{ t('cloud_hub.quota.cleanup_direct_btn') }}
                             </button>
                             <button
@@ -589,14 +589,24 @@
                                 class="rounded-md bg-primary px-3 py-1.5 font-medium text-primary-foreground hover:opacity-90 disabled:opacity-50"
                                 :disabled="
                                     cleaningDb ||
-                                    !quotaInfo?.r2Enabled ||
+                                    (!quotaInfo?.r2Enabled && !cleanupPreview?.b2Enabled) ||
                                     !cleanupPreview ||
                                     cleanupPreview.totalRows === 0
                                 "
-                                @click="requestCleanupConfirm('backup_and_delete')">
+                                @click="requestCleanupConfirm('backup_and_delete', 'auto')">
                                 {{ t('cloud_hub.quota.cleanup_backup_r2_btn') }}
                             </button>
-                            <span v-if="quotaInfo && !quotaInfo.r2Enabled" class="text-[11px] text-muted-foreground">
+                            <button
+                                v-if="cleanupPreview?.b2Enabled"
+                                type="button"
+                                class="rounded-md border border-primary/50 px-3 py-1.5 font-medium text-primary hover:bg-primary/10 disabled:opacity-50"
+                                :disabled="cleaningDb || !cleanupPreview || cleanupPreview.totalRows === 0"
+                                @click="requestCleanupConfirm('backup_and_delete', 'b2')">
+                                {{ t('cloud_hub.quota.cleanup_backup_b2_btn') }}
+                            </button>
+                            <span
+                                v-if="quotaInfo && !quotaInfo.r2Enabled && !cleanupPreview?.b2Enabled"
+                                class="text-[11px] text-muted-foreground">
                                 {{ t('cloud_hub.quota.cleanup_r2_unbound') }}
                             </span>
                         </div>
@@ -607,10 +617,15 @@
                             <div class="text-[11px] font-medium text-foreground">
                                 {{
                                     pendingCleanupMode === 'backup_and_delete'
-                                        ? t('cloud_hub.quota.cleanup_confirm_backup_desc', {
-                                              months: resolvedCleanupMonths,
-                                              rows: (cleanupPreview?.totalRows ?? 0).toLocaleString()
-                                          })
+                                        ? pendingCleanupTarget === 'b2' || cleanupPreview?.overflowActive
+                                            ? t('cloud_hub.quota.cleanup_confirm_backup_b2_desc', {
+                                                  months: resolvedCleanupMonths,
+                                                  rows: (cleanupPreview?.totalRows ?? 0).toLocaleString()
+                                              })
+                                            : t('cloud_hub.quota.cleanup_confirm_backup_desc', {
+                                                  months: resolvedCleanupMonths,
+                                                  rows: (cleanupPreview?.totalRows ?? 0).toLocaleString()
+                                              })
                                         : t('cloud_hub.quota.cleanup_confirm_direct_desc', {
                                               months: resolvedCleanupMonths,
                                               rows: (cleanupPreview?.totalRows ?? 0).toLocaleString()
@@ -647,7 +662,7 @@
                         <p v-if="cleanupNotice" class="text-[11px] text-primary">{{ cleanupNotice }}</p>
                         <p v-if="cleanupError" class="text-[11px] text-destructive">{{ cleanupError }}</p>
 
-                        <div v-if="quotaInfo?.r2Enabled && cleanupBackups.length > 0" class="space-y-1.5 pt-1">
+                        <div v-if="cleanupBackups.length > 0" class="space-y-1.5 pt-1">
                             <div class="text-[11px] font-medium text-muted-foreground">
                                 {{ t('cloud_hub.quota.cleanup_r2_backups_heading', { count: cleanupBackups.length }) }}
                             </div>
@@ -655,9 +670,18 @@
                                 v-for="item in cleanupBackups"
                                 :key="item.key"
                                 class="flex flex-wrap items-center justify-between gap-2 rounded border border-border px-2.5 py-1.5 text-[11px]">
-                                <div class="min-w-0 truncate">
-                                    <span class="font-mono text-foreground">{{ item.fileName }}</span>
-                                    <span class="ml-2 text-muted-foreground">
+                                <div class="min-w-0 flex items-center gap-1.5 truncate">
+                                    <span
+                                        class="shrink-0 rounded px-1.5 py-0.5 font-mono text-[10px] font-semibold uppercase"
+                                        :class="
+                                            item.provider === 'b2'
+                                                ? 'bg-primary/15 text-primary'
+                                                : 'bg-muted text-muted-foreground'
+                                        ">
+                                        {{ item.provider === 'b2' ? 'B2' : 'R2' }}
+                                    </span>
+                                    <span class="truncate font-mono text-foreground">{{ item.fileName }}</span>
+                                    <span class="shrink-0 text-muted-foreground">
                                         {{ formatBytes(item.bytes) }}
                                         <template v-if="item.totalRows > 0">
                                             · {{ item.totalRows.toLocaleString() }}
@@ -866,6 +890,7 @@
     const cleanupPreview = ref(null);
     const loadingCleanupPreview = ref(false);
     const pendingCleanupMode = ref('');
+    const pendingCleanupTarget = ref('auto');
     const cleaningDb = ref(false);
     const cleanupNotice = ref('');
     const cleanupError = ref('');
@@ -1152,14 +1177,16 @@
         }
     }
 
-    function requestCleanupConfirm(mode) {
+    function requestCleanupConfirm(mode, target = 'auto') {
         cleanupNotice.value = '';
         cleanupError.value = '';
         pendingCleanupMode.value = mode;
+        pendingCleanupTarget.value = target;
     }
 
     async function executeCleanup() {
         const mode = pendingCleanupMode.value;
+        const backupTarget = pendingCleanupTarget.value || 'auto';
         if (!mode || cleaningDb.value) return;
         cleaningDb.value = true;
         cleanupError.value = '';
@@ -1171,18 +1198,20 @@
             let totalBackedUp = 0;
             let backupCount = 0;
             let lastFileName = '';
+            let lastProvider = '';
             let truncated = false;
 
             for (let round = 0; round < 20; round++) {
                 const res = await cloudFetch('/api/admin/cleanup', {
                     method: 'POST',
-                    json: { months, mode, includeLegacy }
+                    json: { months, mode, includeLegacy, backupTarget }
                 });
                 totalDeleted += Number(res?.deletedRows || 0);
                 totalBackedUp += Number(res?.backedUpRows || 0);
                 if (res?.backupFileName) {
                     backupCount++;
                     lastFileName = res.backupFileName;
+                    lastProvider = res.backupProvider === 'b2' ? 'Backblaze B2' : 'R2';
                 }
                 if (!res?.hasMore) break;
                 if (round === 19) truncated = true;
@@ -1190,13 +1219,16 @@
 
             pendingCleanupMode.value = '';
             if (mode === 'backup_and_delete') {
+                const targetLabel = lastProvider || (backupTarget === 'b2' ? 'Backblaze B2' : 'R2');
                 cleanupNotice.value =
                     backupCount > 1
                         ? t('cloud_hub.quota.cleanup_done_backup_multi', {
+                              target: targetLabel,
                               rows: totalDeleted.toLocaleString(),
                               files: backupCount
                           })
                         : t('cloud_hub.quota.cleanup_done_backup', {
+                              target: targetLabel,
                               rows: totalDeleted.toLocaleString(),
                               file: lastFileName || `${totalBackedUp}`
                           });
