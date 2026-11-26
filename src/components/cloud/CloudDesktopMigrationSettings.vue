@@ -253,7 +253,7 @@
                         :key="item.key"
                         class="flex items-start justify-between gap-3 px-3 py-2.5 transition-colors"
                         :class="
-                            item.rowCount > 0 && !isJobActive
+                            item.rowCount > 0 && !isJobActive && !wouldExceedLimit(item)
                                 ? 'cursor-pointer hover:bg-accent/40'
                                 : 'cursor-not-allowed opacity-55'
                         ">
@@ -262,8 +262,8 @@
                                 type="checkbox"
                                 class="mt-0.5 rounded border-input"
                                 :checked="Boolean(selectedCategories[item.key])"
-                                :disabled="item.rowCount <= 0 || isJobActive"
-                                @change="toggleCategory(item.key, $event.target.checked)" />
+                                :disabled="item.rowCount <= 0 || isJobActive || wouldExceedLimit(item)"
+                                @change="toggleCategory(item.key, $event.target.checked, item)" />
                             <div class="min-w-0 space-y-0.5">
                                 <div class="flex flex-wrap items-center gap-2">
                                     <span class="font-medium text-foreground">{{ categoryLabel(item.key) }}</span>
@@ -271,6 +271,11 @@
                                         v-if="importedStats[item.key] > 0"
                                         class="rounded bg-primary/15 px-1.5 py-0.5 text-[10px] font-medium text-primary">
                                         {{ t('cloud_hub.migration.already_imported_badge', { count: importedStats[item.key].toLocaleString() }) }}
+                                    </span>
+                                    <span
+                                        v-if="wouldExceedLimit(item)"
+                                        class="rounded bg-destructive/15 px-1.5 py-0.5 text-[10px] font-medium text-destructive">
+                                        {{ t('cloud_hub.migration.exceeds_500mb_badge') }}
                                     </span>
                                 </div>
                                 <div class="text-[11px] text-muted-foreground">
@@ -380,7 +385,6 @@
         'feed'
     ];
     const LIGHTWEIGHT_CATEGORIES = ['memos_notes', 'favorites', 'avatar_history', 'friend_log', 'moderation_profiles'];
-    const SOFT_LIMIT_BYTES = 480 * 1024 * 1024;
     const WARN_LIMIT_BYTES = 400 * 1024 * 1024;
 
     const loadingState = ref(false);
@@ -479,7 +483,17 @@
         Number(((selectedEstimatedBytes.value / Math.max(1, legacyDbLimitBytes.value)) * 100).toFixed(2))
     );
     const projectedNearLimit = computed(() => projectedTotalBytes.value >= WARN_LIMIT_BYTES);
-    const projectedExceedsLimit = computed(() => projectedTotalBytes.value >= SOFT_LIMIT_BYTES);
+    const projectedExceedsLimit = computed(
+        () =>
+            selectedEstimatedBytes.value > legacyDbLimitBytes.value ||
+            projectedTotalBytes.value > legacyDbLimitBytes.value
+    );
+
+    function wouldExceedLimit(item) {
+        if (!item || selectedCategories[item.key] || item.rowCount <= 0) return false;
+        const nextSelected = selectedEstimatedBytes.value + Number(item.estimatedDbBytes || 0);
+        return nextSelected > legacyDbLimitBytes.value || legacyDbBytes.value + nextSelected > legacyDbLimitBytes.value;
+    }
 
     const jobProgressPercent = computed(() => {
         if (!job.value) return 0;
@@ -524,7 +538,15 @@
         return `${dt.getFullYear()}-${pad(dt.getMonth() + 1)}-${pad(dt.getDate())} ${pad(dt.getHours())}:${pad(dt.getMinutes())}:${pad(dt.getSeconds())}`;
     }
 
-    function toggleCategory(key, checked) {
+    function toggleCategory(key, checked, item = null) {
+        if (checked) {
+            const target = item || mergedCategoryList.value.find((c) => c.key === key);
+            if (target && wouldExceedLimit(target)) {
+                selectedCategories[key] = false;
+                toast.warning(t('cloud_hub.migration.exceeds_500mb_toast'));
+                return;
+            }
+        }
         selectedCategories[key] = Boolean(checked);
     }
 
@@ -536,9 +558,15 @@
 
     function selectLightweightCategories() {
         resetSelectionsToOff();
-        for (const item of mergedCategoryList.value) {
-            if (item.rowCount > 0 && LIGHTWEIGHT_CATEGORIES.includes(item.key)) {
+        let runningBytes = legacyDbBytes.value;
+        const candidates = mergedCategoryList.value
+            .filter((item) => item.rowCount > 0 && LIGHTWEIGHT_CATEGORIES.includes(item.key))
+            .sort((a, b) => a.estimatedDbBytes - b.estimatedDbBytes);
+        for (const item of candidates) {
+            const itemBytes = Number(item.estimatedDbBytes || 0);
+            if (runningBytes + itemBytes <= legacyDbLimitBytes.value) {
                 selectedCategories[item.key] = true;
+                runningBytes += itemBytes;
             }
         }
     }

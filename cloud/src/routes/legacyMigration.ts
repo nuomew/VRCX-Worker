@@ -1289,6 +1289,23 @@ export async function handleLegacyMigrationWebRoutes(
             }
         }
 
+        if (
+            estimatedBytes > LEGACY_DB_FREE_LIMIT_BYTES ||
+            currentBytes + estimatedBytes > LEGACY_DB_FREE_LIMIT_BYTES
+        ) {
+            return Response.json(
+                {
+                    ok: false,
+                    error: {
+                        code: 'SELECTION_EXCEEDS_LIMIT',
+                        message:
+                            'Selected legacy data plus current DB_LEGACY usage exceeds the 500 MB single-database maximum. Please uncheck larger categories.'
+                    }
+                },
+                { status: 400 }
+            );
+        }
+
         const jobId = `mig_${randomHex(8)}`;
         const effectiveDeviceId = targetDeviceId || inventory?.deviceId || '';
         const dispatch = await dispatchAgentCommandInternal(env, {

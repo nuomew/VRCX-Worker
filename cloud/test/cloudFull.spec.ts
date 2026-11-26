@@ -5827,6 +5827,89 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
             });
             expect(emptyStartRes.status).toBe(400);
 
+            // 3b. Selecting categories whose projected DB_LEGACY footprint exceeds 500 MB MUST be rejected (HTTP 400)
+            const oversizedInvRes = await exports.default.fetch('http://example.com/api/agent/migration/inventory', {
+                method: 'POST',
+                headers: agentHeaders,
+                body: JSON.stringify({
+                    deviceName: 'Legacy-Migration-PC',
+                    dbFound: true,
+                    dbFileName: 'VRCX.sqlite3',
+                    dbFileBytes: 700 * 1024 * 1024,
+                    sharedCategories: [
+                        { key: 'memos_notes', rowCount: 2, rawBytes: 256, estimatedDbBytes: 4096, tables: ['memos'] },
+                        {
+                            key: 'gamelog',
+                            rowCount: 1_500_000,
+                            rawBytes: 400 * 1024 * 1024,
+                            estimatedDbBytes: 510 * 1024 * 1024,
+                            tables: ['gamelog_location']
+                        },
+                        { key: 'settings', rowCount: 2, rawBytes: 128, estimatedDbBytes: 4096, tables: ['configs'] }
+                    ],
+                    accounts: [
+                        {
+                            prefix: 'usr11112222333344445555666677778888',
+                            label: 'usr_11112222-3333-4444-5555-666677778888',
+                            categories: [
+                                {
+                                    key: 'feed',
+                                    rowCount: 1,
+                                    rawBytes: 200,
+                                    estimatedDbBytes: 4096,
+                                    tables: ['usr11112222333344445555666677778888_feed_gps']
+                                }
+                            ]
+                        }
+                    ]
+                })
+            });
+            expect(oversizedInvRes.status).toBe(200);
+            const over500Res = await exports.default.fetch('http://example.com/api/migration/start', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+                body: JSON.stringify({
+                    deviceId,
+                    accountPrefix: 'usr11112222333344445555666677778888',
+                    categories: ['memos_notes', 'gamelog']
+                })
+            });
+            expect(over500Res.status).toBe(400);
+            const over500Json = (await over500Res.json()) as { ok: boolean; error?: { code?: string } };
+            expect(over500Json.error?.code).toBe('SELECTION_EXCEEDS_LIMIT');
+
+            // Restore normal-sized inventory before continuing full migration flow
+            await exports.default.fetch('http://example.com/api/agent/migration/inventory', {
+                method: 'POST',
+                headers: agentHeaders,
+                body: JSON.stringify({
+                    deviceName: 'Legacy-Migration-PC',
+                    dbFound: true,
+                    dbFileName: 'VRCX.sqlite3',
+                    dbFileBytes: 12_345_678,
+                    sharedCategories: [
+                        { key: 'memos_notes', rowCount: 2, rawBytes: 256, estimatedDbBytes: 4096, tables: ['memos'] },
+                        { key: 'gamelog', rowCount: 2, rawBytes: 512, estimatedDbBytes: 4096, tables: ['gamelog_location'] },
+                        { key: 'settings', rowCount: 2, rawBytes: 128, estimatedDbBytes: 4096, tables: ['configs'] }
+                    ],
+                    accounts: [
+                        {
+                            prefix: 'usr11112222333344445555666677778888',
+                            label: 'usr_11112222-3333-4444-5555-666677778888',
+                            categories: [
+                                {
+                                    key: 'feed',
+                                    rowCount: 1,
+                                    rawBytes: 200,
+                                    estimatedDbBytes: 4096,
+                                    tables: ['usr11112222333344445555666677778888_feed_gps']
+                                }
+                            ]
+                        }
+                    ]
+                })
+            });
+
             // Seed an active DB_CORE memo & theme setting to verify active DB_CORE precedence over DB_LEGACY
             const seedMemoRes = await exports.default.fetch('http://example.com/api/memos', {
                 method: 'PUT',
