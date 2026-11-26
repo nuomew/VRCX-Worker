@@ -155,6 +155,20 @@ describe('Tools.vue', () => {
         expect(push).toHaveBeenCalledWith({ name: 'avatar-search' });
     });
 
+    test('renders chat translator under system tools and navigates to chat-translator route', async () => {
+        const wrapper = mount(Tools);
+        await flushPromises();
+
+        const systemHeader = findCategoryHeaderByTitle(wrapper, 'view.tools.system_tools.header');
+        expect(systemHeader).toBeTruthy();
+
+        const chatTranslatorItem = findToolItemByTitle(wrapper, 'view.tools.system_tools.chat_translator');
+        expect(chatTranslatorItem).toBeTruthy();
+
+        await chatTranslatorItem.trigger('click');
+        expect(push).toHaveBeenCalledWith({ name: 'chat-translator' });
+    });
+
     test('useNavLayout preserves non-feed reload target routes instead of redirecting to first nav item', async () => {
         const memStore = new Map();
         getString.mockImplementation(async (key, fallback = null) =>

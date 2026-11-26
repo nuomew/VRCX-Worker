@@ -7555,4 +7555,187 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
             ).run();
         }
     });
+
+    it('supports VRChat OSC chat translator commands, loopback validation, agent chat sync, and delivery status updates', async () => {
+        const guardedEnv: Env = { ...env, AGENT_SYNC_KEY: 'osc-chat-test-sync-key' };
+        const deviceId = 'win-osc-chat-device';
+
+        try {
+            // 1. Strict SSRF & parameter validation on /api/commands for OSC actions
+            const hostOverrideRes = await exports.default.fetch('http://example.com/api/commands', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+                body: JSON.stringify({
+                    action: 'send_osc_chatbox',
+                    params: { message: 'hello', oscHost: '169.254.169.254', oscPort: 9000 }
+                })
+            });
+            expect(hostOverrideRes.status).toBe(400);
+
+            const badPortRes = await exports.default.fetch('http://example.com/api/commands', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+                body: JSON.stringify({
+                    action: 'send_osc_chatbox',
+                    params: { message: 'hello', oscPort: 80 }
+                })
+            });
+            expect(badPortRes.status).toBe(400);
+
+            // 2. Register online Windows companion via /api/agent/chat/sync with an incoming desktop OSC message
+            const firstAgentSync = await worker.fetch(
+                new Request('http://example.com/api/agent/chat/sync', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        Authorization: 'Bearer osc-chat-test-sync-key',
+                        'X-Device-Id': deviceId,
+                        'X-Device-Name': 'VR-Rig-OSC'
+                    },
+                    body: JSON.stringify({
+                        oscState: {
+                            enabled: true,
+                            sendPort: 9000,
+                            listenEnabled: true,
+                            listenPort: 9002,
+                            forwardToVrchat: true,
+                            vrcRunning: true
+                        },
+                        messages: [
+                            {
+                                id: 'osc_desktop_01',
+                                direction: 'desktop_sync',
+                                sourceText: 'こんにちは VRChat',
+                                sentText: 'こんにちは VRChat',
+                                oscPort: 9000,
+                                createdAt: '2026-11-26T09:00:00.000Z'
+                            }
+                        ]
+                    })
+                }),
+                guardedEnv
+            );
+            expect(firstAgentSync.status).toBe(200);
+            const firstSyncJson = (await firstAgentSync.json()) as { data: { ingested: number } };
+            expect(firstSyncJson.data.ingested).toBe(1);
+
+            // 3. Web fetches chat messages (touches chat_web_active) and sees synced desktop message + device OSC state
+            const listRes = await exports.default.fetch('http://example.com/api/chat/messages?limit=20');
+            expect(listRes.status).toBe(200);
+            const listJson = (await listRes.json()) as {
+                data: {
+                    messages: Array<{ id: string; sourceText: string; direction: string }>;
+                    devices: Array<{ deviceId: string; vrcRunning: boolean; osc: { listenEnabled: boolean; listenPort: number } }>;
+                };
+            };
+            expect(listJson.data.messages.some((m) => m.id === 'osc_desktop_01' && m.direction === 'desktop_sync')).toBe(true);
+            const oscDev = listJson.data.devices.find((d) => d.deviceId === deviceId);
+            expect(oscDev?.vrcRunning).toBe(true);
+            expect(oscDev?.osc.listenEnabled).toBe(true);
+            expect(oscDev?.osc.listenPort).toBe(9002);
+
+            // 4. Web patches translation onto desktop-synced message
+            const patchRes = await exports.default.fetch('http://example.com/api/chat/messages/osc_desktop_01', {
+                method: 'PATCH',
+                headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+                body: JSON.stringify({ translatedText: 'Hello VRChat', targetLang: 'en' })
+            });
+            expect(patchRes.status).toBe(200);
+            const patchJson = (await patchRes.json()) as { data: { message: { translatedText: string } } };
+            expect(patchJson.data.message.translatedText).toBe('Hello VRChat');
+
+            // 5. Web sends a translated message to VRChat OSC -> queued command claimed by agent chat sync -> result updates status to 'sent'
+            const sendRes = await exports.default.fetch('http://example.com/api/chat/send', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+                body: JSON.stringify({
+                    sourceText: '你好！',
+                    translatedText: 'Hello!',
+                    sentText: 'Hello!\n(你好！)',
+                    sourceLang: 'zh-CN',
+                    targetLang: 'en',
+                    displayMode: 'translated_and_source',
+                    immediate: true,
+                    playSfx: false,
+                    oscPort: 9000,
+                    targetDeviceId: deviceId
+                })
+            });
+            expect(sendRes.status).toBe(200);
+            const sendJson = (await sendRes.json()) as {
+                data: {
+                    deliveryStatus: string;
+                    message: { id: string; cmdId: string; status: string };
+                };
+            };
+            expect(sendJson.data.deliveryStatus).toBe('queued');
+            expect(sendJson.data.message.cmdId).toBeTruthy();
+
+            const secondAgentSync = await worker.fetch(
+                new Request('http://example.com/api/agent/chat/sync', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        Authorization: 'Bearer osc-chat-test-sync-key',
+                        'X-Device-Id': deviceId
+                    },
+                    body: JSON.stringify({ messages: [] })
+                }),
+                guardedEnv
+            );
+            expect(secondAgentSync.status).toBe(200);
+            const secondSyncJson = (await secondAgentSync.json()) as {
+                data: {
+                    chatSessionActive: boolean;
+                    pendingCommands: Array<{ cmdId: string; action: string; params: Record<string, unknown> }>;
+                };
+            };
+            expect(secondSyncJson.data.chatSessionActive).toBe(true);
+            const oscCmd = secondSyncJson.data.pendingCommands.find((c) => c.cmdId === sendJson.data.message.cmdId);
+            expect(oscCmd?.action).toBe('send_osc_chatbox');
+            expect(oscCmd?.params.message).toBe('Hello!\n(你好！)');
+            expect(oscCmd?.params.playSfx).toBe(false);
+
+            // Agent reports execution success -> chat message transitions to 'sent'
+            const reportRes = await worker.fetch(
+                new Request(`http://example.com/api/agent/commands/${encodeURIComponent(sendJson.data.message.cmdId)}/result`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        Authorization: 'Bearer osc-chat-test-sync-key',
+                        'X-Device-Id': deviceId
+                    },
+                    body: JSON.stringify({ status: 'succeeded', message: 'Sent OSC chatbox message' })
+                }),
+                guardedEnv
+            );
+            expect(reportRes.status).toBe(200);
+
+            const afterReport = await exports.default.fetch('http://example.com/api/chat/messages?limit=20&heartbeat=0');
+            const afterJson = (await afterReport.json()) as {
+                data: { messages: Array<{ id: string; status: string }> };
+            };
+            const delivered = afterJson.data.messages.find((m) => m.id === sendJson.data.message.id);
+            expect(delivered?.status).toBe('sent');
+
+            // 6. Delete single & clear all
+            const delOne = await exports.default.fetch(
+                `http://example.com/api/chat/messages?id=${encodeURIComponent('osc_desktop_01')}`,
+                { method: 'DELETE', headers: { Origin: 'http://example.com' } }
+            );
+            expect(delOne.status).toBe(200);
+            const delAll = await exports.default.fetch('http://example.com/api/chat/messages', {
+                method: 'DELETE',
+                headers: { Origin: 'http://example.com' }
+            });
+            expect(delAll.status).toBe(200);
+        } finally {
+            await env.DB_CORE.batch([
+                env.DB_CORE.prepare('DELETE FROM cloud_chat_messages'),
+                env.DB_CORE.prepare('DELETE FROM cloud_devices WHERE device_id = ?').bind(deviceId),
+                env.DB_CORE.prepare('DELETE FROM cloud_device_states WHERE device_id = ?').bind(deviceId),
+                env.DB_CORE.prepare("DELETE FROM cloud_bg_sync_state WHERE state_key = 'chat_web_active'")
+            ]).catch(() => {});
+        }
+    });
 });

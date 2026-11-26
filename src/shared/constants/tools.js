@@ -168,6 +168,16 @@ const toolDefinitions = [
         action: { type: 'dialog', dialogKey: 'auto-change-status' }
     },
     {
+        key: 'chat-translator',
+        category: 'system',
+        iconKey: 'languages',
+        navIcon: 'ri-translate-2',
+        titleKey: 'view.tools.system_tools.chat_translator',
+        descriptionKey: 'view.tools.system_tools.chat_translator_description',
+        navEligible: true,
+        action: { type: 'route', routeName: 'chat-translator' }
+    },
+    {
         key: 'group-calendar',
         category: 'group',
         iconKey: 'calendar',

@@ -294,6 +294,61 @@ public sealed class HttpSyncClient
     }
 
     /// <summary>
+    /// Lightweight chat/OSC sync to `POST /api/agent/chat/sync` for low-latency OSC message delivery
+    /// and uploading locally captured OSC chatbox messages.
+    /// </summary>
+    public async Task<AgentChatSyncResponse> SyncChatOscAsync(
+        AgentConfig config,
+        IReadOnlyList<OscChatMessageUpload> messages,
+        bool vrcRunning,
+        CancellationToken ct)
+    {
+        if (!config.IsConfigured || !TryNormalizeCloudUrl(config.CloudUrl, out string normalizedBaseUrl))
+        {
+            throw new InvalidOperationException("Cloud URL is not configured.");
+        }
+
+        string endpoint = normalizedBaseUrl + "/api/agent/chat/sync";
+        var payload = new Dictionary<string, object?>
+        {
+            ["messages"] = messages,
+            ["oscState"] = new
+            {
+                enabled = config.OscChatSyncEnabled,
+                sendPort = OscProtocol.IsValidOscPort(config.OscSendPort) ? config.OscSendPort : OscProtocol.DefaultVrChatOscSendPort,
+                listenEnabled = config.OscListenEnabled,
+                listenPort = OscProtocol.IsValidOscPort(config.OscListenPort) ? config.OscListenPort : OscProtocol.DefaultOscRelayListenPort,
+                forwardToVrchat = config.OscForwardToVrchat,
+                vrcRunning
+            }
+        };
+
+        string jsonBody = JsonConvert.SerializeObject(payload);
+        using var req = new HttpRequestMessage(HttpMethod.Post, endpoint)
+        {
+            Content = new StringContent(jsonBody, Encoding.UTF8, "application/json")
+        };
+        HmacSigner.ApplySyncAuthHeaders(req, config);
+
+        using HttpResponseMessage res = await _httpProvider().SendAsync(req, ct).ConfigureAwait(false);
+        string raw = await res.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+        if (!res.IsSuccessStatusCode)
+        {
+            string errDetail = ExtractErrorMessage(raw, $"HTTP {(int)res.StatusCode}");
+            throw new HttpRequestException(AgentStrings.FormatSyncRejected((int)res.StatusCode, errDetail), null, res.StatusCode);
+        }
+
+        JObject root = JObject.Parse(raw);
+        if (root["ok"]?.Value<bool>() != true)
+        {
+            string errDetail = root["error"]?["message"]?.Value<string>() ?? AgentStrings.UnknownSyncError;
+            throw new HttpRequestException(errDetail);
+        }
+
+        return root["data"]?.ToObject<AgentChatSyncResponse>() ?? new AgentChatSyncResponse();
+    }
+
+    /// <summary>
     /// Reports the execution outcome of a command pulled during periodic sync.
     /// </summary>
     public async Task<bool> ReportCommandResultAsync(

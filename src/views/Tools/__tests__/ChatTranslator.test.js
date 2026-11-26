@@ -1,0 +1,272 @@
+import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
+import { ref } from 'vue';
+import { flushPromises, mount } from '@vue/test-utils';
+
+const mocks = vi.hoisted(() => ({
+    push: vi.fn(),
+    cloudFetch: vi.fn(),
+    onCloudChatEvent: vi.fn(() => () => {}),
+    onCloudCommandResult: vi.fn(() => () => {}),
+    translateText: vi.fn(),
+    setTranslationApi: vi.fn(),
+    confirm: vi.fn(),
+    getString: vi.fn(),
+    setString: vi.fn()
+}));
+
+const translationApi = ref(true);
+const translationApiKey = ref('test-key');
+const translationApiType = ref('openai');
+const translationApiEndpoint = ref('https://api.openai.com/v1/chat/completions');
+const translationApiModel = ref('gpt-4o-mini');
+const translationApiPrompt = ref('');
+
+vi.mock('vue-router', async (importOriginal) => {
+    const actual = await importOriginal();
+    return {
+        ...actual,
+        useRouter: () => ({ push: mocks.push })
+    };
+});
+
+vi.mock('vue-i18n', () => ({
+    useI18n: () => ({ t: (key) => key })
+}));
+
+vi.mock('pinia', async (importOriginal) => {
+    const actual = await importOriginal();
+    return {
+        ...actual,
+        storeToRefs: (store) => store
+    };
+});
+
+vi.mock('vue-sonner', () => ({
+    toast: {
+        success: vi.fn(),
+        warning: vi.fn(),
+        error: vi.fn()
+    }
+}));
+
+vi.mock('@/ipc-web/apiClient', () => ({
+    cloudFetch: (...args) => mocks.cloudFetch(...args),
+    onCloudChatEvent: (...args) => mocks.onCloudChatEvent(...args),
+    onCloudCommandResult: (...args) => mocks.onCloudCommandResult(...args)
+}));
+
+vi.mock('@/services/config', () => ({
+    default: {
+        getString: (...args) => mocks.getString(...args),
+        setString: (...args) => mocks.setString(...args)
+    }
+}));
+
+vi.mock('@/stores', () => ({
+    useAdvancedSettingsStore: () => ({
+        translationApi,
+        translationApiKey,
+        translationApiType,
+        translationApiEndpoint,
+        translationApiModel,
+        translationApiPrompt,
+        translateText: (...args) => mocks.translateText(...args),
+        setTranslationApi: (...args) => mocks.setTranslationApi(...args)
+    }),
+    useModalStore: () => ({
+        confirm: (...args) => mocks.confirm(...args)
+    })
+}));
+
+vi.mock('@/views/Settings/dialogs/TranslationApiDialog.vue', () => ({
+    default: {
+        name: 'TranslationApiDialog',
+        template: '<div class="mock-translation-dialog" />',
+        props: ['isTranslationApiDialogVisible']
+    }
+}));
+
+import ChatTranslator from '../ChatTranslator.vue';
+import {
+    buildChatTranslationPrompt,
+    composeOscChatboxPayload,
+    normalizeOscPort,
+    sanitizeOscChatboxText,
+    VRC_OSC_MAX_CHARS,
+    VRC_OSC_MAX_LINES
+} from '../chatTranslatorUtils';
+
+describe('chatTranslatorUtils', () => {
+    test('enforces VRChat 144-char and 9-line limits while preserving emoji code points', () => {
+        const elevenLines = Array.from({ length: 11 }, (_, i) => `L${i + 1}`).join('\n');
+        const lineRes = sanitizeOscChatboxText(elevenLines);
+        expect(lineRes.truncated).toBe(true);
+        expect(lineRes.lineCount).toBe(VRC_OSC_MAX_LINES);
+        expect(lineRes.text.endsWith('L9')).toBe(true);
+
+        const emoji150 = '😀'.repeat(150);
+        const emojiRes = sanitizeOscChatboxText(emoji150);
+        expect(emojiRes.truncated).toBe(true);
+        expect(emojiRes.charCount).toBe(VRC_OSC_MAX_CHARS);
+        expect(Array.from(emojiRes.text)).toHaveLength(VRC_OSC_MAX_CHARS);
+
+        const ctrl = sanitizeOscChatboxText('hello\u0000\u0007\r\nworld');
+        expect(ctrl.text).toBe('hello\nworld');
+    });
+
+    test('composes OSC chatbox payload across all display modes', () => {
+        expect(
+            composeOscChatboxPayload({
+                sourceText: '你好',
+                translatedText: 'Hello',
+                displayMode: 'translated_only'
+            }).text
+        ).toBe('Hello');
+
+        expect(
+            composeOscChatboxPayload({
+                sourceText: '你好',
+                translatedText: 'Hello',
+                displayMode: 'translated_and_source'
+            }).text
+        ).toBe('Hello\n(你好)');
+
+        expect(
+            composeOscChatboxPayload({
+                sourceText: '你好',
+                translatedText: 'Hello',
+                displayMode: 'source_and_translated'
+            }).text
+        ).toBe('你好\n(Hello)');
+
+        expect(
+            composeOscChatboxPayload({
+                sourceText: '你好',
+                translatedText: 'Hello',
+                displayMode: 'source_only'
+            }).text
+        ).toBe('你好');
+    });
+
+    test('normalizes OSC port bounds and builds prompt', () => {
+        expect(normalizeOscPort(9000)).toBe(9000);
+        expect(normalizeOscPort('9005')).toBe(9005);
+        expect(normalizeOscPort(80, 9000)).toBe(9000);
+        expect(normalizeOscPort(70000, 9000)).toBe(9000);
+
+        expect(buildChatTranslationPrompt('zh-CN', 'ja', 'Custom prompt')).toBe('Custom prompt');
+        expect(buildChatTranslationPrompt('zh-CN', 'ja', '')).toContain('Simplified Chinese');
+        expect(buildChatTranslationPrompt('zh-CN', 'ja', '')).toContain('Japanese');
+    });
+});
+
+describe('ChatTranslator.vue', () => {
+    beforeEach(() => {
+        vi.clearAllMocks();
+        vi.stubGlobal('WEB', true);
+        translationApi.value = true;
+        translationApiType.value = 'openai';
+        translationApiEndpoint.value = 'https://api.openai.com/v1/chat/completions';
+        translationApiModel.value = 'gpt-4o-mini';
+        mocks.getString.mockResolvedValue('');
+        mocks.confirm.mockResolvedValue({ ok: true });
+    });
+
+    afterEach(() => {
+        vi.unstubAllGlobals();
+    });
+
+    test('loads synced messages and translates & sends a new web message to VRChat OSC', async () => {
+        mocks.cloudFetch.mockImplementation(async (url, opts) => {
+            if (url.startsWith('/api/chat/messages') && (!opts || !opts.method || opts.method === 'GET')) {
+                return {
+                    messages: [
+                        {
+                            id: 'osc_sync_1',
+                            direction: 'desktop_sync',
+                            sourceText: 'こんにちは',
+                            translatedText: '',
+                            sentText: 'こんにちは',
+                            sourceLang: 'auto',
+                            targetLang: '',
+                            oscPort: 9000,
+                            status: 'synced',
+                            createdAt: '2026-11-26T10:00:00.000Z'
+                        }
+                    ],
+                    devices: [
+                        {
+                            deviceId: 'win-desk-1',
+                            deviceName: 'Main-PC',
+                            online: true,
+                            vrcRunning: true,
+                            osc: {
+                                enabled: true,
+                                sendPort: 9000,
+                                listenEnabled: true,
+                                listenPort: 9002,
+                                forwardToVrchat: true
+                            }
+                        }
+                    ]
+                };
+            }
+            if (url === '/api/chat/send' && opts?.method === 'POST') {
+                return {
+                    deliveryStatus: 'dispatched',
+                    message: {
+                        id: 'chat_sent_1',
+                        direction: 'web_to_vrc',
+                        sourceText: '你好世界',
+                        translatedText: 'Hello world',
+                        sentText: 'Hello world\n(你好世界)',
+                        sourceLang: 'auto',
+                        targetLang: 'en',
+                        oscPort: 9000,
+                        status: 'dispatched',
+                        createdAt: '2026-11-26T10:01:00.000Z'
+                    }
+                };
+            }
+            return {};
+        });
+        mocks.translateText.mockResolvedValue('Hello world');
+
+        const wrapper = mount(ChatTranslator);
+        await flushPromises();
+
+        expect(wrapper.text()).toContain('こんにちは');
+
+        const textarea = wrapper.find('textarea');
+        await textarea.setValue('你好世界');
+
+        const sendBtn = wrapper
+            .findAll('button')
+            .find((b) => b.text().includes('view.tools.chat_translator.translate_and_send_btn'));
+        expect(sendBtn).toBeTruthy();
+        await sendBtn.trigger('click');
+        await flushPromises();
+
+        expect(mocks.translateText).toHaveBeenCalledWith(
+            '你好世界',
+            'en',
+            expect.objectContaining({ type: 'openai' })
+        );
+        expect(mocks.cloudFetch).toHaveBeenCalledWith(
+            '/api/chat/send',
+            expect.objectContaining({
+                method: 'POST',
+                json: expect.objectContaining({
+                    sourceText: '你好世界',
+                    translatedText: 'Hello world',
+                    sentText: 'Hello world\n(你好世界)',
+                    oscPort: 9000,
+                    sendToVrc: true
+                })
+            })
+        );
+        expect(wrapper.text()).toContain('Hello world');
+
+        wrapper.unmount();
+    });
+});

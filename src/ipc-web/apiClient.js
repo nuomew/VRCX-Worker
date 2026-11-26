@@ -13,6 +13,8 @@ let consecutiveWsFailures = 0;
 const gameLogListeners = [];
 /** @type {Array<(msg: any) => void>} */
 const commandResultListeners = [];
+/** @type {Array<(msg: any) => void>} */
+const chatEventListeners = [];
 /** @type {Array<() => void>} */
 const unauthorizedListeners = [];
 
@@ -37,6 +39,14 @@ export function onCloudCommandResult(listener) {
     return () => {
         const idx = commandResultListeners.indexOf(listener);
         if (idx >= 0) commandResultListeners.splice(idx, 1);
+    };
+}
+
+export function onCloudChatEvent(listener) {
+    chatEventListeners.push(listener);
+    return () => {
+        const idx = chatEventListeners.indexOf(listener);
+        if (idx >= 0) chatEventListeners.splice(idx, 1);
     };
 }
 
@@ -275,6 +285,18 @@ export function connectCloudHubWs() {
                         fn(msg);
                     } catch (err) {
                         console.error('[cloud] cmd result listener error', err);
+                    }
+                }
+            } else if (
+                msg.type === 'chat.message' ||
+                msg.type === 'chat.deleted' ||
+                msg.type === 'chat.cleared'
+            ) {
+                for (const fn of chatEventListeners) {
+                    try {
+                        fn(msg);
+                    } catch (err) {
+                        console.error('[cloud] chat event listener error', err);
                     }
                 }
             }

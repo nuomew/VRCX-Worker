@@ -65,6 +65,8 @@ public sealed class RemoteCommandExecutor
                 "quit_vrc" => QuitVrChat(cmdId),
                 "clear_cache" => ClearVrChatCache(cmdId, parameters),
                 "send_vr_notify" => await SendVrNotificationAsync(cmdId, parameters, ct).ConfigureAwait(false),
+                "send_osc_chatbox" => await SendOscChatboxAsync(cmdId, parameters, ct).ConfigureAwait(false),
+                "send_osc_typing" => await SendOscTypingAsync(cmdId, parameters, ct).ConfigureAwait(false),
                 "discord_update" => UpdateDiscordPresence(cmdId, parameters),
                 "sync_now" => await TriggerSyncNowAsync(cmdId, ct).ConfigureAwait(false),
                 "desktop_scan" => await TriggerDesktopScanAsync(cmdId, ct).ConfigureAwait(false),
@@ -237,6 +239,74 @@ public sealed class RemoteCommandExecutor
             CmdId = cmdId,
             Status = sent ? "succeeded" : "failed",
             Message = sent ? $"Dispatched VR notification via {(target == "ovrtoolkit" ? "OVRToolkit" : "XSOverlay")}" : "VR overlay unreachable"
+        };
+    }
+
+    private async Task<CommandExecutionResult> SendOscChatboxAsync(
+        string cmdId,
+        Dictionary<string, object?> parameters,
+        CancellationToken ct)
+    {
+        AgentConfig cfg = _configProvider();
+        if (!cfg.OscChatSyncEnabled)
+        {
+            return new CommandExecutionResult
+            {
+                CmdId = cmdId,
+                Status = "failed",
+                Message = "OSC chat sync is disabled on this Windows companion agent"
+            };
+        }
+
+        string message = GetString(parameters, "message");
+        bool immediate = GetBool(parameters, "immediate", true);
+        bool playSfx = GetBool(parameters, "playSfx", true);
+        int defaultPort = OscProtocol.IsValidOscPort(cfg.OscSendPort)
+            ? cfg.OscSendPort
+            : OscProtocol.DefaultVrChatOscSendPort;
+        int port = parameters.TryGetValue("oscPort", out var rawPort) && rawPort != null && CommandValidator.TryParseValidOscPort(rawPort, out int parsedPort)
+            ? parsedPort
+            : defaultPort;
+
+        var (ok, detail) = await OscProtocol.SendChatboxInputAsync(message, immediate, playSfx, port, ct).ConfigureAwait(false);
+        return new CommandExecutionResult
+        {
+            CmdId = cmdId,
+            Status = ok ? "succeeded" : "failed",
+            Message = detail
+        };
+    }
+
+    private async Task<CommandExecutionResult> SendOscTypingAsync(
+        string cmdId,
+        Dictionary<string, object?> parameters,
+        CancellationToken ct)
+    {
+        AgentConfig cfg = _configProvider();
+        if (!cfg.OscChatSyncEnabled)
+        {
+            return new CommandExecutionResult
+            {
+                CmdId = cmdId,
+                Status = "failed",
+                Message = "OSC chat sync is disabled on this Windows companion agent"
+            };
+        }
+
+        bool isTyping = GetBool(parameters, "typing", false);
+        int defaultPort = OscProtocol.IsValidOscPort(cfg.OscSendPort)
+            ? cfg.OscSendPort
+            : OscProtocol.DefaultVrChatOscSendPort;
+        int port = parameters.TryGetValue("oscPort", out var rawPort) && rawPort != null && CommandValidator.TryParseValidOscPort(rawPort, out int parsedPort)
+            ? parsedPort
+            : defaultPort;
+
+        var (ok, detail) = await OscProtocol.SendChatboxTypingAsync(isTyping, port, ct).ConfigureAwait(false);
+        return new CommandExecutionResult
+        {
+            CmdId = cmdId,
+            Status = ok ? "succeeded" : "failed",
+            Message = detail
         };
     }
 

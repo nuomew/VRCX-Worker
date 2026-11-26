@@ -210,6 +210,30 @@ public static class AgentStrings
     public static string MenuCompressScreenshots => IsChinese
         ? "压缩上传照片"
         : "Compress Screenshots";
+    public static string MenuOscChatSync => IsChinese
+        ? "VRChat OSC 聊天同步"
+        : "VRChat OSC Chat Sync";
+    public static string MenuOscRelayListen => IsChinese
+        ? "本地 OSC 监听中继 (9002→9000)"
+        : "Local OSC Relay Listener (9002->9000)";
+    public static string OscChatSyncCheckbox => IsChinese
+        ? "启用 VRChat OSC 聊天与翻译同步（网页发送 / 桌面中继）"
+        : "Enable VRChat OSC chat && translation sync";
+    public static string BalloonOscChatSyncOn => IsChinese
+        ? "已开启 VRChat OSC 聊天同步。"
+        : "VRChat OSC chat sync enabled.";
+    public static string BalloonOscChatSyncOff => IsChinese
+        ? "已关闭 VRChat OSC 聊天同步。"
+        : "VRChat OSC chat sync disabled.";
+    public static string FormatBalloonOscRelayOn(int listenPort, int sendPort) => IsChinese
+        ? $"已开启本地 OSC 监听中继（127.0.0.1:{listenPort} → {sendPort}），外部 OSC 聊天将自动同步至网页。"
+        : $"Local OSC relay ON (127.0.0.1:{listenPort} -> {sendPort}). External OSC chat now syncs to Web.";
+    public static string BalloonOscRelayOff => IsChinese
+        ? "已关闭本地 OSC 监听中继。"
+        : "Local OSC relay listener OFF.";
+    public static string FormatBalloonOscRelayFailed(int listenPort) => IsChinese
+        ? $"无法监听本机 UDP 端口 {listenPort}，请确认端口未被其他程序占用。"
+        : $"Could not bind loopback UDP port {listenPort}. Check if another app is using it.";
     public static string MenuSyncNow => IsChinese ? "立即同步" : "Sync Now";
     public static string MenuOpenWebUi => IsChinese ? "打开云端网页" : "Open Cloud Web UI";
     public static string MenuAutoStart => IsChinese ? "开机自动后台启动" : "Start with Windows";

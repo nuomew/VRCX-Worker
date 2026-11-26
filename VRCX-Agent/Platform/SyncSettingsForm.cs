@@ -27,6 +27,7 @@ public sealed class SyncSettingsForm : Form
     private readonly TextBox _proxyAddressBox;
     private readonly CheckBox _autoUploadScreenshotsCheck;
     private readonly CheckBox _compressScreenshotsCheck;
+    private readonly CheckBox _oscChatSyncCheck;
     private readonly CheckBox _autoStartCheck;
     private readonly CheckBox _autoCheckUpdatesCheck;
     private readonly Label _statusLabel;
@@ -63,7 +64,7 @@ public sealed class SyncSettingsForm : Form
         MaximizeBox = false;
         MinimizeBox = false;
         StartPosition = FormStartPosition.CenterScreen;
-        ClientSize = new Size(504, 538);
+        ClientSize = new Size(504, 568);
         _uiFont = new Font(AgentStrings.UiFontFamily, 9.5f);
         Font = _uiFont;
 
@@ -184,10 +185,18 @@ public sealed class SyncSettingsForm : Form
             _compressScreenshotsCheck.Enabled = _autoUploadScreenshotsCheck.Checked;
         };
 
+        _oscChatSyncCheck = new CheckBox
+        {
+            Text = AgentStrings.OscChatSyncCheckbox,
+            Location = new Point(20, 358),
+            AutoSize = true,
+            Checked = currentConfig.OscChatSyncEnabled
+        };
+
         _autoStartCheck = new CheckBox
         {
             Text = AgentStrings.AutoStartCheckbox,
-            Location = new Point(20, 358),
+            Location = new Point(20, 388),
             AutoSize = true,
             Checked = autoStartEnabled
         };
@@ -195,14 +204,14 @@ public sealed class SyncSettingsForm : Form
         _autoCheckUpdatesCheck = new CheckBox
         {
             Text = AgentStrings.AutoCheckUpdatesCheckbox,
-            Location = new Point(20, 388),
+            Location = new Point(20, 418),
             AutoSize = true,
             Checked = currentConfig.AutoCheckUpdates
         };
 
         _statusLabel = new Label
         {
-            Location = new Point(20, 422),
+            Location = new Point(20, 452),
             Size = new Size(464, 48),
             ForeColor = Color.DimGray,
             Text = AgentStrings.SettingsDefaultHint
@@ -211,7 +220,7 @@ public sealed class SyncSettingsForm : Form
         _exportButton = new Button
         {
             Text = AgentStrings.ExportCloudDataButton,
-            Location = new Point(20, 482),
+            Location = new Point(20, 512),
             Width = 104,
             Height = 34,
             Visible = _onExportCloudData != null
@@ -230,7 +239,7 @@ public sealed class SyncSettingsForm : Form
         _saveButton = new Button
         {
             Text = AgentStrings.TestAndSaveButton,
-            Location = new Point(298, 482),
+            Location = new Point(298, 512),
             Width = 88,
             Height = 34
         };
@@ -239,7 +248,7 @@ public sealed class SyncSettingsForm : Form
         var cancelButton = new Button
         {
             Text = AgentStrings.CancelButton,
-            Location = new Point(396, 482),
+            Location = new Point(396, 512),
             Width = 88,
             Height = 34,
             DialogResult = DialogResult.Cancel
@@ -253,6 +262,7 @@ public sealed class SyncSettingsForm : Form
             networkGroup,
             _autoUploadScreenshotsCheck,
             _compressScreenshotsCheck,
+            _oscChatSyncCheck,
             _autoStartCheck,
             _autoCheckUpdatesCheck,
             _statusLabel,
@@ -386,6 +396,11 @@ public sealed class SyncSettingsForm : Form
                 AutoCheckUpdates = _autoCheckUpdatesCheck.Checked,
                 WritePngMetadata = _initialConfig.WritePngMetadata,
                 AutoLaunchAppsEnabled = _initialConfig.AutoLaunchAppsEnabled,
+                OscChatSyncEnabled = _oscChatSyncCheck.Checked,
+                OscSendPort = _initialConfig.OscSendPort,
+                OscListenEnabled = _initialConfig.OscListenEnabled,
+                OscListenPort = _initialConfig.OscListenPort,
+                OscForwardToVrchat = _initialConfig.OscForwardToVrchat,
                 VrChatLogDirectory = _initialConfig.VrChatLogDirectory,
                 AutoLaunchDirectory = _initialConfig.AutoLaunchDirectory,
                 VrChatExecutableOverride = _initialConfig.VrChatExecutableOverride

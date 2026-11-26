@@ -28,6 +28,12 @@ import {
     getCloudSyncIntervalSeconds,
     resolveRecentHttpAgents
 } from './coreData';
+import {
+    isChatWebSessionActive,
+    parseOscPort,
+    sanitizeOscChatboxText,
+    syncChatMessageStatusByCmdId
+} from './chatOscRoutes';
 import { type GameLogIngestItem, ingestGameLogItems } from './eventsData';
 
 // Strict command allowlist (R.A.I.L.G.U.A.R.D.)
@@ -36,6 +42,8 @@ const ALLOWED_ACTIONS = new Set([
     'quit_vrc',
     'clear_cache',
     'send_vr_notify',
+    'send_osc_chatbox',
+    'send_osc_typing',
     'discord_update',
     'sync_now',
     'desktop_scan',
@@ -222,6 +230,35 @@ export function validateCommand(
         const jobId = typeof params.jobId === 'string' ? params.jobId.trim() : '';
         if (!MIGRATION_JOB_ID_RE.test(jobId)) {
             return { ok: false, message: 'desktop_migrate_cancel requires a valid jobId' };
+        }
+    } else if (action === 'send_osc_chatbox') {
+        // Security: disallow arbitrary target hosts; agent sends strictly to loopback 127.0.0.1.
+        if (params.oscHost !== undefined || params.host !== undefined) {
+            return { ok: false, message: 'send_osc_chatbox does not allow overriding target host' };
+        }
+        const rawMsg = typeof params.message === 'string' ? params.message : '';
+        const sanitized = sanitizeOscChatboxText(rawMsg);
+        if (!sanitized) {
+            return { ok: false, message: 'send_osc_chatbox requires a non-empty message (max 144 chars)' };
+        }
+        if (params.immediate !== undefined && typeof params.immediate !== 'boolean') {
+            return { ok: false, message: 'send_osc_chatbox immediate must be a boolean' };
+        }
+        if (params.playSfx !== undefined && typeof params.playSfx !== 'boolean') {
+            return { ok: false, message: 'send_osc_chatbox playSfx must be a boolean' };
+        }
+        if (parseOscPort(params.oscPort) === null) {
+            return { ok: false, message: 'send_osc_chatbox oscPort must be an integer between 1024 and 65535' };
+        }
+    } else if (action === 'send_osc_typing') {
+        if (params.oscHost !== undefined || params.host !== undefined) {
+            return { ok: false, message: 'send_osc_typing does not allow overriding target host' };
+        }
+        if (typeof params.typing !== 'boolean') {
+            return { ok: false, message: 'send_osc_typing requires a boolean typing flag' };
+        }
+        if (parseOscPort(params.oscPort) === null) {
+            return { ok: false, message: 'send_osc_typing oscPort must be an integer between 1024 and 65535' };
         }
     }
     return { ok: true };
@@ -1150,7 +1187,10 @@ export async function handleAgentPublicRoutes(request: Request, env: Env, url: U
         // Periodic HTTP sync persists live state into DB_CORE.cloud_device_states and GameLog into DB_GAMELOG
         // without waking AgentHubDO on every 60s tick (preserving Free-tier Durable Object quotas).
 
-        const syncIntervalSeconds = await getCloudSyncIntervalSeconds(env);
+        const [syncIntervalSeconds, chatSession] = await Promise.all([
+            getCloudSyncIntervalSeconds(env),
+            isChatWebSessionActive(env)
+        ]);
         await accrueCloudUptime(env.DB_CORE, nowIso, Math.max(syncIntervalSeconds * 3, 360));
         const syncedMs = Date.parse(nowIso);
         const nextSyncAt = new Date(syncedMs + syncIntervalSeconds * 1000).toISOString();
@@ -1164,6 +1204,7 @@ export async function handleAgentPublicRoutes(request: Request, env: Env, url: U
                 syncIntervalSeconds,
                 nextSyncAt,
                 ingest,
+                chatSessionActive: chatSession.active,
                 pendingCommands
             }
         });
@@ -1230,6 +1271,8 @@ export async function handleAgentPublicRoutes(request: Request, env: Env, url: U
         )
             .bind(status, resultJson, nowIso, cmdId, auth.deviceId)
             .run();
+
+        await syncChatMessageStatusByCmdId(env, cmdId, status, String(body.message ?? ''));
 
         return Response.json({ ok: true, data: { cmdId, status } });
     }

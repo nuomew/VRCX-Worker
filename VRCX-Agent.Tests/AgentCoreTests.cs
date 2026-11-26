@@ -3079,6 +3079,129 @@ INSERT INTO {acctPrefix}_friend_log_history (created_at, type, user_id, display_
         }
     }
 
+    [Fact]
+    public async Task OscProtocol_And_Bridge_ValidateCommandsEncodeDecodeAndRelayLoopback()
+    {
+        // 1. OSC 1.0 /chatbox/input encode + decode roundtrip with UTF-8 CJK + emoji and 4-byte alignment
+        byte[] inputPacket = OscProtocol.BuildChatboxInputPacket("你好 VRChat 😀", immediate: true, playSfx: false);
+        Assert.Equal(0, inputPacket.Length % 4);
+        Assert.True(OscProtocol.TryExtractChatboxInput(inputPacket, out string decodedText, out bool immediate, out bool playSfx));
+        Assert.Equal("你好 VRChat 😀", decodedText);
+        Assert.True(immediate);
+        Assert.False(playSfx);
+
+        // 2. OSC /chatbox/typing encode + decode roundtrip
+        byte[] typingPacket = OscProtocol.BuildChatboxTypingPacket(true);
+        Assert.Equal(0, typingPacket.Length % 4);
+        Assert.True(OscProtocol.TryParseMessage(typingPacket, out ParsedOscMessage? parsedTyping));
+        Assert.Equal("/chatbox/typing", parsedTyping!.Address);
+        Assert.Equal(",T", parsedTyping.TypeTags);
+        Assert.Single(parsedTyping.Arguments);
+        Assert.Equal(true, parsedTyping.Arguments[0]);
+
+        // 3. VRChat 144-rune and 9-line sanitization
+        string longEmoji = string.Concat(Enumerable.Repeat("🌸", 160));
+        string sanitizedEmoji = OscProtocol.SanitizeChatboxMessage(longEmoji);
+        Assert.Equal(144, sanitizedEmoji.EnumerateRunes().Count());
+
+        string twelveLines = string.Join("\n", Enumerable.Range(1, 12).Select(i => $"Line{i}"));
+        string sanitizedLines = OscProtocol.SanitizeChatboxMessage(twelveLines);
+        Assert.Equal(9, sanitizedLines.Split('\n').Length);
+
+        // 4. CommandValidator allowlist & anti-SSRF host rejection for OSC actions
+        Assert.True(CommandValidator.ValidateRemoteCommand("send_osc_chatbox", new Dictionary<string, object?>
+        {
+            ["message"] = "Hello VRChat",
+            ["immediate"] = true,
+            ["playSfx"] = true,
+            ["oscPort"] = 9000
+        }).Ok);
+        Assert.False(CommandValidator.ValidateRemoteCommand("send_osc_chatbox", new Dictionary<string, object?>
+        {
+            ["message"] = "Hello",
+            ["oscHost"] = "169.254.169.254"
+        }).Ok);
+        Assert.False(CommandValidator.ValidateRemoteCommand("send_osc_chatbox", new Dictionary<string, object?>
+        {
+            ["message"] = "   "
+        }).Ok);
+        Assert.False(CommandValidator.ValidateRemoteCommand("send_osc_chatbox", new Dictionary<string, object?>
+        {
+            ["message"] = "Hello",
+            ["oscPort"] = 80
+        }).Ok);
+        Assert.True(CommandValidator.ValidateRemoteCommand("send_osc_typing", new Dictionary<string, object?>
+        {
+            ["typing"] = true,
+            ["oscPort"] = 9000
+        }).Ok);
+        Assert.False(CommandValidator.ValidateRemoteCommand("send_osc_typing", new Dictionary<string, object?>
+        {
+            ["typing"] = "yes"
+        }).Ok);
+
+        // 5. OscChatBridge rejects self-loop configuration and relays loopback packets cleanly
+        using var bridge = new OscChatBridge();
+        Assert.False(bridge.Reconfigure(enabled: true, listenPort: 9000, forwardSendPort: 9000, forwardToVrchat: true));
+
+        using var receiver = new System.Net.Sockets.UdpClient(new System.Net.IPEndPoint(System.Net.IPAddress.Loopback, 0));
+        int targetPort = ((System.Net.IPEndPoint)receiver.Client.LocalEndPoint!).Port;
+        using var probeSocket = new System.Net.Sockets.UdpClient(new System.Net.IPEndPoint(System.Net.IPAddress.Loopback, 0));
+        int relayPort = ((System.Net.IPEndPoint)probeSocket.Client.LocalEndPoint!).Port;
+        probeSocket.Dispose();
+
+        Assert.True(bridge.Reconfigure(enabled: true, listenPort: relayPort, forwardSendPort: targetPort, forwardToVrchat: true));
+        var (sentOk, _) = await OscProtocol.SendChatboxInputAsync("Relay test 消息", immediate: true, playSfx: true, port: relayPort);
+        Assert.True(sentOk);
+
+        using var recvCts = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+        var forwarded = await receiver.ReceiveAsync(recvCts.Token);
+        Assert.True(OscProtocol.TryExtractChatboxInput(forwarded.Buffer, out string fwdText, out bool fwdImm, out bool fwdSfx));
+        Assert.Equal("Relay test 消息", fwdText);
+        Assert.True(fwdImm);
+        Assert.True(fwdSfx);
+
+        List<OscChatMessageUpload> buffered = bridge.PeekBatch(10);
+        Assert.Single(buffered);
+        Assert.Equal("Relay test 消息", buffered[0].SourceText);
+        bridge.AcknowledgeBatch(1);
+        Assert.Equal(0, bridge.PendingCount);
+
+        // 6. HttpSyncClient.SyncChatOscAsync posts messages + oscState and parses pendingCommands
+        string? capturedBody = null;
+        using var stubHttp = new HttpClient(new StubHttpHandler(async req =>
+        {
+            Assert.Equal("/api/agent/chat/sync", req.RequestUri!.AbsolutePath);
+            capturedBody = await req.Content!.ReadAsStringAsync();
+            return new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(
+                    "{\"ok\":true,\"data\":{\"deviceId\":\"win-1\",\"syncedAt\":\"2026-11-26T10:00:00Z\",\"ingested\":1,\"chatSessionActive\":true,\"pendingCommands\":[{\"cmdId\":\"cmd_osc_1\",\"action\":\"send_osc_chatbox\",\"params\":{\"message\":\"Hi\"}}]}}",
+                    Encoding.UTF8,
+                    "application/json")
+            };
+        }));
+        var syncClient = new HttpSyncClient(stubHttp);
+        var cfg = new AgentConfig
+        {
+            CloudUrl = "https://vrcx.example.workers.dev",
+            SyncSecret = "vrcx_sync_test_secret",
+            OscChatSyncEnabled = true,
+            OscSendPort = 9000,
+            OscListenEnabled = true,
+            OscListenPort = 9002
+        };
+        AgentChatSyncResponse chatResp = await syncClient.SyncChatOscAsync(
+            cfg,
+            new[] { new OscChatMessageUpload { Id = "osc_1", SourceText = "Hi", SentText = "Hi" } },
+            vrcRunning: true,
+            CancellationToken.None);
+        Assert.True(chatResp.ChatSessionActive);
+        Assert.Single(chatResp.PendingCommands);
+        Assert.Equal("send_osc_chatbox", chatResp.PendingCommands[0].Action);
+        Assert.Contains("\"oscState\"", capturedBody);
+    }
+
     private sealed class StubHttpHandler : HttpMessageHandler
     {
         private readonly Func<HttpRequestMessage, Task<HttpResponseMessage>> _responder;

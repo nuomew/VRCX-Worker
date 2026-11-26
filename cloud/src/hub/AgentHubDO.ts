@@ -438,18 +438,31 @@ export class AgentHubDO extends DurableObject<Env> {
                 const cmdId = envelope.id || (typeof cmdPayload.cmdId === 'string' ? cmdPayload.cmdId : '');
                 if (cmdId) {
                     const status = cmdPayload.status === 'succeeded' ? 'succeeded' : 'failed';
+                    const chatStatus = status === 'succeeded' ? 'sent' : 'failed';
+                    const errMsg =
+                        status === 'succeeded' ? '' : String(cmdPayload.message ?? 'OSC dispatch failed').slice(0, 512);
                     const now = new Date().toISOString();
                     this.ctx.waitUntil(
-                        this.env.DB_CORE.prepare(
-                            `UPDATE cloud_commands
-                             SET status = ?, result_json = ?, finished_at = ?
-                             WHERE cmd_id = ?
-                               AND (target_device_id = '' OR target_device_id = ?)
-                               AND status IN ('pending', 'dispatching', 'dispatched')`
-                        )
-                            .bind(status, JSON.stringify(cmdPayload), now, cmdId, attachment.deviceId)
-                            .run()
-                            .catch(() => {})
+                        Promise.all([
+                            this.env.DB_CORE.prepare(
+                                `UPDATE cloud_commands
+                                 SET status = ?, result_json = ?, finished_at = ?
+                                 WHERE cmd_id = ?
+                                   AND (target_device_id = '' OR target_device_id = ?)
+                                   AND status IN ('pending', 'dispatching', 'dispatched')`
+                            )
+                                .bind(status, JSON.stringify(cmdPayload), now, cmdId, attachment.deviceId)
+                                .run()
+                                .catch(() => {}),
+                            this.env.DB_CORE.prepare(
+                                `UPDATE cloud_chat_messages
+                                 SET status = ?, error_message = ?
+                                 WHERE cmd_id = ?`
+                            )
+                                .bind(chatStatus, errMsg, cmdId)
+                                .run()
+                                .catch(() => {})
+                        ])
                     );
                 }
                 this.broadcastToRole('web', {

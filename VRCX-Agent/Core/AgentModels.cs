@@ -74,6 +74,16 @@ public sealed class AgentConfig
     public bool AutoCheckUpdates { get; set; } = true;
     public bool WritePngMetadata { get; set; } = true;
     public bool AutoLaunchAppsEnabled { get; set; } = true;
+    /// <summary>Whether OSC chatbox sync & remote send commands are enabled (default: true).</summary>
+    public bool OscChatSyncEnabled { get; set; } = true;
+    /// <summary>Local VRChat OSC listening UDP port (default: 9000, strictly 127.0.0.1).</summary>
+    public int OscSendPort { get; set; } = OscProtocol.DefaultVrChatOscSendPort;
+    /// <summary>Optional local loopback OSC relay listener (default: false; captures third-party OSC chatbox input).</summary>
+    public bool OscListenEnabled { get; set; } = false;
+    /// <summary>Local loopback UDP port for optional OSC relay listener (default: 9002).</summary>
+    public int OscListenPort { get; set; } = OscProtocol.DefaultOscRelayListenPort;
+    /// <summary>When OSC relay listener captures /chatbox/input, also forward it to VRChat's OscSendPort.</summary>
+    public bool OscForwardToVrchat { get; set; } = true;
     public string VrChatLogDirectory { get; set; } = string.Empty;
     public string AutoLaunchDirectory { get; set; } = string.Empty;
     public string VrChatExecutableOverride { get; set; } = string.Empty;
@@ -115,6 +125,11 @@ public sealed class AgentConfig
             AutoCheckUpdates = AutoCheckUpdates,
             WritePngMetadata = WritePngMetadata,
             AutoLaunchAppsEnabled = AutoLaunchAppsEnabled,
+            OscChatSyncEnabled = OscChatSyncEnabled,
+            OscSendPort = OscSendPort,
+            OscListenEnabled = OscListenEnabled,
+            OscListenPort = OscListenPort,
+            OscForwardToVrchat = OscForwardToVrchat,
             VrChatLogDirectory = VrChatLogDirectory,
             AutoLaunchDirectory = AutoLaunchDirectory,
             VrChatExecutableOverride = VrChatExecutableOverride
@@ -251,6 +266,21 @@ public sealed class LiveAgentState
     [JsonProperty("offlineQueueCount")]
     public int OfflineQueueCount { get; set; }
 
+    [JsonProperty("oscChatSyncEnabled")]
+    public bool OscChatSyncEnabled { get; set; } = true;
+
+    [JsonProperty("oscSendPort")]
+    public int OscSendPort { get; set; } = OscProtocol.DefaultVrChatOscSendPort;
+
+    [JsonProperty("oscListenEnabled")]
+    public bool OscListenEnabled { get; set; }
+
+    [JsonProperty("oscListenPort")]
+    public int OscListenPort { get; set; } = OscProtocol.DefaultOscRelayListenPort;
+
+    [JsonProperty("oscForwardToVrchat")]
+    public bool OscForwardToVrchat { get; set; } = true;
+
     /// <summary>
     /// Selects the earliest valid OS process start timestamp, falling back to the previously observed
     /// timestamp or current detection time when Win32 process StartTime access is restricted.
@@ -316,6 +346,60 @@ public sealed class AgentSyncResponse
 
     [JsonProperty("ingest")]
     public AgentSyncIngestResult Ingest { get; set; } = new();
+
+    [JsonProperty("chatSessionActive")]
+    public bool ChatSessionActive { get; set; }
+
+    [JsonProperty("pendingCommands")]
+    public List<PendingRemoteCommand> PendingCommands { get; set; } = new();
+}
+
+public sealed class OscChatMessageUpload
+{
+    [JsonProperty("id")]
+    public string Id { get; set; } = string.Empty;
+
+    [JsonProperty("direction")]
+    public string Direction { get; set; } = "desktop_sync";
+
+    [JsonProperty("sourceText")]
+    public string SourceText { get; set; } = string.Empty;
+
+    [JsonProperty("sentText")]
+    public string SentText { get; set; } = string.Empty;
+
+    [JsonProperty("oscAddress")]
+    public string OscAddress { get; set; } = OscProtocol.ChatboxInputAddress;
+
+    [JsonProperty("oscPort")]
+    public int OscPort { get; set; } = OscProtocol.DefaultVrChatOscSendPort;
+
+    [JsonProperty("immediate")]
+    public bool Immediate { get; set; } = true;
+
+    [JsonProperty("playSfx")]
+    public bool PlaySfx { get; set; } = true;
+
+    [JsonProperty("createdAt")]
+    public string CreatedAt { get; set; } = string.Empty;
+}
+
+public sealed class AgentChatSyncResponse
+{
+    [JsonProperty("deviceId")]
+    public string DeviceId { get; set; } = string.Empty;
+
+    [JsonProperty("syncedAt")]
+    public string SyncedAt { get; set; } = string.Empty;
+
+    [JsonProperty("ingested")]
+    public int Ingested { get; set; }
+
+    [JsonProperty("chatSessionActive")]
+    public bool ChatSessionActive { get; set; }
+
+    [JsonProperty("activeUntilIso")]
+    public string ActiveUntilIso { get; set; } = string.Empty;
 
     [JsonProperty("pendingCommands")]
     public List<PendingRemoteCommand> PendingCommands { get; set; } = new();

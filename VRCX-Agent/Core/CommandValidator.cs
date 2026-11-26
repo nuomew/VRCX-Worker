@@ -17,6 +17,8 @@ public static class CommandValidator
         "quit_vrc",
         "clear_cache",
         "send_vr_notify",
+        "send_osc_chatbox",
+        "send_osc_typing",
         "discord_update",
         "sync_now",
         "desktop_scan",
@@ -160,8 +162,69 @@ public static class CommandValidator
                 return (false, "desktop_migrate_cancel requires a valid jobId.");
             }
         }
+        else if (action == "send_osc_chatbox")
+        {
+            if (parameters != null && (parameters.ContainsKey("oscHost") || parameters.ContainsKey("host")))
+            {
+                return (false, "send_osc_chatbox does not allow overriding the loopback target host.");
+            }
+            string rawMsg = parameters != null && parameters.TryGetValue("message", out var rawMessage) && rawMessage is string msgStr
+                ? msgStr
+                : string.Empty;
+            if (string.IsNullOrEmpty(OscProtocol.SanitizeChatboxMessage(rawMsg)))
+            {
+                return (false, "send_osc_chatbox requires a non-empty message.");
+            }
+            if (parameters != null && parameters.TryGetValue("oscPort", out var rawPort) && rawPort != null)
+            {
+                if (!TryParseValidOscPort(rawPort, out _))
+                {
+                    return (false, "send_osc_chatbox oscPort must be an integer between 1024 and 65535.");
+                }
+            }
+        }
+        else if (action == "send_osc_typing")
+        {
+            if (parameters != null && (parameters.ContainsKey("oscHost") || parameters.ContainsKey("host")))
+            {
+                return (false, "send_osc_typing does not allow overriding the loopback target host.");
+            }
+            if (parameters == null || !parameters.TryGetValue("typing", out var rawTyping) || rawTyping is not bool)
+            {
+                return (false, "send_osc_typing requires a boolean typing flag.");
+            }
+            if (parameters.TryGetValue("oscPort", out var rawPort) && rawPort != null)
+            {
+                if (!TryParseValidOscPort(rawPort, out _))
+                {
+                    return (false, "send_osc_typing oscPort must be an integer between 1024 and 65535.");
+                }
+            }
+        }
 
         return (true, string.Empty);
+    }
+
+    public static bool TryParseValidOscPort(object? raw, out int port)
+    {
+        port = OscProtocol.DefaultVrChatOscSendPort;
+        if (raw == null) return true;
+        if (raw is int i)
+        {
+            port = i;
+            return OscProtocol.IsValidOscPort(port);
+        }
+        if (raw is long l && l >= int.MinValue && l <= int.MaxValue)
+        {
+            port = (int)l;
+            return OscProtocol.IsValidOscPort(port);
+        }
+        if (raw is string s && int.TryParse(s.Trim(), System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out int parsed))
+        {
+            port = parsed;
+            return OscProtocol.IsValidOscPort(port);
+        }
+        return false;
     }
 
     public static List<string> ExtractStringList(object? raw)

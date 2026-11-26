@@ -3,6 +3,7 @@ import { ensureSchemaReady } from './db/schemaBootstrap';
 import type { Env } from './env';
 import { AgentHubDO } from './hub/AgentHubDO';
 import { handleAgentPublicRoutes, handleAgentWebRoutes } from './routes/agentRoutes';
+import { handleChatOscAgentRoutes, handleChatOscWebRoutes } from './routes/chatOscRoutes';
 import { handleCoreDataRoutes } from './routes/coreData';
 import { handleDbCleanupRoutes } from './routes/dbCleanup';
 import { handleEventsDataRoutes } from './routes/eventsData';
@@ -128,6 +129,10 @@ export default {
             if (agentPublicResp) {
                 return agentPublicResp;
             }
+            const chatAgentResp = await handleChatOscAgentRoutes(request, env, url);
+            if (chatAgentResp) {
+                return chatAgentResp;
+            }
             const legacyAgentResp = await handleLegacyMigrationAgentRoutes(request, env, url);
             if (legacyAgentResp) {
                 return legacyAgentResp;
@@ -225,6 +230,9 @@ export default {
 
             const agentWebResp = await handleAgentWebRoutes(request, env, url);
             if (agentWebResp) return agentWebResp;
+
+            const chatWebResp = await handleChatOscWebRoutes(request, env, url);
+            if (chatWebResp) return chatWebResp;
 
             const legacyWebResp = await handleLegacyMigrationWebRoutes(request, env, url);
             if (legacyWebResp) return legacyWebResp;

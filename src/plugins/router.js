@@ -3,6 +3,7 @@ import { createRouter, createWebHashHistory } from 'vue-router';
 import { watchState } from '../services/watchState';
 
 import AvatarSearch from './../views/Tools/AvatarSearch.vue';
+import ChatTranslator from './../views/Tools/ChatTranslator.vue';
 import FavoritesAvatar from './../views/Favorites/FavoritesAvatar.vue';
 import FavoritesFriend from './../views/Favorites/FavoritesFriend.vue';
 import FavoritesWorld from './../views/Favorites/FavoritesWorld.vue';
@@ -126,6 +127,12 @@ const routes = [
                 name: 'avatar-search',
                 component: AvatarSearch,
                 meta: { navKeys: ['tool-avatar-search', 'tools'] }
+            },
+            {
+                path: 'tools/chat-translator',
+                name: 'chat-translator',
+                component: ChatTranslator,
+                meta: { navKeys: ['tool-chat-translator', 'tools'] }
             },
             {
                 path: 'tools/screenshot-metadata',
