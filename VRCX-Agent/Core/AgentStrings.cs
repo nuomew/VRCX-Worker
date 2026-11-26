@@ -388,4 +388,63 @@ public static class AgentStrings
     public static string UpdateDownloadedFileTooSmallError => IsChinese
         ? "下载的安装包文件不完整，请重试。"
         : "Downloaded installer file appears incomplete; please try again.";
+
+    // Cloud data one-click export (desktop VRCX compatible ZIP)
+    public static string MenuExportCloudData => IsChinese
+        ? "一键导出云端数据…"
+        : "Export Cloud Data...";
+
+    public static string ExportCloudDataButton => IsChinese
+        ? "导出云端数据…"
+        : "Export Cloud Data...";
+
+    public static string ExportNotConfiguredMessage => IsChinese
+        ? "请先配置并保存云端连接地址和同步密钥，然后再导出云端数据。"
+        : "Please configure and save your Cloud URL and Sync Secret before exporting cloud data.";
+
+    public static string ExportSaveDialogTitle => IsChinese
+        ? "选择云端数据导出 ZIP 保存位置（含原版 VRCX.sqlite3）"
+        : "Save VRCX Cloud Export ZIP (Includes Desktop VRCX.sqlite3)";
+
+    public static string ExportSaveDialogFilter => IsChinese
+        ? "ZIP 压缩包 (*.zip)|*.zip"
+        : "ZIP Archive (*.zip)|*.zip";
+
+    public static string ExportDialogTitle => IsChinese
+        ? "VRCX 云端伴侣 — 一键导出云端数据"
+        : "VRCX Cloud Agent — One-Click Cloud Data Export";
+
+    public static string ExportDialogHeader => IsChinese
+        ? "正在导出适配原版桌面 VRCX 的完整数据包"
+        : "Exporting Desktop VRCX Compatible Backup Archive";
+
+    public static string ExportStartingHint => IsChinese
+        ? "正在连接云端并获取数据目录…"
+        : "Connecting to VRCX Cloud and fetching table summary...";
+
+    public static string FormatExportFetching(string table, long processed, long total) => IsChinese
+        ? $"正在拉取数据表 {table}…（{processed:N0} / {total:N0} 条）"
+        : $"Fetching {table}... ({processed:N0} / {total:N0} rows)";
+
+    public static string ExportBuildingSqliteHint => IsChinese
+        ? "正在生成原版桌面 VRCX 兼容数据库（VRCX.sqlite3）…"
+        : "Building upstream desktop VRCX compatible database (VRCX.sqlite3)...";
+
+    public static string ExportPackagingZipHint => IsChinese
+        ? "正在打包 ZIP 压缩包（含 VRCX.sqlite3 与 JSON 归档）…"
+        : "Packaging ZIP archive (VRCX.sqlite3 + JSON backup)...";
+
+    public static string FormatExportCompleted(long totalRows, string userPrefix, double sizeMb) => IsChinese
+        ? $"导出完成！共 {totalRows:N0} 条记录 · 账号前缀 {userPrefix} · 压缩包 {sizeMb:F2} MB（内含可直接放入原版桌面 VRCX 的 VRCX.sqlite3）。"
+        : $"Export complete! {totalRows:N0} rows · Account prefix {userPrefix} · {sizeMb:F2} MB ZIP (ready-to-use VRCX.sqlite3 inside).";
+
+    public static string FormatExportFailed(string error) => IsChinese
+        ? $"导出失败：{error}"
+        : $"Export failed: {error}";
+
+    public static string ExportOpenFolderButton => IsChinese
+        ? "打开所在文件夹"
+        : "Open Folder";
+
+    public static string CloseButton => IsChinese ? "关闭" : "Close";
 }

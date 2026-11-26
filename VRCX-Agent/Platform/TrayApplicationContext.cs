@@ -70,6 +70,7 @@ public sealed class TrayApplicationContext : ApplicationContext
     private int _updateDownloadActive;
     private SyncSettingsForm? _activeSettingsDialog;
     private UpdateProgressForm? _activeUpdateDialog;
+    private CloudExportForm? _activeExportDialog;
     private AgentReleaseInfo? _availableUpdate;
     private volatile bool _isAutoUpdating;
     private string _autoUpdatingTag = string.Empty;
@@ -190,6 +191,7 @@ public sealed class TrayApplicationContext : ApplicationContext
         menu.Items.Add(_compressScreenshotsItem);
         menu.Items.Add(AgentStrings.MenuSyncNow, null, (_, _) => _ = Task.Run(() => RunSyncCycleAsync(force: true, _shutdownToken)));
         menu.Items.Add(AgentStrings.MenuOpenWebUi, null, (_, _) => OpenCloudWebUi());
+        menu.Items.Add(AgentStrings.MenuExportCloudData, null, (_, _) => ShowCloudExportFlow());
         menu.Items.Add(_autoStartItem);
         menu.Items.Add(_checkUpdateItem);
         menu.Items.Add(new ToolStripSeparator());
@@ -986,7 +988,7 @@ public sealed class TrayApplicationContext : ApplicationContext
 
         bool initialAutoStart = AgentConfigStore.IsAutoStartEnabled();
         using Icon? dialogIcon = CloneDialogIconSafe();
-        using var dialog = new SyncSettingsForm(GetConfigSnapshot(), _syncClient, initialAutoStart, dialogIcon);
+        using var dialog = new SyncSettingsForm(GetConfigSnapshot(), _syncClient, initialAutoStart, dialogIcon, ShowCloudExportFlow);
         _activeSettingsDialog = dialog;
         try
         {
@@ -1353,6 +1355,103 @@ public sealed class TrayApplicationContext : ApplicationContext
         }
     }
 
+    private static string ResolveDefaultExportDirectory()
+    {
+        string desktop = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
+        if (!string.IsNullOrWhiteSpace(desktop) && Directory.Exists(desktop))
+        {
+            return desktop;
+        }
+        string docs = Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments);
+        return !string.IsNullOrWhiteSpace(docs) && Directory.Exists(docs)
+            ? docs
+            : Environment.CurrentDirectory;
+    }
+
+    private void ShowCloudExportFlow()
+    {
+        if (_isExiting || _shutdownToken.IsCancellationRequested) return;
+
+        if (_activeExportDialog != null && !_activeExportDialog.IsDisposed)
+        {
+            if (_activeExportDialog.WindowState == FormWindowState.Minimized)
+            {
+                _activeExportDialog.WindowState = FormWindowState.Normal;
+            }
+            _activeExportDialog.BringToFront();
+            _activeExportDialog.Activate();
+            return;
+        }
+
+        AgentConfig cfg = GetConfigSnapshot();
+        if (!cfg.IsConfigured || string.IsNullOrWhiteSpace(cfg.SyncSecret))
+        {
+            ShowNoticeMessage(AgentStrings.ExportNotConfiguredMessage, MessageBoxIcon.Information);
+            if (_activeSettingsDialog == null || _activeSettingsDialog.IsDisposed)
+            {
+                ShowSyncSettingsDialog();
+            }
+            return;
+        }
+
+        string targetZipPath;
+        using (var saveDialog = new SaveFileDialog
+        {
+            Title = AgentStrings.ExportSaveDialogTitle,
+            Filter = AgentStrings.ExportSaveDialogFilter,
+            DefaultExt = "zip",
+            AddExtension = true,
+            OverwritePrompt = true,
+            InitialDirectory = ResolveDefaultExportDirectory(),
+            FileName = $"VRCX-Cloud-Export-{DateTime.Now:yyyyMMdd-HHmmss}.zip"
+        })
+        {
+            DialogResult pickResult = _activeSettingsDialog != null && !_activeSettingsDialog.IsDisposed
+                ? saveDialog.ShowDialog(_activeSettingsDialog)
+                : saveDialog.ShowDialog();
+            if (pickResult != DialogResult.OK || string.IsNullOrWhiteSpace(saveDialog.FileName))
+            {
+                return;
+            }
+            targetZipPath = saveDialog.FileName;
+        }
+
+        using Icon? dialogIcon = CloneDialogIconSafe();
+        using var exportDialog = new CloudExportForm(cfg, _syncClient, targetZipPath, dialogIcon);
+        _activeExportDialog = exportDialog;
+        try
+        {
+            if (_activeSettingsDialog != null && !_activeSettingsDialog.IsDisposed)
+            {
+                exportDialog.ShowDialog(_activeSettingsDialog);
+            }
+            else
+            {
+                exportDialog.ShowDialog();
+            }
+        }
+        finally
+        {
+            _activeExportDialog = null;
+            if ((_activeSettingsDialog == null || _activeSettingsDialog.IsDisposed) &&
+                !string.IsNullOrWhiteSpace(_pendingAutoInstallPath) &&
+                !_isExiting &&
+                !_shutdownToken.IsCancellationRequested)
+            {
+                string deferredInstallPath = _pendingAutoInstallPath;
+                _pendingAutoInstallPath = string.Empty;
+                if (File.Exists(deferredInstallPath))
+                {
+                    LaunchDownloadedInstallerAndExit(deferredInstallPath);
+                }
+                else
+                {
+                    RestoreCheckUpdateMenuText();
+                }
+            }
+        }
+    }
+
     private void UpdateTrayStatus()
     {
         if (_isExiting) return;
@@ -1449,7 +1548,8 @@ public sealed class TrayApplicationContext : ApplicationContext
         {
             return false;
         }
-        if (_activeSettingsDialog != null && !_activeSettingsDialog.IsDisposed)
+        if ((_activeSettingsDialog != null && !_activeSettingsDialog.IsDisposed) ||
+            (_activeExportDialog != null && !_activeExportDialog.IsDisposed))
         {
             string tag = _availableUpdate?.TagName ?? "latest";
             ShowNoticeMessage(AgentStrings.FormatBalloonAutoInstallingUpdate(tag), MessageBoxIcon.Information);
@@ -1691,9 +1791,10 @@ public sealed class TrayApplicationContext : ApplicationContext
 
             RunOnUiThread(() =>
             {
-                if (_activeSettingsDialog != null && !_activeSettingsDialog.IsDisposed)
+                if ((_activeSettingsDialog != null && !_activeSettingsDialog.IsDisposed) ||
+                    (_activeExportDialog != null && !_activeExportDialog.IsDisposed))
                 {
-                    // Defer silent install until the user closes the modal settings dialog.
+                    // Defer silent install until the user closes the modal settings or export dialog.
                     _pendingAutoInstallPath = installerPath;
                     return;
                 }
@@ -1961,6 +2062,14 @@ public sealed class TrayApplicationContext : ApplicationContext
             if (_activeSettingsDialog != null && !_activeSettingsDialog.IsDisposed)
             {
                 _activeSettingsDialog.Close();
+            }
+        }
+        catch { /* ignore */ }
+        try
+        {
+            if (_activeExportDialog != null && !_activeExportDialog.IsDisposed)
+            {
+                _activeExportDialog.Close();
             }
         }
         catch { /* ignore */ }

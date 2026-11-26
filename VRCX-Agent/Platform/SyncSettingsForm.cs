@@ -16,6 +16,7 @@ public sealed class SyncSettingsForm : Form
 {
     private readonly AgentConfig _initialConfig;
     private readonly HttpSyncClient _syncClient;
+    private readonly Action? _onExportCloudData;
 
     private readonly TextBox _urlBox;
     private readonly TextBox _secretBox;
@@ -29,6 +30,7 @@ public sealed class SyncSettingsForm : Form
     private readonly CheckBox _autoStartCheck;
     private readonly CheckBox _autoCheckUpdatesCheck;
     private readonly Label _statusLabel;
+    private readonly Button _exportButton;
     private readonly Button _saveButton;
     private readonly Font _uiFont;
     private readonly CancellationTokenSource _closeCts = new();
@@ -38,10 +40,16 @@ public sealed class SyncSettingsForm : Form
     public AgentSyncResponse? InitialSyncResponse { get; private set; }
     public bool AutoStartEnabled => _autoStartCheck.Checked;
 
-    public SyncSettingsForm(AgentConfig currentConfig, HttpSyncClient syncClient, bool autoStartEnabled = false, Icon? windowIcon = null)
+    public SyncSettingsForm(
+        AgentConfig currentConfig,
+        HttpSyncClient syncClient,
+        bool autoStartEnabled = false,
+        Icon? windowIcon = null,
+        Action? onExportCloudData = null)
     {
         _initialConfig = currentConfig;
         _syncClient = syncClient;
+        _onExportCloudData = onExportCloudData;
 
         SuspendLayout();
         AutoScaleDimensions = new SizeF(96F, 96F);
@@ -200,6 +208,25 @@ public sealed class SyncSettingsForm : Form
             Text = AgentStrings.SettingsDefaultHint
         };
 
+        _exportButton = new Button
+        {
+            Text = AgentStrings.ExportCloudDataButton,
+            Location = new Point(20, 482),
+            Width = 148,
+            Height = 34,
+            Visible = _onExportCloudData != null
+        };
+        _exportButton.Click += (_, _) =>
+        {
+            if (!_initialConfig.IsConfigured || string.IsNullOrWhiteSpace(_initialConfig.SyncSecret))
+            {
+                _statusLabel.ForeColor = Color.Firebrick;
+                _statusLabel.Text = AgentStrings.ExportNotConfiguredMessage;
+                return;
+            }
+            _onExportCloudData?.Invoke();
+        };
+
         _saveButton = new Button
         {
             Text = AgentStrings.TestAndSaveButton,
@@ -229,7 +256,7 @@ public sealed class SyncSettingsForm : Form
             _autoStartCheck,
             _autoCheckUpdatesCheck,
             _statusLabel,
-            _saveButton, cancelButton
+            _exportButton, _saveButton, cancelButton
         });
         AcceptButton = _saveButton;
         CancelButton = cancelButton;

@@ -6391,4 +6391,249 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
             ]);
         }
     });
+
+    it('supports dual-channel paginated cloud data export (Web + Agent) with secret stripping and legacy merge', async () => {
+        const legacyDb = env.DB_LEGACY;
+        expect(legacyDb).toBeDefined();
+        let createdDeviceId = '';
+
+        try {
+            // 1. Seed active DB_CORE / DB_GAMELOG / DB_FEED + DB_LEGACY rows, including sensitive configs that MUST be stripped
+            const ownerUid = 'usr_aa11bb22-cc33-dd44-ee55-ff6677889900';
+            await env.DB_CORE.batch([
+                env.DB_CORE.prepare(
+                    `INSERT INTO cloud_bg_sync_state (state_key, payload_json, updated_at)
+                     VALUES ('friend_log_owner', ?, ?)
+                     ON CONFLICT(state_key) DO UPDATE SET payload_json = excluded.payload_json, updated_at = excluded.updated_at`
+                ).bind(JSON.stringify({ userId: ownerUid }), '2026-11-26T00:00:00Z'),
+                env.DB_CORE.prepare(
+                    'INSERT OR REPLACE INTO memos (user_id, edited_at, memo) VALUES (?, ?, ?)'
+                ).bind('usr_export_overlap', '2026-11-26T01:00:00Z', 'Active Cloud Memo'),
+                env.DB_CORE.prepare(
+                    `INSERT INTO config_bundles (bundle_key, payload_json, updated_at)
+                     VALUES ('vrcx_config', ?, ?)
+                     ON CONFLICT(bundle_key) DO UPDATE SET payload_json = excluded.payload_json, updated_at = excluded.updated_at`
+                ).bind(
+                    JSON.stringify({
+                        'config:vrcx_thememode': 'midnight',
+                        'config:vrcx_savedcredentials': 'TOP_SECRET_CREDENTIAL',
+                        'config:vrcx_authtoken': 'authcookie_must_strip',
+                        'config:cloud:syncIntervalSeconds': '60'
+                    }),
+                    '2026-11-26T01:00:00Z'
+                )
+            ]);
+
+            await env.DB_GAMELOG.batch([
+                env.DB_GAMELOG.prepare(
+                    'INSERT OR IGNORE INTO gamelog_location (created_at, location, world_id, world_name, time, group_name) VALUES (?, ?, ?, ?, ?, ?)'
+                ).bind('2026-11-26T01:01:00Z', 'wrld_exp_1:100', 'wrld_exp_1', 'Export Hall 1', 600, ''),
+                env.DB_GAMELOG.prepare(
+                    'INSERT OR IGNORE INTO gamelog_location (created_at, location, world_id, world_name, time, group_name) VALUES (?, ?, ?, ?, ?, ?)'
+                ).bind('2026-11-26T01:02:00Z', 'wrld_exp_2:200', 'wrld_exp_2', 'Export Hall 2', 1200, '')
+            ]);
+
+            await env.DB_FEED.prepare(
+                'INSERT OR IGNORE INTO feed_gps (created_at, user_id, display_name, location, world_name, previous_location, time, group_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+            )
+                .bind('2026-11-26T01:03:00Z', 'usr_export_friend', 'ExportPal', 'wrld_exp_1:100', 'Export Hall 1', '', 300, '')
+                .run();
+
+            await legacyDb!.batch([
+                legacyDb!
+                    .prepare('INSERT OR REPLACE INTO memos (user_id, edited_at, memo) VALUES (?, ?, ?)')
+                    .bind('usr_export_overlap', '2024-01-01T00:00:00Z', 'Old Legacy Memo'),
+                legacyDb!
+                    .prepare('INSERT OR REPLACE INTO memos (user_id, edited_at, memo) VALUES (?, ?, ?)')
+                    .bind('usr_export_legacy_only', '2024-01-02T00:00:00Z', 'Legacy Only Memo'),
+                legacyDb!
+                    .prepare('INSERT OR REPLACE INTO legacy_configs (config_key, config_value, updated_at) VALUES (?, ?, ?)')
+                    .bind('config:vrcx_fontsize', '14', '2024-01-01T00:00:00Z'),
+                legacyDb!
+                    .prepare('INSERT OR REPLACE INTO legacy_configs (config_key, config_value, updated_at) VALUES (?, ?, ?)')
+                    .bind('config:vrcx_password', 'LEAK_LEGACY_SECRET', '2024-01-01T00:00:00Z')
+            ]);
+
+            // 2. Web summary endpoint returns 27 tables, resolved userPrefix, and both active + legacy counts
+            const summaryRes = await exports.default.fetch(
+                'http://example.com/api/migration/export?scope=summary&includeLegacy=1'
+            );
+            expect(summaryRes.status).toBe(200);
+            const summaryJson = (await summaryRes.json()) as {
+                ok: boolean;
+                data: {
+                    userId: string;
+                    userPrefix: string;
+                    legacyDbBound: boolean;
+                    hasLegacyData: boolean;
+                    totalActiveRows: number;
+                    totalLegacyRows: number;
+                    tables: Array<{ name: string; activeCount: number; legacyCount: number }>;
+                };
+            };
+            expect(summaryJson.ok).toBe(true);
+            expect(summaryJson.data.userId).toBe(ownerUid);
+            expect(summaryJson.data.userPrefix).toBe('usraa11bb22cc33dd44ee55ff6677889900');
+            expect(summaryJson.data.legacyDbBound).toBe(true);
+            expect(summaryJson.data.hasLegacyData).toBe(true);
+            expect(summaryJson.data.tables).toHaveLength(27);
+            const locSummary = summaryJson.data.tables.find((t) => t.name === 'gamelog_location');
+            expect(locSummary!.activeCount).toBeGreaterThanOrEqual(2);
+
+            // 3. Cursor pagination on gamelog_location: verify limit=1 first page, then drain all remaining pages with zero duplicates
+            const seenWorldIds = new Set<string>();
+            const seenRowIds = new Set<number>();
+            const firstPageRes = await exports.default.fetch(
+                'http://example.com/api/migration/export?table=gamelog_location&source=active&afterRowId=0&limit=1'
+            );
+            expect(firstPageRes.status).toBe(200);
+            const firstPageJson = (await firstPageRes.json()) as {
+                ok: boolean;
+                data: {
+                    rows: Array<{ id?: number; world_id?: string; _cursor_id?: unknown }>;
+                    nextAfterRowId: number;
+                    hasMore: boolean;
+                };
+            };
+            expect(firstPageJson.data.rows).toHaveLength(1);
+            expect(firstPageJson.data.hasMore).toBe(true);
+            expect(firstPageJson.data.nextAfterRowId).toBeGreaterThan(0);
+            expect(firstPageJson.data.rows[0]!._cursor_id).toBeUndefined();
+            if (typeof firstPageJson.data.rows[0]!.id === 'number') {
+                seenRowIds.add(firstPageJson.data.rows[0]!.id);
+            }
+            if (firstPageJson.data.rows[0]!.world_id) {
+                seenWorldIds.add(firstPageJson.data.rows[0]!.world_id);
+            }
+
+            let cursor = firstPageJson.data.nextAfterRowId;
+            let pages = 0;
+            while (pages < 50) {
+                const pageRes = await exports.default.fetch(
+                    `http://example.com/api/migration/export?table=gamelog_location&source=active&afterRowId=${cursor}&limit=100`
+                );
+                expect(pageRes.status).toBe(200);
+                const pageJson = (await pageRes.json()) as {
+                    ok: boolean;
+                    data: {
+                        rows: Array<{ id?: number; world_id?: string; _cursor_id?: unknown }>;
+                        nextAfterRowId: number;
+                        hasMore: boolean;
+                    };
+                };
+                for (const row of pageJson.data.rows) {
+                    expect(row._cursor_id).toBeUndefined();
+                    if (typeof row.id === 'number') {
+                        expect(seenRowIds.has(row.id)).toBe(false);
+                        seenRowIds.add(row.id);
+                    }
+                    if (row.world_id) seenWorldIds.add(row.world_id);
+                }
+                pages++;
+                if (!pageJson.data.hasMore) break;
+                expect(pageJson.data.nextAfterRowId).toBeGreaterThan(cursor);
+                cursor = pageJson.data.nextAfterRowId;
+            }
+            expect(seenWorldIds.has('wrld_exp_1')).toBe(true);
+            expect(seenWorldIds.has('wrld_exp_2')).toBe(true);
+
+            // 4. Active and legacy configs strictly strip credentials, tokens, passwords, and cloud:* internal keys
+            const activeCfgRes = await exports.default.fetch(
+                'http://example.com/api/migration/export?table=configs&source=active'
+            );
+            expect(activeCfgRes.status).toBe(200);
+            const activeCfgJson = (await activeCfgRes.json()) as {
+                data: { rows: Array<{ key: string; value: string }> };
+            };
+            const activeKeys = activeCfgJson.data.rows.map((r) => r.key);
+            expect(activeKeys).toContain('config:vrcx_thememode');
+            expect(activeKeys.some((k) => k.includes('savedcredentials') || k.includes('authtoken') || k.includes('cloud:'))).toBe(
+                false
+            );
+
+            const legacyCfgRes = await exports.default.fetch(
+                'http://example.com/api/migration/export?table=configs&source=legacy'
+            );
+            expect(legacyCfgRes.status).toBe(200);
+            const legacyCfgJson = (await legacyCfgRes.json()) as {
+                data: { rows: Array<{ key: string; value: string }> };
+            };
+            const legacyKeys = legacyCfgJson.data.rows.map((r) => r.key);
+            expect(legacyKeys).toContain('config:vrcx_fontsize');
+            expect(legacyKeys.some((k) => k.includes('password'))).toBe(false);
+
+            // 5. Rejects non-allowlisted / sensitive tables and invalid source values
+            for (const badTable of ['cloud_cookie_vault', 'cloud_devices', 'cloud_bg_sync_state', 'sqlite_master']) {
+                const badRes = await exports.default.fetch(
+                    `http://example.com/api/migration/export?table=${encodeURIComponent(badTable)}&source=active`
+                );
+                expect(badRes.status).toBe(400);
+            }
+            const badSourceRes = await exports.default.fetch(
+                'http://example.com/api/migration/export?table=memos&source=secret'
+            );
+            expect(badSourceRes.status).toBe(400);
+
+            // 6. Agent export route rejects anonymous callers AND invalid Sync Keys (401) even in open_setup mode
+            const unauthAgentRes = await exports.default.fetch(
+                'http://example.com/api/agent/migration/export?scope=summary'
+            );
+            expect(unauthAgentRes.status).toBe(401);
+            const badKeyAgentRes = await exports.default.fetch(
+                'http://example.com/api/agent/migration/export?scope=summary',
+                {
+                    headers: { Authorization: 'Bearer vrcx_sync_invalid_forged_key' }
+                }
+            );
+            expect(badKeyAgentRes.status).toBe(401);
+
+            const keyRes = await exports.default.fetch('http://example.com/api/agent/sync-key', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+                body: JSON.stringify({ deviceName: 'Export-Test-PC' })
+            });
+            expect(keyRes.status).toBe(200);
+            const { syncKey, deviceId } = ((await keyRes.json()) as { data: { syncKey: string; deviceId: string } }).data;
+            createdDeviceId = deviceId;
+
+            const agentSummaryRes = await exports.default.fetch(
+                'http://example.com/api/agent/migration/export?scope=summary&includeLegacy=1',
+                {
+                    headers: { Authorization: `Bearer ${syncKey}` }
+                }
+            );
+            expect(agentSummaryRes.status).toBe(200);
+            const agentSummaryJson = (await agentSummaryRes.json()) as {
+                data: { userPrefix: string; hasLegacyData: boolean };
+            };
+            expect(agentSummaryJson.data.userPrefix).toBe('usraa11bb22cc33dd44ee55ff6677889900');
+            expect(agentSummaryJson.data.hasLegacyData).toBe(true);
+
+            const agentLegacyMemosRes = await exports.default.fetch(
+                'http://example.com/api/agent/migration/export?table=memos&source=legacy&afterRowId=0&limit=50',
+                {
+                    headers: { Authorization: `Bearer ${syncKey}` }
+                }
+            );
+            expect(agentLegacyMemosRes.status).toBe(200);
+            const agentLegacyMemosJson = (await agentLegacyMemosRes.json()) as {
+                data: { rows: Array<{ user_id: string; memo: string }> };
+            };
+            expect(agentLegacyMemosJson.data.rows.some((r) => r.user_id === 'usr_export_legacy_only')).toBe(true);
+        } finally {
+            if (createdDeviceId) {
+                await env.DB_CORE.prepare('DELETE FROM cloud_devices WHERE device_id = ?').bind(createdDeviceId).run();
+            }
+            await env.DB_CORE.batch([
+                env.DB_CORE.prepare("DELETE FROM memos WHERE user_id = 'usr_export_overlap'"),
+                env.DB_CORE.prepare("DELETE FROM cloud_bg_sync_state WHERE state_key = 'friend_log_owner'")
+            ]);
+            await env.DB_GAMELOG.prepare("DELETE FROM gamelog_location WHERE world_id IN ('wrld_exp_1', 'wrld_exp_2')").run();
+            await env.DB_FEED.prepare("DELETE FROM feed_gps WHERE user_id = 'usr_export_friend'").run();
+            await legacyDb!.batch([
+                legacyDb!.prepare("DELETE FROM memos WHERE user_id IN ('usr_export_overlap', 'usr_export_legacy_only')"),
+                legacyDb!.prepare("DELETE FROM legacy_configs WHERE config_key IN ('config:vrcx_fontsize', 'config:vrcx_password')")
+            ]);
+        }
+    });
 });

@@ -3942,7 +3942,23 @@
             "job_started_toast": "Desktop legacy migration started in background.",
             "job_completed_toast": "Desktop legacy data migration completed.",
             "job_cancelled_toast": "Desktop migration cancelled.",
-            "cleared_toast": "Cleared all legacy data from DB_LEGACY."
+            "cleared_toast": "Cleared all legacy data from DB_LEGACY.",
+            "export_section_title": "Cloud Data Export",
+            "export_title": "Export Cloud Data as ZIP",
+            "export_desc": "Export your cloud memos, favorites, friend logs, notifications, game logs, feed, and safe preferences into a ZIP archive (includes JSON backup and desktop VRCX compatible SQL restore script; excludes all passwords, cookies, and keys).",
+            "export_btn": "Export Cloud Data (.zip)",
+            "exporting_btn": "Exporting...",
+            "export_cancel_btn": "Cancel",
+            "export_include_legacy_label": "Also include migrated legacy data from DB_LEGACY",
+            "export_account_prefix_label": "Desktop Account Prefix:",
+            "export_account_prefix_placeholder": "Auto-detected (e.g. usr1a2b3c...)",
+            "export_account_prefix_hint": "Used for per-account desktop VRCX tables (auto-filled when detected).",
+            "export_summary_loaded": "Cloud active: {active} rows · Legacy DB: {legacy} rows",
+            "export_progress_table": "Fetching {table}... ({processed} / {total} rows)",
+            "export_packaging": "Packaging ZIP archive...",
+            "export_done_toast": "Exported {rows} rows into {file}.",
+            "export_cancelled_toast": "Cloud data export cancelled.",
+            "export_agent_tip": "Tip: For one-click export of a ready-to-drop desktop VRCX.sqlite3 database ZIP, right-click VRCX.Agent (v1.12.0+) in the Windows tray and select \"Export Cloud Data...\"."
         }
     }
 }

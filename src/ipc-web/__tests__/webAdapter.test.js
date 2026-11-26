@@ -41,6 +41,11 @@ import {
 import { watchState } from '../../services/watchState.js';
 import { formatTotalUptime } from '../../components/statusBarUtils.js';
 import { formatCloudPhotoDateTime, groupCloudScreenshotsByDate } from '../cloudGalleryUtils.js';
+import {
+    buildUpstreamDesktopSql,
+    exportCloudDataToZip,
+    normalizeExportUserPrefix
+} from '../cloudDataExport.js';
 
 function mockOk(data, status = 200) {
     return new Response(JSON.stringify({ ok: true, data }), {
@@ -2652,5 +2657,176 @@ describe('WEB cloud adapter (stateless)', () => {
         expect(enStaticKeys.length).toBeGreaterThanOrEqual(25);
         expect(Object.keys(zhCnJson.default.cloud_hub.static_passcode).sort()).toEqual(enStaticKeys);
         expect(Object.keys(zhTwJson.default.cloud_hub.static_passcode).sort()).toEqual(enStaticKeys);
+    });
+
+    it('exports cloud data to standard PKZIP with active-over-legacy deduplication, desktop SQLite DDL, and trilingual export i18n parity', async () => {
+        // 1. User prefix normalization matches upstream desktop VRCX rules
+        expect(normalizeExportUserPrefix('usr_11112222-3333-4444-5555-666677778888')).toBe(
+            'usr11112222333344445555666677778888'
+        );
+        expect(normalizeExportUserPrefix('123456-7890')).toBe('_1234567890');
+        expect(normalizeExportUserPrefix('bad; DROP TABLE')).toBe('usrdefault');
+        expect(normalizeExportUserPrefix('')).toBe('usrdefault');
+
+        // 2. Upstream SQL generator produces exact desktop DDL and escapes SQLite quotes
+        const sql = buildUpstreamDesktopSql('usr_11112222-3333-4444-5555-666677778888', {
+            configs: [{ key: 'config:vrcx_thememode', value: 'midnight' }],
+            memos: [{ user_id: 'usr_a', edited_at: '2026-11-26T00:00:00Z', memo: "O'Brien's Memo" }],
+            feed_gps: [
+                {
+                    created_at: '2026-11-26T00:01:00Z',
+                    user_id: 'usr_a',
+                    display_name: 'Alice',
+                    location: 'wrld_1:100',
+                    world_name: '桜の神社',
+                    previous_location: '',
+                    time: 600,
+                    group_name: ''
+                }
+            ]
+        });
+        expect(sql).toContain('CREATE TABLE IF NOT EXISTS configs (`key` TEXT PRIMARY KEY, `value` TEXT);');
+        expect(sql).toContain('CREATE TABLE IF NOT EXISTS usr11112222333344445555666677778888_feed_gps');
+        expect(sql).toContain("'O''Brien''s Memo'");
+        expect(sql).toContain("'桜の神社'");
+
+        // 3. Full paginated export merges active + legacy (active wins on conflict) and writes valid PKZIP bytes
+        const mockFetchJson = vi.fn(async (path) => {
+            if (path.includes('scope=summary')) {
+                return {
+                    exportedAt: '2026-11-26T02:00:00.000Z',
+                    userId: 'usr_11112222-3333-4444-5555-666677778888',
+                    userPrefix: 'usr11112222333344445555666677778888',
+                    legacyDbBound: true,
+                    hasLegacyData: true,
+                    totalActiveRows: 3,
+                    totalLegacyRows: 2,
+                    tables: [
+                        { name: 'configs', activeCount: 1, legacyCount: 0 },
+                        { name: 'memos', activeCount: 1, legacyCount: 2 },
+                        { name: 'gamelog_location', activeCount: 2, legacyCount: 0 }
+                    ]
+                };
+            }
+            if (path.includes('table=configs') && path.includes('source=active')) {
+                return {
+                    table: 'configs',
+                    source: 'active',
+                    rows: [{ key: 'config:vrcx_thememode', value: 'midnight' }],
+                    nextAfterRowId: 1,
+                    hasMore: false
+                };
+            }
+            if (path.includes('table=memos') && path.includes('source=active')) {
+                return {
+                    table: 'memos',
+                    source: 'active',
+                    rows: [{ user_id: 'usr_dup', edited_at: '2026-11-26T00:00:00Z', memo: 'Active Winner' }],
+                    nextAfterRowId: 1,
+                    hasMore: false
+                };
+            }
+            if (path.includes('table=memos') && path.includes('source=legacy')) {
+                return {
+                    table: 'memos',
+                    source: 'legacy',
+                    rows: [
+                        { user_id: 'usr_dup', edited_at: '2024-01-01T00:00:00Z', memo: 'Legacy Loser' },
+                        { user_id: 'usr_legacy', edited_at: '2024-01-02T00:00:00Z', memo: 'Legacy Kept' }
+                    ],
+                    nextAfterRowId: 2,
+                    hasMore: false
+                };
+            }
+            if (path.includes('table=gamelog_location') && path.includes('afterRowId=0')) {
+                return {
+                    table: 'gamelog_location',
+                    source: 'active',
+                    rows: [
+                        {
+                            created_at: '2026-11-26T01:00:00Z',
+                            location: 'wrld_p1:1',
+                            world_id: 'wrld_p1',
+                            world_name: 'Page 1 World',
+                            time: 100,
+                            group_name: ''
+                        }
+                    ],
+                    nextAfterRowId: 10,
+                    hasMore: true
+                };
+            }
+            if (path.includes('table=gamelog_location') && path.includes('afterRowId=10')) {
+                return {
+                    table: 'gamelog_location',
+                    source: 'active',
+                    rows: [
+                        {
+                            created_at: '2026-11-26T01:05:00Z',
+                            location: 'wrld_p2:2',
+                            world_id: 'wrld_p2',
+                            world_name: 'Page 2 World',
+                            time: 200,
+                            group_name: ''
+                        }
+                    ],
+                    nextAfterRowId: 20,
+                    hasMore: false
+                };
+            }
+            return { rows: [], nextAfterRowId: 0, hasMore: false };
+        });
+
+        const progressEvents = [];
+        const result = await exportCloudDataToZip({
+            fetchJson: mockFetchJson,
+            includeLegacy: true,
+            onProgress: (p) => progressEvents.push(p)
+        });
+
+        expect(result.userPrefix).toBe('usr11112222333344445555666677778888');
+        expect(result.tableCounts).toEqual({
+            configs: 1,
+            memos: 2,
+            gamelog_location: 2
+        });
+        expect(result.totalRows).toBe(5);
+        expect(result.fileName).toMatch(/^VRCX-Cloud-Export-\d{8}-\d{6}\.zip$/);
+        expect(progressEvents.at(-1)?.percent).toBe(100);
+
+        // Verify valid PKZIP header (PK\x03\x04) and EOCD signature (PK\x05\x06) + entry names in central directory
+        const bytes = result.zipBytes;
+        expect(bytes[0]).toBe(0x50);
+        expect(bytes[1]).toBe(0x4b);
+        expect(bytes[2]).toBe(0x03);
+        expect(bytes[3]).toBe(0x04);
+        const eocdOffset = bytes.length - 22;
+        expect(bytes[eocdOffset]).toBe(0x50);
+        expect(bytes[eocdOffset + 1]).toBe(0x4b);
+        expect(bytes[eocdOffset + 2]).toBe(0x05);
+        expect(bytes[eocdOffset + 3]).toBe(0x06);
+
+        const rawAscii = Buffer.from(bytes).toString('latin1');
+        expect(rawAscii).toContain('manifest.json');
+        expect(rawAscii).toContain('README.txt');
+        expect(rawAscii).toContain('vrcx_desktop_restore.sql');
+        expect(rawAscii).toContain('data/configs.json');
+        expect(rawAscii).toContain('data/memos.json');
+        expect(rawAscii).toContain('data/gamelog_location.json');
+
+        // 4. Trilingual parity for all cloud_hub.migration.export_* keys
+        const [enJson, zhCnJson, zhTwJson] = await Promise.all([
+            import('../../localization/en.json'),
+            import('../../localization/zh-CN.json'),
+            import('../../localization/zh-TW.json')
+        ]);
+        const exportKeys = (obj) =>
+            Object.keys(obj.default.cloud_hub.migration)
+                .filter((k) => k.startsWith('export'))
+                .sort();
+        const enExportKeys = exportKeys(enJson);
+        expect(enExportKeys.length).toBeGreaterThanOrEqual(16);
+        expect(exportKeys(zhCnJson)).toEqual(enExportKeys);
+        expect(exportKeys(zhTwJson)).toEqual(enExportKeys);
     });
 });

@@ -414,6 +414,79 @@ public sealed class HttpSyncClient
         return root["data"]?.ToObject<LegacyMigrationBatchResponse>() ?? new LegacyMigrationBatchResponse();
     }
 
+    /// <summary>
+    /// Fetches export table counts and owner account prefix from `GET /api/agent/migration/export?scope=summary`.
+    /// </summary>
+    public async Task<CloudExportSummary> GetCloudExportSummaryAsync(
+        AgentConfig config,
+        bool includeLegacy,
+        CancellationToken ct)
+    {
+        if (!config.IsConfigured || !TryNormalizeCloudUrl(config.CloudUrl, out string normalizedBaseUrl))
+        {
+            throw new InvalidOperationException("Cloud URL is not configured.");
+        }
+
+        string endpoint = $"{normalizedBaseUrl}/api/agent/migration/export?scope=summary&includeLegacy={(includeLegacy ? "1" : "0")}";
+        using var req = new HttpRequestMessage(HttpMethod.Get, endpoint);
+        HmacSigner.ApplySyncAuthHeaders(req, config);
+
+        using HttpResponseMessage res = await _httpProvider().SendAsync(req, ct).ConfigureAwait(false);
+        string raw = await res.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+        if (!res.IsSuccessStatusCode)
+        {
+            string errDetail = ExtractErrorMessage(raw, $"HTTP {(int)res.StatusCode}");
+            throw new HttpRequestException($"Cloud export summary rejected ({(int)res.StatusCode}): {errDetail}", null, res.StatusCode);
+        }
+
+        JObject root = JObject.Parse(raw);
+        if (root["ok"]?.Value<bool>() != true)
+        {
+            string errDetail = root["error"]?["message"]?.Value<string>() ?? "Cloud export summary failed";
+            throw new HttpRequestException(errDetail);
+        }
+        return root["data"]?.ToObject<CloudExportSummary>() ?? new CloudExportSummary();
+    }
+
+    /// <summary>
+    /// Fetches a single paginated slice of a cloud table from `GET /api/agent/migration/export`.
+    /// </summary>
+    public async Task<CloudExportPage> GetCloudExportPageAsync(
+        AgentConfig config,
+        string tableName,
+        string source,
+        long afterRowId,
+        int limit,
+        CancellationToken ct)
+    {
+        if (!config.IsConfigured || !TryNormalizeCloudUrl(config.CloudUrl, out string normalizedBaseUrl))
+        {
+            throw new InvalidOperationException("Cloud URL is not configured.");
+        }
+
+        int safeLimit = Math.Clamp(limit, 1, 500);
+        string endpoint =
+            $"{normalizedBaseUrl}/api/agent/migration/export?table={Uri.EscapeDataString(tableName)}&source={Uri.EscapeDataString(source)}&afterRowId={Math.Max(0, afterRowId)}&limit={safeLimit}";
+        using var req = new HttpRequestMessage(HttpMethod.Get, endpoint);
+        HmacSigner.ApplySyncAuthHeaders(req, config);
+
+        using HttpResponseMessage res = await _httpProvider().SendAsync(req, ct).ConfigureAwait(false);
+        string raw = await res.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+        if (!res.IsSuccessStatusCode)
+        {
+            string errDetail = ExtractErrorMessage(raw, $"HTTP {(int)res.StatusCode}");
+            throw new HttpRequestException($"Cloud export page rejected ({(int)res.StatusCode}): {errDetail}", null, res.StatusCode);
+        }
+
+        JObject root = JObject.Parse(raw);
+        if (root["ok"]?.Value<bool>() != true)
+        {
+            string errDetail = root["error"]?["message"]?.Value<string>() ?? "Cloud export page failed";
+            throw new HttpRequestException(errDetail);
+        }
+        return root["data"]?.ToObject<CloudExportPage>() ?? new CloudExportPage();
+    }
+
     private static string ExtractErrorMessage(string raw, string fallback)
     {
         try

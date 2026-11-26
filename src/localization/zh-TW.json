@@ -3605,7 +3605,23 @@
             "job_started_toast": "已下發桌面舊資料遷移任務，正在背景分批上傳至獨立舊庫。",
             "job_completed_toast": "桌面舊資料遷移已全部完成。",
             "job_cancelled_toast": "已停止桌面舊資料遷移。",
-            "cleared_toast": "已清空獨立庫 DB_LEGACY 中的所有舊資料。"
+            "cleared_toast": "已清空獨立庫 DB_LEGACY 中的所有舊資料。",
+            "export_section_title": "雲端資料匯出",
+            "export_title": "匯出雲端資料為 ZIP 壓縮檔",
+            "export_desc": "將雲端備註、收藏、好友變更、通知、遊戲日誌、動態與安全偏好一鍵打包為 ZIP 歸檔（含結構化 JSON 備份與適配原版桌面 VRCX 的 SQLite 還原腳本，不含密碼、Cookie 或金鑰）。",
+            "export_btn": "匯出雲端資料 (.zip)",
+            "exporting_btn": "正在匯出...",
+            "export_cancel_btn": "取消匯出",
+            "export_include_legacy_label": "同時合併獨立舊庫（DB_LEGACY）中的歷史資料",
+            "export_account_prefix_label": "桌面帳號前綴：",
+            "export_account_prefix_placeholder": "自動識別（如 usr1a2b3c...）",
+            "export_account_prefix_hint": "用於產生原版桌面 VRCX 帳號分表（已自動識別時無需修改）",
+            "export_summary_loaded": "雲端現網 {active} 筆 · 獨立舊庫 {legacy} 筆",
+            "export_progress_table": "正在拉取 {table}...（已拉取 {processed} / {total} 筆）",
+            "export_packaging": "正在打包 ZIP 檔案...",
+            "export_done_toast": "匯出完成：共 {rows} 筆資料，已儲存為 {file}。",
+            "export_cancelled_toast": "已取消雲端資料匯出。",
+            "export_agent_tip": "提示：如需一鍵直接匯出內含現成原版 VRCX.sqlite3 的 ZIP 壓縮檔，可於電腦右下角右鍵點擊 VRCX.Agent（v1.12.0+）選擇「一鍵匯出雲端資料…」。"
         }
     }
 }

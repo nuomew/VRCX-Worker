@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.IO.Compression;
 using System.Linq;
 using System.Net;
 using System.Net.Http;
@@ -2736,6 +2737,336 @@ INSERT INTO {acctPrefix}_friend_log_history (created_at, type, user_id, display_
                 CancellationToken.None);
             Assert.False(completedStop);
             Assert.Equal(1, stopCalls);
+        }
+        finally
+        {
+            if (Directory.Exists(tempRoot)) Directory.Delete(tempRoot, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task CloudDataExporter_BuildsUpstreamDesktopSqliteAndZipArchiveFromPaginatedApi()
+    {
+        string tempRoot = Path.Combine(Path.GetTempPath(), "vrcx_cloud_export_test_" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(tempRoot);
+        try
+        {
+            const string expectedPrefix = "usr11112222333344445555666677778888";
+
+            // 1. Verify prefix normalization & local desktop DB read-only auto-detection fallback
+            Assert.Equal(expectedPrefix, CloudDataExporter.NormalizeExportUserPrefix("usr_11112222-3333-4444-5555-666677778888"));
+            string probeDbPath = Path.Combine(tempRoot, "probe_desktop.sqlite3");
+            using (var probeConn = new SqliteConnection($"Data Source={probeDbPath};Pooling=False"))
+            {
+                probeConn.Open();
+                using var probeCmd = probeConn.CreateCommand();
+                probeCmd.CommandText = $"CREATE TABLE {expectedPrefix}_feed_gps (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT);";
+                probeCmd.ExecuteNonQuery();
+            }
+            Assert.Equal(expectedPrefix, CloudDataExporter.NormalizeExportUserPrefix("", probeDbPath));
+
+            // 2. Mock paginated /api/agent/migration/export API (active + legacy conflict + 2-page gamelog_location)
+            using var stubHttp = new HttpClient(new StubHttpHandler(req =>
+            {
+                string query = req.RequestUri?.Query ?? string.Empty;
+                string payload;
+                if (query.Contains("scope=summary", StringComparison.Ordinal))
+                {
+                    payload = JsonConvert.SerializeObject(new
+                    {
+                        ok = true,
+                        data = new
+                        {
+                            exportedAt = "2026-11-26T02:30:00.000Z",
+                            userId = "usr_11112222-3333-4444-5555-666677778888",
+                            userPrefix = expectedPrefix,
+                            legacyDbBound = true,
+                            hasLegacyData = true,
+                            totalActiveRows = 5,
+                            totalLegacyRows = 2,
+                            tables = new object[]
+                            {
+                                new { name = "configs", activeCount = 1, legacyCount = 1 },
+                                new { name = "memos", activeCount = 1, legacyCount = 2 },
+                                new { name = "notes", activeCount = 1, legacyCount = 0 },
+                                new { name = "gamelog_location", activeCount = 2, legacyCount = 0 },
+                                new { name = "feed_gps", activeCount = 1, legacyCount = 0 },
+                                new { name = "notifications_v2", activeCount = 1, legacyCount = 0 }
+                            }
+                        }
+                    });
+                }
+                else if (query.Contains("table=configs", StringComparison.Ordinal) && query.Contains("source=active", StringComparison.Ordinal))
+                {
+                    payload = JsonConvert.SerializeObject(new
+                    {
+                        ok = true,
+                        data = new
+                        {
+                            table = "configs",
+                            source = "active",
+                            rows = new[] { new { key = "config:vrcx_thememode", value = "midnight" } },
+                            nextAfterRowId = 1,
+                            hasMore = false
+                        }
+                    });
+                }
+                else if (query.Contains("table=configs", StringComparison.Ordinal) && query.Contains("source=legacy", StringComparison.Ordinal))
+                {
+                    payload = JsonConvert.SerializeObject(new
+                    {
+                        ok = true,
+                        data = new
+                        {
+                            table = "configs",
+                            source = "legacy",
+                            rows = new[]
+                            {
+                                new { key = "config:vrcx_thememode", value = "light" },
+                                new { key = "config:vrcx_fontsize", value = "15" }
+                            },
+                            nextAfterRowId = 2,
+                            hasMore = false
+                        }
+                    });
+                }
+                else if (query.Contains("table=memos", StringComparison.Ordinal) && query.Contains("source=active", StringComparison.Ordinal))
+                {
+                    payload = JsonConvert.SerializeObject(new
+                    {
+                        ok = true,
+                        data = new
+                        {
+                            table = "memos",
+                            source = "active",
+                            rows = new[] { new { user_id = "usr_conflict", edited_at = "2026-11-26T00:00:00Z", memo = "Cloud Winner" } },
+                            nextAfterRowId = 1,
+                            hasMore = false
+                        }
+                    });
+                }
+                else if (query.Contains("table=memos", StringComparison.Ordinal) && query.Contains("source=legacy", StringComparison.Ordinal))
+                {
+                    payload = JsonConvert.SerializeObject(new
+                    {
+                        ok = true,
+                        data = new
+                        {
+                            table = "memos",
+                            source = "legacy",
+                            rows = new[]
+                            {
+                                new { user_id = "usr_conflict", edited_at = "2024-01-01T00:00:00Z", memo = "Old Loser" },
+                                new { user_id = "usr_old_only", edited_at = "2024-01-02T00:00:00Z", memo = "Legacy Only" }
+                            },
+                            nextAfterRowId = 2,
+                            hasMore = false
+                        }
+                    });
+                }
+                else if (query.Contains("table=notes", StringComparison.Ordinal))
+                {
+                    payload = JsonConvert.SerializeObject(new
+                    {
+                        ok = true,
+                        data = new
+                        {
+                            table = "notes",
+                            source = "active",
+                            rows = new[] { new { user_id = "usr_old_only", display_name = "Sakura", note = "Met at JP Shrine", created_at = "2026-11-25T00:00:00Z" } },
+                            nextAfterRowId = 1,
+                            hasMore = false
+                        }
+                    });
+                }
+                else if (query.Contains("table=gamelog_location", StringComparison.Ordinal) && query.Contains("afterRowId=0", StringComparison.Ordinal))
+                {
+                    payload = JsonConvert.SerializeObject(new
+                    {
+                        ok = true,
+                        data = new
+                        {
+                            table = "gamelog_location",
+                            source = "active",
+                            rows = new[]
+                            {
+                                new { created_at = "2026-11-25T10:00:00Z", location = "wrld_jp1:100", world_id = "wrld_jp1", world_name = "桜の神社", time = 1800, group_name = "" }
+                            },
+                            nextAfterRowId = 11,
+                            hasMore = true
+                        }
+                    });
+                }
+                else if (query.Contains("table=gamelog_location", StringComparison.Ordinal) && query.Contains("afterRowId=11", StringComparison.Ordinal))
+                {
+                    payload = JsonConvert.SerializeObject(new
+                    {
+                        ok = true,
+                        data = new
+                        {
+                            table = "gamelog_location",
+                            source = "active",
+                            rows = new[]
+                            {
+                                new { created_at = "2026-11-25T11:00:00Z", location = "wrld_jp2:200", world_id = "wrld_jp2", world_name = "月見茶屋", time = 900, group_name = "" }
+                            },
+                            nextAfterRowId = 22,
+                            hasMore = false
+                        }
+                    });
+                }
+                else if (query.Contains("table=feed_gps", StringComparison.Ordinal))
+                {
+                    payload = JsonConvert.SerializeObject(new
+                    {
+                        ok = true,
+                        data = new
+                        {
+                            table = "feed_gps",
+                            source = "active",
+                            rows = new[]
+                            {
+                                new { created_at = "2026-11-25T10:05:00Z", user_id = "usr_old_only", display_name = "Sakura", location = "wrld_jp1:100", world_name = "桜の神社", previous_location = "", time = 600, group_name = "" }
+                            },
+                            nextAfterRowId = 1,
+                            hasMore = false
+                        }
+                    });
+                }
+                else if (query.Contains("table=notifications_v2", StringComparison.Ordinal))
+                {
+                    payload = JsonConvert.SerializeObject(new
+                    {
+                        ok = true,
+                        data = new
+                        {
+                            table = "notifications_v2",
+                            source = "active",
+                            rows = new[]
+                            {
+                                new
+                                {
+                                    id = "not_v2_exp_1",
+                                    created_at = "2026-11-25T12:00:00Z",
+                                    updated_at = "2026-11-25T12:00:00Z",
+                                    expires_at = "2026-12-25T12:00:00Z",
+                                    type = "boop",
+                                    link = "",
+                                    link_text = "",
+                                    message = "Boop!",
+                                    title = "",
+                                    image_url = "",
+                                    seen = 1,
+                                    sender_user_id = "usr_old_only",
+                                    sender_username = "Sakura",
+                                    data = "{}",
+                                    responses = "[]",
+                                    details = "{}"
+                                }
+                            },
+                            nextAfterRowId = 1,
+                            hasMore = false
+                        }
+                    });
+                }
+                else
+                {
+                    payload = "{\"ok\":true,\"data\":{\"rows\":[],\"nextAfterRowId\":0,\"hasMore\":false}}";
+                }
+
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent(payload, Encoding.UTF8, "application/json")
+                });
+            }));
+
+            var syncClient = new HttpSyncClient(stubHttp);
+            var cfg = new AgentConfig
+            {
+                CloudUrl = "https://vrcx.example.workers.dev",
+                SyncSecret = "vrcx_sync_export_key",
+                DeviceId = "dev_export_test"
+            };
+            string outZipPath = Path.Combine(tempRoot, "VRCX-Cloud-Export-Test.zip");
+
+            CloudExportResult result = await CloudDataExporter.ExportToZipAsync(
+                cfg,
+                syncClient,
+                outZipPath,
+                includeLegacy: true,
+                ct: CancellationToken.None);
+
+            Assert.True(File.Exists(outZipPath));
+            Assert.False(File.Exists(outZipPath + ".part"));
+            Assert.True(result.ZipBytes > 0);
+            Assert.Equal(expectedPrefix, result.UserPrefix);
+            Assert.Equal(9, result.TotalRows); // 2 configs + 2 memos + 1 note + 2 locations + 1 feed_gps + 1 noty_v2
+
+            // 3. Extract and inspect ZIP entries & open generated VRCX.sqlite3 with Microsoft.Data.Sqlite
+            string extractDir = Path.Combine(tempRoot, "extracted");
+            ZipFile.ExtractToDirectory(outZipPath, extractDir);
+            string exportedDb = Path.Combine(extractDir, "VRCX.sqlite3");
+            Assert.True(File.Exists(exportedDb));
+            Assert.True(File.Exists(Path.Combine(extractDir, "manifest.json")));
+            Assert.True(File.Exists(Path.Combine(extractDir, "使用说明_README.txt")));
+            Assert.True(File.Exists(Path.Combine(extractDir, "data", "memos.json")));
+            Assert.True(File.Exists(Path.Combine(extractDir, "data", "gamelog_location.json")));
+
+            using (var conn = new SqliteConnection($"Data Source={exportedDb};Mode=ReadOnly;Pooling=False"))
+            {
+                conn.Open();
+
+                // configs: active midnight wins over legacy light; legacy fontsize preserved
+                using (var cmd = conn.CreateCommand())
+                {
+                    cmd.CommandText = "SELECT `value` FROM configs WHERE `key` = 'config:vrcx_thememode'";
+                    Assert.Equal("midnight", cmd.ExecuteScalar()?.ToString());
+                }
+                using (var cmd = conn.CreateCommand())
+                {
+                    cmd.CommandText = "SELECT `value` FROM configs WHERE `key` = 'config:vrcx_fontsize'";
+                    Assert.Equal("15", cmd.ExecuteScalar()?.ToString());
+                }
+
+                // memos: active Cloud Winner overrides legacy Old Loser; Legacy Only kept
+                using (var cmd = conn.CreateCommand())
+                {
+                    cmd.CommandText = "SELECT memo FROM memos WHERE user_id = 'usr_conflict'";
+                    Assert.Equal("Cloud Winner", cmd.ExecuteScalar()?.ToString());
+                }
+                using (var cmd = conn.CreateCommand())
+                {
+                    cmd.CommandText = "SELECT memo FROM memos WHERE user_id = 'usr_old_only'";
+                    Assert.Equal("Legacy Only", cmd.ExecuteScalar()?.ToString());
+                }
+
+                // gamelog_location: both paginated CJK worlds present
+                var worlds = new List<string>();
+                using (var cmd = conn.CreateCommand())
+                {
+                    cmd.CommandText = "SELECT world_name FROM gamelog_location ORDER BY created_at ASC";
+                    using SqliteDataReader r = cmd.ExecuteReader();
+                    while (r.Read()) worlds.Add(r.GetString(0));
+                }
+                Assert.Equal(new[] { "桜の神社", "月見茶屋" }, worlds);
+
+                // Account-prefixed upstream tables created & populated
+                using (var cmd = conn.CreateCommand())
+                {
+                    cmd.CommandText = $"SELECT note FROM {expectedPrefix}_notes WHERE user_id = 'usr_old_only'";
+                    Assert.Equal("Met at JP Shrine", cmd.ExecuteScalar()?.ToString());
+                }
+                using (var cmd = conn.CreateCommand())
+                {
+                    cmd.CommandText = $"SELECT world_name FROM {expectedPrefix}_feed_gps WHERE user_id = 'usr_old_only'";
+                    Assert.Equal("桜の神社", cmd.ExecuteScalar()?.ToString());
+                }
+                using (var cmd = conn.CreateCommand())
+                {
+                    cmd.CommandText = $"SELECT message FROM {expectedPrefix}_notifications_v2 WHERE id = 'not_v2_exp_1'";
+                    Assert.Equal("Boop!", cmd.ExecuteScalar()?.ToString());
+                }
+            }
         }
         finally
         {

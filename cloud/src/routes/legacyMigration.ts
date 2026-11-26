@@ -36,6 +36,304 @@ export const LEGACY_CATEGORIES = [
 export type LegacyCategory = (typeof LEGACY_CATEGORIES)[number];
 
 export const LEGACY_CATEGORY_SET = new Set<string>(LEGACY_CATEGORIES);
+
+const CLOUD_EXPORT_TABLES = [
+    { name: 'configs', activeShard: 'core' as const, isConfig: true },
+    { name: 'memos', activeShard: 'core' as const },
+    { name: 'world_memos', activeShard: 'core' as const },
+    { name: 'avatar_memos', activeShard: 'core' as const },
+    { name: 'notes', activeShard: 'core' as const },
+    { name: 'favorite_friend', activeShard: 'core' as const },
+    { name: 'favorite_world', activeShard: 'core' as const },
+    { name: 'favorite_avatar', activeShard: 'core' as const },
+    { name: 'favorite_print', activeShard: 'core' as const },
+    { name: 'avatar_tags', activeShard: 'core' as const },
+    { name: 'avatar_history', activeShard: 'core' as const },
+    { name: 'friend_log_current', activeShard: 'core' as const },
+    { name: 'friend_log_history', activeShard: 'core' as const },
+    { name: 'notifications', activeShard: 'core' as const },
+    { name: 'notifications_v2', activeShard: 'core' as const },
+    { name: 'moderation', activeShard: 'core' as const },
+    { name: 'user_profile', activeShard: 'core' as const },
+    { name: 'gamelog_location', activeShard: 'gamelog' as const },
+    { name: 'gamelog_join_leave', activeShard: 'gamelog' as const },
+    { name: 'gamelog_portal_spawn', activeShard: 'gamelog' as const },
+    { name: 'gamelog_video_play', activeShard: 'gamelog' as const },
+    { name: 'gamelog_event', activeShard: 'gamelog' as const },
+    { name: 'gamelog_external', activeShard: 'gamelog' as const },
+    { name: 'feed_gps', activeShard: 'feed' as const },
+    { name: 'feed_online_offline', activeShard: 'feed' as const },
+    { name: 'feed_status', activeShard: 'feed' as const },
+    { name: 'feed_bio', activeShard: 'feed' as const }
+] as const;
+
+type CloudExportTableMeta = (typeof CLOUD_EXPORT_TABLES)[number];
+const CLOUD_EXPORT_TABLE_MAP = new Map<string, CloudExportTableMeta>(CLOUD_EXPORT_TABLES.map((t) => [t.name, t]));
+const MAX_EXPORT_PAGE_LIMIT = 500;
+
+function deriveUpstreamUserPrefix(userId: string): string {
+    const cleaned = userId.replace(/-/g, '').replace(/_/g, '').trim();
+    if (!cleaned) return '';
+    const prefixed = /^\d/.test(cleaned) ? `_${cleaned}` : cleaned;
+    return ACCOUNT_PREFIX_RE.test(prefixed) ? prefixed : '';
+}
+
+function getActiveShardDb(env: Env, shard: 'core' | 'gamelog' | 'feed'): D1Database {
+    if (shard === 'gamelog') return env.DB_GAMELOG;
+    if (shard === 'feed') return env.DB_FEED;
+    return env.DB_CORE;
+}
+
+async function resolveExportOwnerIdentity(env: Env): Promise<{ userId: string; userPrefix: string }> {
+    let userId = '';
+    let userPrefix = '';
+    try {
+        const ownerRow = await env.DB_CORE.prepare(
+            "SELECT payload_json FROM cloud_bg_sync_state WHERE state_key = 'friend_log_owner' LIMIT 1"
+        ).first<{ payload_json?: string }>();
+        if (ownerRow?.payload_json) {
+            const parsed = JSON.parse(ownerRow.payload_json) as { userId?: unknown };
+            if (typeof parsed?.userId === 'string' && parsed.userId.trim()) {
+                userId = parsed.userId.trim();
+                userPrefix = deriveUpstreamUserPrefix(userId);
+            }
+        }
+    } catch {
+        // Non-fatal fallback
+    }
+
+    if (!userPrefix) {
+        const legacyDb = getLegacyDb(env);
+        if (legacyDb) {
+            const [job, inv] = await Promise.all([
+                readLegacyState<LegacyMigrationJob>(legacyDb, STATE_KEY_JOB),
+                readLegacyState<LegacyDesktopInventory>(legacyDb, STATE_KEY_INVENTORY)
+            ]);
+            const candidate = job?.accountPrefix || inv?.accounts?.[0]?.prefix || '';
+            if (candidate && ACCOUNT_PREFIX_RE.test(candidate)) {
+                userPrefix = candidate;
+            }
+            if (!userId && inv?.accounts?.[0]?.label?.startsWith('usr_')) {
+                userId = inv.accounts[0].label;
+            }
+        }
+    }
+    return { userId, userPrefix };
+}
+
+async function readSafeActiveConfigRows(env: Env): Promise<Array<{ key: string; value: string }>> {
+    try {
+        const row = await env.DB_CORE.prepare(
+            "SELECT payload_json FROM config_bundles WHERE bundle_key = 'vrcx_config' LIMIT 1"
+        ).first<{ payload_json?: string }>();
+        if (!row?.payload_json) return [];
+        const parsed = JSON.parse(row.payload_json) as Record<string, unknown>;
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return [];
+        const out: Array<{ key: string; value: string }> = [];
+        for (const [k, v] of Object.entries(parsed)) {
+            if (!isSafeLegacyConfigKey(k)) continue;
+            if (v === null || v === undefined) continue;
+            out.push({ key: normalizeLegacyConfigKey(k), value: String(v) });
+        }
+        return out;
+    } catch {
+        return [];
+    }
+}
+
+async function readSafeLegacyConfigRows(legacyDb: D1Database): Promise<Array<{ key: string; value: string }>> {
+    try {
+        const res = await legacyDb
+            .prepare('SELECT config_key, config_value FROM legacy_configs ORDER BY config_key ASC LIMIT 2000')
+            .all<{ config_key: string; config_value: string }>();
+        const out: Array<{ key: string; value: string }> = [];
+        for (const r of res.results ?? []) {
+            if (!r.config_key || !isSafeLegacyConfigKey(r.config_key)) continue;
+            out.push({ key: normalizeLegacyConfigKey(r.config_key), value: r.config_value ?? '' });
+        }
+        return out;
+    } catch {
+        return [];
+    }
+}
+
+/**
+ * Shared read-only paginated cloud export handler backing both Web (`GET /api/migration/export`)
+ * and Windows `VRCX.Agent` (`GET /api/agent/migration/export`). Never exposes credentials, cookies,
+ * 2FA/passphrase secrets, or device tokens.
+ */
+async function handleCloudExportQuery(env: Env, url: URL): Promise<Response> {
+    const scope = (url.searchParams.get('scope') ?? '').trim().toLowerCase();
+    const includeLegacy = url.searchParams.get('includeLegacy') !== '0';
+    const legacyDb = includeLegacy ? getLegacyDb(env) : null;
+
+    if (scope === 'summary' || !url.searchParams.get('table')) {
+        const [identity, activeConfigs, legacyConfigs] = await Promise.all([
+            resolveExportOwnerIdentity(env),
+            readSafeActiveConfigRows(env),
+            legacyDb ? readSafeLegacyConfigRows(legacyDb) : Promise.resolve([])
+        ]);
+
+        const nonConfigTables = CLOUD_EXPORT_TABLES.filter((t) => !('isConfig' in t && t.isConfig));
+        const coreTables = nonConfigTables.filter((t) => t.activeShard === 'core');
+        const gamelogTables = nonConfigTables.filter((t) => t.activeShard === 'gamelog');
+        const feedTables = nonConfigTables.filter((t) => t.activeShard === 'feed');
+
+        const [coreCounts, gamelogCounts, feedCounts, legacyCountsBatch] = await Promise.all([
+            env.DB_CORE.batch(coreTables.map((t) => env.DB_CORE.prepare(`SELECT COUNT(*) AS cnt FROM ${t.name}`))),
+            env.DB_GAMELOG.batch(
+                gamelogTables.map((t) => env.DB_GAMELOG.prepare(`SELECT COUNT(*) AS cnt FROM ${t.name}`))
+            ),
+            env.DB_FEED.batch(feedTables.map((t) => env.DB_FEED.prepare(`SELECT COUNT(*) AS cnt FROM ${t.name}`))),
+            legacyDb
+                ? legacyDb
+                      .batch(nonConfigTables.map((t) => legacyDb.prepare(`SELECT COUNT(*) AS cnt FROM ${t.name}`)))
+                      .catch(() => nonConfigTables.map(() => ({ results: [{ cnt: 0 }] })))
+                : Promise.resolve(nonConfigTables.map(() => ({ results: [{ cnt: 0 }] })))
+        ]);
+
+        const activeCountMap = new Map<string, number>([['configs', activeConfigs.length]]);
+        coreTables.forEach((t, i) => {
+            const first = (coreCounts[i]?.results?.[0] ?? null) as { cnt?: number } | null;
+            activeCountMap.set(t.name, Number(first?.cnt ?? 0));
+        });
+        gamelogTables.forEach((t, i) => {
+            const first = (gamelogCounts[i]?.results?.[0] ?? null) as { cnt?: number } | null;
+            activeCountMap.set(t.name, Number(first?.cnt ?? 0));
+        });
+        feedTables.forEach((t, i) => {
+            const first = (feedCounts[i]?.results?.[0] ?? null) as { cnt?: number } | null;
+            activeCountMap.set(t.name, Number(first?.cnt ?? 0));
+        });
+
+        const legacyCountMap = new Map<string, number>([['configs', legacyConfigs.length]]);
+        nonConfigTables.forEach((t, i) => {
+            const first = (legacyCountsBatch[i]?.results?.[0] ?? null) as { cnt?: number } | null;
+            legacyCountMap.set(t.name, Number(first?.cnt ?? 0));
+        });
+
+        let totalActiveRows = 0;
+        let totalLegacyRows = 0;
+        const tables = CLOUD_EXPORT_TABLES.map((t) => {
+            const activeCount = activeCountMap.get(t.name) ?? 0;
+            const legacyCount = legacyCountMap.get(t.name) ?? 0;
+            totalActiveRows += activeCount;
+            totalLegacyRows += legacyCount;
+            return {
+                name: t.name,
+                activeCount,
+                legacyCount
+            };
+        });
+
+        return Response.json(
+            {
+                ok: true,
+                data: {
+                    exportedAt: new Date().toISOString(),
+                    userId: identity.userId,
+                    userPrefix: identity.userPrefix,
+                    legacyDbBound: Boolean(getLegacyDb(env)),
+                    hasLegacyData: totalLegacyRows > 0,
+                    totalActiveRows,
+                    totalLegacyRows,
+                    tables
+                }
+            },
+            { headers: { 'Cache-Control': 'no-store' } }
+        );
+    }
+
+    const tableName = (url.searchParams.get('table') ?? '').trim();
+    const meta = CLOUD_EXPORT_TABLE_MAP.get(tableName);
+    if (!meta) {
+        return Response.json(
+            { ok: false, error: { code: 'INVALID_EXPORT_TABLE', message: 'Unsupported export table' } },
+            { status: 400 }
+        );
+    }
+
+    const source = (url.searchParams.get('source') ?? 'active').trim().toLowerCase();
+    if (source !== 'active' && source !== 'legacy') {
+        return Response.json(
+            { ok: false, error: { code: 'BAD_REQUEST', message: "source must be 'active' or 'legacy'" } },
+            { status: 400 }
+        );
+    }
+
+    if (source === 'legacy' && !legacyDb) {
+        return Response.json(
+            {
+                ok: true,
+                data: {
+                    table: tableName,
+                    source: 'legacy',
+                    rows: [],
+                    nextAfterRowId: 0,
+                    hasMore: false
+                }
+            },
+            { headers: { 'Cache-Control': 'no-store' } }
+        );
+    }
+
+    const afterRowId = Math.max(0, asFiniteInt(url.searchParams.get('afterRowId'), 0));
+    const limit = Math.min(Math.max(asFiniteInt(url.searchParams.get('limit'), 400), 1), MAX_EXPORT_PAGE_LIMIT);
+
+    if ('isConfig' in meta && meta.isConfig) {
+        const rows =
+            source === 'legacy'
+                ? legacyDb
+                    ? await readSafeLegacyConfigRows(legacyDb)
+                    : []
+                : await readSafeActiveConfigRows(env);
+        return Response.json(
+            {
+                ok: true,
+                data: {
+                    table: 'configs',
+                    source,
+                    rows: afterRowId > 0 ? [] : rows,
+                    nextAfterRowId: rows.length,
+                    hasMore: false
+                }
+            },
+            { headers: { 'Cache-Control': 'no-store' } }
+        );
+    }
+
+    const targetDb = source === 'legacy' ? legacyDb! : getActiveShardDb(env, meta.activeShard);
+    const res = await targetDb
+        .prepare(`SELECT rowid AS _cursor_id, * FROM ${tableName} WHERE rowid > ? ORDER BY rowid ASC LIMIT ?`)
+        .bind(afterRowId, limit + 1)
+        .all<Record<string, unknown>>();
+    const fetched = res.results ?? [];
+    const hasMore = fetched.length > limit;
+    const page = hasMore ? fetched.slice(0, limit) : fetched;
+    let nextAfterRowId = afterRowId;
+    const rows = page.map((r) => {
+        const cursorVal = Number(r._cursor_id ?? 0);
+        if (Number.isFinite(cursorVal) && cursorVal > nextAfterRowId) {
+            nextAfterRowId = cursorVal;
+        }
+        const { _cursor_id: _drop, ...clean } = r;
+        return clean;
+    });
+
+    return Response.json(
+        {
+            ok: true,
+            data: {
+                table: tableName,
+                source,
+                rows,
+                nextAfterRowId,
+                hasMore
+            }
+        },
+        { headers: { 'Cache-Control': 'no-store' } }
+    );
+}
 // Matches upstream desktop VRCX userPrefix: `userId.replaceAll('-', '').replaceAll('_', '')` with optional leading '_'
 // (e.g. `usr1a2b3c...`, `_1234567890`, or `usr_...`).
 export const ACCOUNT_PREFIX_RE = /^[A-Za-z_][A-Za-z0-9_]{2,64}$/;
@@ -1045,6 +1343,42 @@ export async function handleLegacyMigrationAgentRoutes(
         });
     }
 
+    if (url.pathname === '/api/agent/migration/export' && request.method === 'GET') {
+        // Full-database export always requires an explicit Sync Key / Bearer credential so open_setup
+        // deployments protected by Web 2FA or Static Passphrase can never be dumped anonymously.
+        const authHeader = request.headers.get('Authorization') ?? '';
+        const syncKeyHeader = request.headers.get('X-Sync-Key')?.trim() ?? '';
+        const hasExplicitToken =
+            (authHeader.startsWith('Bearer ') && authHeader.slice(7).trim().length > 0) || syncKeyHeader.length > 0;
+        if (!hasExplicitToken) {
+            return Response.json(
+                {
+                    ok: false,
+                    error: {
+                        code: 'UNAUTHORIZED_AGENT',
+                        message: 'A valid Agent Sync Key is required to export cloud data'
+                    }
+                },
+                { status: 401 }
+            );
+        }
+        const preAuth = await preAuthenticateAgent(request, env);
+        if (!preAuth.authenticated || !preAuth.deviceId) {
+            return Response.json(
+                { ok: false, error: { code: 'UNAUTHORIZED_AGENT', message: preAuth.reason ?? 'Unauthorized agent' } },
+                { status: 401 }
+            );
+        }
+        const auth = await verifyAgentBodyHmac(request, env, preAuth, '');
+        if (!auth.authenticated || !auth.deviceId) {
+            return Response.json(
+                { ok: false, error: { code: 'UNAUTHORIZED_AGENT', message: auth.reason ?? 'Unauthorized agent' } },
+                { status: 401 }
+            );
+        }
+        return handleCloudExportQuery(env, url);
+    }
+
     return null;
 }
 
@@ -1385,6 +1719,10 @@ export async function handleLegacyMigrationWebRoutes(
         }).catch(() => {});
 
         return Response.json({ ok: true, data: { cancelled: true, job: cancelledJob } });
+    }
+
+    if (url.pathname === '/api/migration/export' && request.method === 'GET') {
+        return handleCloudExportQuery(env, url);
     }
 
     if (url.pathname === '/api/migration/data' && request.method === 'DELETE') {
