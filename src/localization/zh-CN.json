@@ -3789,6 +3789,7 @@
             "derivative_notice_suffix": " 由 nuomew（诺喵）二次开发的 Cloudflare Workers 云端托管版本（MIT 协议）。"
         },
         "two_factor": {
+            "tab_label": "安全",
             "section_title": "安全与二步验证（2FA）",
             "title": "打开页面 2FA 验证（一次性验证码）",
             "desc": "默认关闭。开启后，打开页面需输入验证器 6 位一次性验证码；验证后可设置当前浏览器免验证时长（最多 30 天），浏览器清理缓存 / Cookie 后需重新验证。",

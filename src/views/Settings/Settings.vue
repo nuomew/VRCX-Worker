@@ -8,6 +8,9 @@
                 <template #system>
                     <SystemTab />
                 </template>
+                <template #security>
+                    <SecurityTab v-if="isWeb" />
+                </template>
                 <template #interface>
                     <InterfaceTab />
                 </template>
@@ -35,7 +38,7 @@
 </template>
 
 <script setup>
-    import { computed, onBeforeMount } from 'vue';
+    import { computed, defineAsyncComponent, onBeforeMount } from 'vue';
     import { TabsUnderline } from '@/components/ui/tabs';
     import { useI18n } from 'vue-i18n';
 
@@ -48,11 +51,14 @@
     import SystemTab from './components/Tabs/SystemTab.vue';
     import VrTab from './components/Tabs/VrTab.vue';
 
+    const SecurityTab = defineAsyncComponent(() => import('./components/Tabs/SecurityTab.vue'));
+
     const { t } = useI18n();
     const isWeb = typeof WEB !== 'undefined' && WEB;
     const settingsTabs = computed(() => {
         const tabs = [
             { value: 'system', label: t('view.settings.category.system') },
+            ...(isWeb ? [{ value: 'security', label: t('cloud_hub.two_factor.tab_label') }] : []),
             { value: 'interface', label: t('view.settings.category.interface') },
             { value: 'social', label: t('view.settings.category.social') },
             { value: 'notifications', label: t('view.settings.category.notifications') },

@@ -78,10 +78,6 @@
             </SettingsItem>
         </SettingsGroup>
 
-        <SettingsGroup v-if="isWeb" :title="t('cloud_hub.two_factor.section_title')">
-            <CloudTwoFactorSettings />
-        </SettingsGroup>
-
         <SettingsGroup v-if="!isWeb" :title="t('view.settings.general.vrcx_updater.header')">
             <div class="flex gap-2">
                 <Button size="sm" variant="outline" @click="showChangeLogDialog">{{
@@ -271,9 +267,6 @@
 
     const OpenSourceSoftwareNoticeDialog = defineAsyncComponent(
         () => import('../../dialogs/OpenSourceSoftwareNoticeDialog.vue')
-    );
-    const CloudTwoFactorSettings = defineAsyncComponent(
-        () => import('@/components/cloud/CloudTwoFactorSettings.vue')
     );
 
     function openOSSDialog() {

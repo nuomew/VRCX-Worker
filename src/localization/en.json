@@ -3791,6 +3791,7 @@
             "derivative_notice_suffix": " by nuomew (MIT)."
         },
         "two_factor": {
+            "tab_label": "Security",
             "section_title": "Security & Two-Factor Authentication (2FA)",
             "title": "Page Access 2FA (TOTP One-Time Code)",
             "desc": "Disabled by default. When enabled, opening the page requires a 6-digit authenticator code. You can trust a browser for up to 30 days; clearing browser cache/cookies requires re-verification.",

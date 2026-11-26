@@ -3454,6 +3454,7 @@
             "derivative_notice_suffix": " 由 nuomew（諾喵）二次開發的 Cloudflare Workers 雲端託管版本（MIT 授權）。"
         },
         "two_factor": {
+            "tab_label": "安全",
             "section_title": "安全與二步驗證（2FA）",
             "title": "開啟頁面 2FA 驗證（一次性驗證碼）",
             "desc": "預設關閉。開啟後，開啟頁面須輸入驗證器 6 位數一次性驗證碼；驗證後可設定目前瀏覽器免驗證時長（最多 30 天），瀏覽器清除快取 / Cookie 後須重新驗證。",
