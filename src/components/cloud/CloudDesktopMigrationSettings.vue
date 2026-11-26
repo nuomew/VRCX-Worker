@@ -35,6 +35,30 @@
             </div>
         </SettingsItem>
 
+        <!-- Cloud-controlled Migration Concurrency Setting -->
+        <SettingsItem :label="t('cloud_hub.migration.concurrency_label')">
+            <div class="flex flex-wrap items-center gap-2">
+                <select
+                    :value="migrationConcurrency"
+                    :disabled="savingConcurrency || isJobActive || !legacyDbBound"
+                    class="rounded-md border border-input bg-background px-2.5 py-1.5 text-xs text-foreground dark:[color-scheme:dark]"
+                    data-migration-concurrency
+                    @change="handleConcurrencyChange($event.target.value)">
+                    <option
+                        v-for="opt in CONCURRENCY_OPTIONS"
+                        :key="opt"
+                        class="bg-card text-foreground"
+                        :value="opt">
+                        {{
+                            opt === 2 || opt === 4
+                                ? t('cloud_hub.migration.concurrency_option_recommended', { count: opt })
+                                : t('cloud_hub.migration.concurrency_option', { count: opt })
+                        }}
+                    </option>
+                </select>
+            </div>
+        </SettingsItem>
+
         <!-- Dedicated Legacy D1 Storage Usage Card -->
         <div class="rounded-lg border border-border bg-card/60 p-4 space-y-2.5">
             <div class="flex flex-wrap items-center justify-between gap-2">
@@ -145,6 +169,11 @@
                         class="rounded-full border px-2 py-0.5 text-[11px] font-medium"
                         :class="jobStatusBadgeClass">
                         {{ jobStatusLabel }}
+                    </span>
+                    <span
+                        v-if="job.concurrency > 0"
+                        class="rounded bg-muted px-2 py-0.5 font-mono text-[11px] text-muted-foreground">
+                        {{ t('cloud_hub.migration.concurrency_badge', { count: job.concurrency }) }}
                     </span>
                 </div>
                 <Button
@@ -383,6 +412,7 @@
         'feed'
     ];
     const LIGHTWEIGHT_CATEGORIES = ['memos_notes', 'favorites', 'avatar_history', 'friend_log', 'moderation_profiles'];
+    const CONCURRENCY_OPTIONS = [1, 2, 3, 4, 6, 8];
     const WARN_LIMIT_BYTES = 400 * 1024 * 1024;
 
     const loadingState = ref(false);
@@ -392,6 +422,7 @@
     const startingJob = ref(false);
     const cancellingJob = ref(false);
     const clearingData = ref(false);
+    const savingConcurrency = ref(false);
     const showClearConfirm = ref(false);
     const actionError = ref('');
 
@@ -400,6 +431,7 @@
     const legacyDbLimitBytes = ref(500 * 1024 * 1024);
     const legacyDbPercent = ref(0);
     const syncIntervalSeconds = ref(60);
+    const migrationConcurrency = ref(2);
     const devices = ref([]);
     const selectedDeviceId = ref('');
     const inventory = ref(null);
@@ -594,6 +626,10 @@
             legacyDbLimitBytes.value = Number(data?.legacyDbLimitBytes || 500 * 1024 * 1024);
             legacyDbPercent.value = Number(data?.legacyDbPercent || 0);
             syncIntervalSeconds.value = Number(data?.syncIntervalSeconds || 60);
+            if (!savingConcurrency.value && Number.isInteger(Number(data?.migrationConcurrency))) {
+                const clamped = Math.min(8, Math.max(1, Number(data.migrationConcurrency)));
+                migrationConcurrency.value = clamped;
+            }
             devices.value = Array.isArray(data?.devices) ? data.devices : [];
             if (!selectedDeviceId.value && devices.value.length > 0) {
                 const onlineFirst = devices.value.find((d) => d.online) || devices.value[0];
@@ -667,6 +703,28 @@
         }
     }
 
+    async function handleConcurrencyChange(rawValue) {
+        const next = Math.min(8, Math.max(1, Math.floor(Number(rawValue) || 2)));
+        const prev = migrationConcurrency.value;
+        if (next === prev || savingConcurrency.value) return;
+        migrationConcurrency.value = next;
+        savingConcurrency.value = true;
+        actionError.value = '';
+        try {
+            const res = await cloudFetch('/api/migration/settings', {
+                method: 'PUT',
+                json: { concurrency: next }
+            });
+            migrationConcurrency.value = Number(res?.concurrency || next);
+            toast.success(t('cloud_hub.migration.concurrency_saved_toast', { count: migrationConcurrency.value }));
+        } catch (err) {
+            migrationConcurrency.value = prev;
+            actionError.value = err?.message || String(err);
+        } finally {
+            savingConcurrency.value = false;
+        }
+    }
+
     async function startMigration() {
         if (startingJob.value || selectedCategoryKeys.value.length === 0) return;
         startingJob.value = true;
@@ -677,7 +735,8 @@
                 json: {
                     deviceId: selectedDeviceId.value || inventory.value?.deviceId || undefined,
                     accountPrefix: selectedAccountPrefix.value || '',
-                    categories: selectedCategoryKeys.value
+                    categories: selectedCategoryKeys.value,
+                    concurrency: migrationConcurrency.value
                 }
             });
             job.value = res?.job || null;

@@ -2,9 +2,12 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Net;
+using System.Net.Http;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
+using System.Threading.Channels;
 using System.Threading.Tasks;
 using Microsoft.Data.Sqlite;
 using Newtonsoft.Json;
@@ -93,9 +96,13 @@ public sealed class LegacyMigrationBatchResponse
 public static class DesktopLegacyMigrator
 {
     private static readonly Logger Log = LogManager.GetCurrentClassLogger();
-    private const int BatchRowsLimit = 80;
+    public const int MinConcurrency = 1;
+    public const int MaxConcurrency = 8;
+    public const int DefaultConcurrency = 2;
+    private const int BatchRowsLimit = 240;
     private const int MaxBatchPayloadBytes = 180 * 1024;
     private const int MaxSingleFieldChars = 16384;
+    private const int MaxBatchRetryAttempts = 3;
     private const int SampleHalfRows = 200;
 
     public static readonly IReadOnlyList<string> AllowedCategories = new[]
@@ -525,9 +532,59 @@ public static class DesktopLegacyMigrator
         }
     }
 
+    private static bool IsTransientBatchError(Exception ex, CancellationToken externalCt)
+    {
+        if (externalCt.IsCancellationRequested) return false;
+        if (ex is TaskCanceledException) return true; // HttpClient request timeout
+        if (ex is HttpRequestException httpEx)
+        {
+            if (httpEx.StatusCode == null) return true; // network/socket error
+            int code = (int)httpEx.StatusCode.Value;
+            return code == (int)HttpStatusCode.TooManyRequests ||
+                   code == (int)HttpStatusCode.RequestTimeout ||
+                   code >= 500;
+        }
+        return false;
+    }
+
+    private static async Task<LegacyMigrationBatchResponse> PostMigrationBatchWithRetryAsync(
+        HttpSyncClient syncClient,
+        AgentConfig config,
+        string jobId,
+        string category,
+        IReadOnlyList<Dictionary<string, object?>> items,
+        bool categoryDone,
+        bool allDone,
+        string? errorMessage,
+        CancellationToken ct)
+    {
+        for (int attempt = 0; ; attempt++)
+        {
+            try
+            {
+                return await syncClient
+                    .PostMigrationBatchAsync(config, jobId, category, items, categoryDone, allDone, errorMessage, ct)
+                    .ConfigureAwait(false);
+            }
+            catch (Exception ex) when (attempt < MaxBatchRetryAttempts && IsTransientBatchError(ex, ct))
+            {
+                int delayMs = attempt switch
+                {
+                    0 => 500,
+                    1 => 1500,
+                    _ => 3500
+                };
+                Log.Warn(ex, "Transient migration batch error for {JobId}/{Category} (attempt {Attempt}/{Max}); retrying in {DelayMs}ms.",
+                    jobId, category, attempt + 1, MaxBatchRetryAttempts, delayMs);
+                await Task.Delay(delayMs, ct).ConfigureAwait(false);
+            }
+        }
+    }
+
     /// <summary>
     /// Streams selected categories from the read-only desktop VRCX database in bounded batches
-    /// into the dedicated cloud DB_LEGACY database, respecting cancellation and server quota stop signals.
+    /// into the dedicated cloud DB_LEGACY database, supporting cloud-configured concurrency,
+    /// transient batch retries, cancellation, and server quota stop signals.
     /// </summary>
     public static async Task<(bool Completed, long UploadedBatches, string Message)> RunMigrationAsync(
         AgentConfig config,
@@ -536,7 +593,8 @@ public static class DesktopLegacyMigrator
         string accountPrefix,
         IReadOnlyList<string> categories,
         HttpSyncClient syncClient,
-        CancellationToken ct)
+        CancellationToken ct,
+        int concurrency = 1)
     {
         if (string.IsNullOrWhiteSpace(dbPath) || !File.Exists(dbPath))
         {
@@ -547,6 +605,7 @@ public static class DesktopLegacyMigrator
         }
 
         string safePrefix = IsValidAccountPrefix(accountPrefix) ? accountPrefix.Trim() : string.Empty;
+        int effectiveConcurrency = Math.Clamp(concurrency, MinConcurrency, MaxConcurrency);
         long batchesSent = 0;
 
         try
@@ -561,33 +620,163 @@ public static class DesktopLegacyMigrator
 
                 var buffer = new List<Dictionary<string, object?>>(BatchRowsLimit);
                 int bufferBytes = 256;
-                bool stoppedByServer = false;
+                int stoppedByServer = 0;
+                Exception? workerFailure = null;
+
+                using var categoryCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                Channel<List<Dictionary<string, object?>>>? batchChannel = null;
+                Task[]? workerTasks = null;
+
+                if (effectiveConcurrency > 1)
+                {
+                    batchChannel = Channel.CreateBounded<List<Dictionary<string, object?>>>(
+                        new BoundedChannelOptions(effectiveConcurrency * 2)
+                        {
+                            SingleWriter = true,
+                            SingleReader = false,
+                            FullMode = BoundedChannelFullMode.Wait
+                        });
+                    workerTasks = new Task[effectiveConcurrency];
+                    for (int w = 0; w < effectiveConcurrency; w++)
+                    {
+                        workerTasks[w] = Task.Run(async () =>
+                        {
+                            try
+                            {
+                                await foreach (var batch in batchChannel.Reader.ReadAllAsync(categoryCts.Token).ConfigureAwait(false))
+                                {
+                                    if (Volatile.Read(ref stoppedByServer) != 0) break;
+                                    LegacyMigrationBatchResponse res = await PostMigrationBatchWithRetryAsync(
+                                        syncClient,
+                                        config,
+                                        jobId,
+                                        rawCategory,
+                                        batch,
+                                        categoryDone: false,
+                                        allDone: false,
+                                        errorMessage: null,
+                                        categoryCts.Token).ConfigureAwait(false);
+                                    Interlocked.Increment(ref batchesSent);
+                                    if (res.ShouldStop)
+                                    {
+                                        Interlocked.Exchange(ref stoppedByServer, 1);
+                                        try { categoryCts.Cancel(); } catch { /* ignore */ }
+                                        break;
+                                    }
+                                }
+                            }
+                            catch (OperationCanceledException) when (Volatile.Read(ref stoppedByServer) != 0 || ct.IsCancellationRequested)
+                            {
+                                // Normal halt on server stop signal or external cancellation
+                            }
+                            catch (Exception ex)
+                            {
+                                Interlocked.CompareExchange(ref workerFailure, ex, null);
+                                try { categoryCts.Cancel(); } catch { /* ignore */ }
+                            }
+                        }, CancellationToken.None);
+                    }
+                }
 
                 async Task<bool> FlushBufferAsync(bool categoryDone)
                 {
-                    if (buffer.Count == 0 && !categoryDone) return false;
-                    var batchToSend = new List<Dictionary<string, object?>>(buffer);
-                    buffer.Clear();
-                    bufferBytes = 256;
-
-                    LegacyMigrationBatchResponse res = await syncClient
-                        .PostMigrationBatchAsync(config, jobId, rawCategory, batchToSend, categoryDone, false, null, ct)
-                        .ConfigureAwait(false);
-                    batchesSent++;
-                    if (res.ShouldStop)
+                    if (effectiveConcurrency <= 1)
                     {
-                        stoppedByServer = true;
-                        return true;
+                        if (buffer.Count == 0 && !categoryDone) return false;
+                        var batchToSend = new List<Dictionary<string, object?>>(buffer);
+                        buffer.Clear();
+                        bufferBytes = 256;
+
+                        LegacyMigrationBatchResponse res = await PostMigrationBatchWithRetryAsync(
+                            syncClient,
+                            config,
+                            jobId,
+                            rawCategory,
+                            batchToSend,
+                            categoryDone,
+                            allDone: false,
+                            errorMessage: null,
+                            ct).ConfigureAwait(false);
+                        Interlocked.Increment(ref batchesSent);
+                        if (res.ShouldStop)
+                        {
+                            Interlocked.Exchange(ref stoppedByServer, 1);
+                            return true;
+                        }
+                        return false;
                     }
+
+                    // Concurrent mode: push data batches to bounded worker channel; send categoryDone only after all workers drain.
+                    if (buffer.Count > 0)
+                    {
+                        var batchToSend = new List<Dictionary<string, object?>>(buffer);
+                        buffer.Clear();
+                        bufferBytes = 256;
+                        try
+                        {
+                            await batchChannel!.Writer.WriteAsync(batchToSend, categoryCts.Token).ConfigureAwait(false);
+                        }
+                        catch (OperationCanceledException) when (Volatile.Read(ref stoppedByServer) != 0 || workerFailure != null)
+                        {
+                            return true;
+                        }
+                    }
+
                     if (!categoryDone)
                     {
-                        await Task.Delay(150, ct).ConfigureAwait(false);
+                        return Volatile.Read(ref stoppedByServer) != 0 || workerFailure != null;
+                    }
+
+                    batchChannel!.Writer.TryComplete();
+                    await Task.WhenAll(workerTasks!).ConfigureAwait(false);
+                    if (workerFailure != null)
+                    {
+                        throw workerFailure;
+                    }
+                    ct.ThrowIfCancellationRequested();
+                    if (Volatile.Read(ref stoppedByServer) != 0)
+                    {
+                        return true;
+                    }
+
+                    LegacyMigrationBatchResponse doneRes = await PostMigrationBatchWithRetryAsync(
+                        syncClient,
+                        config,
+                        jobId,
+                        rawCategory,
+                        Array.Empty<Dictionary<string, object?>>(),
+                        categoryDone: true,
+                        allDone: false,
+                        errorMessage: null,
+                        ct).ConfigureAwait(false);
+                    if (doneRes.ShouldStop)
+                    {
+                        Interlocked.Exchange(ref stoppedByServer, 1);
+                        return true;
                     }
                     return false;
                 }
 
+                async Task DrainWorkersOnEarlyExitAsync()
+                {
+                    if (batchChannel != null && workerTasks != null)
+                    {
+                        batchChannel.Writer.TryComplete();
+                        try { categoryCts.Cancel(); } catch { /* ignore */ }
+                        await Task.WhenAll(workerTasks).ConfigureAwait(false);
+                        if (workerFailure != null && Volatile.Read(ref stoppedByServer) == 0)
+                        {
+                            throw workerFailure;
+                        }
+                    }
+                }
+
                 async Task<bool> EnqueueItemAsync(Dictionary<string, object?> item)
                 {
+                    if (Volatile.Read(ref stoppedByServer) != 0 || workerFailure != null)
+                    {
+                        return true;
+                    }
                     int itemBytes = Encoding.UTF8.GetByteCount(JsonConvert.SerializeObject(item)) + 2;
                     if (itemBytes > MaxBatchPayloadBytes)
                     {
@@ -637,6 +826,7 @@ public static class DesktopLegacyMigrator
                         if (mapped == null) continue;
                         if (await EnqueueItemAsync(mapped).ConfigureAwait(false))
                         {
+                            await DrainWorkersOnEarlyExitAsync().ConfigureAwait(false);
                             return true;
                         }
                     }
@@ -949,21 +1139,28 @@ public static class DesktopLegacyMigrator
                     }).ConfigureAwait(false)) return (false, batchesSent, "Stopped by server");
                 }
 
-                if (await FlushBufferAsync(categoryDone: true).ConfigureAwait(false) || stoppedByServer)
+                if (await FlushBufferAsync(categoryDone: true).ConfigureAwait(false) || Volatile.Read(ref stoppedByServer) != 0)
                 {
-                    return (false, batchesSent, "Stopped by server");
+                    return (false, Volatile.Read(ref batchesSent), "Stopped by server");
                 }
             }
 
             // Signal completion across all selected categories
-            await syncClient
-                .PostMigrationBatchAsync(config, jobId, string.Empty, Array.Empty<Dictionary<string, object?>>(), false, true, null, ct)
-                .ConfigureAwait(false);
-            return (true, batchesSent, "Desktop legacy migration completed");
+            await PostMigrationBatchWithRetryAsync(
+                syncClient,
+                config,
+                jobId,
+                string.Empty,
+                Array.Empty<Dictionary<string, object?>>(),
+                categoryDone: false,
+                allDone: true,
+                errorMessage: null,
+                ct).ConfigureAwait(false);
+            return (true, Volatile.Read(ref batchesSent), "Desktop legacy migration completed");
         }
         catch (OperationCanceledException)
         {
-            return (false, batchesSent, "Desktop legacy migration cancelled");
+            return (false, Volatile.Read(ref batchesSent), "Desktop legacy migration cancelled");
         }
         catch (Exception ex)
         {
@@ -978,7 +1175,7 @@ public static class DesktopLegacyMigrator
             {
                 // Ignore secondary failure while reporting error
             }
-            return (false, batchesSent, ex.Message);
+            return (false, Volatile.Read(ref batchesSent), ex.Message);
         }
     }
 }

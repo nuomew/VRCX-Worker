@@ -2747,7 +2747,108 @@ INSERT INTO {acctPrefix}_friend_log_history (created_at, type, user_id, display_
             Assert.True(completedBig);
             Assert.True(maxBatchBytes > 0 && maxBatchBytes <= 180 * 1024, $"Expected clamped batch <= 180 KiB, got {maxBatchBytes}");
 
-            // 6. Server shouldStop=true halts migration immediately without sending remaining categories
+            // 6. CommandValidator validates cloud-controlled concurrency (1..8) and rejects out-of-range values
+            Assert.True(CommandValidator.ValidateRemoteCommand("desktop_migrate", new Dictionary<string, object?>
+            {
+                ["jobId"] = "mig_valid_001",
+                ["categories"] = new[] { "settings" },
+                ["concurrency"] = 4
+            }).Ok);
+            Assert.False(CommandValidator.ValidateRemoteCommand("desktop_migrate", new Dictionary<string, object?>
+            {
+                ["jobId"] = "mig_valid_001",
+                ["categories"] = new[] { "settings" },
+                ["concurrency"] = 0
+            }).Ok);
+            Assert.False(CommandValidator.ValidateRemoteCommand("desktop_migrate", new Dictionary<string, object?>
+            {
+                ["jobId"] = "mig_valid_001",
+                ["categories"] = new[] { "settings" },
+                ["concurrency"] = 9
+            }).Ok);
+
+            // 7. Concurrent migration (concurrency=4) uploads batches in parallel, retries transient 503 once, and finalizes categoryDone after drain
+            using (var connBulk = new SqliteConnection($"Data Source={dbPath}"))
+            {
+                connBulk.Open();
+                using var tx = connBulk.BeginTransaction();
+                using var cmdIns = connBulk.CreateCommand();
+                cmdIns.CommandText = $"INSERT INTO \"{acctPrefix}_feed_gps\" (created_at, user_id, display_name, location, world_name, previous_location, time, group_name) VALUES ($ts, $uid, 'Pal', 'wrld_x:1', 'WorldX', '', 60, '')";
+                var pTs = cmdIns.Parameters.Add("$ts", SqliteType.Text);
+                var pUid = cmdIns.Parameters.Add("$uid", SqliteType.Text);
+                for (int i = 0; i < 600; i++)
+                {
+                    pTs.Value = $"2024-04-01T00:{(i / 60):D2}:{(i % 60):D2}Z";
+                    pUid.Value = $"usr_bulk_{i}";
+                    cmdIns.ExecuteNonQuery();
+                }
+                tx.Commit();
+            }
+
+            int inFlight = 0;
+            int maxInFlight = 0;
+            int transientInjected = 0;
+            int categoryDoneCount = 0;
+            int totalConcurrentItems = 0;
+            using var concHttp = new HttpClient(new StubHttpHandler(async req =>
+            {
+                string body = req.Content != null ? await req.Content.ReadAsStringAsync() : "{}";
+                JObject jo = JObject.Parse(body);
+                bool isCatDone = jo["categoryDone"]?.Value<bool>() == true;
+                bool isAllDone = jo["allDone"]?.Value<bool>() == true;
+                int itemCount = (jo["items"] as JArray)?.Count ?? 0;
+
+                if (!isCatDone && !isAllDone && itemCount > 0)
+                {
+                    if (Interlocked.Exchange(ref transientInjected, 1) == 0)
+                    {
+                        return new HttpResponseMessage(HttpStatusCode.ServiceUnavailable)
+                        {
+                            Content = new StringContent("{\"ok\":false,\"error\":{\"message\":\"Temporary 503\"}}", Encoding.UTF8, "application/json")
+                        };
+                    }
+                    int cur = Interlocked.Increment(ref inFlight);
+                    int prevMax;
+                    do
+                    {
+                        prevMax = Volatile.Read(ref maxInFlight);
+                    } while (cur > prevMax && Interlocked.CompareExchange(ref maxInFlight, cur, prevMax) != prevMax);
+
+                    await Task.Delay(60);
+                    Interlocked.Add(ref totalConcurrentItems, itemCount);
+                    Interlocked.Decrement(ref inFlight);
+                }
+                else if (isCatDone)
+                {
+                    Interlocked.Increment(ref categoryDoneCount);
+                    Assert.Equal(0, Volatile.Read(ref inFlight)); // categoryDone must run strictly after all workers drain
+                }
+
+                return new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent(
+                        "{\"ok\":true,\"data\":{\"inserted\":1,\"skipped\":0,\"legacyDbBytes\":65536,\"shouldStop\":false}}",
+                        Encoding.UTF8,
+                        "application/json")
+                };
+            }));
+
+            var (completedConc, concBatches, _) = await DesktopLegacyMigrator.RunMigrationAsync(
+                cfg,
+                dbPath,
+                "mig_conc_004",
+                acctPrefix,
+                new[] { "feed" },
+                new HttpSyncClient(concHttp),
+                CancellationToken.None,
+                concurrency: 4);
+            Assert.True(completedConc);
+            Assert.True(concBatches >= 3);
+            Assert.True(maxInFlight >= 2, $"Expected parallel in-flight batches >= 2, observed {maxInFlight}");
+            Assert.Equal(1, categoryDoneCount);
+            Assert.True(totalConcurrentItems >= 600);
+
+            // 8. Server shouldStop=true halts migration immediately without sending remaining categories
             int stopCalls = 0;
             using var stopHttp = new HttpClient(new StubHttpHandler(_ =>
             {

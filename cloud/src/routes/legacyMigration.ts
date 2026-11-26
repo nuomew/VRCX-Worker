@@ -19,7 +19,10 @@ export const LEGACY_DB_FREE_LIMIT_BYTES = 500 * 1024 * 1024;
 export const LEGACY_DB_SOFT_STOP_BYTES = 480 * 1024 * 1024;
 const MAX_INVENTORY_BODY_BYTES = 128 * 1024;
 const MAX_BATCH_BODY_BYTES = 4 * 1024 * 1024;
-const MAX_BATCH_ITEMS = 120;
+const MAX_BATCH_ITEMS = 300;
+export const MIN_MIGRATION_CONCURRENCY = 1;
+export const MAX_MIGRATION_CONCURRENCY = 8;
+export const DEFAULT_MIGRATION_CONCURRENCY = 2;
 
 export const LEGACY_CATEGORIES = [
     'memos_notes',
@@ -343,6 +346,7 @@ const STATE_KEY_INVENTORY = 'inventory';
 const STATE_KEY_JOB = 'job';
 const STATE_KEY_IMPORTED_STATS = 'imported_stats';
 const STATE_KEY_SCAN_REQUEST = 'scan_request';
+const STATE_KEY_SETTINGS = 'settings';
 
 const SENSITIVE_OR_DESKTOP_CONFIG_FRAGMENTS = [
     'savedcredentials',
@@ -410,6 +414,7 @@ export interface LegacyMigrationJob {
     deviceId: string;
     accountPrefix: string;
     categories: LegacyCategory[];
+    concurrency?: number;
     status: 'queued' | 'running' | 'completed' | 'cancelled' | 'failed' | 'stopped_quota_limit';
     startedAt: string;
     updatedAt: string;
@@ -422,6 +427,85 @@ export interface LegacyMigrationJob {
     skippedRows: number;
     estimatedBytes: number;
     errorMessage: string;
+}
+
+export interface LegacyMigrationSettings {
+    concurrency: number;
+}
+
+export function normalizeMigrationConcurrency(raw: unknown, fallback = DEFAULT_MIGRATION_CONCURRENCY): number {
+    const n = Number(raw);
+    if (!Number.isFinite(n)) return fallback;
+    const rounded = Math.floor(n);
+    if (rounded < MIN_MIGRATION_CONCURRENCY) return MIN_MIGRATION_CONCURRENCY;
+    if (rounded > MAX_MIGRATION_CONCURRENCY) return MAX_MIGRATION_CONCURRENCY;
+    return rounded;
+}
+
+async function readLegacyMigrationSettings(db: D1Database): Promise<LegacyMigrationSettings> {
+    const raw = await readLegacyState<Partial<LegacyMigrationSettings>>(db, STATE_KEY_SETTINGS);
+    return {
+        concurrency: normalizeMigrationConcurrency(raw?.concurrency, DEFAULT_MIGRATION_CONCURRENCY)
+    };
+}
+
+/**
+ * Atomically increments one category counter inside `imported_stats` so concurrent
+ * migration batch uploads never overwrite each other's counts.
+ */
+async function incrementLegacyCategoryStatAtomic(
+    legacyDb: D1Database,
+    category: LegacyCategory,
+    delta: number,
+    nowIso: string
+): Promise<void> {
+    if (delta <= 0) return;
+    const jsonPath = `$.${category}`;
+    await legacyDb.batch([
+        legacyDb
+            .prepare(
+                `INSERT OR IGNORE INTO legacy_migration_state (state_key, payload_json, updated_at)
+                 VALUES (?, ?, ?)`
+            )
+            .bind(STATE_KEY_IMPORTED_STATS, JSON.stringify(emptyImportedStats()), nowIso),
+        legacyDb
+            .prepare(
+                `UPDATE legacy_migration_state
+                 SET payload_json = json_set(
+                         payload_json,
+                         ?,
+                         COALESCE(CAST(json_extract(payload_json, ?) AS INTEGER), 0) + ?
+                     ),
+                     updated_at = ?
+                 WHERE state_key = ?`
+            )
+            .bind(jsonPath, jsonPath, delta, nowIso, STATE_KEY_IMPORTED_STATS)
+    ]);
+}
+
+/**
+ * Packs multiple rows into multi-row INSERT statements while staying strictly under
+ * Cloudflare D1's 100-bind-parameter-per-statement limit.
+ */
+function pushMultiRowInsert(
+    legacyDb: D1Database,
+    stmts: D1PreparedStatement[],
+    sqlPrefix: string,
+    colCount: number,
+    rows: unknown[][]
+): void {
+    if (rows.length === 0) return;
+    const maxRowsPerStmt = Math.max(1, Math.floor(96 / colCount));
+    const rowPlaceholder = `(${Array.from({ length: colCount }, () => '?').join(', ')})`;
+    for (let i = 0; i < rows.length; i += maxRowsPerStmt) {
+        const chunk = rows.slice(i, i + maxRowsPerStmt);
+        const placeholders = chunk.map(() => rowPlaceholder).join(', ');
+        const params: unknown[] = [];
+        for (const r of chunk) {
+            for (const v of r) params.push(v);
+        }
+        stmts.push(legacyDb.prepare(`${sqlPrefix} VALUES ${placeholders}`).bind(...params));
+    }
 }
 
 export type LegacyImportedStats = Record<LegacyCategory, number>;
@@ -552,6 +636,12 @@ async function ingestLegacyCategoryBatch(
     items: Array<Record<string, unknown>>
 ): Promise<{ inserted: number; skipped: number; legacyDbBytes: number }> {
     const stmts: D1PreparedStatement[] = [];
+    const gamelogLocationRows: unknown[][] = [];
+    const gamelogJoinLeaveRows: unknown[][] = [];
+    const feedGpsRows: unknown[][] = [];
+    const feedOnlineOfflineRows: unknown[][] = [];
+    const feedStatusRows: unknown[][] = [];
+    const feedBioRows: unknown[][] = [];
     const userEntities = new Map<string, string>();
     const worldEntities = new Map<string, string>();
     const nowIso = new Date().toISOString();
@@ -820,38 +910,26 @@ async function ingestLegacyCategoryBatch(
                 const rawWorldId = asStr(raw.worldId ?? raw.world_id, 128).trim() || (location.split(':')[0] ?? '').trim();
                 const worldId = rawWorldId.startsWith('wrld_') ? rawWorldId : '';
                 const worldName = asStr(raw.worldName ?? raw.world_name, 512);
-                stmts.push(
-                    legacyDb
-                        .prepare(
-                            'INSERT OR IGNORE INTO gamelog_location (created_at, location, world_id, world_name, time, group_name) VALUES (?, ?, ?, ?, ?, ?)'
-                        )
-                        .bind(
-                            createdAt,
-                            location,
-                            worldId,
-                            worldName,
-                            Math.max(0, asFiniteInt(raw.time, 0)),
-                            asStr(raw.groupName ?? raw.group_name, 256)
-                        )
-                );
+                gamelogLocationRows.push([
+                    createdAt,
+                    location,
+                    worldId,
+                    worldName,
+                    Math.max(0, asFiniteInt(raw.time, 0)),
+                    asStr(raw.groupName ?? raw.group_name, 256)
+                ]);
                 if (worldId && worldName) worldEntities.set(worldId, worldName);
             } else if (type === 'OnPlayerJoined' || type === 'OnPlayerLeft') {
                 const displayName = asStr(raw.displayName ?? raw.display_name, 256);
                 const userId = asStr(raw.userId ?? raw.user_id, 128);
-                stmts.push(
-                    legacyDb
-                        .prepare(
-                            'INSERT OR IGNORE INTO gamelog_join_leave (created_at, type, display_name, location, user_id, time) VALUES (?, ?, ?, ?, ?, ?)'
-                        )
-                        .bind(
-                            createdAt,
-                            type,
-                            displayName,
-                            asStr(raw.location, 512),
-                            userId,
-                            Math.max(0, asFiniteInt(raw.time, 0))
-                        )
-                );
+                gamelogJoinLeaveRows.push([
+                    createdAt,
+                    type,
+                    displayName,
+                    asStr(raw.location, 512),
+                    userId,
+                    Math.max(0, asFiniteInt(raw.time, 0))
+                ]);
                 if (userId && displayName) userEntities.set(userId, displayName);
             } else if (type === 'PortalSpawn') {
                 const displayName = asStr(raw.displayName ?? raw.display_name, 256);
@@ -919,83 +997,59 @@ async function ingestLegacyCategoryBatch(
                 const worldName = asStr(raw.worldName ?? raw.world_name, 512);
                 const wid = (location.split(':')[0] ?? '').trim();
                 if (wid.startsWith('wrld_') && worldName) worldEntities.set(wid, worldName);
-                stmts.push(
-                    legacyDb
-                        .prepare(
-                            'INSERT OR IGNORE INTO feed_gps (created_at, user_id, display_name, location, world_name, previous_location, time, group_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
-                        )
-                        .bind(
-                            createdAt,
-                            userId,
-                            displayName,
-                            location,
-                            worldName,
-                            asStr(raw.previousLocation ?? raw.previous_location, 512),
-                            Math.max(0, asFiniteInt(raw.time, 0)),
-                            asStr(raw.groupName ?? raw.group_name, 256)
-                        )
-                );
+                feedGpsRows.push([
+                    createdAt,
+                    userId,
+                    displayName,
+                    location,
+                    worldName,
+                    asStr(raw.previousLocation ?? raw.previous_location, 512),
+                    Math.max(0, asFiniteInt(raw.time, 0)),
+                    asStr(raw.groupName ?? raw.group_name, 256)
+                ]);
             } else if (type === 'Online' || type === 'Offline') {
                 const location = asStr(raw.location, 512);
                 const worldName = asStr(raw.worldName ?? raw.world_name, 512);
                 const wid = (location.split(':')[0] ?? '').trim();
                 if (wid.startsWith('wrld_') && worldName) worldEntities.set(wid, worldName);
-                stmts.push(
-                    legacyDb
-                        .prepare(
-                            'INSERT OR IGNORE INTO feed_online_offline (created_at, user_id, display_name, type, location, world_name, time, group_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
-                        )
-                        .bind(
-                            createdAt,
-                            userId,
-                            displayName,
-                            type,
-                            location,
-                            worldName,
-                            Math.max(0, asFiniteInt(raw.time, 0)),
-                            asStr(raw.groupName ?? raw.group_name, 256)
-                        )
-                );
+                feedOnlineOfflineRows.push([
+                    createdAt,
+                    userId,
+                    displayName,
+                    type,
+                    location,
+                    worldName,
+                    Math.max(0, asFiniteInt(raw.time, 0)),
+                    asStr(raw.groupName ?? raw.group_name, 256)
+                ]);
             } else if (type === 'Status') {
-                stmts.push(
-                    legacyDb
-                        .prepare(
-                            'INSERT OR IGNORE INTO feed_status (created_at, user_id, display_name, status, status_description, previous_status, previous_status_description) VALUES (?, ?, ?, ?, ?, ?, ?)'
-                        )
-                        .bind(
-                            createdAt,
-                            userId,
-                            displayName,
-                            asStr(raw.status, 64),
-                            asStr(raw.statusDescription ?? raw.status_description, 1024),
-                            asStr(raw.previousStatus ?? raw.previous_status, 64),
-                            asStr(raw.previousStatusDescription ?? raw.previous_status_description, 1024)
-                        )
-                );
+                feedStatusRows.push([
+                    createdAt,
+                    userId,
+                    displayName,
+                    asStr(raw.status, 64),
+                    asStr(raw.statusDescription ?? raw.status_description, 1024),
+                    asStr(raw.previousStatus ?? raw.previous_status, 64),
+                    asStr(raw.previousStatusDescription ?? raw.previous_status_description, 1024)
+                ]);
             } else if (type === 'Bio') {
-                stmts.push(
-                    legacyDb
-                        .prepare(
-                            'INSERT OR IGNORE INTO feed_bio (created_at, user_id, display_name, bio, previous_bio, bio_links, previous_bio_links) VALUES (?, ?, ?, ?, ?, ?, ?)'
-                        )
-                        .bind(
-                            createdAt,
-                            userId,
-                            displayName,
-                            asStr(raw.bio, 4096),
-                            asStr(raw.previousBio ?? raw.previous_bio, 4096),
-                            typeof raw.bioLinks === 'string'
-                                ? raw.bioLinks.slice(0, 4096)
-                                : typeof raw.bio_links === 'string'
-                                  ? raw.bio_links.slice(0, 4096)
-                                  : JSON.stringify(raw.bioLinks ?? []),
-                            typeof raw.previousBioLinks === 'string'
-                                ? raw.previousBioLinks.slice(0, 4096)
-                                : typeof raw.previous_bio_links === 'string'
-                                  ? raw.previous_bio_links.slice(0, 4096)
-                                  : JSON.stringify(raw.previousBioLinks ?? [])
-                        )
-                );
+                feedBioRows.push([
+                    createdAt,
+                    userId,
+                    displayName,
+                    asStr(raw.bio, 4096),
+                    asStr(raw.previousBio ?? raw.previous_bio, 4096),
+                    typeof raw.bioLinks === 'string'
+                        ? raw.bioLinks.slice(0, 4096)
+                        : typeof raw.bio_links === 'string'
+                          ? raw.bio_links.slice(0, 4096)
+                          : JSON.stringify(raw.bioLinks ?? []),
+                    typeof raw.previousBioLinks === 'string'
+                        ? raw.previousBioLinks.slice(0, 4096)
+                        : typeof raw.previous_bio_links === 'string'
+                          ? raw.previous_bio_links.slice(0, 4096)
+                          : JSON.stringify(raw.previousBioLinks ?? [])
+                ]);
             }
         } else if (category === 'settings') {
             const rawKey = asStr(raw.key ?? raw.configKey ?? raw.config_key, 160).trim();
@@ -1015,6 +1069,49 @@ async function ingestLegacyCategoryBatch(
             );
         }
     }
+
+    pushMultiRowInsert(
+        legacyDb,
+        stmts,
+        'INSERT OR IGNORE INTO gamelog_location (created_at, location, world_id, world_name, time, group_name)',
+        6,
+        gamelogLocationRows
+    );
+    pushMultiRowInsert(
+        legacyDb,
+        stmts,
+        'INSERT OR IGNORE INTO gamelog_join_leave (created_at, type, display_name, location, user_id, time)',
+        6,
+        gamelogJoinLeaveRows
+    );
+    pushMultiRowInsert(
+        legacyDb,
+        stmts,
+        'INSERT OR IGNORE INTO feed_gps (created_at, user_id, display_name, location, world_name, previous_location, time, group_name)',
+        8,
+        feedGpsRows
+    );
+    pushMultiRowInsert(
+        legacyDb,
+        stmts,
+        'INSERT OR IGNORE INTO feed_online_offline (created_at, user_id, display_name, type, location, world_name, time, group_name)',
+        8,
+        feedOnlineOfflineRows
+    );
+    pushMultiRowInsert(
+        legacyDb,
+        stmts,
+        'INSERT OR IGNORE INTO feed_status (created_at, user_id, display_name, status, status_description, previous_status, previous_status_description)',
+        7,
+        feedStatusRows
+    );
+    pushMultiRowInsert(
+        legacyDb,
+        stmts,
+        'INSERT OR IGNORE INTO feed_bio (created_at, user_id, display_name, bio, previous_bio, bio_links, previous_bio_links)',
+        7,
+        feedBioRows
+    );
 
     let inserted = 0;
     let legacyDbBytes = 0;
@@ -1293,44 +1390,92 @@ export async function handleLegacyMigrationAgentRoutes(
             legacyDbBytes = result.legacyDbBytes;
 
             if (inserted > 0) {
-                const stats = (await readLegacyState<LegacyImportedStats>(legacyDb, STATE_KEY_IMPORTED_STATS)) ?? emptyImportedStats();
-                stats[category] = Math.max(0, asFiniteInt(stats[category], 0)) + inserted;
-                await writeLegacyState(legacyDb, STATE_KEY_IMPORTED_STATS, stats, nowIso);
+                await incrementLegacyCategoryStatAtomic(legacyDb, category, inserted, nowIso);
             }
         } else {
             const probe = await legacyDb.prepare('SELECT 1 AS ok').all();
             legacyDbBytes = probe.meta?.size_after ?? 0;
         }
 
-        const completedCategories = new Set(existingJob.completedCategories ?? []);
-        if (body.categoryDone === true && categoryRaw && LEGACY_CATEGORY_SET.has(categoryRaw)) {
-            completedCategories.add(categoryRaw);
-        }
-
         const quotaReached = legacyDbBytes >= LEGACY_DB_SOFT_STOP_BYTES;
         const allDone = body.allDone === true;
+        const categoryDone = body.categoryDone === true && Boolean(categoryRaw) && LEGACY_CATEGORY_SET.has(categoryRaw);
         const nextStatus: LegacyMigrationJob['status'] = quotaReached
             ? 'stopped_quota_limit'
             : allDone
               ? 'completed'
               : 'running';
 
-        const nextJob: LegacyMigrationJob = {
-            ...existingJob,
-            deviceId: auth.deviceId,
-            status: nextStatus,
-            updatedAt: nowIso,
-            finishedAt: nextStatus === 'completed' || nextStatus === 'stopped_quota_limit' ? nowIso : '',
-            currentCategory: allDone ? '' : categoryRaw || existingJob.currentCategory,
-            completedCategories: Array.from(completedCategories),
-            processedRows: existingJob.processedRows + rawItems.length,
-            insertedRows: existingJob.insertedRows + inserted,
-            skippedRows: existingJob.skippedRows + skipped,
-            errorMessage: quotaReached
-                ? 'Legacy database reached 480 MB safety limit (500 MB Free-tier ceiling).'
-                : existingJob.errorMessage
-        };
-        await writeLegacyState(legacyDb, STATE_KEY_JOB, nextJob, nowIso);
+        // Atomically accumulate counters so concurrent worker uploads never clobber each other's progress
+        await legacyDb
+            .prepare(
+                `UPDATE legacy_migration_state
+                 SET payload_json = json_set(
+                         payload_json,
+                         '$.deviceId', ?,
+                         '$.updatedAt', ?,
+                         '$.currentCategory', CASE
+                             WHEN ? = 1 THEN ''
+                             WHEN ? != '' THEN ?
+                             ELSE COALESCE(json_extract(payload_json, '$.currentCategory'), '')
+                         END,
+                         '$.processedRows', COALESCE(CAST(json_extract(payload_json, '$.processedRows') AS INTEGER), 0) + ?,
+                         '$.insertedRows', COALESCE(CAST(json_extract(payload_json, '$.insertedRows') AS INTEGER), 0) + ?,
+                         '$.skippedRows', COALESCE(CAST(json_extract(payload_json, '$.skippedRows') AS INTEGER), 0) + ?,
+                         '$.status', CASE
+                             WHEN json_extract(payload_json, '$.status') IN ('queued', 'running') THEN ?
+                             ELSE json_extract(payload_json, '$.status')
+                         END
+                     ),
+                     updated_at = ?
+                 WHERE state_key = ?
+                   AND json_extract(payload_json, '$.jobId') = ?`
+            )
+            .bind(
+                auth.deviceId,
+                nowIso,
+                allDone ? 1 : 0,
+                categoryRaw,
+                categoryRaw,
+                rawItems.length,
+                inserted,
+                skipped,
+                nextStatus,
+                nowIso,
+                STATE_KEY_JOB,
+                jobId
+            )
+            .run();
+
+        if (categoryDone || allDone || quotaReached) {
+            const latestJob = await readLegacyState<LegacyMigrationJob>(legacyDb, STATE_KEY_JOB);
+            if (latestJob && latestJob.jobId === jobId && latestJob.status !== 'cancelled') {
+                const completedCategories = new Set(latestJob.completedCategories ?? []);
+                if (categoryDone) {
+                    completedCategories.add(categoryRaw);
+                }
+                const finalizedStatus: LegacyMigrationJob['status'] = quotaReached
+                    ? 'stopped_quota_limit'
+                    : allDone
+                      ? 'completed'
+                      : latestJob.status;
+                const finalizedJob: LegacyMigrationJob = {
+                    ...latestJob,
+                    status: finalizedStatus,
+                    updatedAt: nowIso,
+                    finishedAt:
+                        finalizedStatus === 'completed' || finalizedStatus === 'stopped_quota_limit'
+                            ? nowIso
+                            : latestJob.finishedAt,
+                    currentCategory: allDone ? '' : latestJob.currentCategory,
+                    completedCategories: Array.from(completedCategories),
+                    errorMessage: quotaReached
+                        ? 'Legacy database reached 480 MB safety limit (500 MB Free-tier ceiling).'
+                        : latestJob.errorMessage
+                };
+                await writeLegacyState(legacyDb, STATE_KEY_JOB, finalizedJob, nowIso);
+            }
+        }
 
         return Response.json({
             ok: true,
@@ -1422,6 +1567,7 @@ export async function handleLegacyMigrationWebRoutes(
                         legacyDbLimitBytes: LEGACY_DB_FREE_LIMIT_BYTES,
                         legacyDbPercent: 0,
                         syncIntervalSeconds,
+                        migrationConcurrency: DEFAULT_MIGRATION_CONCURRENCY,
                         devices,
                         inventory: null,
                         scanRequest: null,
@@ -1433,12 +1579,13 @@ export async function handleLegacyMigrationWebRoutes(
             );
         }
 
-        const [probe, inventory, job, stats, scanRequest] = await Promise.all([
+        const [probe, inventory, job, stats, scanRequest, settings] = await Promise.all([
             legacyDb.prepare('SELECT 1 AS ok').all(),
             readLegacyState<LegacyDesktopInventory>(legacyDb, STATE_KEY_INVENTORY),
             readLegacyState<LegacyMigrationJob>(legacyDb, STATE_KEY_JOB),
             readLegacyState<LegacyImportedStats>(legacyDb, STATE_KEY_IMPORTED_STATS),
-            readLegacyState<Record<string, unknown>>(legacyDb, STATE_KEY_SCAN_REQUEST)
+            readLegacyState<Record<string, unknown>>(legacyDb, STATE_KEY_SCAN_REQUEST),
+            readLegacyMigrationSettings(legacyDb)
         ]);
 
         const legacyDbBytes = probe.meta?.size_after ?? 0;
@@ -1453,6 +1600,7 @@ export async function handleLegacyMigrationWebRoutes(
                     legacyDbLimitBytes: LEGACY_DB_FREE_LIMIT_BYTES,
                     legacyDbPercent,
                     syncIntervalSeconds,
+                    migrationConcurrency: settings.concurrency,
                     devices,
                     inventory,
                     scanRequest,
@@ -1462,6 +1610,52 @@ export async function handleLegacyMigrationWebRoutes(
             },
             { headers: { 'Cache-Control': 'no-store' } }
         );
+    }
+
+    if (url.pathname === '/api/migration/settings' && request.method === 'PUT') {
+        const legacyDb = getLegacyDb(env);
+        if (!legacyDb) {
+            return Response.json(
+                {
+                    ok: false,
+                    error: {
+                        code: 'LEGACY_DB_UNAVAILABLE',
+                        message: 'Dedicated legacy database (DB_LEGACY) is not bound yet. Redeploy Worker first.'
+                    }
+                },
+                { status: 503 }
+            );
+        }
+        const rawBody = await request.json().catch(() => null);
+        if (!isPlainObject(rawBody)) {
+            return Response.json(
+                { ok: false, error: { code: 'BAD_REQUEST', message: 'Invalid JSON body' } },
+                { status: 400 }
+            );
+        }
+        const rawConcurrency = Number(rawBody.concurrency);
+        if (
+            !Number.isInteger(rawConcurrency) ||
+            rawConcurrency < MIN_MIGRATION_CONCURRENCY ||
+            rawConcurrency > MAX_MIGRATION_CONCURRENCY
+        ) {
+            return Response.json(
+                {
+                    ok: false,
+                    error: {
+                        code: 'INVALID_CONCURRENCY',
+                        message: `concurrency must be an integer between ${MIN_MIGRATION_CONCURRENCY} and ${MAX_MIGRATION_CONCURRENCY}`
+                    }
+                },
+                { status: 400 }
+            );
+        }
+        const nowIso = new Date().toISOString();
+        await writeLegacyState(legacyDb, STATE_KEY_SETTINGS, { concurrency: rawConcurrency }, nowIso);
+        return Response.json({
+            ok: true,
+            data: { concurrency: rawConcurrency }
+        });
     }
 
     if (url.pathname === '/api/migration/scan' && request.method === 'POST') {
@@ -1640,6 +1834,32 @@ export async function handleLegacyMigrationWebRoutes(
             );
         }
 
+        const storedSettings = await readLegacyMigrationSettings(legacyDb);
+        let effectiveConcurrency = storedSettings.concurrency;
+        if (rawBody.concurrency !== undefined && rawBody.concurrency !== null) {
+            const parsedConcurrency = Number(rawBody.concurrency);
+            if (
+                !Number.isInteger(parsedConcurrency) ||
+                parsedConcurrency < MIN_MIGRATION_CONCURRENCY ||
+                parsedConcurrency > MAX_MIGRATION_CONCURRENCY
+            ) {
+                return Response.json(
+                    {
+                        ok: false,
+                        error: {
+                            code: 'INVALID_CONCURRENCY',
+                            message: `concurrency must be an integer between ${MIN_MIGRATION_CONCURRENCY} and ${MAX_MIGRATION_CONCURRENCY}`
+                        }
+                    },
+                    { status: 400 }
+                );
+            }
+            effectiveConcurrency = parsedConcurrency;
+            if (effectiveConcurrency !== storedSettings.concurrency) {
+                await writeLegacyState(legacyDb, STATE_KEY_SETTINGS, { concurrency: effectiveConcurrency });
+            }
+        }
+
         const jobId = `mig_${randomHex(8)}`;
         const effectiveDeviceId = targetDeviceId || inventory?.deviceId || '';
         const dispatch = await dispatchAgentCommandInternal(env, {
@@ -1647,7 +1867,8 @@ export async function handleLegacyMigrationWebRoutes(
             params: {
                 jobId,
                 accountPrefix,
-                categories
+                categories,
+                concurrency: effectiveConcurrency
             },
             targetDeviceId: effectiveDeviceId,
             ttlSec: 900,
@@ -1666,6 +1887,7 @@ export async function handleLegacyMigrationWebRoutes(
             deviceId: dispatch.deviceId || effectiveDeviceId,
             accountPrefix,
             categories,
+            concurrency: effectiveConcurrency,
             status: 'queued',
             startedAt: nowIso,
             updatedAt: nowIso,

@@ -5945,18 +5945,43 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
                 'feed',
                 'settings'
             ];
+            // Verify cloud-controlled migration concurrency settings validation & persistence
+            const badSettingsRes = await exports.default.fetch('http://example.com/api/migration/settings', {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+                body: JSON.stringify({ concurrency: 16 })
+            });
+            expect(badSettingsRes.status).toBe(400);
+
+            const saveSettingsRes = await exports.default.fetch('http://example.com/api/migration/settings', {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+                body: JSON.stringify({ concurrency: 4 })
+            });
+            expect(saveSettingsRes.status).toBe(200);
+            expect(((await saveSettingsRes.json()) as { data: { concurrency: number } }).data.concurrency).toBe(4);
+
+            const stateWithSettingsRes = await exports.default.fetch('http://example.com/api/migration/state');
+            expect(stateWithSettingsRes.status).toBe(200);
+            expect(
+                ((await stateWithSettingsRes.json()) as { data: { migrationConcurrency: number } }).data
+                    .migrationConcurrency
+            ).toBe(4);
+
             const startRes = await exports.default.fetch('http://example.com/api/migration/start', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
                 body: JSON.stringify({
                     deviceId,
                     accountPrefix: 'usr11112222333344445555666677778888',
-                    categories: selectedCategories
+                    categories: selectedCategories,
+                    concurrency: 4
                 })
             });
             expect(startRes.status).toBe(200);
-            const startJson = (await startRes.json()) as { data: { job: { jobId: string } } };
+            const startJson = (await startRes.json()) as { data: { job: { jobId: string; concurrency?: number } } };
             const jobId = startJson.data.job.jobId;
+            expect(startJson.data.job.concurrency).toBe(4);
 
             const postBatch = async (category: string, items: unknown[], categoryDone = true, allDone = false) => {
                 const res = await exports.default.fetch('http://example.com/api/agent/migration/batch', {
@@ -6031,18 +6056,64 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
                     time: 0
                 }
             ]);
-            await postBatch('feed', [
-                {
-                    type: 'GPS',
-                    created_at: '2024-03-01T10:05:00Z',
-                    userId: 'usr_legacy_only',
-                    displayName: 'LegacyPal',
-                    location: 'wrld_legacy_shrine:100',
-                    worldName: '古都の桜神社',
-                    previousLocation: '',
-                    time: 900
-                }
+            // Concurrent multi-worker feed uploads + multi-row INSERT batching preserve exact atomic counters
+            const [feedBatchA, feedBatchB] = await Promise.all([
+                postBatch(
+                    'feed',
+                    [
+                        {
+                            type: 'GPS',
+                            created_at: '2024-03-01T10:05:00Z',
+                            userId: 'usr_legacy_only',
+                            displayName: 'LegacyPal',
+                            location: 'wrld_legacy_shrine:100',
+                            worldName: '古都の桜神社',
+                            previousLocation: '',
+                            time: 900
+                        },
+                        {
+                            type: 'Online',
+                            created_at: '2024-03-01T10:06:00Z',
+                            userId: 'usr_legacy_only',
+                            displayName: 'LegacyPal',
+                            location: 'wrld_legacy_shrine:100',
+                            worldName: '古都の桜神社',
+                            time: 0
+                        }
+                    ],
+                    false,
+                    false
+                ),
+                postBatch(
+                    'feed',
+                    [
+                        {
+                            type: 'Status',
+                            created_at: '2024-03-01T10:07:00Z',
+                            userId: 'usr_legacy_only',
+                            displayName: 'LegacyPal',
+                            status: 'join me',
+                            statusDescription: 'At shrine'
+                        },
+                        {
+                            type: 'Bio',
+                            created_at: '2024-03-01T10:08:00Z',
+                            userId: 'usr_legacy_only',
+                            displayName: 'LegacyPal',
+                            bio: 'Legacy bio update',
+                            bioLinks: '[]'
+                        }
+                    ],
+                    false,
+                    false
+                )
             ]);
+            expect(feedBatchA.data.inserted + feedBatchB.data.inserted).toBe(4);
+            await postBatch('feed', [], true, false);
+            const afterConcurrentFeedState = (await (
+                await exports.default.fetch('http://example.com/api/migration/state')
+            ).json()) as { data: { importedStats: { feed: number } } };
+            expect(afterConcurrentFeedState.data.importedStats.feed).toBe(4);
             const bSettings = await postBatch(
                 'settings',
                 [

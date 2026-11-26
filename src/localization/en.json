@@ -4182,7 +4182,12 @@
             "export_progress_table": "Fetching {table}... ({processed} / {total} rows)",
             "export_packaging": "Packaging ZIP archive...",
             "export_done_toast": "Exported {rows} rows into {file}.",
-            "export_cancelled_toast": "Cloud data export cancelled."
+            "export_cancelled_toast": "Cloud data export cancelled.",
+            "concurrency_label": "Sync Concurrency",
+            "concurrency_option": "{count} threads",
+            "concurrency_option_recommended": "{count} threads (Recommended)",
+            "concurrency_saved_toast": "Cloud sync concurrency saved ({count} threads).",
+            "concurrency_badge": "{count} threads"
         }
     }
 }

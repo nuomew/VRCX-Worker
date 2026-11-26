@@ -151,6 +151,13 @@ public static class CommandValidator
             {
                 return (false, "desktop_migrate contains unsupported or empty categories.");
             }
+            if (parameters.TryGetValue("concurrency", out var rawConc) && rawConc != null)
+            {
+                if (!TryParseValidMigrationConcurrency(rawConc, out _))
+                {
+                    return (false, $"desktop_migrate concurrency must be an integer between {DesktopLegacyMigrator.MinConcurrency} and {DesktopLegacyMigrator.MaxConcurrency}.");
+                }
+            }
         }
         else if (action == "desktop_migrate_cancel")
         {
@@ -203,6 +210,28 @@ public static class CommandValidator
         }
 
         return (true, string.Empty);
+    }
+
+    public static bool TryParseValidMigrationConcurrency(object? raw, out int concurrency)
+    {
+        concurrency = DesktopLegacyMigrator.DefaultConcurrency;
+        if (raw == null) return true;
+        if (raw is int i)
+        {
+            concurrency = i;
+            return concurrency >= DesktopLegacyMigrator.MinConcurrency && concurrency <= DesktopLegacyMigrator.MaxConcurrency;
+        }
+        if (raw is long l && l >= int.MinValue && l <= int.MaxValue)
+        {
+            concurrency = (int)l;
+            return concurrency >= DesktopLegacyMigrator.MinConcurrency && concurrency <= DesktopLegacyMigrator.MaxConcurrency;
+        }
+        if (raw is string s && int.TryParse(s.Trim(), System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out int parsed))
+        {
+            concurrency = parsed;
+            return concurrency >= DesktopLegacyMigrator.MinConcurrency && concurrency <= DesktopLegacyMigrator.MaxConcurrency;
+        }
+        return false;
     }
 
     public static bool TryParseValidOscPort(object? raw, out int port)

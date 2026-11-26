@@ -624,11 +624,16 @@ public sealed class TrayApplicationContext : ApplicationContext
         return $"Scanned {report.DbFileName} ({totalAccounts} account(s), {totalRows} rows)";
     }
 
-    private Task<string> StartDesktopLegacyMigrationAsync(string jobId, string accountPrefix, IReadOnlyList<string> categories)
+    private Task<string> StartDesktopLegacyMigrationAsync(
+        string jobId,
+        string accountPrefix,
+        IReadOnlyList<string> categories,
+        int concurrency)
     {
         AgentConfig cfg = GetConfigSnapshot();
         string dbPath = DesktopLegacyMigrator.ResolveDesktopVrcxDatabasePath();
         List<string> safeCategories = categories.Where(DesktopLegacyMigrator.AllowedCategorySet.Contains).Distinct(StringComparer.Ordinal).ToList();
+        int safeConcurrency = Math.Clamp(concurrency, DesktopLegacyMigrator.MinConcurrency, DesktopLegacyMigrator.MaxConcurrency);
 
         CancellationTokenSource linkedCts;
         lock (_migrationLock)
@@ -645,9 +650,9 @@ public sealed class TrayApplicationContext : ApplicationContext
             try
             {
                 var (completed, batches, message) = await DesktopLegacyMigrator
-                    .RunMigrationAsync(cfg, dbPath, jobId, accountPrefix, safeCategories, _syncClient, linkedCts.Token)
+                    .RunMigrationAsync(cfg, dbPath, jobId, accountPrefix, safeCategories, _syncClient, linkedCts.Token, safeConcurrency)
                     .ConfigureAwait(false);
-                Log.Info("Desktop legacy migration {JobId} finished (completed={Completed}, batches={Batches}): {Msg}", jobId, completed, batches, message);
+                Log.Info("Desktop legacy migration {JobId} finished (completed={Completed}, batches={Batches}, threads={Threads}): {Msg}", jobId, completed, batches, safeConcurrency, message);
             }
             catch (Exception ex)
             {
@@ -667,7 +672,7 @@ public sealed class TrayApplicationContext : ApplicationContext
             }
         });
 
-        return Task.FromResult($"Started desktop legacy migration job {jobId} ({safeCategories.Count} categories)");
+        return Task.FromResult($"Started desktop legacy migration job {jobId} ({safeCategories.Count} categories, {safeConcurrency} thread(s))");
     }
 
     private string CancelDesktopLegacyMigration(string jobId)

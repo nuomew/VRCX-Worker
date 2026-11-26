@@ -4180,7 +4180,12 @@
             "export_progress_table": "正在拉取 {table}...（已拉取 {processed} / {total} 条）",
             "export_packaging": "正在打包 ZIP 文件...",
             "export_done_toast": "导出完成：共 {rows} 条数据，已保存为 {file}。",
-            "export_cancelled_toast": "已取消云端数据导出。"
+            "export_cancelled_toast": "已取消云端数据导出。",
+            "concurrency_label": "同步并发线程",
+            "concurrency_option": "{count} 线程",
+            "concurrency_option_recommended": "{count} 线程（推荐）",
+            "concurrency_saved_toast": "已保存云端同步并发线程数（{count} 线程）。",
+            "concurrency_badge": "{count} 线程"
         }
     }
 }

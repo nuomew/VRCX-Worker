@@ -3845,7 +3845,12 @@
             "export_progress_table": "正在拉取 {table}...（已拉取 {processed} / {total} 筆）",
             "export_packaging": "正在打包 ZIP 檔案...",
             "export_done_toast": "匯出完成：共 {rows} 筆資料，已儲存為 {file}。",
-            "export_cancelled_toast": "已取消雲端資料匯出。"
+            "export_cancelled_toast": "已取消雲端資料匯出。",
+            "concurrency_label": "同步並發執行緒",
+            "concurrency_option": "{count} 執行緒",
+            "concurrency_option_recommended": "{count} 執行緒（推薦）",
+            "concurrency_saved_toast": "已儲存雲端同步並發執行緒數（{count} 執行緒）。",
+            "concurrency_badge": "{count} 執行緒"
         }
     }
 }
