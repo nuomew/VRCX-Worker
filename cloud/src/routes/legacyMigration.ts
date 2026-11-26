@@ -1,12 +1,16 @@
 import { preAuthenticateAgent, verifyAgentBodyHmac } from '../auth/auth';
 import { randomHex } from '../crypto/vault';
 import {
+    CHUNK_KIND_TO_CORE_TABLE,
     CHUNK_KIND_TO_FEED_TABLE,
     CHUNK_KIND_TO_GAMELOG_TABLE,
     COMPACT_CHUNK_MAX_BYTES,
     COMPACT_CHUNK_MAX_ROWS,
     COMPACT_EXPORT_CHUNK_OFFSET,
     computeCompactChunkKey,
+    CORE_TABLE_TO_CHUNK_KIND,
+    type CoreChunkKind,
+    decodeCoreChunkRows,
     decodeFeedChunkForExport,
     decodeFeedChunkRows,
     decodeGameLogChunkForExport,
@@ -204,16 +208,24 @@ async function handleCloudExportQuery(env: Env, url: URL): Promise<Response> {
             coreCounts,
             gamelogCounts,
             feedCounts,
+            activeCoreChunkCountsRes,
             activeFeedChunkCountsRes,
             activeGamelogChunkCountsRes,
             legacyCountsBatch,
-            legacyFeedChunkCountsRes
+            legacyFeedChunkCountsRes,
+            legacyGamelogChunkCountsRes,
+            legacyCoreChunkCountsRes
         ] = await Promise.all([
             env.DB_CORE.batch(coreTables.map((t) => env.DB_CORE.prepare(`SELECT COUNT(*) AS cnt FROM ${t.name}`))),
             env.DB_GAMELOG.batch(
                 gamelogTables.map((t) => env.DB_GAMELOG.prepare(`SELECT COUNT(*) AS cnt FROM ${t.name}`))
             ),
             env.DB_FEED.batch(feedTables.map((t) => env.DB_FEED.prepare(`SELECT COUNT(*) AS cnt FROM ${t.name}`))),
+            env.DB_CORE.prepare(
+                'SELECT core_kind, COALESCE(SUM(row_count), 0) AS cnt FROM core_archive_chunks GROUP BY core_kind'
+            )
+                .all<{ core_kind: string; cnt: number }>()
+                .catch(() => ({ results: [] as Array<{ core_kind: string; cnt: number }> })),
             env.DB_FEED.prepare(
                 'SELECT feed_kind, COALESCE(SUM(row_count), 0) AS cnt FROM feed_archive_chunks GROUP BY feed_kind'
             )
@@ -236,7 +248,23 @@ async function handleCloudExportQuery(env: Env, url: URL): Promise<Response> {
                       )
                       .all<{ feed_kind: string; cnt: number }>()
                       .catch(() => ({ results: [] as Array<{ feed_kind: string; cnt: number }> }))
-                : Promise.resolve({ results: [] as Array<{ feed_kind: string; cnt: number }> })
+                : Promise.resolve({ results: [] as Array<{ feed_kind: string; cnt: number }> }),
+            legacyDb
+                ? legacyDb
+                      .prepare(
+                          'SELECT gamelog_kind, COALESCE(SUM(row_count), 0) AS cnt FROM legacy_gamelog_chunks GROUP BY gamelog_kind'
+                      )
+                      .all<{ gamelog_kind: string; cnt: number }>()
+                      .catch(() => ({ results: [] as Array<{ gamelog_kind: string; cnt: number }> }))
+                : Promise.resolve({ results: [] as Array<{ gamelog_kind: string; cnt: number }> }),
+            legacyDb
+                ? legacyDb
+                      .prepare(
+                          'SELECT core_kind, COALESCE(SUM(row_count), 0) AS cnt FROM legacy_core_chunks GROUP BY core_kind'
+                      )
+                      .all<{ core_kind: string; cnt: number }>()
+                      .catch(() => ({ results: [] as Array<{ core_kind: string; cnt: number }> }))
+                : Promise.resolve({ results: [] as Array<{ core_kind: string; cnt: number }> })
         ]);
 
         const activeCountMap = new Map<string, number>([['configs', activeConfigs.length]]);
@@ -252,6 +280,12 @@ async function handleCloudExportQuery(env: Env, url: URL): Promise<Response> {
             const first = (feedCounts[i]?.results?.[0] ?? null) as { cnt?: number } | null;
             activeCountMap.set(t.name, Number(first?.cnt ?? 0));
         });
+        for (const row of activeCoreChunkCountsRes.results ?? []) {
+            const coreTable = CHUNK_KIND_TO_CORE_TABLE[row.core_kind as CoreChunkKind];
+            if (coreTable) {
+                activeCountMap.set(coreTable, (activeCountMap.get(coreTable) ?? 0) + Number(row.cnt ?? 0));
+            }
+        }
         for (const row of activeFeedChunkCountsRes.results ?? []) {
             const feedTable = CHUNK_KIND_TO_FEED_TABLE[row.feed_kind as FeedChunkKind];
             if (feedTable) {
@@ -274,6 +308,18 @@ async function handleCloudExportQuery(env: Env, url: URL): Promise<Response> {
             const feedTable = CHUNK_KIND_TO_FEED_TABLE[row.feed_kind as FeedChunkKind];
             if (feedTable) {
                 legacyCountMap.set(feedTable, (legacyCountMap.get(feedTable) ?? 0) + Number(row.cnt ?? 0));
+            }
+        }
+        for (const row of legacyGamelogChunkCountsRes.results ?? []) {
+            const glTable = CHUNK_KIND_TO_GAMELOG_TABLE[row.gamelog_kind as GameLogChunkKind];
+            if (glTable) {
+                legacyCountMap.set(glTable, (legacyCountMap.get(glTable) ?? 0) + Number(row.cnt ?? 0));
+            }
+        }
+        for (const row of legacyCoreChunkCountsRes.results ?? []) {
+            const coreTable = CHUNK_KIND_TO_CORE_TABLE[row.core_kind as CoreChunkKind];
+            if (coreTable) {
+                legacyCountMap.set(coreTable, (legacyCountMap.get(coreTable) ?? 0) + Number(row.cnt ?? 0));
             }
         }
 
@@ -370,34 +416,40 @@ async function handleCloudExportQuery(env: Env, url: URL): Promise<Response> {
     const targetDb = source === 'legacy' ? legacyDb! : getActiveShardDb(env, meta.activeShard);
     const archiveSpec:
         | {
-              archiveTable: 'legacy_feed_chunks' | 'feed_archive_chunks' | 'gamelog_archive_chunks';
-              kindCol: 'feed_kind' | 'gamelog_kind';
+              archiveTable:
+                  | 'legacy_feed_chunks'
+                  | 'legacy_gamelog_chunks'
+                  | 'legacy_core_chunks'
+                  | 'feed_archive_chunks'
+                  | 'gamelog_archive_chunks'
+                  | 'core_archive_chunks';
+              kindCol: 'feed_kind' | 'gamelog_kind' | 'core_kind';
               kindVal: string;
-              decode: (payloadJson: string) => Array<Record<string, unknown>>;
+              decode: (chunkId: number, payloadJson: string) => Array<Record<string, unknown>>;
           }
-        | null =
-        source === 'legacy' && FEED_TABLE_TO_CHUNK_KIND[tableName]
+        | null = FEED_TABLE_TO_CHUNK_KIND[tableName]
+        ? {
+              archiveTable: source === 'legacy' ? 'legacy_feed_chunks' : 'feed_archive_chunks',
+              kindCol: 'feed_kind',
+              kindVal: FEED_TABLE_TO_CHUNK_KIND[tableName]!,
+              decode: (_id, p) => decodeFeedChunkForExport(FEED_TABLE_TO_CHUNK_KIND[tableName]!, p)
+          }
+        : GAMELOG_TABLE_TO_CHUNK_KIND[tableName]
+          ? {
+                archiveTable: source === 'legacy' ? 'legacy_gamelog_chunks' : 'gamelog_archive_chunks',
+                kindCol: 'gamelog_kind',
+                kindVal: GAMELOG_TABLE_TO_CHUNK_KIND[tableName]!,
+                decode: (_id, p) => decodeGameLogChunkForExport(GAMELOG_TABLE_TO_CHUNK_KIND[tableName]!, p)
+            }
+          : CORE_TABLE_TO_CHUNK_KIND[tableName]
             ? {
-                  archiveTable: 'legacy_feed_chunks',
-                  kindCol: 'feed_kind',
-                  kindVal: FEED_TABLE_TO_CHUNK_KIND[tableName]!,
-                  decode: (p) => decodeFeedChunkForExport(FEED_TABLE_TO_CHUNK_KIND[tableName]!, p)
+                  archiveTable: source === 'legacy' ? 'legacy_core_chunks' : 'core_archive_chunks',
+                  kindCol: 'core_kind',
+                  kindVal: CORE_TABLE_TO_CHUNK_KIND[tableName]!,
+                  decode: (cid, p) =>
+                      decodeCoreChunkRows(cid, CORE_TABLE_TO_CHUNK_KIND[tableName]!, p, { forExport: true })
               }
-            : source === 'active' && FEED_TABLE_TO_CHUNK_KIND[tableName]
-              ? {
-                    archiveTable: 'feed_archive_chunks',
-                    kindCol: 'feed_kind',
-                    kindVal: FEED_TABLE_TO_CHUNK_KIND[tableName]!,
-                    decode: (p) => decodeFeedChunkForExport(FEED_TABLE_TO_CHUNK_KIND[tableName]!, p)
-                }
-              : source === 'active' && GAMELOG_TABLE_TO_CHUNK_KIND[tableName]
-                ? {
-                      archiveTable: 'gamelog_archive_chunks',
-                      kindCol: 'gamelog_kind',
-                      kindVal: GAMELOG_TABLE_TO_CHUNK_KIND[tableName]!,
-                      decode: (p) => decodeGameLogChunkForExport(GAMELOG_TABLE_TO_CHUNK_KIND[tableName]!, p)
-                  }
-                : null;
+            : null;
 
     const readArchiveChunkExportResponse = async (chunkAfterId: number): Promise<Response> => {
         const spec = archiveSpec!;
@@ -420,7 +472,7 @@ async function handleCloudExportQuery(env: Env, url: URL): Promise<Response> {
             if (consumedCount > 0 && chunkRows.length + Number(chunk.row_count || 0) > limit) {
                 break;
             }
-            const unpacked = spec.decode(chunk.payload_json);
+            const unpacked = spec.decode(chunk.id, chunk.payload_json);
             for (const r of unpacked) chunkRows.push(r);
             lastChunkId = Number(chunk.id);
             consumedCount++;
@@ -2400,7 +2452,10 @@ export async function handleLegacyMigrationWebRoutes(
                 'gamelog_portal_spawn',
                 'gamelog_video_play',
                 'gamelog_event',
-                'gamelog_external'
+                'gamelog_external',
+                'legacy_gamelog_chunks',
+                'gamelog_user_rollup',
+                'gamelog_world_rollup'
             ],
             feed: ['feed_gps', 'feed_online_offline', 'feed_status', 'feed_bio', 'legacy_feed_chunks'],
             settings: ['legacy_configs']
@@ -2419,17 +2474,30 @@ export async function handleLegacyMigrationWebRoutes(
             );
         }
 
-        const deleteTables: string[] = [];
+        const deleteStmts: D1PreparedStatement[] = [];
         for (const cat of targetCategories) {
-            deleteTables.push(...tablesByCategory[cat]);
+            for (const t of tablesByCategory[cat]) {
+                deleteStmts.push(legacyDb.prepare(`DELETE FROM ${t}`));
+            }
+            if (cat === 'friend_log') {
+                deleteStmts.push(legacyDb.prepare("DELETE FROM legacy_core_chunks WHERE core_kind = 'friend_log'"));
+            } else if (cat === 'notifications') {
+                deleteStmts.push(
+                    legacyDb.prepare("DELETE FROM legacy_core_chunks WHERE core_kind IN ('notif_v1', 'notif_v2')")
+                );
+            }
             stats[cat] = 0;
         }
         if (!categoryParam) {
-            deleteTables.push('entity_users', 'entity_worlds');
+            deleteStmts.push(
+                legacyDb.prepare('DELETE FROM legacy_core_chunks'),
+                legacyDb.prepare('DELETE FROM entity_users'),
+                legacyDb.prepare('DELETE FROM entity_worlds')
+            );
         }
 
-        for (let i = 0; i < deleteTables.length; i += 20) {
-            await legacyDb.batch(deleteTables.slice(i, i + 20).map((t) => legacyDb.prepare(`DELETE FROM ${t}`)));
+        for (let i = 0; i < deleteStmts.length; i += 20) {
+            await legacyDb.batch(deleteStmts.slice(i, i + 20));
         }
         await writeLegacyState(legacyDb, STATE_KEY_IMPORTED_STATS, stats, nowIso);
         await clearLegacyCursors(legacyDb, categoryParam ? { categories: targetCategories } : {});

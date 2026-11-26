@@ -5,8 +5,8 @@ let initPromise: Promise<void> | null = null;
 
 // Static DDL mirrored from cloud/migrations/*/0001_init.sql.
 // Uses a schema_meta version sentinel so upgrades from Phase 0 auto-add Phase 1 tables idempotently.
-const SCHEMA_VERSION = 'v7-unique-screenshot-filename';
-const LEGACY_SCHEMA_VERSION = 'v2-compact-1000-drop-dup-idx';
+const SCHEMA_VERSION = 'v8-core-archive-chunks';
+const LEGACY_SCHEMA_VERSION = 'v3-full-compact-rollups';
 
 const CORE_STATEMENTS: readonly string[] = [
     `CREATE TABLE IF NOT EXISTS schema_meta (
@@ -282,7 +282,17 @@ const CORE_STATEMENTS: readonly string[] = [
         failures INTEGER NOT NULL DEFAULT 0,
         locked_until TEXT NOT NULL DEFAULT '',
         updated_at TEXT NOT NULL
-    )`
+    )`,
+    `CREATE TABLE IF NOT EXISTS core_archive_chunks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chunk_key TEXT NOT NULL UNIQUE,
+        core_kind TEXT NOT NULL,
+        min_created_at TEXT NOT NULL,
+        max_created_at TEXT NOT NULL,
+        row_count INTEGER NOT NULL DEFAULT 0,
+        payload_json TEXT NOT NULL
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_core_archive_chunks_kind_max ON core_archive_chunks (core_kind, max_created_at DESC)`
 ];
 
 const GAMELOG_STATEMENTS: readonly string[] = [
@@ -360,7 +370,22 @@ const GAMELOG_STATEMENTS: readonly string[] = [
         row_count INTEGER NOT NULL DEFAULT 0,
         payload_json TEXT NOT NULL
     )`,
-    `CREATE INDEX IF NOT EXISTS idx_gamelog_archive_chunks_kind_max ON gamelog_archive_chunks (gamelog_kind, max_created_at DESC)`
+    `CREATE INDEX IF NOT EXISTS idx_gamelog_archive_chunks_kind_max ON gamelog_archive_chunks (gamelog_kind, max_created_at DESC)`,
+    `CREATE TABLE IF NOT EXISTS gamelog_user_rollup (
+        user_id TEXT PRIMARY KEY,
+        display_name TEXT NOT NULL DEFAULT '',
+        join_count INTEGER NOT NULL DEFAULT 0,
+        time_spent INTEGER NOT NULL DEFAULT 0,
+        last_seen TEXT NOT NULL DEFAULT '',
+        second_last_seen TEXT NOT NULL DEFAULT ''
+    )`,
+    `CREATE TABLE IF NOT EXISTS gamelog_world_rollup (
+        world_id TEXT PRIMARY KEY,
+        world_name TEXT NOT NULL DEFAULT '',
+        visit_count INTEGER NOT NULL DEFAULT 0,
+        total_time INTEGER NOT NULL DEFAULT 0,
+        last_visit TEXT NOT NULL DEFAULT ''
+    )`
 ];
 
 const FEED_STATEMENTS: readonly string[] = [
@@ -774,7 +799,42 @@ const LEGACY_STATEMENTS: readonly string[] = [
         row_count INTEGER NOT NULL DEFAULT 0,
         payload_json TEXT NOT NULL
     )`,
-    `CREATE INDEX IF NOT EXISTS idx_legacy_feed_chunks_kind_max ON legacy_feed_chunks (feed_kind, max_created_at DESC)`
+    `CREATE INDEX IF NOT EXISTS idx_legacy_feed_chunks_kind_max ON legacy_feed_chunks (feed_kind, max_created_at DESC)`,
+    `CREATE TABLE IF NOT EXISTS legacy_gamelog_chunks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chunk_key TEXT NOT NULL UNIQUE,
+        gamelog_kind TEXT NOT NULL,
+        min_created_at TEXT NOT NULL,
+        max_created_at TEXT NOT NULL,
+        row_count INTEGER NOT NULL DEFAULT 0,
+        payload_json TEXT NOT NULL
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_legacy_gamelog_chunks_kind_max ON legacy_gamelog_chunks (gamelog_kind, max_created_at DESC)`,
+    `CREATE TABLE IF NOT EXISTS legacy_core_chunks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chunk_key TEXT NOT NULL UNIQUE,
+        core_kind TEXT NOT NULL,
+        min_created_at TEXT NOT NULL,
+        max_created_at TEXT NOT NULL,
+        row_count INTEGER NOT NULL DEFAULT 0,
+        payload_json TEXT NOT NULL
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_legacy_core_chunks_kind_max ON legacy_core_chunks (core_kind, max_created_at DESC)`,
+    `CREATE TABLE IF NOT EXISTS gamelog_user_rollup (
+        user_id TEXT PRIMARY KEY,
+        display_name TEXT NOT NULL DEFAULT '',
+        join_count INTEGER NOT NULL DEFAULT 0,
+        time_spent INTEGER NOT NULL DEFAULT 0,
+        last_seen TEXT NOT NULL DEFAULT '',
+        second_last_seen TEXT NOT NULL DEFAULT ''
+    )`,
+    `CREATE TABLE IF NOT EXISTS gamelog_world_rollup (
+        world_id TEXT PRIMARY KEY,
+        world_name TEXT NOT NULL DEFAULT '',
+        visit_count INTEGER NOT NULL DEFAULT 0,
+        total_time INTEGER NOT NULL DEFAULT 0,
+        last_visit TEXT NOT NULL DEFAULT ''
+    )`
 ];
 
 const CHAT_STATEMENTS: readonly string[] = [
@@ -803,7 +863,16 @@ const CHAT_STATEMENTS: readonly string[] = [
         created_at TEXT NOT NULL
     )`,
     `CREATE INDEX IF NOT EXISTS idx_chat_messages_created ON cloud_chat_messages (created_at DESC)`,
-    `CREATE INDEX IF NOT EXISTS idx_chat_messages_cmd ON cloud_chat_messages (cmd_id)`
+    `CREATE INDEX IF NOT EXISTS idx_chat_messages_cmd ON cloud_chat_messages (cmd_id)`,
+    `CREATE TABLE IF NOT EXISTS chat_archive_chunks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chunk_key TEXT NOT NULL UNIQUE,
+        min_created_at TEXT NOT NULL,
+        max_created_at TEXT NOT NULL,
+        row_count INTEGER NOT NULL DEFAULT 0,
+        payload_json TEXT NOT NULL
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_chat_archive_chunks_max ON chat_archive_chunks (max_created_at DESC)`
 ];
 
 /**
@@ -918,10 +987,10 @@ export async function ensureSchemaReady(env: Env): Promise<void> {
     if (!initPromise) {
         const tasks: Array<Promise<void>> = [
             initCoreIfNeeded(env.DB_CORE),
-            initShardIfNeeded(env.DB_GAMELOG, 'idx_gamelog_archive_chunks_kind_max', GAMELOG_STATEMENTS, 'index'),
+            initShardIfNeeded(env.DB_GAMELOG, 'gamelog_world_rollup', GAMELOG_STATEMENTS, 'table'),
             initShardIfNeeded(env.DB_FEED, 'idx_feed_archive_chunks_kind_max', FEED_STATEMENTS, 'index'),
             initShardIfNeeded(getCacheDb(env), 'cloud_rss_snapshot', CACHE_STATEMENTS, 'table'),
-            initShardIfNeeded(getChatDb(env), 'cloud_chat_config', CHAT_STATEMENTS, 'table')
+            initShardIfNeeded(getChatDb(env), 'idx_chat_archive_chunks_max', CHAT_STATEMENTS, 'index')
         ];
         if (env.DB_LEGACY) {
             tasks.push(initLegacyIfNeeded(env.DB_LEGACY));

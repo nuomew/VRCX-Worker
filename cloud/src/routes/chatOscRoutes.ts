@@ -1,5 +1,6 @@
 import { preAuthenticateAgent, verifyAgentBodyHmac } from '../auth/auth';
 import { randomHex } from '../crypto/vault';
+import { decodeChatChunkRows } from '../db/compactArchive';
 import { getChatDb } from '../db/schemaBootstrap';
 import type { Env } from '../env';
 import {
@@ -962,7 +963,55 @@ export async function handleChatOscWebRoutes(request: Request, env: Env, url: UR
             heartbeat ? touchChatWebActive(env, nowIso) : Promise.resolve()
         ]);
 
-        const rawRows = rowsRes.results ?? [];
+        const rawRows: ChatMessageRow[] = [...(rowsRes.results ?? [])];
+        // Transparently read compact archived chat chunks when hot messages do not fill the page
+        if (rawRows.length <= limit) {
+            try {
+                const chunkRes = before
+                    ? await chatDb
+                          .prepare(
+                              `SELECT id, payload_json
+                               FROM chat_archive_chunks
+                               WHERE min_created_at <= ?
+                               ORDER BY max_created_at DESC, id DESC
+                               LIMIT 10`
+                          )
+                          .bind(before)
+                          .all<{ id: number; payload_json: string }>()
+                    : await chatDb
+                          .prepare(
+                              `SELECT id, payload_json
+                               FROM chat_archive_chunks
+                               ORDER BY max_created_at DESC, id DESC
+                               LIMIT 10`
+                          )
+                          .all<{ id: number; payload_json: string }>();
+                const seenIds = new Set(rawRows.map((r) => r.id));
+                for (const chunk of chunkRes.results ?? []) {
+                    const unpacked = decodeChatChunkRows(chunk.payload_json);
+                    for (const row of unpacked) {
+                        if (!row.id || seenIds.has(row.id)) continue;
+                        if (before) {
+                            if (beforeId) {
+                                if (!(row.created_at < before || (row.created_at === before && row.id < beforeId))) {
+                                    continue;
+                                }
+                            } else if (!(row.created_at < before)) {
+                                continue;
+                            }
+                        }
+                        seenIds.add(row.id);
+                        rawRows.push(row);
+                    }
+                }
+                rawRows.sort((a, b) => {
+                    const cmp = b.created_at.localeCompare(a.created_at);
+                    return cmp !== 0 ? cmp : b.id.localeCompare(a.id);
+                });
+            } catch {
+                // Graceful fallback if chat_archive_chunks is not initialized yet
+            }
+        }
         const hasMore = rawRows.length > limit;
         const pageRows = hasMore ? rawRows.slice(0, limit) : rawRows;
         const lastRow = pageRows.length > 0 ? pageRows[pageRows.length - 1] : null;
@@ -1291,7 +1340,10 @@ export async function handleChatOscWebRoutes(request: Request, env: Env, url: UR
             return Response.json({ ok: true, data: { deletedId: id } });
         }
 
-        await chatDb.prepare('DELETE FROM cloud_chat_messages').run();
+        await chatDb.batch([
+            chatDb.prepare('DELETE FROM cloud_chat_messages'),
+            chatDb.prepare('DELETE FROM chat_archive_chunks')
+        ]);
         await broadcastChatEvent(env, 'chat.cleared', {});
         return Response.json({ ok: true, data: { cleared: true } });
     }

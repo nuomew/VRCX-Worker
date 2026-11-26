@@ -4002,12 +4002,15 @@
             "b2_pricing_hint_prefix": "Register an account and create a B2 bucket at ",
             "b2_pricing_hint_suffix": " (first 10 GB free; storage pricing is $6.95 / TB / month).",
             "status_unsaved": "Unsaved",
-            "compact_heading": "Database Row Compaction",
-            "compact_desc": "Packs historical Feed & event logs older than 30 days (up to 1,000 rows per row) and prunes expired caches/commands. Queries and exports stay 100% intact.",
-            "compact_btn": "Compact Databases",
+            "compact_heading": "All-6-Database Compaction",
+            "compact_desc": "Compacts existing data across all 6 D1 databases (Core, GameLog, Feed, Cache, Legacy, Chat) into 1,000-row chunks with rollup stats and gzip-compressed API caches. Queries, stats, search, and exports stay 100% intact.",
+            "compact_mode_all": "All existing data (Compact now)",
+            "compact_mode_7d": "Keep last 7 days hot",
+            "compact_mode_30d": "Keep last 30 days hot",
+            "compact_btn": "Compact All 6 DBs",
             "compacting_btn": "Compacting...",
-            "compact_done_toast": "Compacted {packed} rows into {chunks} chunks and pruned {pruned} expired rows.",
-            "compact_noop_toast": "All databases are already compact; no older rows needed packing."
+            "compact_done_toast": "Compacted {packed} rows into {chunks} chunks, gzip-compressed {compressed} cache entries, and pruned {pruned} expired rows.",
+            "compact_noop_toast": "All 6 databases are already compact; no rows needed packing or compression."
         },
         "settings": {
             "restoring_session": "Restoring session...",

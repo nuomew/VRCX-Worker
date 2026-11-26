@@ -1,7 +1,7 @@
 import {
     buildPruneExpiredVrcCacheStatement,
-    buildPutCachedVrcStatements,
-    buildWriteRssSnapshotStatement,
+    buildPutCachedVrcStatementsAsync,
+    buildWriteRssSnapshotStatementAsync,
     classifyVrcCacheUrl,
     getCachedVrcResponses,
     readRssSnapshot,
@@ -1942,10 +1942,6 @@ export async function runBackgroundFeedSync(
         const sessionStillSameForCache = (postFeedVault.jar.auth?.trim() ?? '') === initialAuthCookie;
         let committedRssSnapshot: RssSnapshotPayload | undefined;
         if (sessionStillSameForCache) {
-            const vrcCacheStmts = [
-                ...buildPutCachedVrcStatements(env, allCacheWrites, nowMs),
-                buildPruneExpiredVrcCacheStatement(env, nowMs)
-            ];
             const rssSnapshotPayload: RssSnapshotPayload = {
                 syncedAt: nowIso,
                 onlineCount: inGameCount,
@@ -1956,7 +1952,11 @@ export async function runBackgroundFeedSync(
                 onlineFriendsTruncated: onlineListTruncated,
                 onlineFriends: attachPresenceTimesToOnlineFriends(rawOnlineFriendRecords, nextSnapshot)
             };
-            const rssSnapshotStmt = buildWriteRssSnapshotStatement(env, rssSnapshotPayload);
+            const [putCacheStmts, rssSnapshotStmt] = await Promise.all([
+                buildPutCachedVrcStatementsAsync(env, allCacheWrites, nowMs),
+                buildWriteRssSnapshotStatementAsync(env, rssSnapshotPayload)
+            ]);
+            const vrcCacheStmts = [...putCacheStmts, buildPruneExpiredVrcCacheStatement(env, nowMs)];
             const cacheDb = getCacheDb(env);
             try {
                 await cacheDb.batch([...vrcCacheStmts, rssSnapshotStmt]);

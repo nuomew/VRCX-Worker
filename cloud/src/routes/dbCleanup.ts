@@ -172,6 +172,12 @@ const CLEANUP_TABLES: readonly CleanupTableSpec[] = [
     },
     {
         shard: 'core',
+        table: 'core_archive_chunks',
+        whereSql: 'max_created_at < ?',
+        cutoffKind: 'iso'
+    },
+    {
+        shard: 'core',
         table: 'cloud_commands',
         whereSql: "created_at < ? AND status != 'pending'",
         cutoffKind: 'iso',
@@ -187,6 +193,20 @@ const LEGACY_CLEANUP_TABLES: readonly CleanupTableSpec[] = [
         whereSql: 'max_created_at < ?',
         cutoffKind: 'iso',
         legacyCategory: 'feed'
+    },
+    {
+        shard: 'gamelog',
+        table: 'legacy_gamelog_chunks',
+        whereSql: 'max_created_at < ?',
+        cutoffKind: 'iso',
+        legacyCategory: 'gamelog'
+    },
+    {
+        shard: 'core',
+        table: 'legacy_core_chunks',
+        whereSql: 'max_created_at < ?',
+        cutoffKind: 'iso',
+        legacyCategory: 'notifications'
     }
 ];
 

@@ -361,3 +361,42 @@ CREATE TABLE IF NOT EXISTS legacy_feed_chunks (
     payload_json TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_legacy_feed_chunks_kind_max ON legacy_feed_chunks (feed_kind, max_created_at DESC);
+
+CREATE TABLE IF NOT EXISTS legacy_gamelog_chunks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chunk_key TEXT NOT NULL UNIQUE,
+    gamelog_kind TEXT NOT NULL,
+    min_created_at TEXT NOT NULL,
+    max_created_at TEXT NOT NULL,
+    row_count INTEGER NOT NULL DEFAULT 0,
+    payload_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_legacy_gamelog_chunks_kind_max ON legacy_gamelog_chunks (gamelog_kind, max_created_at DESC);
+
+CREATE TABLE IF NOT EXISTS legacy_core_chunks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chunk_key TEXT NOT NULL UNIQUE,
+    core_kind TEXT NOT NULL,
+    min_created_at TEXT NOT NULL,
+    max_created_at TEXT NOT NULL,
+    row_count INTEGER NOT NULL DEFAULT 0,
+    payload_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_legacy_core_chunks_kind_max ON legacy_core_chunks (core_kind, max_created_at DESC);
+
+CREATE TABLE IF NOT EXISTS gamelog_user_rollup (
+    user_id TEXT PRIMARY KEY,
+    display_name TEXT NOT NULL DEFAULT '',
+    join_count INTEGER NOT NULL DEFAULT 0,
+    time_spent INTEGER NOT NULL DEFAULT 0,
+    last_seen TEXT NOT NULL DEFAULT '',
+    second_last_seen TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS gamelog_world_rollup (
+    world_id TEXT PRIMARY KEY,
+    world_name TEXT NOT NULL DEFAULT '',
+    visit_count INTEGER NOT NULL DEFAULT 0,
+    total_time INTEGER NOT NULL DEFAULT 0,
+    last_visit TEXT NOT NULL DEFAULT ''
+);

@@ -24,7 +24,7 @@
                     </div>
                 </div>
 
-                <!-- Database Row Compaction (1000-row Cold Chunks + Cache/Control Pruning) -->
+                <!-- Database Row Compaction (All 6 D1 Shards: 1000-row Chunks + Cache Gzip + Control Pruning) -->
                 <div class="rounded-lg border border-border bg-card/60 p-4 space-y-2.5">
                     <div class="flex flex-wrap items-center justify-between gap-2">
                         <div class="space-y-0.5">
@@ -35,17 +35,33 @@
                                 {{ t('cloud_hub.storage.compact_desc') }}
                             </div>
                         </div>
-                        <Button
-                            size="sm"
-                            variant="outline"
-                            :disabled="compactingDb || cleaningDb"
-                            @click="runDatabaseCompaction">
-                            {{
-                                compactingDb
-                                    ? t('cloud_hub.storage.compacting_btn')
-                                    : t('cloud_hub.storage.compact_btn')
-                            }}
-                        </Button>
+                        <div class="flex flex-wrap items-center gap-2">
+                            <select
+                                v-model="compactRetentionDays"
+                                :disabled="compactingDb || cleaningDb"
+                                class="rounded-md border border-input bg-background px-2.5 py-1.5 text-xs text-foreground dark:[color-scheme:dark]">
+                                <option class="bg-card text-foreground" value="0">
+                                    {{ t('cloud_hub.storage.compact_mode_all') }}
+                                </option>
+                                <option class="bg-card text-foreground" value="7">
+                                    {{ t('cloud_hub.storage.compact_mode_7d') }}
+                                </option>
+                                <option class="bg-card text-foreground" value="30">
+                                    {{ t('cloud_hub.storage.compact_mode_30d') }}
+                                </option>
+                            </select>
+                            <Button
+                                size="sm"
+                                variant="outline"
+                                :disabled="compactingDb || cleaningDb"
+                                @click="runDatabaseCompaction">
+                                {{
+                                    compactingDb
+                                        ? t('cloud_hub.storage.compacting_btn')
+                                        : t('cloud_hub.storage.compact_btn')
+                                }}
+                            </Button>
+                        </div>
                     </div>
                     <p v-if="compactNotice" class="text-[11px] text-primary">{{ compactNotice }}</p>
                     <p v-if="compactError" class="text-[11px] text-destructive">{{ compactError }}</p>
@@ -666,6 +682,7 @@
     const pendingCleanupTarget = ref('auto');
     const cleaningDb = ref(false);
     const compactingDb = ref(false);
+    const compactRetentionDays = ref('0');
     const compactNotice = ref('');
     const compactError = ref('');
     const cleanupNotice = ref('');
@@ -757,26 +774,28 @@
         compactNotice.value = '';
         compactError.value = '';
         try {
+            const parsedDays = Number(compactRetentionDays.value);
+            const retentionDays = Number.isInteger(parsedDays) && parsedDays >= 0 && parsedDays <= 365 ? parsedDays : 0;
             let totalPacked = 0;
             let totalChunks = 0;
+            let totalCompressed = 0;
             let totalPruned = 0;
-            for (let round = 0; round < 10; round++) {
+            for (let round = 0; round < 12; round++) {
                 const res = await cloudFetch('/api/admin/storage/compact', {
                     method: 'POST',
-                    json: { retentionDays: 30, includeLegacy: true, maxChunksPerTable: 8 }
+                    json: { retentionDays, includeLegacy: true, maxChunksPerTable: 8 }
                 });
                 totalPacked += Number(res?.totalPackedRows || 0);
-                totalChunks +=
-                    Number(res?.feedChunksCreated || 0) +
-                    Number(res?.gamelogChunksCreated || 0) +
-                    Number(res?.legacyFeedChunksCreated || 0);
+                totalChunks += Number(res?.totalChunksCreated || 0);
+                totalCompressed += Number(res?.cacheCompressedRows || 0);
                 totalPruned += Number(res?.totalPrunedRows || 0);
                 if (!res?.hasMore) break;
             }
-            if (totalPacked > 0 || totalPruned > 0) {
+            if (totalPacked > 0 || totalCompressed > 0 || totalPruned > 0) {
                 compactNotice.value = t('cloud_hub.storage.compact_done_toast', {
                     packed: totalPacked.toLocaleString(),
                     chunks: totalChunks.toLocaleString(),
+                    compressed: totalCompressed.toLocaleString(),
                     pruned: totalPruned.toLocaleString()
                 });
             } else {

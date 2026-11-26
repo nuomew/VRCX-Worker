@@ -812,29 +812,36 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
                     row.rowId = -rid;
                 }
             }
-        } else if (normalized.length < limit) {
-            // Merge compact cold archive chunks from DB_GAMELOG (portal/video/event/external >30d)
+        }
+        // Merge compact archive chunks transparently across ALL 6 GameLog tables
+        // (`gamelog_archive_chunks` on active DB_GAMELOG, `legacy_gamelog_chunks` on DB_LEGACY)
+        if (negateRowIds || normalized.length < limit) {
             const chunkKinds: string[] = [];
+            if (wantLocation) chunkKinds.push('location');
+            if (wantJl) chunkKinds.push('join_leave');
             if (wantPortal) chunkKinds.push('portal');
             if (wantVideo) chunkKinds.push('video');
             if (wantEvent) chunkKinds.push('event');
             if (wantExternal) chunkKinds.push('external');
             if (chunkKinds.length > 0) {
+                const archiveTable = negateRowIds ? 'legacy_gamelog_chunks' : 'gamelog_archive_chunks';
                 try {
                     const kindPh = chunkKinds.map(() => '?').join(', ');
                     const chunkRes = await db
                         .prepare(
                             `SELECT id, gamelog_kind, payload_json
-                             FROM gamelog_archive_chunks
+                             FROM ${archiveTable}
                              WHERE gamelog_kind IN (${kindPh})
                              ORDER BY max_created_at DESC, id DESC
                              LIMIT ?`
                         )
-                        .bind(...chunkKinds, hasVip ? 12 : 6)
+                        .bind(...chunkKinds, hasVip ? 16 : 8)
                         .all<{ id: number; gamelog_kind: string; payload_json: string }>();
                     const vipSet = hasVip ? new Set(cleanVips) : null;
                     for (const c of chunkRes.results ?? []) {
-                        const unpacked = decodeGameLogChunkRows(c.id, c.gamelog_kind, c.payload_json);
+                        const unpacked = decodeGameLogChunkRows(c.id, c.gamelog_kind, c.payload_json, {
+                            negateRowIds
+                        });
                         for (const entry of unpacked) {
                             const entryType = String(entry.type ?? '');
                             if (hasTypeFilter && !typeSet.has(entryType)) continue;
@@ -844,7 +851,7 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
                     }
                     normalized.sort((a, b) => String(b.created_at ?? '').localeCompare(String(a.created_at ?? '')));
                 } catch {
-                    // Graceful fallback if gamelog_archive_chunks has not been initialized yet
+                    // Graceful fallback if archive chunk table has not been initialized yet
                 }
             }
         }
@@ -1357,27 +1364,89 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
 
         const queryUserStatsChunk = async (db: D1Database, chunk: string[]) => {
             const ph = chunk.map(() => '?').join(', ');
-            const res = await db
-                .prepare(
-                    `SELECT
-                        MAX(created_at) AS last_seen,
-                        user_id,
-                        COALESCE(SUM(time), 0) AS time_spent,
-                        COUNT(DISTINCT CASE WHEN location != '' THEN location END) AS join_count,
-                        MAX(display_name) AS display_name
-                     FROM gamelog_join_leave
-                     WHERE user_id IN (${ph})
-                     GROUP BY user_id`
-                )
-                .bind(...chunk)
-                .all<{
-                    last_seen: string;
-                    user_id: string;
-                    time_spent: number;
-                    join_count: number;
-                    display_name: string;
-                }>();
-            return res.results ?? [];
+            const [hotRes, rollupRes] = await Promise.all([
+                db
+                    .prepare(
+                        `SELECT
+                            MAX(created_at) AS last_seen,
+                            user_id,
+                            COALESCE(SUM(time), 0) AS time_spent,
+                            COUNT(DISTINCT CASE WHEN location != '' THEN location END) AS join_count,
+                            MAX(display_name) AS display_name
+                         FROM gamelog_join_leave
+                         WHERE user_id IN (${ph})
+                         GROUP BY user_id`
+                    )
+                    .bind(...chunk)
+                    .all<{
+                        last_seen: string;
+                        user_id: string;
+                        time_spent: number;
+                        join_count: number;
+                        display_name: string;
+                    }>(),
+                db
+                    .prepare(
+                        `SELECT
+                            last_seen,
+                            user_id,
+                            time_spent,
+                            join_count,
+                            display_name
+                         FROM gamelog_user_rollup
+                         WHERE user_id IN (${ph})`
+                    )
+                    .bind(...chunk)
+                    .all<{
+                        last_seen: string;
+                        user_id: string;
+                        time_spent: number;
+                        join_count: number;
+                        display_name: string;
+                    }>()
+                    .catch(() => ({
+                        results: [] as Array<{
+                            last_seen: string;
+                            user_id: string;
+                            time_spent: number;
+                            join_count: number;
+                            display_name: string;
+                        }>
+                    }))
+            ]);
+            return [...(hotRes.results ?? []), ...(rollupRes.results ?? [])];
+        };
+
+        const mergeUserStatRow = (r: {
+            last_seen: string;
+            user_id: string;
+            time_spent: number;
+            join_count: number;
+            display_name: string;
+        }) => {
+            const uid = r.user_id || '';
+            if (!uid) return;
+            const prev = mergedByUser.get(uid);
+            if (!prev) {
+                mergedByUser.set(uid, {
+                    lastSeen: r.last_seen || '',
+                    userId: uid,
+                    timeSpent: Number(r.time_spent ?? 0),
+                    joinCount: Number(r.join_count ?? 0),
+                    displayName: r.display_name || ''
+                });
+            } else {
+                const candidateLast = r.last_seen || '';
+                if (candidateLast && (!prev.lastSeen || candidateLast > prev.lastSeen)) {
+                    prev.lastSeen = candidateLast;
+                    if (r.display_name) prev.displayName = r.display_name;
+                }
+                prev.timeSpent += Number(r.time_spent ?? 0);
+                prev.joinCount += Number(r.join_count ?? 0);
+                if (!prev.displayName && r.display_name) {
+                    prev.displayName = r.display_name;
+                }
+            }
         };
 
         // Chunk <= 40 per query to stay strictly below D1's 100 bind-parameter ceiling
@@ -1387,41 +1456,8 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
                 queryUserStatsChunk(env.DB_GAMELOG, chunk),
                 hasLegacyGamelog && legacyDb ? queryUserStatsChunk(legacyDb, chunk).catch(() => []) : Promise.resolve([])
             ]);
-            for (const r of activeRows) {
-                const uid = r.user_id || '';
-                if (!uid) continue;
-                mergedByUser.set(uid, {
-                    lastSeen: r.last_seen || '',
-                    userId: uid,
-                    timeSpent: Number(r.time_spent ?? 0),
-                    joinCount: Number(r.join_count ?? 0),
-                    displayName: r.display_name || ''
-                });
-            }
-            for (const r of legacyRows) {
-                const uid = r.user_id || '';
-                if (!uid) continue;
-                const prev = mergedByUser.get(uid);
-                if (!prev) {
-                    mergedByUser.set(uid, {
-                        lastSeen: r.last_seen || '',
-                        userId: uid,
-                        timeSpent: Number(r.time_spent ?? 0),
-                        joinCount: Number(r.join_count ?? 0),
-                        displayName: r.display_name || ''
-                    });
-                } else {
-                    const legacyLast = r.last_seen || '';
-                    if (legacyLast && (!prev.lastSeen || legacyLast > prev.lastSeen)) {
-                        prev.lastSeen = legacyLast;
-                    }
-                    prev.timeSpent += Number(r.time_spent ?? 0);
-                    prev.joinCount += Number(r.join_count ?? 0);
-                    if (!prev.displayName && r.display_name) {
-                        prev.displayName = r.display_name;
-                    }
-                }
-            }
+            for (const r of activeRows) mergeUserStatRow(r);
+            for (const r of legacyRows) mergeUserStatRow(r);
         }
         return Response.json({ ok: true, data: Array.from(mergedByUser.values()) });
     }
@@ -1524,17 +1560,41 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
         const limit = clampLimit(url.searchParams.get('limit'), 50);
 
         if (kind === 'world' && worldId) {
-            const [agg, lastVisit, recent] = await env.DB_GAMELOG.batch([
+            const legacyDb = getLegacyDb(env);
+            const legacyStats = legacyDb ? await getLegacyImportedStats(env) : null;
+            const hasLegacyGamelog = Boolean(legacyDb && (legacyStats?.gamelog ?? 0) > 0);
+            const [activeBatch, activeRollup, legacyRollup, fallbackWorld] = await Promise.all([
+                env.DB_GAMELOG.batch([
+                    env.DB_GAMELOG.prepare(
+                        'SELECT COUNT(*) AS visitCount, COALESCE(SUM(time), 0) AS totalTime FROM gamelog_location WHERE world_id = ?'
+                    ).bind(worldId),
+                    env.DB_GAMELOG.prepare(
+                        'SELECT created_at, world_name, location FROM gamelog_location WHERE world_id = ? ORDER BY created_at DESC, id DESC LIMIT 10'
+                    ).bind(worldId),
+                    env.DB_GAMELOG.prepare(
+                        'SELECT id, created_at, location, world_id, world_name, time, group_name FROM gamelog_location WHERE world_id = ? ORDER BY created_at DESC, id DESC LIMIT ?'
+                    ).bind(worldId, Math.max(limit, 100))
+                ]),
                 env.DB_GAMELOG.prepare(
-                    'SELECT COUNT(*) AS visitCount, COALESCE(SUM(time), 0) AS totalTime FROM gamelog_location WHERE world_id = ?'
-                ).bind(worldId),
-                env.DB_GAMELOG.prepare(
-                    'SELECT created_at, world_name, location FROM gamelog_location WHERE world_id = ? ORDER BY created_at DESC, id DESC LIMIT 10'
-                ).bind(worldId),
-                env.DB_GAMELOG.prepare(
-                    'SELECT id, created_at, location, world_id, world_name, time, group_name FROM gamelog_location WHERE world_id = ? ORDER BY created_at DESC, id DESC LIMIT ?'
-                ).bind(worldId, Math.max(limit, 100))
+                    'SELECT world_name, visit_count, total_time, last_visit FROM gamelog_world_rollup WHERE world_id = ? LIMIT 1'
+                )
+                    .bind(worldId)
+                    .first<{ world_name?: string; visit_count?: number; total_time?: number; last_visit?: string }>()
+                    .catch(() => null),
+                hasLegacyGamelog && legacyDb
+                    ? legacyDb
+                          .prepare(
+                              'SELECT world_name, visit_count, total_time, last_visit FROM gamelog_world_rollup WHERE world_id = ? LIMIT 1'
+                          )
+                          .bind(worldId)
+                          .first<{ world_name?: string; visit_count?: number; total_time?: number; last_visit?: string }>()
+                          .catch(() => null)
+                    : Promise.resolve(null),
+                env.DB_CORE.prepare('SELECT world_name FROM entity_worlds WHERE world_id = ? LIMIT 1')
+                    .bind(worldId)
+                    .first<{ world_name?: string }>()
             ]);
+            const [agg, lastVisit, recent] = activeBatch;
             const aggRow = (agg?.results?.[0] ?? {}) as { visitCount?: number; totalTime?: number };
             const visitRows = (lastVisit?.results ?? []) as Array<{
                 created_at?: string;
@@ -1558,12 +1618,12 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
                     secondLastVisit = olderDiff?.created_at ?? '';
                 }
             }
-            const fallbackWorld = await env.DB_CORE.prepare(
-                'SELECT world_name FROM entity_worlds WHERE world_id = ? LIMIT 1'
-            )
-                .bind(worldId)
-                .first<{ world_name?: string }>();
-            const resolvedWorldName = lastRow.world_name || fallbackWorld?.world_name || '';
+            const resolvedWorldName =
+                lastRow.world_name ||
+                activeRollup?.world_name ||
+                legacyRollup?.world_name ||
+                fallbackWorld?.world_name ||
+                '';
 
             const byLocation = new Map<
                 string,
@@ -1588,15 +1648,73 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
                     });
                 }
             }
+            // Supplement recent instances from compact location chunks if hot rows are sparse
+            if (byLocation.size < limit && ((activeRollup?.visit_count ?? 0) > 0 || (legacyRollup?.visit_count ?? 0) > 0)) {
+                try {
+                    const chunkRes = await env.DB_GAMELOG.prepare(
+                        `SELECT id, payload_json
+                         FROM gamelog_archive_chunks
+                         WHERE gamelog_kind = 'location'
+                         ORDER BY max_created_at DESC, id DESC
+                         LIMIT 6`
+                    ).all<{ id: number; payload_json: string }>();
+                    for (const c of chunkRes.results ?? []) {
+                        const unpacked = decodeGameLogChunkRows(c.id, 'location', c.payload_json);
+                        for (const entry of unpacked) {
+                            if (String(entry.worldId ?? '') !== worldId) continue;
+                            const loc = String(entry.location ?? '');
+                            if (!loc) continue;
+                            const prev = byLocation.get(loc);
+                            const t = Number(entry.time ?? 0) || 0;
+                            const createdAt = String(entry.created_at ?? '');
+                            if (prev) {
+                                prev.time += t;
+                                if (createdAt > prev.created_at) prev.created_at = createdAt;
+                            } else {
+                                byLocation.set(loc, {
+                                    created_at: createdAt,
+                                    location: loc,
+                                    time: t,
+                                    worldName: String(entry.worldName ?? '') || resolvedWorldName,
+                                    groupName: String(entry.groupName ?? '')
+                                });
+                            }
+                        }
+                    }
+                } catch {
+                    // Non-fatal
+                }
+            }
+            const visitTimestamps = Array.from(
+                new Set(
+                    [
+                        lastRow.created_at ?? '',
+                        secondLastVisit,
+                        activeRollup?.last_visit ?? '',
+                        legacyRollup?.last_visit ?? ''
+                    ].filter(Boolean)
+                )
+            ).sort((a, b) => b.localeCompare(a));
+            const mergedLastVisit = visitTimestamps[0] ?? '';
+            const mergedSecondLastVisit = secondLastVisit || visitTimestamps[1] || '';
+
             return Response.json({
                 ok: true,
                 data: {
-                    visitCount: aggRow.visitCount ?? 0,
-                    timeSpent: aggRow.totalTime ?? 0,
-                    lastVisit: lastRow.created_at ?? '',
-                    secondLastVisit,
+                    visitCount:
+                        Number(aggRow.visitCount ?? 0) +
+                        Number(activeRollup?.visit_count ?? 0) +
+                        Number(legacyRollup?.visit_count ?? 0),
+                    timeSpent:
+                        Number(aggRow.totalTime ?? 0) +
+                        Number(activeRollup?.total_time ?? 0) +
+                        Number(legacyRollup?.total_time ?? 0),
+                    lastVisit: mergedLastVisit,
+                    secondLastVisit: mergedSecondLastVisit,
                     worldName: resolvedWorldName,
-                    instances: Array.from(byLocation.values()).slice(0, limit)
+                    instances: Array.from(byLocation.values())
+                        .sort((a, b) => b.created_at.localeCompare(a.created_at))
+                        .slice(0, limit)
                 }
             });
         }
@@ -1632,27 +1750,73 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
                         .bind(...jlBinds, recentLimit)
                 ]);
 
-            const [activeGamelogBatch, legacyGamelogBatch, coreBatch, latestPresenceRow] = await Promise.all([
-                buildUserGamelogBatch(env.DB_GAMELOG, false),
-                hasLegacyGamelog && legacyDb
-                    ? buildUserGamelogBatch(legacyDb, true).catch(() => null)
-                    : Promise.resolve(null),
-                env.DB_CORE.batch([
-                    env.DB_CORE.prepare(
-                        "SELECT created_at, display_name, previous_display_name FROM friend_log_history WHERE user_id = ? AND type = 'DisplayName' ORDER BY created_at DESC, id DESC LIMIT 30"
-                    ).bind(userId),
-                    env.DB_CORE.prepare('SELECT display_name FROM friend_log_current WHERE user_id = ? LIMIT 1').bind(
-                        userId
-                    ),
-                    env.DB_CORE.prepare('SELECT display_name FROM entity_users WHERE user_id = ? LIMIT 1').bind(userId)
-                ]).catch(() => null),
-                env.DB_FEED.prepare(
-                    "SELECT created_at, type FROM feed_online_offline WHERE user_id = ? AND (type = 'Online' OR type = 'Offline') ORDER BY id DESC LIMIT 1"
-                )
-                    .bind(userId)
-                    .first<{ created_at?: string; type?: string }>()
-                    .catch(() => null)
-            ]);
+            const rollupKeys = displayNameParam
+                ? Array.from(new Set([userId, `name:${displayNameParam.toLowerCase()}`]))
+                : [userId];
+            const rollupPh = rollupKeys.map(() => '?').join(', ');
+            const queryUserRollups = (db: D1Database) =>
+                db
+                    .prepare(
+                        `SELECT display_name, join_count, time_spent, last_seen, second_last_seen
+                         FROM gamelog_user_rollup
+                         WHERE user_id IN (${rollupPh})`
+                    )
+                    .bind(...rollupKeys)
+                    .all<{
+                        display_name?: string;
+                        join_count?: number;
+                        time_spent?: number;
+                        last_seen?: string;
+                        second_last_seen?: string;
+                    }>()
+                    .catch(() => ({
+                        results: [] as Array<{
+                            display_name?: string;
+                            join_count?: number;
+                            time_spent?: number;
+                            last_seen?: string;
+                            second_last_seen?: string;
+                        }>
+                    }));
+
+            const [activeGamelogBatch, legacyGamelogBatch, activeRollupRes, legacyRollupRes, coreBatch, latestPresenceRow] =
+                await Promise.all([
+                    buildUserGamelogBatch(env.DB_GAMELOG, false),
+                    hasLegacyGamelog && legacyDb
+                        ? buildUserGamelogBatch(legacyDb, true).catch(() => null)
+                        : Promise.resolve(null),
+                    queryUserRollups(env.DB_GAMELOG),
+                    hasLegacyGamelog && legacyDb ? queryUserRollups(legacyDb) : Promise.resolve({ results: [] }),
+                    env.DB_CORE.batch([
+                        env.DB_CORE.prepare(
+                            "SELECT created_at, display_name, previous_display_name FROM friend_log_history WHERE user_id = ? AND type = 'DisplayName' ORDER BY created_at DESC, id DESC LIMIT 30"
+                        ).bind(userId),
+                        env.DB_CORE.prepare('SELECT display_name FROM friend_log_current WHERE user_id = ? LIMIT 1').bind(
+                            userId
+                        ),
+                        env.DB_CORE.prepare('SELECT display_name FROM entity_users WHERE user_id = ? LIMIT 1').bind(userId)
+                    ]).catch(() => null),
+                    env.DB_FEED.prepare(
+                        "SELECT created_at, type FROM feed_online_offline WHERE user_id = ? AND (type = 'Online' OR type = 'Offline') ORDER BY id DESC LIMIT 1"
+                    )
+                        .bind(userId)
+                        .first<{ created_at?: string; type?: string }>()
+                        .catch(() => null)
+                ]);
+            const allRollupRows = [...(activeRollupRes.results ?? []), ...(legacyRollupRes.results ?? [])];
+            let rollupJoinCount = 0;
+            let rollupTimeSpent = 0;
+            const rollupSeenCandidates: Array<{ created_at: string; display_name: string }> = [];
+            for (const rr of allRollupRows) {
+                rollupJoinCount += Number(rr.join_count ?? 0);
+                rollupTimeSpent += Number(rr.time_spent ?? 0);
+                if (rr.last_seen) {
+                    rollupSeenCandidates.push({ created_at: rr.last_seen, display_name: rr.display_name || '' });
+                }
+                if (rr.second_last_seen) {
+                    rollupSeenCandidates.push({ created_at: rr.second_last_seen, display_name: rr.display_name || '' });
+                }
+            }
             const [agg, lastSeen, recent] = activeGamelogBatch;
             const activeAggRow = (agg?.results?.[0] ?? {}) as { joinCount?: number; totalTime?: number };
             const legacyAggRow = (legacyGamelogBatch?.[0]?.results?.[0] ?? {}) as {
@@ -1751,7 +1915,25 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
                     combinedJoinCount = unionLocs.size;
                 }
             }
-            const combinedAggTotalTime = Number(activeAggRow.totalTime ?? 0) + Number(legacyAggRow.totalTime ?? 0);
+            const combinedAggTotalTime =
+                Number(activeAggRow.totalTime ?? 0) + Number(legacyAggRow.totalTime ?? 0) + rollupTimeSpent;
+            combinedJoinCount += rollupJoinCount;
+            const mergedSeenTimestamps = Array.from(
+                new Set(
+                    [
+                        lastRow.created_at ?? '',
+                        secondLastSeen,
+                        ...rollupSeenCandidates.map((c) => c.created_at)
+                    ].filter(Boolean)
+                )
+            ).sort((a, b) => b.localeCompare(a));
+            const resolvedLastSeen = mergedSeenTimestamps[0] ?? '';
+            const resolvedSecondLastSeen = secondLastSeen || mergedSeenTimestamps[1] || '';
+            const rollupLatestDisplayName = rollupSeenCandidates
+                .slice()
+                .sort((a, b) => b.created_at.localeCompare(a.created_at))
+                .find((c) => c.display_name)?.display_name;
+            const resolvedLastDisplayName = lastRow.display_name || rollupLatestDisplayName || '';
 
             const nameHistRows = ((coreBatch?.[0]?.results ?? []) as Array<{
                 created_at?: string;
@@ -1917,9 +2099,9 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
                 data: {
                     joinCount: combinedJoinCount,
                     timeSpent: totalTime,
-                    lastSeen: lastRow.created_at ?? '',
-                    secondLastSeen,
-                    lastDisplayName: lastRow.display_name ?? '',
+                    lastSeen: resolvedLastSeen,
+                    secondLastSeen: resolvedSecondLastSeen,
+                    lastDisplayName: resolvedLastDisplayName,
                     lastPresenceType: latestPresenceRow?.type ?? '',
                     lastPresenceAt: latestPresenceRow?.created_at ?? '',
                     previousDisplayNames: Array.from(prevNamesMap.entries()),
@@ -2032,6 +2214,7 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
                 binds.push(excludeWorldId);
             }
             const whereSql = conds.join(' AND ');
+            const topLimit = Math.min(limit, 20);
             const rows = await env.DB_GAMELOG.prepare(
                 `SELECT world_id, MAX(world_name) AS world_name, COUNT(*) AS visits, COALESCE(SUM(time), 0) AS total_time
                  FROM (
@@ -2045,8 +2228,57 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
                  ORDER BY ${orderBySql}
                  LIMIT ?`
             )
-                .bind(...binds, Math.min(limit, 20))
-                .all();
+                .bind(...binds, topLimit)
+                .all<{ world_id: string; world_name: string; visits: number; total_time: number }>();
+            if (days === 0) {
+                const rollupConds: string[] = ["world_id != ''"];
+                const rollupBinds: unknown[] = [];
+                if (excludeWorldId) {
+                    rollupConds.push('world_id != ?');
+                    rollupBinds.push(excludeWorldId);
+                }
+                const rollupOrder =
+                    sortBy === 'count' ? 'visit_count DESC, total_time DESC' : 'total_time DESC, visit_count DESC';
+                const rollupRes = await env.DB_GAMELOG.prepare(
+                    `SELECT world_id, world_name, visit_count AS visits, total_time
+                     FROM gamelog_world_rollup
+                     WHERE ${rollupConds.join(' AND ')}
+                     ORDER BY ${rollupOrder}
+                     LIMIT ?`
+                )
+                    .bind(...rollupBinds, topLimit * 2)
+                    .all<{ world_id: string; world_name: string; visits: number; total_time: number }>()
+                    .catch(() => ({
+                        results: [] as Array<{ world_id: string; world_name: string; visits: number; total_time: number }>
+                    }));
+                const mergedWorlds = new Map<
+                    string,
+                    { world_id: string; world_name: string; visits: number; total_time: number }
+                >();
+                for (const r of [...(rows.results ?? []), ...(rollupRes.results ?? [])]) {
+                    const prev = mergedWorlds.get(r.world_id);
+                    if (!prev) {
+                        mergedWorlds.set(r.world_id, {
+                            world_id: r.world_id,
+                            world_name: r.world_name || '',
+                            visits: Number(r.visits ?? 0),
+                            total_time: Number(r.total_time ?? 0)
+                        });
+                    } else {
+                        prev.visits += Number(r.visits ?? 0);
+                        prev.total_time += Number(r.total_time ?? 0);
+                        if (!prev.world_name && r.world_name) prev.world_name = r.world_name;
+                    }
+                }
+                const sortedWorlds = Array.from(mergedWorlds.values())
+                    .sort((a, b) =>
+                        sortBy === 'count'
+                            ? b.visits - a.visits || b.total_time - a.total_time
+                            : b.total_time - a.total_time || b.visits - a.visits
+                    )
+                    .slice(0, topLimit);
+                return Response.json({ ok: true, data: sortedWorlds });
+            }
             return Response.json({ ok: true, data: rows.results ?? [] });
         }
 
@@ -3015,18 +3247,15 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
             kinds.push('oo_group');
         }
 
-        if (stmts.length === 0) {
-            return Response.json({ ok: true, data: [] });
-        }
-
-        const results = await env.DB_FEED.batch(stmts);
+        const results = stmts.length > 0 ? await env.DB_FEED.batch(stmts) : [];
         const worldIdSet = new Set(worldIds);
+        const userIdSet = new Set(userIds);
         const qLower = q.toLowerCase();
         const seenKeys = new Set<string>();
         const merged: Array<Record<string, unknown>> = [];
 
         const pushUnique = (item: Record<string, unknown>) => {
-            const key = `${String(item.type)}:${String(item.rowId)}`;
+            const key = feedDedupKey(item);
             if (seenKeys.has(key)) return;
             seenKeys.add(key);
             merged.push(item);
@@ -3081,6 +3310,98 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
                         pushUnique(mapFeedOoRow(r));
                     }
                 }
+            }
+        }
+
+        // Also search compact feed archive chunks (`feed_archive_chunks` & `legacy_feed_chunks`)
+        // so searches keep working transparently even after 0-day full compaction.
+        if (merged.length < limit) {
+            const chunkKinds: string[] = [];
+            if (wantGps) chunkKinds.push('gps');
+            if (wantOnline || wantOffline) chunkKinds.push('oo');
+            if (wantStatus) chunkKinds.push('status');
+            if (wantBio) chunkKinds.push('bio');
+            if (chunkKinds.length > 0) {
+                const groupNeedle = isGroupQuery ? `group(${q})` : '';
+                const scanFeedChunksForSearch = async (
+                    db: D1Database,
+                    archiveTable: 'feed_archive_chunks' | 'legacy_feed_chunks',
+                    negateRowIds: boolean
+                ) => {
+                    try {
+                        const kindPh = chunkKinds.map(() => '?').join(', ');
+                        const cConds: string[] = [`feed_kind IN (${kindPh})`];
+                        const cBinds: unknown[] = [...chunkKinds];
+                        if (dateFrom) {
+                            cConds.push('max_created_at >= ?');
+                            cBinds.push(dateFrom);
+                        }
+                        if (dateTo) {
+                            cConds.push('min_created_at <= ?');
+                            cBinds.push(dateTo);
+                        }
+                        const chunkRes = await db
+                            .prepare(
+                                `SELECT id, feed_kind, payload_json
+                                 FROM ${archiveTable}
+                                 WHERE ${cConds.join(' AND ')}
+                                 ORDER BY max_created_at DESC, id DESC
+                                 LIMIT 12`
+                            )
+                            .bind(...cBinds)
+                            .all<{ id: number; feed_kind: string; payload_json: string }>();
+                        for (const c of chunkRes.results ?? []) {
+                            const unpacked = decodeFeedChunkRows(c.id, c.feed_kind, c.payload_json, { negateRowIds });
+                            for (const entry of unpacked) {
+                                const entryType = String(entry.type ?? '');
+                                if (!useAll && !typeSet.has(entryType)) continue;
+                                const createdAt = String(entry.created_at ?? '');
+                                if (dateFrom && createdAt < dateFrom) continue;
+                                if (dateTo && createdAt > dateTo) continue;
+                                const uid = String(entry.userId ?? '');
+                                const dname = String(entry.displayName ?? '').toLowerCase();
+                                const loc = String(entry.location ?? '');
+                                const wname = String(entry.worldName ?? '').toLowerCase();
+                                const gname = String(entry.groupName ?? '').toLowerCase();
+                                let matched = userIdSet.has(uid);
+                                if (!matched && !q.startsWith('usr_') && !q.startsWith('wrld_') && !isGroupQuery) {
+                                    if (qLower.length >= 2 && dname.includes(qLower)) matched = true;
+                                }
+                                if (!matched && entryType === 'GPS') {
+                                    if (isGroupQuery) {
+                                        matched = loc.includes(groupNeedle) || gname.includes(qLower);
+                                    } else if (exactLocationPrefix) {
+                                        matched = loc === exactLocationPrefix || loc.startsWith(exactLocationPrefix);
+                                    } else {
+                                        const colon = loc.indexOf(':');
+                                        const wid = colon > 0 ? loc.slice(0, colon) : loc;
+                                        matched =
+                                            worldIdSet.has(wid) ||
+                                            (qLower.length >= 2 && (wname.includes(qLower) || gname.includes(qLower)));
+                                    }
+                                } else if (!matched && (entryType === 'Online' || entryType === 'Offline')) {
+                                    if (isGroupQuery) {
+                                        matched = loc.includes(groupNeedle) || gname.includes(qLower);
+                                    } else if (qLower.length >= 2) {
+                                        matched = gname.includes(qLower) || wname.includes(qLower);
+                                    }
+                                }
+                                if (matched) pushUnique(entry);
+                            }
+                        }
+                    } catch {
+                        // Non-fatal
+                    }
+                };
+
+                const legacyDb = getLegacyDb(env);
+                const legacyStats = legacyDb ? await getLegacyImportedStats(env) : null;
+                await Promise.all([
+                    scanFeedChunksForSearch(env.DB_FEED, 'feed_archive_chunks', false),
+                    legacyDb && (legacyStats?.feed ?? 0) > 0
+                        ? scanFeedChunksForSearch(legacyDb, 'legacy_feed_chunks', true)
+                        : Promise.resolve()
+                ]);
             }
         }
 
@@ -3158,8 +3479,9 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
             });
         }
 
-        // Merge compact cold GPS archive chunks when querying beyond the 30-day hot window (or when hot rows are sparse)
-        if (days > 30 || hotRows.length < limit) {
+        // Always merge compact GPS archive chunks (indexed on (feed_kind, max_created_at DESC); 0-cost when empty)
+        // so hot-worlds analytics stay accurate even after 0-day full compaction.
+        {
             try {
                 const archiveRes = await env.DB_FEED.prepare(
                     `SELECT id, payload_json
@@ -3301,7 +3623,7 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
                 lastVisit: r.last_visit || ''
             });
         }
-        if (days > 30 || userAgg.size === 0) {
+        {
             try {
                 const archiveRes = await env.DB_FEED.prepare(
                     `SELECT id, payload_json
@@ -3384,13 +3706,63 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
                 );
             }
             const batch = await env.DB_FEED.batch(queries);
+            const seen = new Set<string>();
             const rows: Array<{ created_at: string; type: string }> = [];
+            const pushOo = (createdAt: string, type: string) => {
+                if (!createdAt || (type !== 'Online' && type !== 'Offline')) return;
+                const k = `${createdAt}|${type}`;
+                if (seen.has(k)) return;
+                seen.add(k);
+                rows.push({ created_at: createdAt, type });
+            };
             for (const res of batch) {
                 for (const r of (res?.results ?? []) as Array<{ created_at?: string; type?: string }>) {
-                    if (r.created_at && (r.type === 'Online' || r.type === 'Offline')) {
-                        rows.push({ created_at: String(r.created_at), type: String(r.type) });
+                    pushOo(String(r.created_at ?? ''), String(r.type ?? ''));
+                }
+            }
+            // Also merge compact `feed_archive_chunks` ('oo') so activity charts remain intact after compaction
+            try {
+                const chunkConds = ["feed_kind = 'oo'"];
+                const chunkBinds: unknown[] = [];
+                if (toDateIso) {
+                    chunkConds.push('min_created_at <= ?');
+                    chunkBinds.push(toDateIso);
+                }
+                const chunkRes = await env.DB_FEED.prepare(
+                    `SELECT id, payload_json
+                     FROM feed_archive_chunks
+                     WHERE ${chunkConds.join(' AND ')}
+                     ORDER BY max_created_at DESC, id DESC
+                     LIMIT 16`
+                )
+                    .bind(...chunkBinds)
+                    .all<{ id: number; payload_json: string }>();
+                let latestBefore: { created_at: string; type: string } | null = null;
+                let earliestAfter: { created_at: string; type: string } | null = null;
+                for (const c of chunkRes.results ?? []) {
+                    const unpacked = decodeFeedChunkRows(c.id, 'oo', c.payload_json, { negateRowIds: false });
+                    for (const entry of unpacked) {
+                        if (String(entry.userId ?? '') !== userId) continue;
+                        const ts = String(entry.created_at ?? '');
+                        const tp = String(entry.type ?? '');
+                        if (!ts || (tp !== 'Online' && tp !== 'Offline')) continue;
+                        if (ts < fromDateIso) {
+                            if (!latestBefore || ts > latestBefore.created_at) {
+                                latestBefore = { created_at: ts, type: tp };
+                            }
+                        } else if (toDateIso && ts >= toDateIso) {
+                            if (!earliestAfter || ts < earliestAfter.created_at) {
+                                earliestAfter = { created_at: ts, type: tp };
+                            }
+                        } else {
+                            pushOo(ts, tp);
+                        }
                     }
                 }
+                if (latestBefore) pushOo(latestBefore.created_at, latestBefore.type);
+                if (earliestAfter) pushOo(earliestAfter.created_at, earliestAfter.type);
+            } catch {
+                // Non-fatal
             }
             rows.sort((a, b) => a.created_at.localeCompare(b.created_at));
             return Response.json({ ok: true, data: rows });
@@ -3407,10 +3779,43 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
             )
                 .bind(userId, afterCreatedAt)
                 .all<{ created_at?: string; type?: string }>();
-            const rows = (res.results ?? [])
-                .filter((r) => r.created_at && (r.type === 'Online' || r.type === 'Offline'))
-                .map((r) => ({ created_at: String(r.created_at), type: String(r.type) }));
-            return Response.json({ ok: true, data: rows });
+            const seen = new Set<string>();
+            const rows: Array<{ created_at: string; type: string }> = [];
+            const pushOo = (createdAt: string, type: string) => {
+                if (!createdAt || (type !== 'Online' && type !== 'Offline')) return;
+                const k = `${createdAt}|${type}`;
+                if (seen.has(k)) return;
+                seen.add(k);
+                rows.push({ created_at: createdAt, type });
+            };
+            for (const r of res.results ?? []) {
+                pushOo(String(r.created_at ?? ''), String(r.type ?? ''));
+            }
+            try {
+                const chunkRes = await env.DB_FEED.prepare(
+                    `SELECT id, payload_json
+                     FROM feed_archive_chunks
+                     WHERE feed_kind = 'oo' AND max_created_at > ?
+                     ORDER BY max_created_at ASC, id ASC
+                     LIMIT 16`
+                )
+                    .bind(afterCreatedAt)
+                    .all<{ id: number; payload_json: string }>();
+                for (const c of chunkRes.results ?? []) {
+                    const unpacked = decodeFeedChunkRows(c.id, 'oo', c.payload_json, { negateRowIds: false });
+                    for (const entry of unpacked) {
+                        if (String(entry.userId ?? '') !== userId) continue;
+                        const ts = String(entry.created_at ?? '');
+                        if (ts > afterCreatedAt) {
+                            pushOo(ts, String(entry.type ?? ''));
+                        }
+                    }
+                }
+            } catch {
+                // Non-fatal
+            }
+            rows.sort((a, b) => a.created_at.localeCompare(b.created_at));
+            return Response.json({ ok: true, data: rows.slice(0, 1500) });
         }
 
         if (kind === 'self_slice' || kind === 'self_after') {

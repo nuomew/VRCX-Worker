@@ -3665,12 +3665,15 @@
             "b2_pricing_hint_prefix": "可於 Backblaze 官網註冊帳戶並建立 B2 儲存桶：",
             "b2_pricing_hint_suffix": "（前 10 GB 免費，超出後儲存費用約為 6.95 美元 / TB / 月）。",
             "status_unsaved": "未儲存",
-            "compact_heading": "資料庫分塊壓縮瘦身",
-            "compact_desc": "將超過 30 天的現網動態、事件日誌及舊庫單行動態按每 1,000 筆打包為 1 行，並清理過期快取與歷史指令（所有查詢、熱門世界統計與匯出完全無損相容；背景每日亦會自動執行）。",
-            "compact_btn": "立即壓縮最佳化",
+            "compact_heading": "全部 6 庫分塊壓縮瘦身",
+            "compact_desc": "支援對正在使用的全部 6 個資料庫（Core / GameLog / Feed / Cache / Legacy / Chat）既有資料進行無損壓縮：每 1,000 筆打包為 1 行並自動維護統計彙總，同時對 API 快取執行 gzip 原地壓縮。所有查詢、統計、搜尋與匯出均 100% 透明相容。",
+            "compact_mode_all": "全部既有資料（立即全量壓縮）",
+            "compact_mode_7d": "保留近 7 天熱資料",
+            "compact_mode_30d": "保留近 30 天熱資料",
+            "compact_btn": "立即壓縮 6 個庫",
             "compacting_btn": "壓縮中...",
-            "compact_done_toast": "壓縮完成：已將 {packed} 筆記錄打包為 {chunks} 個緊湊分塊，並清理 {pruned} 筆過期記錄。",
-            "compact_noop_toast": "所有資料庫均已處於緊湊狀態，暫無需要打包的舊資料。"
+            "compact_done_toast": "壓縮完成：已將 {packed} 筆既有記錄打包為 {chunks} 個分塊，gzip 壓縮 {compressed} 筆快取，並清理 {pruned} 筆過期記錄。",
+            "compact_noop_toast": "全部 6 個資料庫均已處於最緊湊狀態，暫無需要打包或壓縮的資料。"
         },
         "settings": {
             "restoring_session": "正在恢復工作階段...",

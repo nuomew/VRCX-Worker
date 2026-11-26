@@ -72,7 +72,7 @@ CREATE TABLE IF NOT EXISTS gamelog_external (
 );
 CREATE INDEX IF NOT EXISTS idx_gamelog_ext_user_id ON gamelog_external (user_id, id DESC);
 
--- Compact chunked cold archive for non-aggregate GameLog tables (portal/video/event/external >30d, up to 1000 rows / <=512 KiB per row)
+-- Compact chunked archive for all 6 GameLog tables (up to 1000 rows / <=512 KiB per row)
 CREATE TABLE IF NOT EXISTS gamelog_archive_chunks (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     chunk_key TEXT NOT NULL UNIQUE,
@@ -83,3 +83,21 @@ CREATE TABLE IF NOT EXISTS gamelog_archive_chunks (
     payload_json TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_gamelog_archive_chunks_kind_max ON gamelog_archive_chunks (gamelog_kind, max_created_at DESC);
+
+-- Pre-aggregated rollup counters preserved atomically when gamelog_join_leave / gamelog_location rows are packed into chunks
+CREATE TABLE IF NOT EXISTS gamelog_user_rollup (
+    user_id TEXT PRIMARY KEY,
+    display_name TEXT NOT NULL DEFAULT '',
+    join_count INTEGER NOT NULL DEFAULT 0,
+    time_spent INTEGER NOT NULL DEFAULT 0,
+    last_seen TEXT NOT NULL DEFAULT '',
+    second_last_seen TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS gamelog_world_rollup (
+    world_id TEXT PRIMARY KEY,
+    world_name TEXT NOT NULL DEFAULT '',
+    visit_count INTEGER NOT NULL DEFAULT 0,
+    total_time INTEGER NOT NULL DEFAULT 0,
+    last_visit TEXT NOT NULL DEFAULT ''
+);

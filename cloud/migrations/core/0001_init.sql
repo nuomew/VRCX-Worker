@@ -314,3 +314,16 @@ CREATE TABLE IF NOT EXISTS cloud_auth_rate_limits (
     locked_until TEXT NOT NULL DEFAULT '',
     updated_at TEXT NOT NULL
 );
+
+-- Compact chunked cold archive for growing DB_CORE history tables (notifications / notifications_v2 / friend_log_history,
+-- up to 1000 rows / <=512 KiB per chunk row)
+CREATE TABLE IF NOT EXISTS core_archive_chunks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chunk_key TEXT NOT NULL UNIQUE,
+    core_kind TEXT NOT NULL,
+    min_created_at TEXT NOT NULL,
+    max_created_at TEXT NOT NULL,
+    row_count INTEGER NOT NULL DEFAULT 0,
+    payload_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_core_archive_chunks_kind_max ON core_archive_chunks (core_kind, max_created_at DESC);

@@ -8898,4 +8898,327 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
             await legacyDb.prepare('DELETE FROM legacy_feed_chunks').run().catch(() => {});
         }
     });
+
+    it('compacts ALL 6 D1 databases immediately with retentionDays=0 while preserving rollups, search, activity, gzip cache, chat pagination, and exports', async () => {
+        const legacyDb = env.DB_LEGACY!;
+        const cacheDb = env.DB_CACHE ?? env.DB_CORE;
+        const chatDb = env.DB_CHAT ?? env.DB_CORE;
+        const nowMs = Date.now();
+        const t1 = new Date(nowMs - 3600_000).toISOString();
+        const t2 = new Date(nowMs - 1800_000).toISOString();
+        const t3 = new Date(nowMs - 900_000).toISOString();
+        const bigCacheUrl = 'https://api.vrchat.cloud/api/1/worlds/wrld_all6_big_cache';
+        const bigCacheBody = JSON.stringify({
+            id: 'wrld_all6_big_cache',
+            name: 'All Six Compression Test World',
+            description: 'Repeated JSON payload for gzip compression verification. '.repeat(120),
+            tags: Array.from({ length: 40 }, (_, i) => `system_approved_tag_${i}`)
+        });
+
+        try {
+            // 1. Seed DB_CORE: friend_log_history, notifications (v1), notifications_v2
+            await env.DB_CORE.batch([
+                env.DB_CORE.prepare(
+                    `INSERT INTO friend_log_history (created_at, type, user_id, display_name, previous_display_name, trust_level, previous_trust_level, friend_number)
+                     VALUES (?, 'Friend', 'usr_all6_core', 'CoreFriend', '', 'Trusted User', '', 42)`
+                ).bind(t1),
+                env.DB_CORE.prepare(
+                    `INSERT OR REPLACE INTO notifications (id, created_at, type, sender_user_id, sender_username, receiver_user_id, message, world_id, world_name, image_url, invite_message, request_message, response_message, expired)
+                     VALUES ('not_all6_v1_exp', ?, 'invite', 'usr_all6_core', 'CoreFriend', 'usr_me', 'Hello from v1', 'wrld_all6_1', 'AllSixWorld', '', '', '', '', 1)`
+                ).bind(t1),
+                env.DB_CORE.prepare(
+                    `INSERT OR REPLACE INTO notifications_v2 (id, created_at, updated_at, expires_at, type, link, link_text, message, title, image_url, seen, sender_user_id, sender_username, data, responses, details)
+                     VALUES ('not_all6_v2_seen', ?, ?, '', 'group.announcement', '', '', 'Hello from v2', 'AllSixTitle', '', 1, 'usr_all6_core', 'CoreFriend', '{}', '[]', '{}')`
+                ).bind(t1, t1)
+            ]);
+
+            // 2. Seed DB_GAMELOG: location + join_leave (recent rows, <1h old)
+            await env.DB_GAMELOG.batch([
+                env.DB_GAMELOG.prepare(
+                    `INSERT OR IGNORE INTO gamelog_location (created_at, location, world_id, world_name, time, group_name)
+                     VALUES (?, 'wrld_all6_1:1001', 'wrld_all6_1', 'AllSixWorld', 50000, '')`
+                ).bind(t1),
+                env.DB_GAMELOG.prepare(
+                    `INSERT OR IGNORE INTO gamelog_location (created_at, location, world_id, world_name, time, group_name)
+                     VALUES (?, 'wrld_all6_1:1002', 'wrld_all6_1', 'AllSixWorld', 70000, '')`
+                ).bind(t2),
+                env.DB_GAMELOG.prepare(
+                    `INSERT OR IGNORE INTO gamelog_join_leave (created_at, type, display_name, location, user_id, time)
+                     VALUES (?, 'OnPlayerJoined', 'AllSixUser', 'wrld_all6_1:1001', 'usr_all6_u1', 40000)`
+                ).bind(t1),
+                env.DB_GAMELOG.prepare(
+                    `INSERT OR IGNORE INTO gamelog_join_leave (created_at, type, display_name, location, user_id, time)
+                     VALUES (?, 'OnPlayerJoined', 'AllSixUser', 'wrld_all6_1:1002', 'usr_all6_u1', 50000)`
+                ).bind(t2)
+            ]);
+
+            // 3. Seed DB_FEED: recent GPS + Online/Offline rows
+            await env.DB_FEED.batch([
+                env.DB_FEED.prepare(
+                    `INSERT OR IGNORE INTO feed_gps (created_at, user_id, display_name, location, world_name, previous_location, time, group_name)
+                     VALUES (?, 'usr_all6_u1', 'AllSixUser', 'wrld_all6_feed:10', 'AllSixFeedWorld', '', 30000, '')`
+                ).bind(t2),
+                env.DB_FEED.prepare(
+                    `INSERT OR IGNORE INTO feed_online_offline (created_at, user_id, display_name, type, location, world_name, time, group_name)
+                     VALUES (?, 'usr_all6_u1', 'AllSixUser', 'Online', '', '', 0, '')`
+                ).bind(t1),
+                env.DB_FEED.prepare(
+                    `INSERT OR IGNORE INTO feed_online_offline (created_at, user_id, display_name, type, location, world_name, time, group_name)
+                     VALUES (?, 'usr_all6_u1', 'AllSixUser', 'Offline', '', '', 1800000, '')`
+                ).bind(t2)
+            ]);
+
+            // 4. Seed DB_CACHE: uncompressed >4 KiB JSON row
+            await cacheDb
+                .prepare(
+                    `INSERT OR REPLACE INTO vrc_api_cache (cache_key, tier, status, body_text, updated_at, expires_at)
+                     VALUES (?, 'world', 200, ?, ?, ?)`
+                )
+                .bind(bigCacheUrl, bigCacheBody, t2, nowMs + 3600_000)
+                .run();
+
+            // 5. Seed DB_LEGACY: single-row gamelog & core rows
+            await legacyDb.batch([
+                legacyDb
+                    .prepare(
+                        `INSERT OR IGNORE INTO gamelog_location (created_at, location, world_id, world_name, time, group_name)
+                         VALUES (?, 'wrld_all6_1:0999', 'wrld_all6_1', 'AllSixWorld', 30000, '')`
+                    )
+                    .bind(t1),
+                legacyDb
+                    .prepare(
+                        `INSERT OR IGNORE INTO gamelog_join_leave (created_at, type, display_name, location, user_id, time)
+                         VALUES (?, 'OnPlayerJoined', 'AllSixUser', 'wrld_all6_1:0999', 'usr_all6_u1', 10000)`
+                    )
+                    .bind(t1),
+                legacyDb
+                    .prepare(
+                        `INSERT OR REPLACE INTO notifications (id, created_at, type, sender_user_id, sender_username, receiver_user_id, message, world_id, world_name, image_url, invite_message, request_message, response_message, expired)
+                         VALUES ('not_all6_legacy', ?, 'invite', 'usr_all6_leg', 'LegSender', 'usr_me', 'Legacy notif', '', '', '', '', '', '', 1)`
+                    )
+                    .bind(t1),
+                legacyDb
+                    .prepare(
+                        `INSERT INTO legacy_migration_state (state_key, payload_json, updated_at)
+                         VALUES ('imported_stats', ?, ?)
+                         ON CONFLICT(state_key) DO UPDATE SET payload_json = excluded.payload_json, updated_at = excluded.updated_at`
+                    )
+                    .bind(JSON.stringify({ gamelog: 2, notifications: 1, friend_log: 0, feed: 0 }), t2)
+            ]);
+
+            // 6. Seed DB_CHAT: 12 chat messages so 0-day compaction keeps newest 5 hot and packs 7 older into chat_archive_chunks
+            const chatInsertStmts: D1PreparedStatement[] = [];
+            for (let i = 1; i <= 12; i++) {
+                const msgTs = new Date(nowMs - (20 - i) * 60_000).toISOString();
+                chatInsertStmts.push(
+                    chatDb
+                        .prepare(
+                            `INSERT OR REPLACE INTO cloud_chat_messages
+                             (id, device_id, direction, source_text, translated_text, sent_text, source_lang, target_lang, display_mode, osc_address, osc_port, immediate, play_sfx, status, cmd_id, error_message, created_at)
+                             VALUES (?, 'dev_all6', 'web_to_vrc', ?, ?, ?, 'en', 'zh-CN', 'translated_only', '/chatbox/input', 9000, 1, 1, 'sent', '', '', ?)`
+                        )
+                        .bind(`chat_all6_${String(i).padStart(2, '0')}`, `Msg ${i}`, `消息 ${i}`, `消息 ${i}`, msgTs)
+                );
+            }
+            await chatDb.batch(chatInsertStmts);
+
+            // Execute 0-day immediate full compaction across ALL 6 databases
+            const compactRes = await exports.default.fetch('http://example.com/api/admin/storage/compact', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+                body: JSON.stringify({ retentionDays: 0, includeLegacy: true })
+            });
+            expect(compactRes.status).toBe(200);
+            const compactJson = (await compactRes.json()) as {
+                data: {
+                    retentionDays: number;
+                    corePackedRows: number;
+                    gamelogPackedRows: number;
+                    feedPackedRows: number;
+                    cacheCompressedRows: number;
+                    cacheBytesSaved: number;
+                    legacyGamelogPackedRows: number;
+                    legacyCorePackedRows: number;
+                    chatPackedRows: number;
+                    databasesBytesAfter: Record<string, number>;
+                };
+            };
+            expect(compactJson.data.retentionDays).toBe(0);
+            expect(compactJson.data.corePackedRows).toBeGreaterThanOrEqual(3);
+            expect(compactJson.data.gamelogPackedRows).toBeGreaterThanOrEqual(4);
+            expect(compactJson.data.feedPackedRows).toBeGreaterThanOrEqual(3);
+            expect(compactJson.data.cacheCompressedRows).toBeGreaterThanOrEqual(1);
+            expect(compactJson.data.cacheBytesSaved).toBeGreaterThan(2000);
+            expect(compactJson.data.legacyGamelogPackedRows).toBeGreaterThanOrEqual(2);
+            expect(compactJson.data.legacyCorePackedRows).toBeGreaterThanOrEqual(1);
+            expect(compactJson.data.chatPackedRows).toBeGreaterThanOrEqual(7);
+            expect(typeof compactJson.data.databasesBytesAfter.core).toBe('number');
+            expect(typeof compactJson.data.databasesBytesAfter.gamelog).toBe('number');
+            expect(typeof compactJson.data.databasesBytesAfter.feed).toBe('number');
+            expect(typeof compactJson.data.databasesBytesAfter.cache).toBe('number');
+            expect(typeof compactJson.data.databasesBytesAfter.legacy).toBe('number');
+            if (env.DB_CHAT) {
+                expect(typeof compactJson.data.databasesBytesAfter.chat).toBe('number');
+            }
+
+            // Re-running compaction immediately is a safe idempotent no-op (no double-counting rollups)
+            const compactAgain = await exports.default.fetch('http://example.com/api/admin/storage/compact', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+                body: JSON.stringify({ retentionDays: 0, includeLegacy: true })
+            });
+            expect(compactAgain.status).toBe(200);
+
+            // Verify DB_CORE transparent reads
+            const flRes = await exports.default.fetch('http://example.com/api/friend-log/history?userId=usr_all6_core');
+            const flJson = (await flRes.json()) as { data: Array<{ user_id: string; display_name: string }> };
+            expect(flJson.data.some((r) => r.user_id === 'usr_all6_core' && r.display_name === 'CoreFriend')).toBe(true);
+
+            const n1Res = await exports.default.fetch('http://example.com/api/notifications?v=1&limit=50');
+            const n1Json = (await n1Res.json()) as { data: Array<{ id: string }> };
+            expect(n1Json.data.some((r) => r.id === 'not_all6_v1_exp')).toBe(true);
+            expect(n1Json.data.some((r) => r.id === 'not_all6_legacy')).toBe(true);
+
+            const n2Res = await exports.default.fetch('http://example.com/api/notifications?v=2&limit=50');
+            const n2Json = (await n2Res.json()) as { data: Array<{ id: string; title?: string }> };
+            expect(n2Json.data.some((r) => r.id === 'not_all6_v2_seen' && r.title === 'AllSixTitle')).toBe(true);
+
+            // Verify DB_GAMELOG transparent query + Rollup stats (active + legacy combined accurately without double-count)
+            const glRes = await exports.default.fetch('http://example.com/api/gamelog/query', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+                body: JSON.stringify({ types: ['Location', 'OnPlayerJoined'], limit: 50 })
+            });
+            const glJson = (await glRes.json()) as { data: Array<{ type: string; worldId?: string; userId?: string }> };
+            expect(glJson.data.some((r) => r.type === 'Location' && r.worldId === 'wrld_all6_1')).toBe(true);
+            expect(glJson.data.some((r) => r.type === 'OnPlayerJoined' && r.userId === 'usr_all6_u1')).toBe(true);
+
+            const worldStatRes = await exports.default.fetch(
+                'http://example.com/api/gamelog/stats?kind=world&worldId=wrld_all6_1'
+            );
+            const worldStatJson = (await worldStatRes.json()) as {
+                data: { visitCount: number; timeSpent: number; worldName: string };
+            };
+            expect(worldStatJson.data.visitCount).toBe(3); // 2 active + 1 legacy
+            expect(worldStatJson.data.timeSpent).toBe(150000); // 50k + 70k + 30k
+            expect(worldStatJson.data.worldName).toBe('AllSixWorld');
+
+            const userStatRes = await exports.default.fetch(
+                'http://example.com/api/gamelog/stats?kind=user&userId=usr_all6_u1'
+            );
+            const userStatJson = (await userStatRes.json()) as {
+                data: { joinCount: number; timeSpent: number; lastDisplayName: string };
+            };
+            expect(userStatJson.data.joinCount).toBe(3); // 2 active + 1 legacy
+            expect(userStatJson.data.timeSpent).toBe(100000); // 40k + 50k + 10k
+            expect(userStatJson.data.lastDisplayName).toBe('AllSixUser');
+
+            const batchUsersStatRes = await exports.default.fetch('http://example.com/api/gamelog/stats/users', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+                body: JSON.stringify({ userIds: ['usr_all6_u1'] })
+            });
+            const batchUsersStatJson = (await batchUsersStatRes.json()) as {
+                data: Array<{ userId: string; joinCount: number; timeSpent: number }>;
+            };
+            const u1Summary = batchUsersStatJson.data.find((u) => u.userId === 'usr_all6_u1');
+            expect(u1Summary?.joinCount).toBe(3);
+            expect(u1Summary?.timeSpent).toBe(100000);
+
+            // Verify DB_FEED transparent search, 7-day hot-worlds, and activity source after 0-day compaction
+            const feedSearchRes = await exports.default.fetch(
+                'http://example.com/api/feed/search?q=AllSixFeedWorld&limit=20'
+            );
+            const feedSearchJson = (await feedSearchRes.json()) as { data: Array<{ worldName?: string }> };
+            expect(feedSearchJson.data.some((r) => r.worldName === 'AllSixFeedWorld')).toBe(true);
+
+            const hot7Res = await exports.default.fetch('http://example.com/api/feed/hot-worlds?days=7&limit=20');
+            const hot7Json = (await hot7Res.json()) as { data: Array<{ worldId: string; visitCount: number }> };
+            expect(hot7Json.data.some((w) => w.worldId === 'wrld_all6_feed' && w.visitCount >= 1)).toBe(true);
+
+            const actSliceRes = await exports.default.fetch(
+                `http://example.com/api/activity/source?kind=friend_slice&userId=usr_all6_u1&fromDateIso=${encodeURIComponent(
+                    new Date(nowMs - 7200_000).toISOString()
+                )}&toDateIso=${encodeURIComponent(t3)}`
+            );
+            const actSliceJson = (await actSliceRes.json()) as { data: Array<{ type: string }> };
+            expect(actSliceJson.data.some((r) => r.type === 'Online')).toBe(true);
+            expect(actSliceJson.data.some((r) => r.type === 'Offline')).toBe(true);
+
+            // Verify DB_CACHE row was gzip-compressed in-place and decompresses identically
+            const rawCacheRow = await cacheDb
+                .prepare('SELECT body_text FROM vrc_api_cache WHERE cache_key = ?')
+                .bind(bigCacheUrl)
+                .first<{ body_text: string }>();
+            expect(rawCacheRow?.body_text.startsWith('gz:')).toBe(true);
+            expect(rawCacheRow!.body_text.length).toBeLessThan(bigCacheBody.length * 0.4);
+            const { getCachedVrcResponses } = await import('../src/cache/vrcCache');
+            const hitMap = await getCachedVrcResponses(env, [bigCacheUrl], nowMs);
+            expect(hitMap.get(bigCacheUrl)?.bodyText).toBe(bigCacheBody);
+
+            // Verify DB_CHAT seamless pagination across hot 5 messages + archived 7 messages
+            const seenChatIds: string[] = [];
+            let before = '';
+            let beforeId = '';
+            for (let page = 0; page < 4; page++) {
+                const qs = before
+                    ? `?limit=4&before=${encodeURIComponent(before)}&beforeId=${encodeURIComponent(beforeId)}`
+                    : '?limit=4&heartbeat=0';
+                const chatPageRes = await exports.default.fetch(`http://example.com/api/chat/messages${qs}`);
+                const chatPageJson = (await chatPageRes.json()) as {
+                    data: {
+                        messages: Array<{ id: string }>;
+                        hasMore: boolean;
+                        nextBefore: string;
+                        nextBeforeId: string;
+                    };
+                };
+                for (const m of chatPageJson.data.messages) {
+                    if (m.id.startsWith('chat_all6_')) seenChatIds.push(m.id);
+                }
+                if (!chatPageJson.data.hasMore) break;
+                before = chatPageJson.data.nextBefore;
+                beforeId = chatPageJson.data.nextBeforeId;
+            }
+            expect(new Set(seenChatIds).size).toBe(12);
+            expect(seenChatIds[0]).toBe('chat_all6_12');
+            expect(seenChatIds[seenChatIds.length - 1]).toBe('chat_all6_01');
+
+            // Verify export summary includes core_archive_chunks + legacy_gamelog_chunks + legacy_core_chunks
+            const expRes = await exports.default.fetch(
+                'http://example.com/api/migration/export?scope=summary&includeLegacy=1'
+            );
+            const expJson = (await expRes.json()) as {
+                data: { tables: Array<{ name: string; activeCount: number; legacyCount: number }> };
+            };
+            expect(expJson.data.tables.find((t) => t.name === 'notifications')!.activeCount).toBeGreaterThanOrEqual(1);
+            expect(expJson.data.tables.find((t) => t.name === 'notifications')!.legacyCount).toBeGreaterThanOrEqual(1);
+            expect(expJson.data.tables.find((t) => t.name === 'gamelog_location')!.activeCount).toBeGreaterThanOrEqual(2);
+            expect(expJson.data.tables.find((t) => t.name === 'gamelog_location')!.legacyCount).toBeGreaterThanOrEqual(1);
+        } finally {
+            await env.DB_CORE.batch([
+                env.DB_CORE.prepare('DELETE FROM core_archive_chunks'),
+                env.DB_CORE.prepare("DELETE FROM friend_log_history WHERE user_id = 'usr_all6_core'"),
+                env.DB_CORE.prepare("DELETE FROM notifications WHERE id = 'not_all6_v1_exp'"),
+                env.DB_CORE.prepare("DELETE FROM notifications_v2 WHERE id = 'not_all6_v2_seen'")
+            ]).catch(() => {});
+            await env.DB_GAMELOG.batch([
+                env.DB_GAMELOG.prepare('DELETE FROM gamelog_archive_chunks'),
+                env.DB_GAMELOG.prepare("DELETE FROM gamelog_world_rollup WHERE world_id = 'wrld_all6_1'"),
+                env.DB_GAMELOG.prepare("DELETE FROM gamelog_user_rollup WHERE user_id = 'usr_all6_u1'")
+            ]).catch(() => {});
+            await env.DB_FEED.prepare('DELETE FROM feed_archive_chunks').run().catch(() => {});
+            await cacheDb.prepare('DELETE FROM vrc_api_cache WHERE cache_key = ?').bind(bigCacheUrl).run().catch(() => {});
+            await legacyDb.batch([
+                legacyDb.prepare('DELETE FROM legacy_gamelog_chunks'),
+                legacyDb.prepare('DELETE FROM legacy_core_chunks'),
+                legacyDb.prepare("DELETE FROM gamelog_world_rollup WHERE world_id = 'wrld_all6_1'"),
+                legacyDb.prepare("DELETE FROM gamelog_user_rollup WHERE user_id = 'usr_all6_u1'")
+            ]).catch(() => {});
+            await chatDb.batch([
+                chatDb.prepare("DELETE FROM cloud_chat_messages WHERE id LIKE 'chat_all6_%'"),
+                chatDb.prepare('DELETE FROM chat_archive_chunks')
+            ]).catch(() => {});
+        }
+    });
 });

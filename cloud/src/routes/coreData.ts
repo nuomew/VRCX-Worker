@@ -1,3 +1,4 @@
+import { decodeCoreChunkRows } from '../db/compactArchive';
 import { getLegacyDb } from '../db/schemaBootstrap';
 import type { Env } from '../env';
 import { loadExternalStorageConfig } from '../storage/objectStorage';
@@ -1154,6 +1155,7 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
             const limit = clampQueryLimit(url.searchParams.get('limit'), 200, 500);
             const legacyDb = getLegacyDb(env);
             const legacyStats = legacyDb ? await getLegacyImportedStats(env) : null;
+            const hasLegacyFriendLog = Boolean(legacyDb && (legacyStats?.friend_log ?? 0) > 0);
             const [res, legacyRes] = await Promise.all([
                 userId
                     ? env.DB_CORE.prepare('SELECT * FROM friend_log_history WHERE user_id = ? ORDER BY id DESC LIMIT ?')
@@ -1162,7 +1164,7 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
                     : env.DB_CORE.prepare('SELECT * FROM friend_log_history ORDER BY id DESC LIMIT ?')
                           .bind(limit)
                           .all<Record<string, unknown>>(),
-                legacyDb && (legacyStats?.friend_log ?? 0) > 0
+                hasLegacyFriendLog && legacyDb
                     ? userId
                         ? legacyDb
                               .prepare(
@@ -1178,9 +1180,48 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
                               .all<Record<string, unknown>>()
                     : Promise.resolve(null)
             ]);
+            const primaryRows: Array<Record<string, unknown>> = [...(res.results ?? [])];
+            const legacyRows: Array<Record<string, unknown>> = [...(legacyRes?.results ?? [])];
+            const readFriendLogChunks = async (
+                db: D1Database,
+                archiveTable: 'core_archive_chunks' | 'legacy_core_chunks',
+                negateRowIds: boolean
+            ): Promise<Array<Record<string, unknown>>> => {
+                try {
+                    const chunkRes = await db
+                        .prepare(
+                            `SELECT id, payload_json
+                             FROM ${archiveTable}
+                             WHERE core_kind = 'friend_log'
+                             ORDER BY max_created_at DESC, id DESC
+                             LIMIT ?`
+                        )
+                        .bind(userId ? 12 : 6)
+                        .all<{ id: number; payload_json: string }>();
+                    const out: Array<Record<string, unknown>> = [];
+                    for (const c of chunkRes.results ?? []) {
+                        const unpacked = decodeCoreChunkRows(c.id, 'friend_log', c.payload_json, { negateRowIds });
+                        for (const entry of unpacked) {
+                            if (userId && String(entry.user_id ?? '') !== userId) continue;
+                            out.push(entry);
+                        }
+                    }
+                    return out;
+                } catch {
+                    return [];
+                }
+            };
+            const [activeArchiveRows, legacyArchiveRows] = await Promise.all([
+                primaryRows.length < limit ? readFriendLogChunks(env.DB_CORE, 'core_archive_chunks', false) : Promise.resolve([]),
+                hasLegacyFriendLog && legacyDb && legacyRows.length < limit
+                    ? readFriendLogChunks(legacyDb, 'legacy_core_chunks', true)
+                    : Promise.resolve([])
+            ]);
+            primaryRows.push(...activeArchiveRows);
+            legacyRows.push(...legacyArchiveRows);
             const merged = mergePrimaryAndLegacy(
-                res.results ?? [],
-                legacyRes?.results ?? [],
+                primaryRows,
+                legacyRows,
                 (r) =>
                     `${String(r.created_at ?? '')}|${String(r.type ?? '')}|${String(r.user_id ?? '')}|${String(r.display_name ?? '')}`
             )
@@ -1278,24 +1319,57 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
             const version = url.searchParams.get('v') === '2' ? 2 : 1;
             const limit = clampQueryLimit(url.searchParams.get('limit'), 100, 200);
             const table = version === 2 ? 'notifications_v2' : 'notifications';
+            const coreKind = version === 2 ? 'notif_v2' : 'notif_v1';
             const legacyDb = getLegacyDb(env);
             const legacyStats = legacyDb ? await getLegacyImportedStats(env) : null;
+            const hasLegacyNotif = Boolean(legacyDb && (legacyStats?.notifications ?? 0) > 0);
             const [res, legacyRes] = await Promise.all([
                 env.DB_CORE.prepare(`SELECT * FROM ${table} ORDER BY created_at DESC LIMIT ?`)
                     .bind(limit)
                     .all<Record<string, unknown>>(),
-                legacyDb && (legacyStats?.notifications ?? 0) > 0
+                hasLegacyNotif && legacyDb
                     ? legacyDb
                           .prepare(`SELECT * FROM ${table} ORDER BY created_at DESC LIMIT ?`)
                           .bind(limit)
                           .all<Record<string, unknown>>()
                     : Promise.resolve(null)
             ]);
-            const merged = mergePrimaryAndLegacy(
-                res.results ?? [],
-                legacyRes?.results ?? [],
-                (r) => String(r.id ?? '')
-            )
+            const primaryRows: Array<Record<string, unknown>> = [...(res.results ?? [])];
+            const legacyRows: Array<Record<string, unknown>> = [...(legacyRes?.results ?? [])];
+            const readNotifChunks = async (
+                db: D1Database,
+                archiveTable: 'core_archive_chunks' | 'legacy_core_chunks',
+                negateRowIds: boolean
+            ): Promise<Array<Record<string, unknown>>> => {
+                try {
+                    const chunkRes = await db
+                        .prepare(
+                            `SELECT id, payload_json
+                             FROM ${archiveTable}
+                             WHERE core_kind = ?
+                             ORDER BY max_created_at DESC, id DESC
+                             LIMIT 6`
+                        )
+                        .bind(coreKind)
+                        .all<{ id: number; payload_json: string }>();
+                    const out: Array<Record<string, unknown>> = [];
+                    for (const c of chunkRes.results ?? []) {
+                        out.push(...decodeCoreChunkRows(c.id, coreKind, c.payload_json, { negateRowIds }));
+                    }
+                    return out;
+                } catch {
+                    return [];
+                }
+            };
+            const [activeArchiveRows, legacyArchiveRows] = await Promise.all([
+                primaryRows.length < limit ? readNotifChunks(env.DB_CORE, 'core_archive_chunks', false) : Promise.resolve([]),
+                hasLegacyNotif && legacyDb && legacyRows.length < limit
+                    ? readNotifChunks(legacyDb, 'legacy_core_chunks', true)
+                    : Promise.resolve([])
+            ]);
+            const primaryMerged = mergePrimaryAndLegacy(primaryRows, activeArchiveRows, (r) => String(r.id ?? ''));
+            const legacyMerged = mergePrimaryAndLegacy(legacyRows, legacyArchiveRows, (r) => String(r.id ?? ''));
+            const merged = mergePrimaryAndLegacy(primaryMerged, legacyMerged, (r) => String(r.id ?? ''))
                 .sort((a, b) => String(b.created_at ?? '').localeCompare(String(a.created_at ?? '')))
                 .slice(0, limit);
             return Response.json({ ok: true, data: merged });

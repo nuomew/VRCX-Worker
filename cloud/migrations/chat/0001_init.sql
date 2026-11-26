@@ -28,3 +28,14 @@ CREATE TABLE IF NOT EXISTS cloud_chat_messages (
 );
 CREATE INDEX IF NOT EXISTS idx_chat_messages_created ON cloud_chat_messages (created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_chat_messages_cmd ON cloud_chat_messages (cmd_id);
+
+-- Compact chunked archive for older chat translator messages (up to 1000 rows / <=512 KiB per chunk row)
+CREATE TABLE IF NOT EXISTS chat_archive_chunks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chunk_key TEXT NOT NULL UNIQUE,
+    min_created_at TEXT NOT NULL,
+    max_created_at TEXT NOT NULL,
+    row_count INTEGER NOT NULL DEFAULT 0,
+    payload_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_chat_archive_chunks_max ON chat_archive_chunks (max_created_at DESC);

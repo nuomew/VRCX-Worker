@@ -33,6 +33,70 @@ export interface RssSnapshotPayload {
 const RSS_SNAPSHOT_PRIMARY_KEY = 'primary';
 const MAX_CACHE_BODY_BYTES = 512 * 1024; // Avoid stuffing oversized payloads into D1 rows
 const MAX_RSS_SNAPSHOT_JSON_BYTES = 1_400_000; // Keep well below D1's 2 MB single-row limit
+const GZIP_TEXT_PREFIX = 'gz:';
+const GZIP_MIN_RAW_BYTES = 2048;
+
+const utf8Encoder = new TextEncoder();
+
+function uint8ToBase64(bytes: Uint8Array): string {
+    const chunkSize = 8192;
+    let binary = '';
+    for (let i = 0; i < bytes.length; i += chunkSize) {
+        const slice = bytes.subarray(i, Math.min(i + chunkSize, bytes.length));
+        let chunkStr = '';
+        for (let j = 0; j < slice.length; j++) {
+            chunkStr += String.fromCharCode(slice[j]!);
+        }
+        binary += chunkStr;
+    }
+    return btoa(binary);
+}
+
+function base64ToUint8(b64: string): Uint8Array {
+    const binary = atob(b64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) {
+        bytes[i] = binary.charCodeAt(i);
+    }
+    return bytes;
+}
+
+/**
+ * Compresses large JSON cache bodies with native Workers gzip + base64 (`gz:` prefix),
+ * shrinking typical VRChat API payloads in DB_CACHE by 75%-88%.
+ * Falls back safely to raw text if small, unsupported, or incompressible.
+ */
+export async function compressCacheTextIfBeneficial(raw: string): Promise<string> {
+    if (!raw || raw.startsWith(GZIP_TEXT_PREFIX)) return raw;
+    const rawBytes = utf8Encoder.encode(raw);
+    if (rawBytes.byteLength < GZIP_MIN_RAW_BYTES || typeof CompressionStream === 'undefined') {
+        return raw;
+    }
+    try {
+        const compressedStream = new Blob([rawBytes]).stream().pipeThrough(new CompressionStream('gzip'));
+        const compressedBuf = await new Response(compressedStream).arrayBuffer();
+        const encoded = `${GZIP_TEXT_PREFIX}${uint8ToBase64(new Uint8Array(compressedBuf))}`;
+        return encoded.length < raw.length ? encoded : raw;
+    } catch {
+        return raw;
+    }
+}
+
+/**
+ * Transparently decompresses `gz:`-prefixed DB_CACHE values back into original JSON text.
+ */
+export async function decompressCacheText(stored: string): Promise<string> {
+    if (!stored || !stored.startsWith(GZIP_TEXT_PREFIX) || typeof DecompressionStream === 'undefined') {
+        return stored;
+    }
+    try {
+        const rawBytes = base64ToUint8(stored.slice(GZIP_TEXT_PREFIX.length));
+        const decompressedStream = new Blob([rawBytes]).stream().pipeThrough(new DecompressionStream('gzip'));
+        return await new Response(decompressedStream).text();
+    } catch {
+        return stored;
+    }
+}
 
 const RSS_FRIEND_CORE_KEYS = [
     'id',
@@ -295,16 +359,28 @@ export async function getCachedVrcResponses(
         body_text: string;
         expires_at: number;
     }>[];
+    const rawHits: Array<{
+        cache_key: string;
+        tier: VrcCacheTier;
+        status: number;
+        body_text: string;
+        expires_at: number;
+    }> = [];
     for (const res of batchResults) {
         for (const row of res.results ?? []) {
-            byNorm.set(row.cache_key, {
-                cacheKey: row.cache_key,
-                tier: row.tier,
-                status: row.status,
-                bodyText: row.body_text,
-                expiresAt: row.expires_at
-            });
+            rawHits.push(row);
         }
+    }
+    const decodedBodies = await Promise.all(rawHits.map((row) => decompressCacheText(row.body_text)));
+    for (let i = 0; i < rawHits.length; i++) {
+        const row = rawHits[i]!;
+        byNorm.set(row.cache_key, {
+            cacheKey: row.cache_key,
+            tier: row.tier,
+            status: row.status,
+            bodyText: decodedBodies[i] ?? row.body_text,
+            expiresAt: row.expires_at
+        });
     }
     for (const [raw, norm] of rawToNorm.entries()) {
         const hit = byNorm.get(norm);
@@ -320,13 +396,12 @@ export function buildPutCachedVrcStatements(
     entries: Array<{ url: string; tier: VrcCacheTier; status: number; bodyText: string; ttlMs: number }>,
     nowMs = Date.now()
 ): D1PreparedStatement[] {
-    const encoder = new TextEncoder();
     const valid = entries.filter(
         (e) =>
             e.url &&
             e.status >= 200 &&
             e.status < 300 &&
-            encoder.encode(e.bodyText).byteLength <= MAX_CACHE_BODY_BYTES
+            utf8Encoder.encode(e.bodyText).byteLength <= MAX_CACHE_BODY_BYTES
     );
     if (valid.length === 0) return [];
 
@@ -349,14 +424,36 @@ export function buildPutCachedVrcStatements(
 }
 
 /**
- * Upserts one or more successful VRChat API GET responses into dedicated DB_CACHE.
+ * Async variant of `buildPutCachedVrcStatements` that gzip-compresses large JSON cache payloads
+ * before writing to DB_CACHE.
+ */
+export async function buildPutCachedVrcStatementsAsync(
+    env: Env,
+    entries: Array<{ url: string; tier: VrcCacheTier; status: number; bodyText: string; ttlMs: number }>,
+    nowMs = Date.now()
+): Promise<D1PreparedStatement[]> {
+    const candidates = entries.filter(
+        (e) => e.url && e.status >= 200 && e.status < 300 && e.bodyText.length > 0
+    );
+    if (candidates.length === 0) return [];
+    const compressed = await Promise.all(
+        candidates.map(async (e) => ({
+            ...e,
+            bodyText: await compressCacheTextIfBeneficial(e.bodyText)
+        }))
+    );
+    return buildPutCachedVrcStatements(env, compressed, nowMs);
+}
+
+/**
+ * Upserts one or more successful VRChat API GET responses into dedicated DB_CACHE (gzip-compressed when beneficial).
  */
 export async function putCachedVrcResponses(
     env: Env,
     entries: Array<{ url: string; tier: VrcCacheTier; status: number; bodyText: string; ttlMs: number }>,
     nowMs = Date.now()
 ): Promise<void> {
-    const stmts = buildPutCachedVrcStatements(env, entries, nowMs);
+    const stmts = await buildPutCachedVrcStatementsAsync(env, entries, nowMs);
     if (stmts.length > 0) {
         const db = getCacheDb(env);
         await db.batch(stmts);
@@ -507,6 +604,91 @@ export async function pruneVrcCacheBounded(env: Env, maxRows = 2500, nowMs = Dat
     return deleted;
 }
 
+export interface CompactVrcCacheResult {
+    prunedRows: number;
+    compressedRows: number;
+    bytesSaved: number;
+    hasMore: boolean;
+}
+
+/**
+ * Compacts existing DB_CACHE storage in place:
+ * 1. Prunes expired entries and enforces `maxRows` cap (default 1000).
+ * 2. Gzip-compresses existing uncompressed `vrc_api_cache` bodies (>=2 KiB) and `cloud_rss_snapshot` in place.
+ */
+export async function compactVrcCacheStorage(
+    env: Env,
+    options: { maxRows?: number; maxCompressRows?: number; nowMs?: number } = {}
+): Promise<CompactVrcCacheResult> {
+    const nowMs = options.nowMs ?? Date.now();
+    const maxRows = Math.max(100, Math.floor(options.maxRows ?? 1000));
+    const maxCompressRows = Math.min(Math.max(Math.floor(options.maxCompressRows ?? 100), 10), 400);
+    const db = getCacheDb(env);
+
+    const prunedRows = await pruneVrcCacheBounded(env, maxRows, nowMs);
+
+    let compressedRows = 0;
+    let bytesSaved = 0;
+    let hasMore = false;
+
+    const rawRowsRes = await db
+        .prepare(
+            `SELECT cache_key, body_text
+             FROM vrc_api_cache
+             WHERE body_text NOT LIKE 'gz:%' AND LENGTH(body_text) >= ?
+             ORDER BY LENGTH(body_text) DESC
+             LIMIT ?`
+        )
+        .bind(GZIP_MIN_RAW_BYTES, maxCompressRows + 1)
+        .all<{ cache_key: string; body_text: string }>();
+
+    const fetched = rawRowsRes.results ?? [];
+    hasMore = fetched.length > maxCompressRows;
+    const toProcess = hasMore ? fetched.slice(0, maxCompressRows) : fetched;
+
+    const updateStmts: D1PreparedStatement[] = [];
+    for (const row of toProcess) {
+        const compressed = await compressCacheTextIfBeneficial(row.body_text);
+        if (compressed.startsWith(GZIP_TEXT_PREFIX) && compressed.length < row.body_text.length) {
+            bytesSaved += row.body_text.length - compressed.length;
+            compressedRows++;
+            updateStmts.push(
+                db
+                    .prepare('UPDATE vrc_api_cache SET body_text = ? WHERE cache_key = ?')
+                    .bind(compressed, row.cache_key)
+            );
+        }
+    }
+
+    // Also compress existing cloud_rss_snapshot payload in place if raw & >= 2 KiB
+    const rssRow = await db
+        .prepare('SELECT payload_json FROM cloud_rss_snapshot WHERE snapshot_key = ? LIMIT 1')
+        .bind(RSS_SNAPSHOT_PRIMARY_KEY)
+        .first<{ payload_json?: string }>();
+    if (
+        rssRow?.payload_json &&
+        !rssRow.payload_json.startsWith(GZIP_TEXT_PREFIX) &&
+        rssRow.payload_json.length >= GZIP_MIN_RAW_BYTES
+    ) {
+        const compressedSnap = await compressCacheTextIfBeneficial(rssRow.payload_json);
+        if (compressedSnap.startsWith(GZIP_TEXT_PREFIX) && compressedSnap.length < rssRow.payload_json.length) {
+            bytesSaved += rssRow.payload_json.length - compressedSnap.length;
+            compressedRows++;
+            updateStmts.push(
+                db
+                    .prepare('UPDATE cloud_rss_snapshot SET payload_json = ? WHERE snapshot_key = ?')
+                    .bind(compressedSnap, RSS_SNAPSHOT_PRIMARY_KEY)
+            );
+        }
+    }
+
+    for (let i = 0; i < updateStmts.length; i += 25) {
+        await db.batch(updateStmts.slice(i, i + 25));
+    }
+
+    return { prunedRows, compressedRows, bytesSaved, hasMore };
+}
+
 /**
  * Purges all cached VRChat API responses and RSS snapshots on logout or account switch
  * so another VRChat account can never read stale cached friend/favorite/notification payloads.
@@ -524,7 +706,8 @@ export async function readRssSnapshot(env: Env): Promise<RssSnapshotPayload | nu
         .first<{ payload_json?: string; synced_at?: string }>();
     if (!row?.payload_json) return null;
     try {
-        const parsed = JSON.parse(row.payload_json) as Partial<RssSnapshotPayload>;
+        const decoded = await decompressCacheText(row.payload_json);
+        const parsed = JSON.parse(decoded) as Partial<RssSnapshotPayload>;
         return {
             syncedAt: parsed.syncedAt || row.synced_at || '',
             onlineCount: Number(parsed.onlineCount ?? 0),
@@ -554,6 +737,25 @@ export function buildWriteRssSnapshotStatement(env: Env, snapshot: RssSnapshotPa
         .bind(RSS_SNAPSHOT_PRIMARY_KEY, serializeBoundedRssSnapshot(snapshot), snapshot.syncedAt);
 }
 
+export async function buildWriteRssSnapshotStatementAsync(
+    env: Env,
+    snapshot: RssSnapshotPayload
+): Promise<D1PreparedStatement> {
+    const db = getCacheDb(env);
+    const serialized = await compressCacheTextIfBeneficial(serializeBoundedRssSnapshot(snapshot));
+    return db
+        .prepare(
+            `INSERT INTO cloud_rss_snapshot (snapshot_key, payload_json, synced_at)
+             VALUES (?, ?, ?)
+             ON CONFLICT(snapshot_key) DO UPDATE SET
+                payload_json = excluded.payload_json,
+                synced_at = excluded.synced_at
+             WHERE excluded.synced_at >= cloud_rss_snapshot.synced_at`
+        )
+        .bind(RSS_SNAPSHOT_PRIMARY_KEY, serialized, snapshot.syncedAt);
+}
+
 export async function writeRssSnapshot(env: Env, snapshot: RssSnapshotPayload): Promise<void> {
-    await buildWriteRssSnapshotStatement(env, snapshot).run();
+    const stmt = await buildWriteRssSnapshotStatementAsync(env, snapshot);
+    await stmt.run();
 }
