@@ -7762,11 +7762,27 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
                 ws.addEventListener('message', onMsg);
             });
 
-        // 0. Dedicated DB_CHAT health & isolation check (DB_CORE must NOT contain cloud_chat_messages / cloud_chat_config)
+        // 0. Dedicated DB_CHAT health, quota & isolation check (DB_CORE must NOT contain cloud_chat_messages / cloud_chat_config)
         expect(env.DB_CHAT).toBeDefined();
         const healthRes = await exports.default.fetch('http://example.com/health');
         const healthJson = (await healthRes.json()) as { data?: { chatDbDedicated?: boolean } };
         expect(healthJson.data?.chatDbDedicated).toBe(true);
+
+        const quotaRes = await exports.default.fetch('http://example.com/api/admin/quota');
+        expect(quotaRes.status).toBe(200);
+        const quotaJson = (await quotaRes.json()) as {
+            ok: boolean;
+            data: {
+                healthy: boolean;
+                chatDbDedicated: boolean;
+                databases: Record<string, { bytes: number; percentOfFreeLimit: number }>;
+            };
+        };
+        expect(quotaJson.data.healthy).toBe(true);
+        expect(quotaJson.data.chatDbDedicated).toBe(true);
+        expect(Object.keys(quotaJson.data.databases)).toEqual(['core', 'gamelog', 'feed', 'cache', 'legacy', 'chat']);
+        expect(quotaJson.data.databases.chat).toBeDefined();
+        expect(quotaJson.data.databases.chat?.bytes).toBeGreaterThanOrEqual(0);
 
         const coreChatTable = await env.DB_CORE.prepare(
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('cloud_chat_messages', 'cloud_chat_config')"

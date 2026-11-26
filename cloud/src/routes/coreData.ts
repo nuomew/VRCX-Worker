@@ -1555,21 +1555,24 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
     }
 
     if (url.pathname === '/api/admin/quota' && request.method === 'GET') {
-        const [coreProbe, gameProbe, feedProbe, cacheProbe, legacyProbe, countersRes, devicesRes] = await Promise.all([
-            env.DB_CORE.prepare('SELECT 1 AS ok').all(),
-            env.DB_GAMELOG.prepare('SELECT 1 AS ok').all(),
-            env.DB_FEED.prepare('SELECT 1 AS ok').all(),
-            env.DB_CACHE ? env.DB_CACHE.prepare('SELECT 1 AS ok').all() : Promise.resolve(null),
-            env.DB_LEGACY ? env.DB_LEGACY.prepare('SELECT 1 AS ok').all() : Promise.resolve(null),
-            env.DB_CORE.prepare('SELECT counter_key, row_count, updated_at FROM stats_counters').all(),
-            env.DB_CORE.prepare('SELECT COUNT(*) AS cnt FROM cloud_devices').first<{ cnt: number }>()
-        ]);
+        const [coreProbe, gameProbe, feedProbe, cacheProbe, legacyProbe, chatProbe, countersRes, devicesRes] =
+            await Promise.all([
+                env.DB_CORE.prepare('SELECT 1 AS ok').all(),
+                env.DB_GAMELOG.prepare('SELECT 1 AS ok').all(),
+                env.DB_FEED.prepare('SELECT 1 AS ok').all(),
+                env.DB_CACHE ? env.DB_CACHE.prepare('SELECT 1 AS ok').all() : Promise.resolve(null),
+                env.DB_LEGACY ? env.DB_LEGACY.prepare('SELECT 1 AS ok').all() : Promise.resolve(null),
+                env.DB_CHAT ? env.DB_CHAT.prepare('SELECT 1 AS ok').all() : Promise.resolve(null),
+                env.DB_CORE.prepare('SELECT counter_key, row_count, updated_at FROM stats_counters').all(),
+                env.DB_CORE.prepare('SELECT COUNT(*) AS cnt FROM cloud_devices').first<{ cnt: number }>()
+            ]);
         const freeDbCapBytes = 500 * 1024 * 1024;
         const sizeCore = coreProbe.meta?.size_after ?? 0;
         const sizeGame = gameProbe.meta?.size_after ?? 0;
         const sizeFeed = feedProbe.meta?.size_after ?? 0;
         const sizeCache = cacheProbe?.meta?.size_after ?? 0;
         const sizeLegacy = legacyProbe?.meta?.size_after ?? 0;
+        const sizeChat = chatProbe?.meta?.size_after ?? 0;
 
         return Response.json({
             ok: true,
@@ -1579,7 +1582,8 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
                         gameProbe.success &&
                         feedProbe.success &&
                         (!cacheProbe || cacheProbe.success) &&
-                        (!legacyProbe || legacyProbe.success)
+                        (!legacyProbe || legacyProbe.success) &&
+                        (!chatProbe || chatProbe.success)
                 ),
                 freeSingleDbLimitBytes: freeDbCapBytes,
                 databases: {
@@ -1610,12 +1614,21 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
                                   percentOfFreeLimit: Number(((sizeLegacy / freeDbCapBytes) * 100).toFixed(2))
                               }
                           }
+                        : {}),
+                    ...(env.DB_CHAT
+                        ? {
+                              chat: {
+                                  bytes: sizeChat,
+                                  percentOfFreeLimit: Number(((sizeChat / freeDbCapBytes) * 100).toFixed(2))
+                              }
+                          }
                         : {})
                 },
                 pairedDevicesCount: devicesRes?.cnt ?? 0,
                 r2Enabled: Boolean(env.R2_MEDIA),
                 cacheDbDedicated: Boolean(env.DB_CACHE),
                 legacyDbDedicated: Boolean(env.DB_LEGACY),
+                chatDbDedicated: Boolean(env.DB_CHAT),
                 counters: countersRes.results ?? []
             }
         });
