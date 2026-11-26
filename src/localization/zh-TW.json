@@ -3507,7 +3507,9 @@
             "direct_proxy_official": "官方直連",
             "direct_proxy_disable_confirm_desc": "關閉後使用官方直連會收取流量費用，確認關閉 Workers 中轉直連並改用 Backblaze B2 官方直連？",
             "direct_proxy_disable_confirm_btn": "確認關閉",
-            "direct_proxy_disable_cancel_btn": "取消"
+            "direct_proxy_disable_cancel_btn": "取消",
+            "b2_pricing_hint_prefix": "可於 Backblaze 官網註冊帳戶並建立 B2 儲存桶：",
+            "b2_pricing_hint_suffix": "（前 10 GB 免費，超出後儲存費用約為 6.95 美元 / TB / 月）。"
         },
         "settings": {
             "sync_interval_label": "雲端同步間隔（網頁端與背景動態）",

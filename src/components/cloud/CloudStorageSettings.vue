@@ -375,6 +375,18 @@
                     </div>
 
                     <template v-if="formEnabled">
+                        <!-- Backblaze B2 Signup & Pricing Hint (shown when extra storage is enabled) -->
+                        <div class="rounded-md border border-border/70 bg-muted/20 px-3 py-2 text-[11px] text-muted-foreground leading-relaxed">
+                            {{ t('cloud_hub.storage.b2_pricing_hint_prefix')
+                            }}<a
+                                href="https://secure.backblaze.com"
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                class="font-medium text-primary hover:underline">
+                                https://secure.backblaze.com</a
+                            >{{ t('cloud_hub.storage.b2_pricing_hint_suffix') }}
+                        </div>
+
                         <!-- Backblaze B2 Usage Meter (shown when B2 is enabled / configured) -->
                         <div
                             v-if="b2Usage?.bound"

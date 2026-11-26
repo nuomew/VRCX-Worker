@@ -3844,7 +3844,9 @@
             "direct_proxy_official": "Official Direct",
             "direct_proxy_disable_confirm_desc": "Disabling this switches to Backblaze B2 official direct links, which incur egress traffic charges. Confirm switching to official direct?",
             "direct_proxy_disable_confirm_btn": "Confirm Disable",
-            "direct_proxy_disable_cancel_btn": "Cancel"
+            "direct_proxy_disable_cancel_btn": "Cancel",
+            "b2_pricing_hint_prefix": "Register an account and create a B2 bucket at ",
+            "b2_pricing_hint_suffix": " (first 10 GB free; storage pricing is $6.95 / TB / month)."
         },
         "settings": {
             "sync_interval_label": "Cloud Sync Interval (Web & Background Feed)",
