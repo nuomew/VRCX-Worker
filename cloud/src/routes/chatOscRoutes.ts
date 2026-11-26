@@ -919,30 +919,65 @@ export async function handleChatOscWebRoutes(request: Request, env: Env, url: UR
         }
     }
 
-    // 1. Fetch chat messages + companion OSC status + cloud config (+ refresh active heartbeat)
+    // 1. Fetch chat messages (newest-first keyset pagination, default 20) + companion OSC status + cloud config
     if (url.pathname === '/api/chat/messages' && request.method === 'GET') {
-        const limit = clampQueryLimit(url.searchParams.get('limit'), 80, 200);
-        const heartbeat = url.searchParams.get('heartbeat') !== '0';
+        const limit = clampQueryLimit(url.searchParams.get('limit'), 20, 200);
+        const beforeRaw = url.searchParams.get('before')?.trim() ?? '';
+        const beforeIdRaw = url.searchParams.get('beforeId')?.trim() ?? '';
+        const before = beforeRaw && Number.isFinite(Date.parse(beforeRaw)) ? beforeRaw : '';
+        const beforeId = beforeIdRaw && CHAT_ID_RE.test(beforeIdRaw) ? beforeIdRaw : '';
+        const isHistoryPage = Boolean(before);
+        const heartbeat = !isHistoryPage && url.searchParams.get('heartbeat') !== '0';
         const nowIso = new Date().toISOString();
 
+        const queryPromise = before
+            ? beforeId
+                ? chatDb
+                      .prepare(
+                          `SELECT * FROM cloud_chat_messages
+                           WHERE (created_at < ? OR (created_at = ? AND id < ?))
+                           ORDER BY created_at DESC, id DESC
+                           LIMIT ?`
+                      )
+                      .bind(before, before, beforeId, limit + 1)
+                      .all<ChatMessageRow>()
+                : chatDb
+                      .prepare(
+                          `SELECT * FROM cloud_chat_messages
+                           WHERE created_at < ?
+                           ORDER BY created_at DESC, id DESC
+                           LIMIT ?`
+                      )
+                      .bind(before, limit + 1)
+                      .all<ChatMessageRow>()
+            : chatDb
+                  .prepare('SELECT * FROM cloud_chat_messages ORDER BY created_at DESC, id DESC LIMIT ?')
+                  .bind(limit + 1)
+                  .all<ChatMessageRow>();
+
         const [rowsRes, devices, config] = await Promise.all([
-            chatDb
-                .prepare('SELECT * FROM cloud_chat_messages ORDER BY created_at DESC LIMIT ?')
-                .bind(limit)
-                .all<ChatMessageRow>(),
-            listChatAgentDevices(env),
-            loadChatTranslatorConfig(env),
+            queryPromise,
+            isHistoryPage ? Promise.resolve(undefined) : listChatAgentDevices(env),
+            isHistoryPage ? Promise.resolve(undefined) : loadChatTranslatorConfig(env),
             heartbeat ? touchChatWebActive(env, nowIso) : Promise.resolve()
         ]);
 
-        const messages = (rowsRes.results ?? []).reverse().map(formatChatMessageDto);
+        const rawRows = rowsRes.results ?? [];
+        const hasMore = rawRows.length > limit;
+        const pageRows = hasMore ? rawRows.slice(0, limit) : rawRows;
+        const lastRow = pageRows.length > 0 ? pageRows[pageRows.length - 1] : null;
+        const messages = pageRows.map(formatChatMessageDto);
+
         return Response.json(
             {
                 ok: true,
                 data: {
                     messages,
-                    devices,
-                    config,
+                    hasMore,
+                    nextBefore: hasMore && lastRow ? lastRow.created_at : '',
+                    nextBeforeId: hasMore && lastRow ? lastRow.id : '',
+                    ...(devices !== undefined ? { devices } : {}),
+                    ...(config !== undefined ? { config } : {}),
                     chatDbDedicated: Boolean(env.DB_CHAT),
                     serverTime: nowIso
                 }

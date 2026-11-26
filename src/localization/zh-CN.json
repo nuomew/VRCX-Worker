@@ -854,7 +854,10 @@
                 "translate_failed": "翻译失败",
                 "copied_toast": "已复制到剪贴板",
                 "copy_failed": "复制失败",
-                "delete_failed": "删除记录失败"
+                "delete_failed": "删除记录失败",
+                "loading_more": "正在加载更早记录…",
+                "scroll_load_more": "滚动到底部自动加载更早记录",
+                "no_more_messages": "已加载全部聊天记录"
             },
             "marketplace": {
                 "header": "市场",

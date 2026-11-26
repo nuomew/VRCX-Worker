@@ -91,7 +91,7 @@
                     :disabled="loadingMessages"
                     :title="t('view.tools.chat_translator.refresh_tooltip')"
                     :ariaLabel="t('view.tools.chat_translator.refresh_tooltip')"
-                    @click="fetchMessages({ showLoader: true })">
+                    @click="fetchMessages({ showLoader: true, reset: true })">
                     <RefreshCw class="size-4" :class="{ 'animate-spin': loadingMessages }" />
                 </Button>
 
@@ -218,10 +218,11 @@
             </div>
         </div>
 
-        <!-- Chat & Sync Conversation Feed -->
+        <!-- Chat & Sync Conversation Feed (newest first; scrolling to bottom auto-loads earlier pages of 20) -->
         <div
             ref="messageListRef"
-            class="flex-1 overflow-y-auto min-h-0 rounded-xl border border-border/80 bg-muted/15 px-4 py-3.5 space-y-3">
+            class="flex-1 overflow-y-auto min-h-0 rounded-xl border border-border/80 bg-muted/15 px-4 py-3.5 space-y-3"
+            @scroll.passive="handleMessageListScroll">
             <!-- Initial Empty Guide + Quick Phrases -->
             <div
                 v-if="messages.length === 0 && !loadingMessages"
@@ -364,7 +365,7 @@
                     </span>
 
                     <span class="opacity-40">·</span>
-                    <span class="tabular-nums opacity-80">{{ formatClockShort(msg.createdAt) }}</span>
+                    <span class="tabular-nums opacity-85">{{ formatDateTime(msg.createdAt) }}</span>
 
                     <template v-if="msg.targetLang">
                         <span class="opacity-40">·</span>
@@ -378,6 +379,23 @@
                         <span class="font-mono text-[10px] opacity-75">:{{ msg.oscPort }}</span>
                     </template>
                 </div>
+            </div>
+
+            <!-- Infinite Scroll Footer Sentinel -->
+            <div
+                v-if="messages.length > 0 && isWebMode"
+                ref="loadMoreSentinelRef"
+                class="pt-2 pb-1 flex items-center justify-center gap-1.5 text-[11px] text-muted-foreground/75 select-none">
+                <template v-if="loadingMoreMessages">
+                    <Spinner class="size-3.5" />
+                    <span>{{ t('view.tools.chat_translator.loading_more') }}</span>
+                </template>
+                <span v-else-if="hasMoreMessages">
+                    {{ t('view.tools.chat_translator.scroll_load_more') }}
+                </span>
+                <span v-else class="opacity-70">
+                    {{ t('view.tools.chat_translator.no_more_messages') }}
+                </span>
             </div>
         </div>
 
@@ -672,7 +690,17 @@
         Trash2,
         X
     } from 'lucide-vue-next';
-    import { computed, nextTick, onActivated, onBeforeUnmount, onDeactivated, onMounted, reactive, ref } from 'vue';
+    import {
+        computed,
+        nextTick,
+        onActivated,
+        onBeforeUnmount,
+        onDeactivated,
+        onMounted,
+        reactive,
+        ref,
+        watch
+    } from 'vue';
     import { storeToRefs } from 'pinia';
     import { toast } from 'vue-sonner';
     import { useI18n } from 'vue-i18n';
@@ -729,6 +757,7 @@
     } = storeToRefs(advancedSettingsStore);
 
     const isWebMode = typeof WEB !== 'undefined' && WEB;
+    const CHAT_PAGE_SIZE = 20;
 
     // Distinct gray (off) vs green (on) toggle colors with crisp white thumb in both light & dark modes.
     const TOGGLE_SWITCH_CLASS =
@@ -754,6 +783,10 @@
     const isTranslationApiDialogVisible = ref(false);
     const isOscSettingsDialogVisible = ref(false);
     const loadingMessages = ref(false);
+    const loadingMoreMessages = ref(false);
+    const hasMoreMessages = ref(false);
+    const nextBefore = ref('');
+    const nextBeforeId = ref('');
     const clearingHistory = ref(false);
     const translatingDraft = ref(false);
     const sending = ref(false);
@@ -767,12 +800,14 @@
     const messages = ref([]);
     const devices = ref([]);
     const messageListRef = ref(null);
+    const loadMoreSentinelRef = ref(null);
     const translatingIds = reactive(new Set());
     const autoTranslatedIds = new Set();
 
     let pollTimer = null;
     let unsubChatEvent = null;
     let unsubCmdResult = null;
+    let loadMoreObserver = null;
     let typingResetTimer = null;
     let isCurrentlyTyping = false;
     let lastTypingSentAt = 0;
@@ -1000,11 +1035,18 @@
         persistPrefs();
     }
 
-    function scrollToBottom() {
+    function compareMessagesDesc(a, b) {
+        const ta = String(a?.createdAt || '');
+        const tb = String(b?.createdAt || '');
+        if (ta !== tb) return tb.localeCompare(ta);
+        return String(b?.id || '').localeCompare(String(a?.id || ''));
+    }
+
+    function scrollToTopIfNearTop() {
         nextTick(() => {
             const el = messageListRef.value;
-            if (el) {
-                el.scrollTop = el.scrollHeight;
+            if (el && el.scrollTop <= 120) {
+                el.scrollTop = 0;
             }
         });
     }
@@ -1015,30 +1057,44 @@
         if (idx >= 0) {
             messages.value[idx] = { ...messages.value[idx], ...incoming };
         } else {
-            messages.value.push(incoming);
-            if (messages.value.length > 200) {
-                messages.value.splice(0, messages.value.length - 200);
-            }
-            scrollToBottom();
+            messages.value.unshift(incoming);
+            messages.value.sort(compareMessagesDesc);
+            scrollToTopIfNearTop();
         }
         maybeAutoTranslateDesktopMessage(incoming);
     }
 
-    async function fetchMessages({ showLoader = false } = {}) {
+    async function fetchMessages({ showLoader = false, reset = false } = {}) {
         if (!isWebMode) return;
         const startSaveGen = configSaveGeneration;
         if (showLoader) loadingMessages.value = true;
         try {
-            const data = await cloudFetch('/api/chat/messages?limit=80');
-            const prevCount = messages.value.length;
-            const prevLastId = prevCount > 0 ? messages.value[prevCount - 1]?.id : '';
+            const data = await cloudFetch(`/api/chat/messages?limit=${CHAT_PAGE_SIZE}`);
             if (Array.isArray(data?.messages)) {
-                messages.value = data.messages;
-                const nextLastId = data.messages.length > 0 ? data.messages[data.messages.length - 1]?.id : '';
-                if (prevCount === 0 || (nextLastId && nextLastId !== prevLastId)) {
-                    scrollToBottom();
+                const incoming = [...data.messages].sort(compareMessagesDesc);
+                if (reset || messages.value.length === 0) {
+                    messages.value = incoming;
+                    hasMoreMessages.value = Boolean(data?.hasMore);
+                    nextBefore.value = typeof data?.nextBefore === 'string' ? data.nextBefore : '';
+                    nextBeforeId.value = typeof data?.nextBeforeId === 'string' ? data.nextBeforeId : '';
+                } else {
+                    // Merge latest 20 items without discarding older pages already loaded via scroll.
+                    const mergedMap = new Map();
+                    for (const item of messages.value) {
+                        if (item?.id) mergedMap.set(item.id, item);
+                    }
+                    for (const item of incoming) {
+                        if (item?.id) mergedMap.set(item.id, { ...(mergedMap.get(item.id) || {}), ...item });
+                    }
+                    const merged = Array.from(mergedMap.values()).sort(compareMessagesDesc);
+                    messages.value = merged;
+                    if (!hasMoreMessages.value && Boolean(data?.hasMore) && merged.length <= CHAT_PAGE_SIZE) {
+                        hasMoreMessages.value = true;
+                        nextBefore.value = typeof data?.nextBefore === 'string' ? data.nextBefore : '';
+                        nextBeforeId.value = typeof data?.nextBeforeId === 'string' ? data.nextBeforeId : '';
+                    }
                 }
-                for (const item of data.messages) {
+                for (const item of incoming) {
                     maybeAutoTranslateDesktopMessage(item);
                 }
             }
@@ -1065,6 +1121,97 @@
             }
         } finally {
             if (showLoader) loadingMessages.value = false;
+        }
+    }
+
+    async function loadMoreMessages() {
+        if (!isWebMode || !hasMoreMessages.value || loadingMoreMessages.value || loadingMessages.value) {
+            return;
+        }
+        const oldest = messages.value.length > 0 ? messages.value[messages.value.length - 1] : null;
+        const cursorBefore = nextBefore.value || oldest?.createdAt || '';
+        const cursorBeforeId = nextBeforeId.value || oldest?.id || '';
+        if (!cursorBefore) {
+            hasMoreMessages.value = false;
+            return;
+        }
+
+        loadingMoreMessages.value = true;
+        try {
+            const params = new URLSearchParams({
+                limit: String(CHAT_PAGE_SIZE),
+                before: cursorBefore,
+                heartbeat: '0'
+            });
+            if (cursorBeforeId) {
+                params.set('beforeId', cursorBeforeId);
+            }
+            const data = await cloudFetch(`/api/chat/messages?${params.toString()}`);
+            const incoming = Array.isArray(data?.messages) ? data.messages : [];
+            if (incoming.length > 0) {
+                const existingIds = new Set(messages.value.map((m) => m.id));
+                const appended = incoming.filter((item) => item?.id && !existingIds.has(item.id));
+                if (appended.length > 0) {
+                    messages.value = [...messages.value, ...appended].sort(compareMessagesDesc);
+                }
+                for (const item of appended) {
+                    maybeAutoTranslateDesktopMessage(item);
+                }
+            }
+            hasMoreMessages.value = Boolean(data?.hasMore) && incoming.length > 0;
+            nextBefore.value = typeof data?.nextBefore === 'string' ? data.nextBefore : '';
+            nextBeforeId.value = typeof data?.nextBeforeId === 'string' ? data.nextBeforeId : '';
+        } catch (err) {
+            toast.error(err?.message || t('view.tools.chat_translator.fetch_failed'));
+        } finally {
+            loadingMoreMessages.value = false;
+        }
+    }
+
+    function setupLoadMoreObserver() {
+        teardownLoadMoreObserver();
+        if (typeof IntersectionObserver === 'undefined' || !messageListRef.value || !loadMoreSentinelRef.value) {
+            return;
+        }
+        loadMoreObserver = new IntersectionObserver(
+            (entries) => {
+                if (entries.some((entry) => entry.isIntersecting)) {
+                    void loadMoreMessages();
+                }
+            },
+            {
+                root: messageListRef.value,
+                rootMargin: '0px 0px 80px 0px',
+                threshold: 0
+            }
+        );
+        loadMoreObserver.observe(loadMoreSentinelRef.value);
+    }
+
+    function teardownLoadMoreObserver() {
+        if (loadMoreObserver) {
+            loadMoreObserver.disconnect();
+            loadMoreObserver = null;
+        }
+    }
+
+    watch(
+        () => loadMoreSentinelRef.value,
+        (el) => {
+            if (el && liveSyncActive) {
+                setupLoadMoreObserver();
+            } else {
+                teardownLoadMoreObserver();
+            }
+        }
+    );
+
+    function handleMessageListScroll() {
+        const el = messageListRef.value;
+        if (!el || !hasMoreMessages.value || loadingMoreMessages.value || loadingMessages.value) return;
+        const remainingPx = el.scrollHeight - el.scrollTop - el.clientHeight;
+        if (remainingPx <= 80) {
+            void loadMoreMessages();
         }
     }
 
@@ -1331,6 +1478,9 @@
                 await cloudFetch('/api/chat/messages', { method: 'DELETE' });
             }
             messages.value = [];
+            hasMoreMessages.value = false;
+            nextBefore.value = '';
+            nextBeforeId.value = '';
             autoTranslatedIds.clear();
             toast.success(t('view.tools.chat_translator.history_cleared'));
         } catch (err) {
@@ -1450,18 +1600,20 @@
         return t('view.tools.chat_translator.status_queued');
     }
 
-    function formatClockShort(iso) {
+    function formatDateTime(iso) {
         if (!iso) return '';
         const dt = new Date(iso);
         if (Number.isNaN(dt.getTime())) return '';
-        return dt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        const pad = (n) => String(n).padStart(2, '0');
+        return `${dt.getFullYear()}-${pad(dt.getMonth() + 1)}-${pad(dt.getDate())} ${pad(dt.getHours())}:${pad(dt.getMinutes())}`;
     }
 
-    function formatClockFull(iso) {
+    function formatDateTimeFull(iso) {
         if (!iso) return '';
         const dt = new Date(iso);
         if (Number.isNaN(dt.getTime())) return '';
-        return dt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+        const pad = (n) => String(n).padStart(2, '0');
+        return `${dt.getFullYear()}-${pad(dt.getMonth() + 1)}-${pad(dt.getDate())} ${pad(dt.getHours())}:${pad(dt.getMinutes())}:${pad(dt.getSeconds())}`;
     }
 
     function formatMessageMetaTooltip(msg) {
@@ -1477,7 +1629,7 @@
             );
         }
         parts.push(`OSC :${msg.oscPort || DEFAULT_OSC_SEND_PORT}`);
-        const fullClock = formatClockFull(msg.createdAt);
+        const fullClock = formatDateTimeFull(msg.createdAt);
         if (fullClock) parts.push(fullClock);
         if (msg.errorMessage) parts.push(msg.errorMessage);
         return parts.join(' · ');
@@ -1543,6 +1695,9 @@
                 messages.value = messages.value.filter((m) => m.id !== evt.payload.id);
             } else if (evt.type === 'chat.cleared') {
                 messages.value = [];
+                hasMoreMessages.value = false;
+                nextBefore.value = '';
+                nextBeforeId.value = '';
                 autoTranslatedIds.clear();
             } else if (evt.type === 'chat.agent_status' && evt.payload) {
                 applyChatAgentStatusEvent(evt.payload);
@@ -1571,6 +1726,7 @@
         });
 
         fetchMessages({ showLoader: messages.value.length === 0 });
+        nextTick(() => setupLoadMoreObserver());
         let fallbackTicks = 0;
         pollTimer = setInterval(() => {
             if (typeof document !== 'undefined' && document.visibilityState !== 'visible') {
@@ -1593,6 +1749,7 @@
 
     function stopLiveSync() {
         liveSyncActive = false;
+        teardownLoadMoreObserver();
         if (pollTimer) {
             clearInterval(pollTimer);
             pollTimer = null;

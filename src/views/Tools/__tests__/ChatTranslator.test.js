@@ -624,4 +624,90 @@ describe('ChatTranslator.vue', () => {
 
         wrapper.unmount();
     });
+
+    test('loads only latest 20 messages initially, displays YYYY-MM-DD HH:mm timestamps, and auto-loads older pages on scroll to bottom', async () => {
+        const requestedUrls = [];
+        const page1 = Array.from({ length: 20 }, (_, i) => {
+            const idx = 25 - i; // 25 down to 6 (newest first)
+            const minute = String(idx).padStart(2, '0');
+            return {
+                id: `msg_${String(idx).padStart(2, '0')}`,
+                direction: 'web_to_vrc',
+                sourceText: `消息 #${idx}`,
+                translatedText: '',
+                sentText: `消息 #${idx}`,
+                oscPort: 9000,
+                status: 'sent',
+                createdAt: `2026-11-26T10:${minute}:00.000Z`
+            };
+        });
+        const page2 = Array.from({ length: 5 }, (_, i) => {
+            const idx = 5 - i; // 5 down to 1
+            const minute = String(idx).padStart(2, '0');
+            return {
+                id: `msg_${String(idx).padStart(2, '0')}`,
+                direction: 'web_to_vrc',
+                sourceText: `消息 #${idx}`,
+                translatedText: '',
+                sentText: `消息 #${idx}`,
+                oscPort: 9000,
+                status: 'sent',
+                createdAt: `2026-11-26T10:${minute}:00.000Z`
+            };
+        });
+
+        mocks.cloudFetch.mockImplementation(async (url, opts) => {
+            if (url.startsWith('/api/chat/messages') && (!opts || !opts.method || opts.method === 'GET')) {
+                requestedUrls.push(url);
+                if (url.includes('before=')) {
+                    return {
+                        chatDbDedicated: true,
+                        messages: page2,
+                        hasMore: false,
+                        nextBefore: '',
+                        nextBeforeId: ''
+                    };
+                }
+                return {
+                    chatDbDedicated: true,
+                    config: { oscEnabled: true, translateEnabled: false },
+                    messages: page1,
+                    hasMore: true,
+                    nextBefore: page1[19].createdAt,
+                    nextBeforeId: page1[19].id,
+                    devices: []
+                };
+            }
+            return {};
+        });
+
+        const wrapper = mount(ChatTranslator);
+        await flushPromises();
+
+        // Initial load requests limit=20 only and renders detailed YYYY-MM-DD HH:mm date-time
+        expect(requestedUrls).toEqual(['/api/chat/messages?limit=20']);
+        expect(wrapper.findAll('[data-msg-side]')).toHaveLength(20);
+        expect(wrapper.text()).toContain('消息 #25');
+        expect(wrapper.text()).not.toContain('消息 #5');
+        expect(wrapper.text()).toMatch(/\d{4}-\d{2}-\d{2} \d{2}:\d{2}/);
+
+        // Simulate scrolling to the bottom of the message list -> auto-loads page 2 with cursor
+        const feedEl = wrapper.find('.overflow-y-auto');
+        Object.defineProperty(feedEl.element, 'scrollHeight', { value: 1200, configurable: true });
+        Object.defineProperty(feedEl.element, 'clientHeight', { value: 400, configurable: true });
+        Object.defineProperty(feedEl.element, 'scrollTop', { value: 760, configurable: true });
+        await feedEl.trigger('scroll');
+        await flushPromises();
+
+        expect(requestedUrls).toHaveLength(2);
+        expect(requestedUrls[1]).toContain('limit=20');
+        expect(requestedUrls[1]).toContain(`before=${encodeURIComponent(page1[19].createdAt)}`);
+        expect(requestedUrls[1]).toContain('beforeId=msg_06');
+        expect(wrapper.findAll('[data-msg-side]')).toHaveLength(25);
+        expect(wrapper.text()).toContain('消息 #5');
+        expect(wrapper.text()).toContain('消息 #1');
+        expect(wrapper.text()).toContain('view.tools.chat_translator.no_more_messages');
+
+        wrapper.unmount();
+    });
 });

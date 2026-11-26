@@ -854,7 +854,10 @@
                 "translate_failed": "Translation failed",
                 "copied_toast": "Copied to clipboard",
                 "copy_failed": "Failed to copy text",
-                "delete_failed": "Failed to delete message"
+                "delete_failed": "Failed to delete message",
+                "loading_more": "Loading earlier messages...",
+                "scroll_load_more": "Scroll to bottom to load earlier messages",
+                "no_more_messages": "All messages loaded"
             },
             "marketplace": {
                 "header": "Marketplace",

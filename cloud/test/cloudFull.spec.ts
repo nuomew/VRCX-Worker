@@ -8003,6 +8003,47 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
             expect(chatDbRows.results ?? []).toHaveLength(2);
             expect((chatDbRows.results ?? []).find((r) => r.id === sendJson.data.message.id)?.status).toBe('sent');
             expect((chatDbRows.results ?? []).find((r) => r.id === 'osc_rt_in_1')?.source_text).toBe('游戏里刚打的字');
+
+            // Verify keyset pagination: default limit=20 newest-first + before/beforeId loads remaining items without gaps
+            await env.DB_CHAT!.prepare('DELETE FROM cloud_chat_messages').run();
+            const seedStmts = Array.from({ length: 25 }, (_, i) => {
+                const idx = i + 1;
+                const ts = new Date(Date.UTC(2026, 10, 26, 12, idx, 0)).toISOString();
+                return env.DB_CHAT!.prepare(
+                    `INSERT INTO cloud_chat_messages
+                     (id, device_id, direction, source_text, translated_text, sent_text, source_lang, target_lang, display_mode, osc_address, osc_port, immediate, play_sfx, status, cmd_id, error_message, created_at)
+                     VALUES (?, ?, 'web_to_vrc', ?, '', ?, 'auto', '', 'source_only', '/chatbox/input', 9000, 1, 1, 'sent', '', '', ?)`
+                ).bind(`page_msg_${String(idx).padStart(2, '0')}`, realtimeDeviceId, `Page text ${idx}`, `Page text ${idx}`, ts);
+            });
+            await env.DB_CHAT!.batch(seedStmts);
+
+            const firstPageRes = await exports.default.fetch('http://example.com/api/chat/messages');
+            expect(firstPageRes.status).toBe(200);
+            const firstPageJson = (await firstPageRes.json()) as {
+                data: {
+                    messages: Array<{ id: string }>;
+                    hasMore: boolean;
+                    nextBefore: string;
+                    nextBeforeId: string;
+                };
+            };
+            expect(firstPageJson.data.messages).toHaveLength(20);
+            expect(firstPageJson.data.messages[0]?.id).toBe('page_msg_25');
+            expect(firstPageJson.data.messages[19]?.id).toBe('page_msg_06');
+            expect(firstPageJson.data.hasMore).toBe(true);
+            expect(firstPageJson.data.nextBeforeId).toBe('page_msg_06');
+
+            const secondPageRes = await exports.default.fetch(
+                `http://example.com/api/chat/messages?limit=20&before=${encodeURIComponent(firstPageJson.data.nextBefore)}&beforeId=${encodeURIComponent(firstPageJson.data.nextBeforeId)}&heartbeat=0`
+            );
+            expect(secondPageRes.status).toBe(200);
+            const secondPageJson = (await secondPageRes.json()) as {
+                data: { messages: Array<{ id: string }>; hasMore: boolean };
+            };
+            expect(secondPageJson.data.messages).toHaveLength(5);
+            expect(secondPageJson.data.messages[0]?.id).toBe('page_msg_05');
+            expect(secondPageJson.data.messages[4]?.id).toBe('page_msg_01');
+            expect(secondPageJson.data.hasMore).toBe(false);
         } finally {
             chatAgentWs.close(1000, 'done');
             webWs.close(1000, 'done');
