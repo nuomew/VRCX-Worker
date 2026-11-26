@@ -538,4 +538,90 @@ describe('ChatTranslator.vue', () => {
 
         wrapper.unmount();
     });
+
+    test('renders gray-off/green-on switches and prevents stale GET polls or WS echoes from bouncing rapid toggle clicks', async () => {
+        let resolveStaleGet;
+        let putResolvers = [];
+        const putPayloads = [];
+        let getCallCount = 0;
+
+        mocks.cloudFetch.mockImplementation((url, opts) => {
+            if (url.startsWith('/api/chat/messages') && (!opts || !opts.method || opts.method === 'GET')) {
+                getCallCount += 1;
+                if (getCallCount === 1) {
+                    return new Promise((resolve) => {
+                        resolveStaleGet = resolve;
+                    });
+                }
+                return Promise.resolve({ chatDbDedicated: true, messages: [], devices: [] });
+            }
+            if (url === '/api/chat/config' && opts?.method === 'PUT') {
+                putPayloads.push({ ...opts.json });
+                return new Promise((resolve) => {
+                    putResolvers.push(resolve);
+                });
+            }
+            return Promise.resolve({});
+        });
+
+        const wrapper = mount(ChatTranslator);
+        await flushPromises();
+
+        const translateSwitch = wrapper.find(
+            'button[role="switch"][aria-label="view.tools.chat_translator.translate_enabled_label"]'
+        );
+        expect(translateSwitch.exists()).toBe(true);
+        // Verify gray off / green on classes
+        expect(translateSwitch.classes().join(' ')).toContain('data-[state=checked]:bg-emerald-500');
+        expect(translateSwitch.classes().join(' ')).toContain('data-[state=unchecked]:bg-zinc-400/75');
+        expect(translateSwitch.attributes('data-state')).toBe('unchecked');
+
+        // 1. User toggles ON while initial GET /api/chat/messages (with old translateEnabled: false) is still in flight
+        await translateSwitch.trigger('click');
+        await flushPromises();
+        expect(translateSwitch.attributes('data-state')).toBe('checked');
+        expect(putPayloads).toHaveLength(1);
+        expect(putPayloads[0].translateEnabled).toBe(true);
+
+        // Stale GET resolves with old false -> MUST NOT bounce switch back to unchecked!
+        resolveStaleGet({
+            chatDbDedicated: true,
+            config: { oscEnabled: true, translateEnabled: false },
+            messages: [],
+            devices: []
+        });
+        await flushPromises();
+        expect(translateSwitch.attributes('data-state')).toBe('checked');
+
+        // 2. While PUT #1 (true) is still in flight, user immediately toggles OFF
+        await translateSwitch.trigger('click');
+        await flushPromises();
+        expect(translateSwitch.attributes('data-state')).toBe('unchecked');
+        // Must serialize PUTs (only 1 in flight at a time, never race PUT #2 concurrently with PUT #1)
+        expect(putPayloads).toHaveLength(1);
+
+        // Echo WS `chat.config_updated` from PUT #1 (true) arrives -> MUST NOT bounce switch back to checked!
+        for (const fn of mocks.chatListeners) {
+            fn({
+                type: 'chat.config_updated',
+                payload: { config: { oscEnabled: true, translateEnabled: true } }
+            });
+        }
+        await flushPromises();
+        expect(translateSwitch.attributes('data-state')).toBe('unchecked');
+
+        // PUT #1 resolves -> serialized queue immediately dispatches PUT #2 with final OFF state (false)
+        putResolvers.shift()({ chatDbDedicated: true, config: { oscEnabled: true, translateEnabled: true } });
+        await flushPromises();
+        expect(translateSwitch.attributes('data-state')).toBe('unchecked');
+        expect(putPayloads).toHaveLength(2);
+        expect(putPayloads[1].translateEnabled).toBe(false);
+
+        // PUT #2 resolves -> stays cleanly unchecked
+        putResolvers.shift()({ chatDbDedicated: true, config: { oscEnabled: true, translateEnabled: false } });
+        await flushPromises();
+        expect(translateSwitch.attributes('data-state')).toBe('unchecked');
+
+        wrapper.unmount();
+    });
 });

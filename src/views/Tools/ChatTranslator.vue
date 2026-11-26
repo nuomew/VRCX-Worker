@@ -113,6 +113,7 @@
                 <div class="inline-flex items-center gap-2 select-none font-medium text-foreground">
                     <Switch
                         :model-value="prefs.translateEnabled"
+                        :class="TOGGLE_SWITCH_CLASS"
                         :aria-label="t('view.tools.chat_translator.translate_enabled_label')"
                         @update:model-value="(val) => setBoolPref('translateEnabled', val)" />
                     <span>{{ t('view.tools.chat_translator.translate_enabled_label') }}</span>
@@ -196,6 +197,7 @@
                     <div class="inline-flex items-center gap-2 select-none ml-auto">
                         <Switch
                             :model-value="prefs.autoTranslateDesktop"
+                            :class="TOGGLE_SWITCH_CLASS"
                             :aria-label="t('view.tools.chat_translator.auto_translate_desktop')"
                             @update:model-value="(val) => setBoolPref('autoTranslateDesktop', val)" />
                         <span>{{ t('view.tools.chat_translator.auto_translate_desktop') }}</span>
@@ -500,6 +502,7 @@
                         </span>
                         <Switch
                             :model-value="prefs.oscEnabled"
+                            :class="TOGGLE_SWITCH_CLASS"
                             :aria-label="t('view.tools.chat_translator.osc_enabled_label')"
                             @update:model-value="(val) => setBoolPref('oscEnabled', val)" />
                     </div>
@@ -554,6 +557,7 @@
                             <span class="text-foreground">{{ t('view.tools.chat_translator.osc_immediate') }}</span>
                             <Switch
                                 :model-value="prefs.immediate"
+                                :class="TOGGLE_SWITCH_CLASS"
                                 :aria-label="t('view.tools.chat_translator.osc_immediate')"
                                 @update:model-value="(val) => setBoolPref('immediate', val)" />
                         </div>
@@ -561,6 +565,7 @@
                             <span class="text-foreground">{{ t('view.tools.chat_translator.osc_play_sfx') }}</span>
                             <Switch
                                 :model-value="prefs.playSfx"
+                                :class="TOGGLE_SWITCH_CLASS"
                                 :aria-label="t('view.tools.chat_translator.osc_play_sfx')"
                                 @update:model-value="(val) => setBoolPref('playSfx', val)" />
                         </div>
@@ -568,6 +573,7 @@
                             <span class="text-foreground">{{ t('view.tools.chat_translator.sync_typing') }}</span>
                             <Switch
                                 :model-value="prefs.syncTyping"
+                                :class="TOGGLE_SWITCH_CLASS"
                                 :aria-label="t('view.tools.chat_translator.sync_typing')"
                                 @update:model-value="(val) => setBoolPref('syncTyping', val)" />
                         </div>
@@ -592,6 +598,7 @@
                             </div>
                             <Switch
                                 :model-value="prefs.oscListenEnabled"
+                                :class="TOGGLE_SWITCH_CLASS"
                                 :aria-label="t('view.tools.chat_translator.osc_listen_enabled_label')"
                                 @update:model-value="(val) => setBoolPref('oscListenEnabled', val)" />
                         </div>
@@ -611,6 +618,7 @@
                                 <span class="text-foreground">{{ t('view.tools.chat_translator.osc_forward_vrc_label') }}</span>
                                 <Switch
                                     :model-value="prefs.oscForwardToVrchat"
+                                    :class="TOGGLE_SWITCH_CLASS"
                                     :aria-label="t('view.tools.chat_translator.osc_forward_vrc_label')"
                                     @update:model-value="(val) => setBoolPref('oscForwardToVrchat', val)" />
                             </div>
@@ -722,6 +730,10 @@
 
     const isWebMode = typeof WEB !== 'undefined' && WEB;
 
+    // Distinct gray (off) vs green (on) toggle colors with crisp white thumb in both light & dark modes.
+    const TOGGLE_SWITCH_CLASS =
+        'data-[state=checked]:bg-emerald-500 dark:data-[state=checked]:bg-emerald-500 data-[state=unchecked]:bg-zinc-400/75 dark:data-[state=unchecked]:bg-zinc-600 [&_[data-slot=switch-thumb]]:bg-white dark:[&_[data-slot=switch-thumb]]:bg-white';
+
     const prefs = reactive({
         oscEnabled: true,
         translateEnabled: false,
@@ -765,6 +777,10 @@
     let isCurrentlyTyping = false;
     let lastTypingSentAt = 0;
     let configSaveGeneration = 0;
+    let configSaveInFlight = false;
+    let configSavePending = false;
+    let suppressRemoteConfigUntil = 0;
+    let liveSyncActive = false;
 
     const hasPortConflict = computed(
         () =>
@@ -878,47 +894,87 @@
         }
     }
 
-    async function persistPrefs() {
+    function buildCloudConfigPayload() {
+        return {
+            oscEnabled: prefs.oscEnabled,
+            oscSendPort: normalizeOscPort(prefs.oscPort, DEFAULT_OSC_SEND_PORT),
+            oscListenEnabled: prefs.oscListenEnabled,
+            oscListenPort: normalizeOscPort(prefs.oscListenPort, DEFAULT_OSC_LISTEN_PORT),
+            oscForwardToVrchat: prefs.oscForwardToVrchat,
+            translateEnabled: prefs.translateEnabled,
+            sourceLang: prefs.sourceLang,
+            targetLang: prefs.targetLang,
+            displayMode: prefs.displayMode,
+            immediate: prefs.immediate,
+            playSfx: prefs.playSfx,
+            syncTyping: prefs.syncTyping,
+            autoTranslateDesktop: prefs.autoTranslateDesktop,
+            targetDeviceId: prefs.targetDeviceId
+        };
+    }
+
+    async function drainConfigSaveQueue() {
+        if (configSaveInFlight) return;
+        configSaveInFlight = true;
+        try {
+            while (configSavePending) {
+                configSavePending = false;
+                if (hasPortConflict.value) {
+                    toast.warning(t('view.tools.chat_translator.osc_port_conflict'));
+                    continue;
+                }
+                const gen = configSaveGeneration;
+                const payload = buildCloudConfigPayload();
+                try {
+                    const res = await cloudFetch('/api/chat/config', {
+                        method: 'PUT',
+                        json: payload
+                    });
+                    // Guard against our own WS echo / concurrent GET poll overwriting the just-saved state.
+                    suppressRemoteConfigUntil = Date.now() + 1500;
+                    if (typeof res?.chatDbDedicated === 'boolean') {
+                        chatDbDedicated.value = res.chatDbDedicated;
+                    }
+                    if (gen === configSaveGeneration && !configSavePending && res?.config) {
+                        applyCloudConfig(res.config);
+                    }
+                } catch (err) {
+                    toast.error(err?.message || t('view.tools.chat_translator.cloud_config_save_failed'));
+                    // If no newer local edits are queued, reconcile back to server truth.
+                    if (gen === configSaveGeneration && !configSavePending) {
+                        try {
+                            const latest = await cloudFetch('/api/chat/config');
+                            if (gen === configSaveGeneration && !configSavePending && latest?.config) {
+                                applyCloudConfig(latest.config);
+                            }
+                        } catch {
+                            // Ignore reconciliation error
+                        }
+                    }
+                }
+            }
+        } finally {
+            configSaveInFlight = false;
+            if (configSavePending) {
+                void drainConfigSaveQueue();
+            }
+        }
+    }
+
+    function persistPrefs() {
         prefs.oscPort = normalizeOscPort(prefs.oscPort, DEFAULT_OSC_SEND_PORT);
         prefs.oscListenPort = normalizeOscPort(prefs.oscListenPort, DEFAULT_OSC_LISTEN_PORT);
         if (!isWebMode) {
             configRepository.setString(CHAT_TRANSLATOR_PREFS_KEY, JSON.stringify({ ...prefs }));
             return;
         }
+        configSaveGeneration++;
         if (hasPortConflict.value) {
             toast.warning(t('view.tools.chat_translator.osc_port_conflict'));
             return;
         }
-        const gen = ++configSaveGeneration;
-        try {
-            const res = await cloudFetch('/api/chat/config', {
-                method: 'PUT',
-                json: {
-                    oscEnabled: prefs.oscEnabled,
-                    oscSendPort: prefs.oscPort,
-                    oscListenEnabled: prefs.oscListenEnabled,
-                    oscListenPort: prefs.oscListenPort,
-                    oscForwardToVrchat: prefs.oscForwardToVrchat,
-                    translateEnabled: prefs.translateEnabled,
-                    sourceLang: prefs.sourceLang,
-                    targetLang: prefs.targetLang,
-                    displayMode: prefs.displayMode,
-                    immediate: prefs.immediate,
-                    playSfx: prefs.playSfx,
-                    syncTyping: prefs.syncTyping,
-                    autoTranslateDesktop: prefs.autoTranslateDesktop,
-                    targetDeviceId: prefs.targetDeviceId
-                }
-            });
-            if (gen === configSaveGeneration && res?.config) {
-                applyCloudConfig(res.config);
-            }
-            if (typeof res?.chatDbDedicated === 'boolean') {
-                chatDbDedicated.value = res.chatDbDedicated;
-            }
-        } catch (err) {
-            toast.error(err?.message || t('view.tools.chat_translator.cloud_config_save_failed'));
-        }
+        configSavePending = true;
+        void drainConfigSaveQueue();
     }
 
     function setBoolPref(key, value) {
@@ -970,6 +1026,7 @@
 
     async function fetchMessages({ showLoader = false } = {}) {
         if (!isWebMode) return;
+        const startSaveGen = configSaveGeneration;
         if (showLoader) loadingMessages.value = true;
         try {
             const data = await cloudFetch('/api/chat/messages?limit=80');
@@ -988,7 +1045,15 @@
             if (Array.isArray(data?.devices)) {
                 devices.value = data.devices;
             }
-            if (data?.config && typeof data.config === 'object') {
+            // Never let a stale GET poll overwrite an in-flight or just-completed local switch change.
+            if (
+                data?.config &&
+                typeof data.config === 'object' &&
+                startSaveGen === configSaveGeneration &&
+                !configSaveInFlight &&
+                !configSavePending &&
+                Date.now() >= suppressRemoteConfigUntil
+            ) {
                 applyCloudConfig(data.config);
             }
             if (typeof data?.chatDbDedicated === 'boolean') {
@@ -1464,8 +1529,9 @@
     }
 
     function startLiveSync() {
-        if (!isWebMode) return;
+        if (!isWebMode || liveSyncActive) return;
         stopLiveSync();
+        liveSyncActive = true;
 
         // Proactively connect `/ws/web` so game/desktop OSC input & delivery receipts arrive instantaneously.
         connectCloudHubWs();
@@ -1480,7 +1546,13 @@
                 autoTranslatedIds.clear();
             } else if (evt.type === 'chat.agent_status' && evt.payload) {
                 applyChatAgentStatusEvent(evt.payload);
-            } else if (evt.type === 'chat.config_updated' && evt.payload?.config) {
+            } else if (
+                evt.type === 'chat.config_updated' &&
+                evt.payload?.config &&
+                !configSaveInFlight &&
+                !configSavePending &&
+                Date.now() >= suppressRemoteConfigUntil
+            ) {
                 applyCloudConfig(evt.payload.config);
             }
         });
@@ -1520,6 +1592,7 @@
     }
 
     function stopLiveSync() {
+        liveSyncActive = false;
         if (pollTimer) {
             clearInterval(pollTimer);
             pollTimer = null;
