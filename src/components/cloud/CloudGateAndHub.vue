@@ -1,18 +1,23 @@
 <template>
-    <!-- 1. Cloud Access / Passcode Unlock Overlay (only when ADMIN_PASSCODE is set and unauthenticated) -->
+    <!-- 1. Cloud Access / Passcode / 2FA Unlock Overlay -->
     <Teleport to="body">
         <div
             v-if="isWeb && cloudState.initialized && !cloudState.authenticated"
             class="fixed inset-0 z-[20000] flex items-center justify-center bg-background/95 backdrop-blur-sm p-4">
         <div class="w-full max-w-sm rounded-xl border border-border bg-card p-6 shadow-2xl space-y-4">
             <div class="space-y-1">
-                <h2 class="text-lg font-semibold text-foreground">{{ t('cloud_hub.unlock.title') }}</h2>
+                <h2 class="text-lg font-semibold text-foreground">
+                    {{ isStandalone2faGate ? t('cloud_hub.unlock.totp_only_title') : t('cloud_hub.unlock.title') }}
+                </h2>
                 <p class="text-xs text-muted-foreground">
                     <template v-if="cloudState.authCheckFailed">
                         {{ t('cloud_hub.unlock.check_failed_desc') }}
                     </template>
-                    <template v-else-if="cloudState.authMode === 'cloudflare_access'">
+                    <template v-else-if="cloudState.authMode === 'cloudflare_access' && !cloudState.primaryAuthenticated">
                         {{ t('cloud_hub.unlock.cf_access_desc') }}
+                    </template>
+                    <template v-else-if="isStandalone2faGate">
+                        {{ t('cloud_hub.unlock.totp_only_desc') }}
                     </template>
                     <template v-else-if="cloudState.requiresTotp">
                         {{ t('cloud_hub.unlock.passcode_totp_desc') }}
@@ -36,7 +41,9 @@
                 </button>
             </div>
 
-            <div v-else-if="cloudState.authMode === 'cloudflare_access'" class="space-y-3">
+            <div
+                v-else-if="cloudState.authMode === 'cloudflare_access' && !cloudState.primaryAuthenticated"
+                class="space-y-3">
                 <button
                     type="button"
                     class="w-full rounded-md bg-primary px-3 py-2 text-sm font-medium text-primary-foreground hover:opacity-90"
@@ -47,6 +54,7 @@
 
             <form v-else class="space-y-3" @submit.prevent="submitUnlock">
                 <input
+                    v-if="!isStandalone2faGate"
                     v-model="passcode"
                     type="password"
                     autocomplete="current-password"
@@ -54,20 +62,61 @@
                     class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm text-foreground"
                     required />
                 <input
-                    v-if="cloudState.requiresTotp"
+                    v-if="isStandalone2faGate || cloudState.requiresTotp"
                     v-model="totpCode"
                     type="text"
                     inputmode="numeric"
+                    autocomplete="one-time-code"
                     maxlength="6"
                     :placeholder="t('cloud_hub.unlock.totp_placeholder')"
-                    class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm text-foreground"
+                    class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm font-mono tracking-widest text-foreground"
+                    :class="isStandalone2faGate ? 'text-center text-base' : ''"
                     required />
+
+                <div v-if="showTrustDurationPicker" class="space-y-1.5 pt-0.5">
+                    <label class="block text-[11px] font-medium text-muted-foreground">
+                        {{ t('cloud_hub.unlock.trust_duration_label') }}
+                    </label>
+                    <select
+                        v-model="trustPresetSelection"
+                        class="w-full rounded-md border border-input bg-background px-3 py-2 text-xs text-foreground">
+                        <option value="0">{{ t('cloud_hub.two_factor.trust_session') }}</option>
+                        <option value="3600">{{ t('cloud_hub.two_factor.trust_1h') }}</option>
+                        <option value="43200">{{ t('cloud_hub.two_factor.trust_12h') }}</option>
+                        <option value="86400">{{ t('cloud_hub.two_factor.trust_1d') }}</option>
+                        <option value="259200">{{ t('cloud_hub.two_factor.trust_3d') }}</option>
+                        <option value="604800">{{ t('cloud_hub.two_factor.trust_7d') }}</option>
+                        <option value="1209600">{{ t('cloud_hub.two_factor.trust_14d') }}</option>
+                        <option value="2592000">{{ t('cloud_hub.two_factor.trust_30d') }}</option>
+                        <option value="custom">{{ t('cloud_hub.two_factor.trust_custom') }}</option>
+                    </select>
+                    <div v-if="trustPresetSelection === 'custom'" class="flex items-center gap-2">
+                        <input
+                            v-model.number="customTrustDays"
+                            type="number"
+                            min="1"
+                            max="30"
+                            step="1"
+                            class="w-24 rounded-md border border-input bg-background px-3 py-1.5 font-mono text-xs text-foreground" />
+                        <span class="text-xs text-muted-foreground">{{ t('cloud_hub.two_factor.custom_days_unit') }}</span>
+                    </div>
+                    <p class="text-[11px] text-muted-foreground leading-relaxed">
+                        {{ t('cloud_hub.unlock.trust_cache_hint') }}
+                    </p>
+                </div>
+
                 <p v-if="unlockError" class="text-xs text-destructive">{{ unlockError }}</p>
                 <button
                     type="submit"
                     :disabled="unlocking"
                     class="w-full rounded-md bg-primary px-3 py-2 text-sm font-medium text-primary-foreground hover:opacity-90 disabled:opacity-50">
-                    {{ unlocking ? t('cloud_hub.unlock.verifying') : t('cloud_hub.unlock.submit') }}
+                    {{
+                        unlocking
+                            ? t('cloud_hub.unlock.verifying')
+                            : isStandalone2faGate
+                              ? t('cloud_hub.unlock.totp_submit')
+                              : t('cloud_hub.unlock.submit')
+                    }}
                 </button>
             </form>
         </div>
@@ -436,9 +485,12 @@
     import { refreshCloudAuthAndBootstrap } from '../../ipc-web/index';
     import {
         applyCloudPresenceUpdate,
+        clamp2faTrustSeconds,
+        CLOUD_2FA_TRUST_PRESETS,
         cloudState,
         getAgentOnlineWindowMs,
-        getOnlineAgentIds
+        getOnlineAgentIds,
+        MAX_CLOUD_2FA_TRUST_DAYS
     } from '../../ipc-web/cloudState';
     import { links } from '../../shared/constants/link';
 
@@ -451,6 +503,42 @@
     const unlockError = ref('');
     const unlocking = ref(false);
     const retryingAuthCheck = ref(false);
+    const trustPresetSelection = ref('604800');
+    const customTrustDays = ref(7);
+
+    const isStandalone2faGate = computed(() => Boolean(cloudState.totpGateEnabled && cloudState.primaryAuthenticated));
+    const showTrustDurationPicker = computed(() =>
+        Boolean(
+            isStandalone2faGate.value ||
+                (cloudState.totpGateEnabled && !cloudState.envTotpConfigured && cloudState.authMode === 'passcode_session')
+        )
+    );
+
+    function syncTrustSelectionFromSeconds(seconds) {
+        const clamped = clamp2faTrustSeconds(seconds);
+        if (CLOUD_2FA_TRUST_PRESETS.includes(clamped)) {
+            trustPresetSelection.value = String(clamped);
+        } else {
+            trustPresetSelection.value = 'custom';
+            customTrustDays.value = Math.min(Math.max(Math.round(clamped / 86400), 1), MAX_CLOUD_2FA_TRUST_DAYS);
+        }
+    }
+
+    function resolveSelectedTrustSeconds() {
+        if (trustPresetSelection.value === 'custom') {
+            const clampedDays = Math.min(Math.max(Math.floor(Number(customTrustDays.value) || 1), 1), MAX_CLOUD_2FA_TRUST_DAYS);
+            return clamp2faTrustSeconds(clampedDays * 86400);
+        }
+        return clamp2faTrustSeconds(Number(trustPresetSelection.value));
+    }
+
+    watch(
+        () => cloudState.default2faTrustSeconds,
+        (val) => {
+            syncTrustSelectionFromSeconds(val);
+        },
+        { immediate: true }
+    );
 
     const tabs = computed(() => [
         { id: 'devices', label: t('cloud_hub.tabs.devices') },
@@ -546,10 +634,38 @@
         unlockError.value = '';
         unlocking.value = true;
         try {
-            await cloudFetch('/api/auth/login', {
+            const cleanTotp = (totpCode.value || '').replace(/\s+/g, '');
+            if (isStandalone2faGate.value) {
+                const res = await cloudFetch('/api/auth/2fa/verify', {
+                    method: 'POST',
+                    json: {
+                        code: cleanTotp,
+                        trustSeconds: resolveSelectedTrustSeconds()
+                    }
+                });
+                cloudState.authenticated = true;
+                cloudState.totpVerified = true;
+                cloudState.totpTrustExpiresAt = typeof res?.trustExpiresAt === 'string' ? res.trustExpiresAt : '';
+                window.location.reload();
+                return;
+            }
+            const loginPayload = {
+                passcode: passcode.value,
+                totp: cleanTotp || undefined
+            };
+            if (showTrustDurationPicker.value) {
+                loginPayload.trustSeconds = resolveSelectedTrustSeconds();
+            }
+            const res = await cloudFetch('/api/auth/login', {
                 method: 'POST',
-                json: { passcode: passcode.value, totp: totpCode.value || undefined }
+                json: loginPayload
             });
+            if (res?.authenticated === false) {
+                passcode.value = '';
+                totpCode.value = '';
+                await refreshCloudAuthAndBootstrap();
+                return;
+            }
             cloudState.authenticated = true;
             window.location.reload();
         } catch (err) {

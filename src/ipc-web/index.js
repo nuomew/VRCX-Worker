@@ -9,7 +9,7 @@ import {
     createVrcxStorageBridge
 } from './appApiWeb.js';
 import { loadBootstrap } from './bootstrapCache.js';
-import { cloudState } from './cloudState.js';
+import { clamp2faTrustSeconds, cloudState, MAX_CLOUD_2FA_TRUST_DAYS } from './cloudState.js';
 import { createWebApiBridge } from './webApiRemote.js';
 
 /**
@@ -22,8 +22,18 @@ export async function refreshCloudAuthAndBootstrap() {
     try {
         const authInfo = await cloudFetch('/api/auth/me');
         cloudState.authenticated = Boolean(authInfo.authenticated);
+        cloudState.primaryAuthenticated =
+            authInfo.primaryAuthenticated !== undefined
+                ? Boolean(authInfo.primaryAuthenticated)
+                : Boolean(authInfo.authenticated);
         cloudState.authMode = authInfo.authMode || 'open_setup';
         cloudState.requiresTotp = Boolean(authInfo.requiresTotp);
+        cloudState.totpGateEnabled = Boolean(authInfo.totpGateEnabled);
+        cloudState.totpVerified = authInfo.totpVerified !== undefined ? Boolean(authInfo.totpVerified) : true;
+        cloudState.envTotpConfigured = Boolean(authInfo.envTotpConfigured);
+        cloudState.default2faTrustSeconds = clamp2faTrustSeconds(authInfo.defaultTrustSeconds);
+        cloudState.max2faTrustDays = Number(authInfo.maxTrustDays) || MAX_CLOUD_2FA_TRUST_DAYS;
+        cloudState.totpTrustExpiresAt = typeof authInfo.trustExpiresAt === 'string' ? authInfo.trustExpiresAt : '';
         cloudState.subject = authInfo.subject || '';
         cloudState.r2Enabled = Boolean(authInfo.r2Enabled);
         cloudState.cloudFallbackAllowed = authInfo.cloudFallbackAllowed !== false;

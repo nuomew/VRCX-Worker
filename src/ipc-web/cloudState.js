@@ -5,6 +5,25 @@ export const MIN_CLOUD_SYNC_INTERVAL_SECONDS = 30;
 export const MAX_CLOUD_SYNC_INTERVAL_SECONDS = 3600;
 export const DEFAULT_WEB_SYNC_INTERVAL_SECONDS = 300;
 export const MIN_WEB_SYNC_INTERVAL_SECONDS = 60;
+export const MAX_CLOUD_2FA_TRUST_DAYS = 30;
+export const MAX_CLOUD_2FA_TRUST_SECONDS = MAX_CLOUD_2FA_TRUST_DAYS * 24 * 60 * 60;
+export const DEFAULT_CLOUD_2FA_TRUST_SECONDS = 7 * 24 * 60 * 60;
+export const CLOUD_2FA_TRUST_PRESETS = Object.freeze([0, 3600, 43200, 86400, 259200, 604800, 1209600, 2592000]);
+
+/**
+ * Clamps a 2FA browser-trust duration in seconds into [0, 30 days] (0 = current browser session only).
+ *
+ * @param {unknown} raw
+ * @param {number} [fallback]
+ * @returns {number}
+ */
+export function clamp2faTrustSeconds(raw, fallback = DEFAULT_CLOUD_2FA_TRUST_SECONDS) {
+    const n = Number(raw);
+    if (!Number.isFinite(n)) {
+        return Math.min(Math.max(Math.floor(fallback), 0), MAX_CLOUD_2FA_TRUST_SECONDS);
+    }
+    return Math.min(Math.max(Math.floor(n), 0), MAX_CLOUD_2FA_TRUST_SECONDS);
+}
 
 /**
  * Normalizes a user or server-supplied VRCX.Agent sync interval into [30, 3600] seconds (default 60s).
@@ -41,10 +60,17 @@ export function clampWebSyncIntervalSeconds(raw) {
 export const cloudState = reactive({
     initialized: false,
     authenticated: false,
+    primaryAuthenticated: false,
     authCheckFailed: false,
     authCheckError: '',
     authMode: 'open_setup',
     requiresTotp: false,
+    totpGateEnabled: false,
+    totpVerified: true,
+    envTotpConfigured: false,
+    default2faTrustSeconds: DEFAULT_CLOUD_2FA_TRUST_SECONDS,
+    max2faTrustDays: MAX_CLOUD_2FA_TRUST_DAYS,
+    totpTrustExpiresAt: '',
     subject: '',
     wsConnected: false,
     r2Enabled: false,

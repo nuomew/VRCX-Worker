@@ -11,11 +11,13 @@ import {
 } from '../bootstrapCache.js';
 import {
     applyCloudPresenceUpdate,
+    clamp2faTrustSeconds,
     cloudState,
     getAggregatedGameStartTimes,
     getAggregatedGameState,
     getOnlineAgentIds,
-    getPrimaryAgentState
+    getPrimaryAgentState,
+    MAX_CLOUD_2FA_TRUST_SECONDS
 } from '../cloudState.js';
 import { cloudFetch, connectCloudHubWs, disconnectCloudHubWs } from '../apiClient.js';
 import { refreshCloudAuthAndBootstrap } from '../index.js';
@@ -2547,5 +2549,58 @@ describe('WEB cloud adapter (stateless)', () => {
         const byNotyId = new Map(notyStore.notificationTable.data.map((r) => [r.id, r]));
         expect(byNotyId.get('n1_hidden')?.$isExpired).toBe(true);
         expect(byNotyId.get('n2_hidden')?.expiresAt).toBe('2026-11-25T12:02:00.000Z');
+    });
+
+    it('hydrates 2FA gate state from /api/auth/me, clamps trust duration to 30 days, and keeps trilingual 2FA i18n keys in parity', async () => {
+        // 1. Trust duration clamping: [0, 30 days]
+        expect(clamp2faTrustSeconds(0)).toBe(0);
+        expect(clamp2faTrustSeconds(-100)).toBe(0);
+        expect(clamp2faTrustSeconds(86400)).toBe(86400);
+        expect(clamp2faTrustSeconds(MAX_CLOUD_2FA_TRUST_SECONDS + 999999)).toBe(MAX_CLOUD_2FA_TRUST_SECONDS);
+        expect(clamp2faTrustSeconds('not-a-number', 3600)).toBe(3600);
+
+        // 2. Unverified browser when 2FA gate is enabled stays unauthenticated and does not call /api/bootstrap
+        fetchSpy.mockResolvedValueOnce(
+            mockOk({
+                authenticated: false,
+                primaryAuthenticated: true,
+                authMode: 'open_setup',
+                requiresTotp: true,
+                totpGateEnabled: true,
+                totpVerified: false,
+                envTotpConfigured: false,
+                defaultTrustSeconds: 259200,
+                maxTrustDays: 30,
+                trustExpiresAt: '',
+                subject: ''
+            })
+        );
+        const ok = await refreshCloudAuthAndBootstrap();
+        expect(ok).toBe(true);
+        expect(cloudState.authenticated).toBe(false);
+        expect(cloudState.primaryAuthenticated).toBe(true);
+        expect(cloudState.totpGateEnabled).toBe(true);
+        expect(cloudState.totpVerified).toBe(false);
+        expect(cloudState.requiresTotp).toBe(true);
+        expect(cloudState.default2faTrustSeconds).toBe(259200);
+        expect(cloudState.max2faTrustDays).toBe(30);
+        expect(fetchSpy).toHaveBeenCalledTimes(1);
+
+        // 3. Trilingual i18n parity check across en / zh-CN / zh-TW for cloud_hub.two_factor & unlock
+        const [enJson, zhCnJson, zhTwJson] = await Promise.all([
+            import('../../localization/en.json'),
+            import('../../localization/zh-CN.json'),
+            import('../../localization/zh-TW.json')
+        ]);
+        const enTwoFactorKeys = Object.keys(enJson.default.cloud_hub.two_factor).sort();
+        const zhCnTwoFactorKeys = Object.keys(zhCnJson.default.cloud_hub.two_factor).sort();
+        const zhTwTwoFactorKeys = Object.keys(zhTwJson.default.cloud_hub.two_factor).sort();
+        expect(enTwoFactorKeys.length).toBeGreaterThanOrEqual(35);
+        expect(zhCnTwoFactorKeys).toEqual(enTwoFactorKeys);
+        expect(zhTwTwoFactorKeys).toEqual(enTwoFactorKeys);
+
+        const enUnlockKeys = Object.keys(enJson.default.cloud_hub.unlock).sort();
+        expect(Object.keys(zhCnJson.default.cloud_hub.unlock).sort()).toEqual(enUnlockKeys);
+        expect(Object.keys(zhTwJson.default.cloud_hub.unlock).sort()).toEqual(enUnlockKeys);
     });
 });

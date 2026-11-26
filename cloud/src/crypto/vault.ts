@@ -130,14 +130,42 @@ export async function verifyPasscode(configured: string, candidate: string): Pro
     return timingSafeEqual(bytesToHex(new Uint8Array(derived)), expectedHex.toLowerCase());
 }
 
+const BASE32_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+
+export function encodeBase32(bytes: Uint8Array): string {
+    let bits = 0;
+    let value = 0;
+    let out = '';
+    for (let i = 0; i < bytes.length; i++) {
+        value = (value << 8) | bytes[i]!;
+        bits += 8;
+        while (bits >= 5) {
+            out += BASE32_ALPHABET[(value >>> (bits - 5)) & 0x1f]!;
+            bits -= 5;
+        }
+    }
+    if (bits > 0) {
+        out += BASE32_ALPHABET[(value << (5 - bits)) & 0x1f]!;
+    }
+    return out;
+}
+
+/**
+ * Generates a cryptographically random RFC 6238 Base32 TOTP secret (default 160-bit / 32 Base32 chars).
+ */
+export function generateTotpSecret(byteLength = 20): string {
+    const bytes = new Uint8Array(byteLength);
+    crypto.getRandomValues(bytes);
+    return encodeBase32(bytes);
+}
+
 function decodeBase32(input: string): Uint8Array {
-    const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
     const clean = input.toUpperCase().replace(/[^A-Z2-7]/g, '');
     let bits = 0;
     let value = 0;
     const out: number[] = [];
     for (const ch of clean) {
-        const idx = alphabet.indexOf(ch);
+        const idx = BASE32_ALPHABET.indexOf(ch);
         if (idx < 0) continue;
         value = (value << 5) | idx;
         bits += 5;
@@ -149,6 +177,40 @@ function decodeBase32(input: string): Uint8Array {
     return new Uint8Array(out);
 }
 
+async function computeHotpForStep(hmacKey: CryptoKey, step: number): Promise<string> {
+    const buf = new ArrayBuffer(8);
+    const view = new DataView(buf);
+    view.setUint32(0, Math.floor(step / 0x100000000));
+    view.setUint32(4, step >>> 0);
+    const mac = new Uint8Array(await crypto.subtle.sign('HMAC', hmacKey, buf));
+    const offset = mac[mac.length - 1]! & 0x0f;
+    const binary =
+        ((mac[offset]! & 0x7f) << 24) |
+        ((mac[offset + 1]! & 0xff) << 16) |
+        ((mac[offset + 2]! & 0xff) << 8) |
+        (mac[offset + 3]! & 0xff);
+    return String(binary % 1_000_000).padStart(6, '0');
+}
+
+/**
+ * Generates an RFC 6238 SHA-1 6-digit TOTP code for a given Base32 secret and timestamp.
+ */
+export async function generateTotpCode(base32Secret: string, nowMs = Date.now()): Promise<string> {
+    const keyBytes = decodeBase32(base32Secret);
+    if (keyBytes.length === 0) {
+        throw new Error('Invalid Base32 TOTP secret');
+    }
+    const hmacKey = await crypto.subtle.importKey(
+        'raw',
+        keyBytes as BufferSource,
+        { name: 'HMAC', hash: 'SHA-1' },
+        false,
+        ['sign']
+    );
+    const step = Math.floor(nowMs / 30_000);
+    return computeHotpForStep(hmacKey, step);
+}
+
 /**
  * RFC 6238 SHA-1 6-digit TOTP verification (±1 step drift tolerance).
  * Returns the matched 30-second time step so callers can enforce single-use replay protection.
@@ -158,7 +220,7 @@ export async function verifyTotpStep(
     code: string,
     nowMs = Date.now()
 ): Promise<{ valid: boolean; step: number }> {
-    const cleanCode = code.trim();
+    const cleanCode = code.replace(/\s+/g, '');
     if (!/^\d{6}$/.test(cleanCode)) {
         return { valid: false, step: 0 };
     }
@@ -176,18 +238,7 @@ export async function verifyTotpStep(
     const currentStep = Math.floor(nowMs / 30_000);
     for (const delta of [-1, 0, 1]) {
         const step = currentStep + delta;
-        const buf = new ArrayBuffer(8);
-        const view = new DataView(buf);
-        view.setUint32(0, Math.floor(step / 0x100000000));
-        view.setUint32(4, step >>> 0);
-        const mac = new Uint8Array(await crypto.subtle.sign('HMAC', hmacKey, buf));
-        const offset = mac[mac.length - 1]! & 0x0f;
-        const binary =
-            ((mac[offset]! & 0x7f) << 24) |
-            ((mac[offset + 1]! & 0xff) << 16) |
-            ((mac[offset + 2]! & 0xff) << 8) |
-            (mac[offset + 3]! & 0xff);
-        const otp = String(binary % 1_000_000).padStart(6, '0');
+        const otp = await computeHotpForStep(hmacKey, step);
         if (timingSafeEqual(otp, cleanCode)) {
             return { valid: true, step };
         }
@@ -225,4 +276,45 @@ export async function verifySessionCookie(
         return { valid: false };
     }
     return { valid: true, sessionId };
+}
+
+/**
+ * Signs a 2FA browser-trust cookie scoped to the active `trustEpoch` so disabling,
+ * re-binding, or revoking all trusted browsers immediately invalidates prior cookies.
+ */
+export async function sign2faTrustCookie(
+    signSecret: string,
+    trustEpoch: string,
+    tokenId: string,
+    expEpochSec: number
+): Promise<string> {
+    const payload = `v1.${trustEpoch}.${tokenId}.${expEpochSec}`;
+    const sig = await hmacSha256Hex(signSecret, payload);
+    return `${payload}.${sig}`;
+}
+
+export async function verify2faTrustCookie(
+    signSecret: string,
+    cookieVal: string,
+    expectedEpoch: string,
+    maxAllowedExpEpochSec: number
+): Promise<{ valid: boolean; tokenId?: string; expEpochSec?: number }> {
+    const parts = cookieVal.split('.');
+    if (parts.length !== 5) {
+        return { valid: false };
+    }
+    const [version, epoch, tokenId, expStr, sig] = parts as [string, string, string, string, string];
+    if (version !== 'v1' || !epoch || !tokenId || !timingSafeEqual(epoch, expectedEpoch)) {
+        return { valid: false };
+    }
+    const exp = Number(expStr);
+    const nowSec = Math.floor(Date.now() / 1000);
+    if (!Number.isInteger(exp) || exp <= nowSec || exp > maxAllowedExpEpochSec) {
+        return { valid: false };
+    }
+    const expectedSig = await hmacSha256Hex(signSecret, `${version}.${epoch}.${tokenId}.${expStr}`);
+    if (!timingSafeEqual(expectedSig, sig)) {
+        return { valid: false };
+    }
+    return { valid: true, tokenId, expEpochSec: exp };
 }

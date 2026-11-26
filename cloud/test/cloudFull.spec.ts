@@ -1,7 +1,7 @@
 import { env as rawEnv, exports as rawExports } from 'cloudflare:workers';
 import { beforeAll, describe, expect, it, vi } from 'vitest';
-import { getMasterKey, isSameOriginRequest } from '../src/auth/auth';
-import { hmacSha256Hex, sha256Hex, verifyPasscode } from '../src/crypto/vault';
+import { getMasterKey, isSameOriginRequest, MAX_2FA_TRUST_SECONDS } from '../src/auth/auth';
+import { generateTotpCode, hmacSha256Hex, sha256Hex, sign2faTrustCookie, verifyPasscode } from '../src/crypto/vault';
 import type { Env } from '../src/env';
 import worker from '../src/index';
 import { incrementCounter } from '../src/routes/coreData';
@@ -5431,5 +5431,255 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
             .bind(revKeyJson.data.deviceId)
             .first();
         expect(devRowAfterRevoke).toBeNull();
+    });
+
+    it('enforces configurable page-access 2FA (disabled by default, <=30d trust cookie, cache/cookie clear re-verify, anti-replay, rate-limit, anti-forgery)', async () => {
+        try {
+            // 1. Disabled by default: /api/auth/me authenticates in open_setup and status reports enabled=false
+            const initialMeRes = await exports.default.fetch('http://example.com/api/auth/me');
+            expect(initialMeRes.status).toBe(200);
+            const initialMe = (await initialMeRes.json()) as {
+                data: {
+                    authenticated: boolean;
+                    primaryAuthenticated: boolean;
+                    totpGateEnabled: boolean;
+                    maxTrustDays: number;
+                };
+            };
+            expect(initialMe.data.authenticated).toBe(true);
+            expect(initialMe.data.primaryAuthenticated).toBe(true);
+            expect(initialMe.data.totpGateEnabled).toBe(false);
+            expect(initialMe.data.maxTrustDays).toBe(30);
+
+            const initialStatusRes = await exports.default.fetch('http://example.com/api/auth/2fa/status');
+            expect(initialStatusRes.status).toBe(200);
+            const initialStatus = (await initialStatusRes.json()) as { data: { enabled: boolean } };
+            expect(initialStatus.data.enabled).toBe(false);
+
+            // 2. Start setup -> returns 160-bit Base32 secret & otpauth URL without enabling 2FA yet
+            const setupRes = await exports.default.fetch('http://example.com/api/auth/2fa/setup', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+                body: '{}'
+            });
+            expect(setupRes.status).toBe(200);
+            const setupJson = (await setupRes.json()) as {
+                data: { setupToken: string; secret: string; otpauthUrl: string };
+            };
+            expect(setupJson.data.setupToken.length).toBeGreaterThanOrEqual(32);
+            expect(setupJson.data.secret).toMatch(/^[A-Z2-7]{32}$/);
+            expect(setupJson.data.otpauthUrl).toContain(`secret=${setupJson.data.secret}`);
+            expect(setupJson.data.otpauthUrl).toContain('otpauth://totp/');
+
+            // Still disabled until confirmed with a valid 6-digit code
+            const stillDisabledRes = await exports.default.fetch('http://example.com/api/bootstrap');
+            expect(stillDisabledRes.status).toBe(200);
+
+            // Reject invalid code during enable
+            const badEnableRes = await exports.default.fetch('http://example.com/api/auth/2fa/enable', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+                body: JSON.stringify({ setupToken: setupJson.data.setupToken, code: '000000' })
+            });
+            expect(badEnableRes.status).toBe(400);
+
+            // 3. Confirm enable with valid previous-step (-30s) code & attempt to request 999 days -> clamped to 30 days
+            const baseNow = Date.now();
+            const enableCode = await generateTotpCode(setupJson.data.secret, baseNow - 30_000);
+            const enableRes = await exports.default.fetch('http://example.com/api/auth/2fa/enable', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+                body: JSON.stringify({
+                    setupToken: setupJson.data.setupToken,
+                    code: enableCode,
+                    defaultTrustDays: 999
+                })
+            });
+            expect(enableRes.status).toBe(200);
+            const enableCookieHeader = enableRes.headers.get('Set-Cookie') ?? '';
+            expect(enableCookieHeader).toContain('vrcx_cloud_2fa=');
+            expect(enableCookieHeader).toContain(`Max-Age=${MAX_2FA_TRUST_SECONDS}`);
+            expect(enableCookieHeader).toContain('HttpOnly');
+            expect(enableCookieHeader).toContain('SameSite=Strict');
+            const enableJson = (await enableRes.json()) as {
+                data: { enabled: boolean; defaultTrustSeconds: number; maxTrustDays: number };
+            };
+            expect(enableJson.data.enabled).toBe(true);
+            expect(enableJson.data.defaultTrustSeconds).toBe(MAX_2FA_TRUST_SECONDS);
+            expect(enableJson.data.maxTrustDays).toBe(30);
+
+            // Extract enabled browser cookie
+            const browser1Cookie = enableCookieHeader.split(';')[0]!;
+
+            // 4. Browser without cookie (fresh browser or cleared browser cache/cookies) is blocked!
+            const unauthMeRes = await exports.default.fetch('http://example.com/api/auth/me');
+            expect(unauthMeRes.status).toBe(200);
+            const unauthMe = (await unauthMeRes.json()) as {
+                data: {
+                    authenticated: boolean;
+                    primaryAuthenticated: boolean;
+                    totpGateEnabled: boolean;
+                    requiresTotp: boolean;
+                    totpVerified: boolean;
+                };
+            };
+            expect(unauthMe.data.authenticated).toBe(false);
+            expect(unauthMe.data.primaryAuthenticated).toBe(true);
+            expect(unauthMe.data.totpGateEnabled).toBe(true);
+            expect(unauthMe.data.requiresTotp).toBe(true);
+            expect(unauthMe.data.totpVerified).toBe(false);
+
+            const blockedBootstrap = await exports.default.fetch('http://example.com/api/bootstrap');
+            expect(blockedBootstrap.status).toBe(401);
+            const blockedDisable = await exports.default.fetch('http://example.com/api/auth/2fa/disable', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+                body: JSON.stringify({ code: enableCode })
+            });
+            expect(blockedDisable.status).toBe(401);
+
+            // Forged cookie signed only with fallback master key (without instance cookieSignKey) MUST be rejected!
+            const storedRow = await env.DB_CORE.prepare(
+                "SELECT payload_json FROM cloud_bg_sync_state WHERE state_key = 'cloud_totp_config'"
+            ).first<{ payload_json: string }>();
+            const storedCfg = JSON.parse(storedRow!.payload_json) as { trustEpoch: string };
+            const forgedSig = await sign2faTrustCookie(
+                getMasterKey(env),
+                storedCfg.trustEpoch,
+                'forged123',
+                Math.floor(Date.now() / 1000) + 3600
+            );
+            const forgedRes = await exports.default.fetch('http://example.com/api/bootstrap', {
+                headers: { Cookie: `vrcx_cloud_2fa=${encodeURIComponent(forgedSig)}` }
+            });
+            expect(forgedRes.status).toBe(401);
+
+            // Trusted browser 1 passes seamlessly without re-verifying
+            const trustedRes = await exports.default.fetch('http://example.com/api/bootstrap', {
+                headers: { Cookie: browser1Cookie }
+            });
+            expect(trustedRes.status).toBe(200);
+
+            // 5. Second browser verifies with 6-digit code & sets 3-day trust window; replaying same code fails
+            const verifyCode0 = await generateTotpCode(setupJson.data.secret, baseNow);
+            const verifyRes = await exports.default.fetch('http://example.com/api/auth/2fa/verify', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+                body: JSON.stringify({ code: verifyCode0, trustDays: 3 })
+            });
+            expect(verifyRes.status).toBe(200);
+            const browser2SetCookie = verifyRes.headers.get('Set-Cookie') ?? '';
+            expect(browser2SetCookie).toContain(`Max-Age=${3 * 86_400}`);
+            const browser2Cookie = browser2SetCookie.split(';')[0]!;
+
+            // Replaying exact same 6-digit code within same step is rejected (single-use)
+            const replayRes = await exports.default.fetch('http://example.com/api/auth/2fa/verify', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+                body: JSON.stringify({ code: verifyCode0, trustDays: 3 })
+            });
+            expect(replayRes.status).toBe(401);
+
+            // Trusted browser 2 accesses protected routes
+            const b2Bootstrap = await exports.default.fetch('http://example.com/api/bootstrap', {
+                headers: { Cookie: browser2Cookie }
+            });
+            expect(b2Bootstrap.status).toBe(200);
+
+            // 6. Rate-limit protection: 5 wrong codes from same IP lock out with HTTP 429
+            const attackerHeaders = {
+                'Content-Type': 'application/json',
+                Origin: 'http://example.com',
+                'CF-Connecting-IP': '198.51.100.42'
+            };
+            for (let i = 0; i < 5; i++) {
+                const failRes = await exports.default.fetch('http://example.com/api/auth/2fa/verify', {
+                    method: 'POST',
+                    headers: attackerHeaders,
+                    body: JSON.stringify({ code: '123456' })
+                });
+                expect(failRes.status).toBe(401);
+            }
+            const lockedRes = await exports.default.fetch('http://example.com/api/auth/2fa/verify', {
+                method: 'POST',
+                headers: attackerHeaders,
+                body: JSON.stringify({ code: '123456' })
+            });
+            expect(lockedRes.status).toBe(429);
+
+            // 7. Update settings to session-only (0s) & apply to current browser -> omits Max-Age
+            const settingsRes = await exports.default.fetch('http://example.com/api/auth/2fa/settings', {
+                method: 'PUT',
+                headers: {
+                    'Content-Type': 'application/json',
+                    Origin: 'http://example.com',
+                    Cookie: browser2Cookie
+                },
+                body: JSON.stringify({ defaultTrustSeconds: 0, applyToCurrentBrowser: true })
+            });
+            expect(settingsRes.status).toBe(200);
+            const sessionCookieHdr = settingsRes.headers.get('Set-Cookie') ?? '';
+            expect(sessionCookieHdr).toContain('vrcx_cloud_2fa=');
+            expect(sessionCookieHdr).not.toContain('Max-Age=');
+
+            // 8. Revoke all trusted browsers -> old cookies immediately become 401
+            const revokeRes = await exports.default.fetch('http://example.com/api/auth/2fa/revoke-all', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    Origin: 'http://example.com',
+                    Cookie: browser1Cookie
+                },
+                body: JSON.stringify({ keepCurrentBrowser: true })
+            });
+            expect(revokeRes.status).toBe(200);
+            const rotatedCookie = (revokeRes.headers.get('Set-Cookie') ?? '').split(';')[0]!;
+            const revokedOldRes = await exports.default.fetch('http://example.com/api/bootstrap', {
+                headers: { Cookie: browser2Cookie }
+            });
+            expect(revokedOldRes.status).toBe(401);
+            const keptNewRes = await exports.default.fetch('http://example.com/api/bootstrap', {
+                headers: { Cookie: rotatedCookie }
+            });
+            expect(keptNewRes.status).toBe(200);
+
+            // 9. Disable 2FA requires a fresh valid 6-digit code (+30s step) and clears the gate
+            const badDisableRes = await exports.default.fetch('http://example.com/api/auth/2fa/disable', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    Origin: 'http://example.com',
+                    Cookie: rotatedCookie
+                },
+                body: JSON.stringify({ code: '999999' })
+            });
+            expect(badDisableRes.status).toBe(400);
+
+            const disableCode = await generateTotpCode(setupJson.data.secret, baseNow + 30_000);
+            const disableRes = await exports.default.fetch('http://example.com/api/auth/2fa/disable', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    Origin: 'http://example.com',
+                    Cookie: rotatedCookie
+                },
+                body: JSON.stringify({ code: disableCode })
+            });
+            expect(disableRes.status).toBe(200);
+            expect(disableRes.headers.get('Set-Cookie') ?? '').toContain('Max-Age=0');
+
+            // After disabling, cookie-less browser accesses /api/bootstrap normally again
+            const openAgainRes = await exports.default.fetch('http://example.com/api/bootstrap');
+            expect(openAgainRes.status).toBe(200);
+        } finally {
+            await env.DB_CORE.batch([
+                env.DB_CORE.prepare(
+                    "DELETE FROM cloud_bg_sync_state WHERE state_key IN ('cloud_totp_config', 'cloud_totp_pending')"
+                ),
+                env.DB_CORE.prepare(
+                    "DELETE FROM cloud_auth_rate_limits WHERE bucket_key = 'totp_gate:last_step' OR bucket_key LIKE 'totp_verify:%' OR bucket_key LIKE 'totp_manage:%'"
+                )
+            ]);
+        }
     });
 });

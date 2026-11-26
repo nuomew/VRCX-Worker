@@ -1,10 +1,14 @@
 import {
     decryptAesGcm,
+    encryptAesGcm,
+    generateTotpSecret,
     hmacSha256Hex,
     randomHex,
     sha256Hex,
+    sign2faTrustCookie,
     signSessionCookie,
     timingSafeEqual,
+    verify2faTrustCookie,
     verifyPasscode,
     verifySessionCookie,
     verifyTotpStep
@@ -12,18 +16,51 @@ import {
 import type { Env } from '../env';
 
 const SESSION_COOKIE_NAME = 'vrcx_cloud_session';
+const TOTP_TRUST_COOKIE_NAME = 'vrcx_cloud_2fa';
 const SESSION_TTL_SECONDS = 60 * 60 * 24 * 14; // 14 days
 const AGENT_REPLAY_WINDOW_SEC = 60;
 const STATE_KEY_REVOKED_SESSIONS = 'revoked_sessions';
+const STATE_KEY_CLOUD_TOTP = 'cloud_totp_config';
+const STATE_KEY_CLOUD_TOTP_PENDING = 'cloud_totp_pending';
 const MAX_REVOKED_SESSIONS = 50;
+
+export const MAX_2FA_TRUST_DAYS = 30;
+export const MAX_2FA_TRUST_SECONDS = MAX_2FA_TRUST_DAYS * 24 * 60 * 60; // 2,592,000s (30 days hard cap)
+export const DEFAULT_2FA_TRUST_SECONDS = 7 * 24 * 60 * 60; // 7 days default
+const SESSION_ONLY_2FA_MAX_EXP_SECONDS = 24 * 60 * 60; // 24h server-side ceiling for browser-session-only cookies
+const PENDING_TOTP_TTL_MS = 10 * 60 * 1000; // 10 minutes
+const MAX_AUTH_BODY_BYTES = 16 * 1024;
 
 export type AuthMode = 'cloudflare_access' | 'passcode_session' | 'bearer_token' | 'open_setup';
 
 export interface WebAuthResult {
     authenticated: boolean;
+    primaryAuthenticated: boolean;
     authMode: AuthMode;
     requiresTotp: boolean;
+    totpGateEnabled: boolean;
+    totpVerified: boolean;
+    envTotpConfigured: boolean;
+    defaultTrustSeconds: number;
+    maxTrustDays: number;
+    trustExpiresAt: string;
     subject: string;
+}
+
+interface StoredCloudTotpConfig {
+    enabled: boolean;
+    secretEnc: { ciphertextB64: string; ivB64: string };
+    cookieSignKey: string;
+    trustEpoch: string;
+    defaultTrustSeconds: number;
+    enabledAt: string;
+    updatedAt: string;
+}
+
+interface StoredPendingTotpSetup {
+    setupToken: string;
+    secretEnc: { ciphertextB64: string; ivB64: string };
+    expiresAtMs: number;
 }
 
 export interface AgentAuthResult {
@@ -285,7 +322,11 @@ async function isSessionRevoked(env: Env, sessionId: string): Promise<boolean> {
     }
 }
 
-async function revokeSessionId(env: Env, sessionId: string): Promise<void> {
+async function revokeSessionId(
+    env: Env,
+    sessionId: string,
+    ttlSeconds = SESSION_TTL_SECONDS
+): Promise<void> {
     if (!sessionId || !env.DB_CORE) return;
     const nowSec = Math.floor(Date.now() / 1000);
     const nowIso = new Date().toISOString();
@@ -311,7 +352,7 @@ async function revokeSessionId(env: Env, sessionId: string): Promise<void> {
                 // Ignore malformed state
             }
         }
-        active.push([sessionId, nowSec + SESSION_TTL_SECONDS]);
+        active.push([sessionId, nowSec + Math.max(60, Math.floor(ttlSeconds))]);
         active.sort((a, b) => b[1] - a[1]);
         const bounded = Object.fromEntries(active.slice(0, MAX_REVOKED_SESSIONS));
         await env.DB_CORE.prepare(
@@ -328,21 +369,300 @@ async function revokeSessionId(env: Env, sessionId: string): Promise<void> {
     }
 }
 
-export async function authenticateWeb(request: Request, env: Env): Promise<WebAuthResult> {
+export function clamp2faTrustSeconds(raw: unknown, fallback = DEFAULT_2FA_TRUST_SECONDS): number {
+    const n = Number(raw);
+    if (!Number.isFinite(n)) {
+        return Math.min(Math.max(Math.floor(fallback), 0), MAX_2FA_TRUST_SECONDS);
+    }
+    return Math.min(Math.max(Math.floor(n), 0), MAX_2FA_TRUST_SECONDS);
+}
+
+function resolveRequestedTrustSeconds(
+    body: { trustSeconds?: unknown; trustDays?: unknown; defaultTrustSeconds?: unknown; defaultTrustDays?: unknown },
+    fallbackSeconds: number
+): number {
+    if (body.trustSeconds !== undefined && body.trustSeconds !== null && body.trustSeconds !== '') {
+        return clamp2faTrustSeconds(body.trustSeconds, fallbackSeconds);
+    }
+    if (body.defaultTrustSeconds !== undefined && body.defaultTrustSeconds !== null && body.defaultTrustSeconds !== '') {
+        return clamp2faTrustSeconds(body.defaultTrustSeconds, fallbackSeconds);
+    }
+    if (body.trustDays !== undefined && body.trustDays !== null && body.trustDays !== '') {
+        const d = Number(body.trustDays);
+        if (Number.isFinite(d)) {
+            return clamp2faTrustSeconds(Math.round(d * 86_400), fallbackSeconds);
+        }
+    }
+    if (body.defaultTrustDays !== undefined && body.defaultTrustDays !== null && body.defaultTrustDays !== '') {
+        const d = Number(body.defaultTrustDays);
+        if (Number.isFinite(d)) {
+            return clamp2faTrustSeconds(Math.round(d * 86_400), fallbackSeconds);
+        }
+    }
+    return clamp2faTrustSeconds(fallbackSeconds, DEFAULT_2FA_TRUST_SECONDS);
+}
+
+async function loadCloudTotpConfig(env: Env): Promise<StoredCloudTotpConfig | null> {
+    if (!env.DB_CORE) return null;
+    try {
+        const row = await env.DB_CORE.prepare(
+            'SELECT payload_json FROM cloud_bg_sync_state WHERE state_key = ? LIMIT 1'
+        )
+            .bind(STATE_KEY_CLOUD_TOTP)
+            .first<{ payload_json?: string }>();
+        if (!row?.payload_json) return null;
+        const parsed = JSON.parse(row.payload_json) as Partial<StoredCloudTotpConfig>;
+        if (
+            !parsed ||
+            parsed.enabled !== true ||
+            !parsed.secretEnc?.ciphertextB64 ||
+            !parsed.secretEnc?.ivB64 ||
+            typeof parsed.cookieSignKey !== 'string' ||
+            !parsed.cookieSignKey ||
+            typeof parsed.trustEpoch !== 'string' ||
+            !parsed.trustEpoch
+        ) {
+            return null;
+        }
+        return {
+            enabled: true,
+            secretEnc: {
+                ciphertextB64: String(parsed.secretEnc.ciphertextB64),
+                ivB64: String(parsed.secretEnc.ivB64)
+            },
+            cookieSignKey: parsed.cookieSignKey,
+            trustEpoch: parsed.trustEpoch,
+            defaultTrustSeconds: clamp2faTrustSeconds(parsed.defaultTrustSeconds, DEFAULT_2FA_TRUST_SECONDS),
+            enabledAt: typeof parsed.enabledAt === 'string' ? parsed.enabledAt : '',
+            updatedAt: typeof parsed.updatedAt === 'string' ? parsed.updatedAt : ''
+        };
+    } catch {
+        return null;
+    }
+}
+
+async function saveCloudTotpConfig(env: Env, config: StoredCloudTotpConfig): Promise<void> {
+    const nowIso = new Date().toISOString();
+    await env.DB_CORE.prepare(
+        `INSERT INTO cloud_bg_sync_state (state_key, payload_json, updated_at)
+         VALUES (?, ?, ?)
+         ON CONFLICT(state_key) DO UPDATE SET
+            payload_json = excluded.payload_json,
+            updated_at = excluded.updated_at`
+    )
+        .bind(STATE_KEY_CLOUD_TOTP, JSON.stringify({ ...config, updatedAt: nowIso }), nowIso)
+        .run();
+}
+
+async function deleteCloudTotpState(env: Env): Promise<void> {
+    await env.DB_CORE.batch([
+        env.DB_CORE.prepare('DELETE FROM cloud_bg_sync_state WHERE state_key IN (?, ?)').bind(
+            STATE_KEY_CLOUD_TOTP,
+            STATE_KEY_CLOUD_TOTP_PENDING
+        ),
+        env.DB_CORE.prepare("DELETE FROM cloud_auth_rate_limits WHERE bucket_key = 'totp_gate:last_step'")
+    ]);
+}
+
+async function loadPendingTotpSetup(env: Env): Promise<StoredPendingTotpSetup | null> {
+    if (!env.DB_CORE) return null;
+    try {
+        const row = await env.DB_CORE.prepare(
+            'SELECT payload_json FROM cloud_bg_sync_state WHERE state_key = ? LIMIT 1'
+        )
+            .bind(STATE_KEY_CLOUD_TOTP_PENDING)
+            .first<{ payload_json?: string }>();
+        if (!row?.payload_json) return null;
+        const parsed = JSON.parse(row.payload_json) as Partial<StoredPendingTotpSetup>;
+        if (
+            !parsed ||
+            typeof parsed.setupToken !== 'string' ||
+            !parsed.setupToken ||
+            !parsed.secretEnc?.ciphertextB64 ||
+            !parsed.secretEnc?.ivB64 ||
+            typeof parsed.expiresAtMs !== 'number' ||
+            !Number.isFinite(parsed.expiresAtMs)
+        ) {
+            return null;
+        }
+        return {
+            setupToken: parsed.setupToken,
+            secretEnc: {
+                ciphertextB64: String(parsed.secretEnc.ciphertextB64),
+                ivB64: String(parsed.secretEnc.ivB64)
+            },
+            expiresAtMs: parsed.expiresAtMs
+        };
+    } catch {
+        return null;
+    }
+}
+
+async function savePendingTotpSetup(env: Env, pending: StoredPendingTotpSetup): Promise<void> {
+    const nowIso = new Date().toISOString();
+    await env.DB_CORE.prepare(
+        `INSERT INTO cloud_bg_sync_state (state_key, payload_json, updated_at)
+         VALUES (?, ?, ?)
+         ON CONFLICT(state_key) DO UPDATE SET
+            payload_json = excluded.payload_json,
+            updated_at = excluded.updated_at`
+    )
+        .bind(STATE_KEY_CLOUD_TOTP_PENDING, JSON.stringify(pending), nowIso)
+        .run();
+}
+
+function resolve2faCookieSignSecret(env: Env, cfg: StoredCloudTotpConfig): string {
+    // Mix the instance-unique 256-bit random cookieSignKey with getMasterKey(env) so even
+    // zero-env open_setup deploys cannot have their 2FA trust cookies forged from source constants.
+    return `${getMasterKey(env)}:${cfg.cookieSignKey}`;
+}
+
+function buildClearCookieHeader(cookieName: string, isSecure: boolean): string {
+    return [
+        `${cookieName}=`,
+        'Path=/',
+        'Max-Age=0',
+        'HttpOnly',
+        'SameSite=Strict',
+        ...(isSecure ? ['Secure'] : [])
+    ].join('; ');
+}
+
+async function build2faTrustCookieHeader(
+    env: Env,
+    cfg: StoredCloudTotpConfig,
+    trustSeconds: number,
+    isSecure: boolean
+): Promise<{ setCookie: string; trustSeconds: number; sessionOnly: boolean; trustExpiresAt: string | null }> {
+    const clampedSeconds = clamp2faTrustSeconds(trustSeconds, cfg.defaultTrustSeconds);
+    const nowSec = Math.floor(Date.now() / 1000);
+    const sessionOnly = clampedSeconds === 0;
+    const expEpochSec = sessionOnly ? nowSec + SESSION_ONLY_2FA_MAX_EXP_SECONDS : nowSec + clampedSeconds;
+    const tokenId = randomHex(16);
+    const signed = await sign2faTrustCookie(resolve2faCookieSignSecret(env, cfg), cfg.trustEpoch, tokenId, expEpochSec);
+    const parts = [`${TOTP_TRUST_COOKIE_NAME}=${encodeURIComponent(signed)}`, 'Path=/'];
+    if (!sessionOnly) {
+        parts.push(`Max-Age=${clampedSeconds}`);
+    }
+    parts.push('HttpOnly', 'SameSite=Strict');
+    if (isSecure) {
+        parts.push('Secure');
+    }
+    return {
+        setCookie: parts.join('; '),
+        trustSeconds: clampedSeconds,
+        sessionOnly,
+        trustExpiresAt: sessionOnly ? null : new Date(expEpochSec * 1000).toISOString()
+    };
+}
+
+async function claimMonotonicTotpStep(env: Env, bucketKey: string, step: number): Promise<boolean> {
+    if (step <= 0) return false;
+    const claimRes = await env.DB_CORE.prepare(
+        `INSERT INTO cloud_auth_rate_limits (bucket_key, failures, locked_until, updated_at)
+         VALUES (?, ?, '', ?)
+         ON CONFLICT(bucket_key) DO UPDATE SET
+            failures = excluded.failures,
+            updated_at = excluded.updated_at
+         WHERE excluded.failures > failures`
+    )
+        .bind(bucketKey, step, new Date().toISOString())
+        .run();
+    return (claimRes.meta?.changes ?? 0) === 1;
+}
+
+async function readBoundedJsonBody<T extends Record<string, unknown>>(
+    request: Request,
+    maxBytes = MAX_AUTH_BODY_BYTES
+): Promise<{ ok: true; data: T } | { ok: false; response: Response }> {
+    try {
+        const contentLength = Number(request.headers.get('Content-Length') ?? '0');
+        if (Number.isFinite(contentLength) && contentLength > maxBytes) {
+            await request.body?.cancel().catch(() => {});
+            return {
+                ok: false,
+                response: Response.json(
+                    { ok: false, error: { code: 'PAYLOAD_TOO_LARGE', message: 'Request payload too large' } },
+                    { status: 413 }
+                )
+            };
+        }
+        let rawText = '';
+        if (request.body) {
+            const reader = request.body.getReader();
+            const chunks: Uint8Array[] = [];
+            let total = 0;
+            try {
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    if (!value || value.byteLength === 0) continue;
+                    total += value.byteLength;
+                    if (total > maxBytes) {
+                        await reader.cancel().catch(() => {});
+                        return {
+                            ok: false,
+                            response: Response.json(
+                                {
+                                    ok: false,
+                                    error: { code: 'PAYLOAD_TOO_LARGE', message: 'Request payload too large' }
+                                },
+                                { status: 413 }
+                            )
+                        };
+                    }
+                    chunks.push(value);
+                }
+            } finally {
+                reader.releaseLock();
+            }
+            const combined = new Uint8Array(total);
+            let off = 0;
+            for (const c of chunks) {
+                combined.set(c, off);
+                off += c.byteLength;
+            }
+            rawText = new TextDecoder().decode(combined);
+        }
+        const parsed = rawText ? JSON.parse(rawText) : {};
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+            return {
+                ok: false,
+                response: Response.json(
+                    { ok: false, error: { code: 'BAD_REQUEST', message: 'Invalid JSON body' } },
+                    { status: 400 }
+                )
+            };
+        }
+        return { ok: true, data: parsed as T };
+    } catch {
+        return {
+            ok: false,
+            response: Response.json(
+                { ok: false, error: { code: 'BAD_REQUEST', message: 'Invalid JSON body' } },
+                { status: 400 }
+            )
+        };
+    }
+}
+
+async function authenticatePrimaryWeb(
+    request: Request,
+    env: Env
+): Promise<{ primaryAuthenticated: boolean; authMode: AuthMode; subject: string; isBearerOverride: boolean }> {
     const authMode = detectAuthMode(env);
-    const requiresTotp = Boolean(env.ADMIN_TOTP_SECRET?.trim());
 
     // Optional bearer override when POC_ADMIN_TOKEN is also configured
     const bearer = env.POC_ADMIN_TOKEN?.trim();
     if (bearer) {
         const authHeader = request.headers.get('Authorization') ?? '';
         if (authHeader.startsWith('Bearer ') && timingSafeEqual(authHeader.slice(7).trim(), bearer)) {
-            return { authenticated: true, authMode, requiresTotp, subject: 'bearer-admin' };
+            return { primaryAuthenticated: true, authMode, subject: 'bearer-admin', isBearerOverride: true };
         }
     }
 
     if (authMode === 'open_setup') {
-        return { authenticated: true, authMode, requiresTotp: false, subject: 'owner' };
+        return { primaryAuthenticated: true, authMode, subject: 'owner', isBearerOverride: false };
     }
 
     if (authMode === 'cloudflare_access') {
@@ -351,35 +671,101 @@ export async function authenticateWeb(request: Request, env: Env): Promise<WebAu
             parseCookies(request.headers.get('Cookie'))['CF_Authorization'] ||
             '';
         if (!jwt) {
-            return { authenticated: false, authMode, requiresTotp: false, subject: '' };
+            return { primaryAuthenticated: false, authMode, subject: '', isBearerOverride: false };
         }
         const subject = await verifyCloudflareAccessJwt(
             jwt,
             env.CF_ACCESS_TEAM_DOMAIN!.trim(),
             env.CF_ACCESS_AUD!.trim()
         );
-        return { authenticated: Boolean(subject), authMode, requiresTotp: false, subject: subject ?? '' };
+        return {
+            primaryAuthenticated: Boolean(subject),
+            authMode,
+            subject: subject ?? '',
+            isBearerOverride: false
+        };
     }
 
     if (authMode === 'passcode_session') {
         const cookies = parseCookies(request.headers.get('Cookie'));
         const token = cookies[SESSION_COOKIE_NAME];
         if (!token) {
-            return { authenticated: false, authMode, requiresTotp, subject: '' };
+            return { primaryAuthenticated: false, authMode, subject: '', isBearerOverride: false };
         }
         const verified = await verifySessionCookie(getMasterKey(env), token);
         const valid = Boolean(
             verified.valid && (!verified.sessionId || !(await isSessionRevoked(env, verified.sessionId)))
         );
         return {
-            authenticated: valid,
+            primaryAuthenticated: valid,
             authMode,
-            requiresTotp,
-            subject: valid ? 'owner' : ''
+            subject: valid ? 'owner' : '',
+            isBearerOverride: false
         };
     }
 
-    return { authenticated: false, authMode, requiresTotp, subject: '' };
+    return { primaryAuthenticated: false, authMode, subject: '', isBearerOverride: false };
+}
+
+export async function authenticateWeb(request: Request, env: Env): Promise<WebAuthResult> {
+    const primary = await authenticatePrimaryWeb(request, env);
+    const envTotpConfigured = Boolean(env.ADMIN_TOTP_SECRET?.trim());
+    const totpCfg = await loadCloudTotpConfig(env);
+    const totpGateEnabled = Boolean(totpCfg?.enabled);
+    const defaultTrustSeconds = totpCfg
+        ? clamp2faTrustSeconds(totpCfg.defaultTrustSeconds, DEFAULT_2FA_TRUST_SECONDS)
+        : DEFAULT_2FA_TRUST_SECONDS;
+
+    if (!totpGateEnabled || primary.isBearerOverride) {
+        return {
+            authenticated: primary.primaryAuthenticated,
+            primaryAuthenticated: primary.primaryAuthenticated,
+            authMode: primary.authMode,
+            requiresTotp: envTotpConfigured && primary.authMode === 'passcode_session',
+            totpGateEnabled,
+            totpVerified: true,
+            envTotpConfigured,
+            defaultTrustSeconds,
+            maxTrustDays: MAX_2FA_TRUST_DAYS,
+            trustExpiresAt: '',
+            subject: primary.subject
+        };
+    }
+
+    let totpVerified = false;
+    let trustExpiresAt = '';
+    const cookies = parseCookies(request.headers.get('Cookie'));
+    const trustToken = cookies[TOTP_TRUST_COOKIE_NAME];
+    if (trustToken && totpCfg) {
+        const nowSec = Math.floor(Date.now() / 1000);
+        const verified = await verify2faTrustCookie(
+            resolve2faCookieSignSecret(env, totpCfg),
+            trustToken,
+            totpCfg.trustEpoch,
+            nowSec + MAX_2FA_TRUST_SECONDS + 60
+        );
+        if (verified.valid && verified.tokenId && !(await isSessionRevoked(env, verified.tokenId))) {
+            totpVerified = true;
+            if (verified.expEpochSec) {
+                trustExpiresAt = new Date(verified.expEpochSec * 1000).toISOString();
+            }
+        }
+    }
+
+    const authenticated = primary.primaryAuthenticated && totpVerified;
+    return {
+        authenticated,
+        primaryAuthenticated: primary.primaryAuthenticated,
+        authMode: primary.authMode,
+        requiresTotp: true,
+        totpGateEnabled: true,
+        totpVerified,
+        envTotpConfigured,
+        defaultTrustSeconds,
+        maxTrustDays: MAX_2FA_TRUST_DAYS,
+        trustExpiresAt,
+        subject: authenticated ? primary.subject : ''
+    };
 }
 
 /**
@@ -605,17 +991,27 @@ export async function clearAuthRateLimit(env: Env, bucketKey: string): Promise<v
 export async function handleAuthRoutes(request: Request, env: Env, url: URL): Promise<Response | null> {
     if (url.pathname === '/api/auth/me' && request.method === 'GET') {
         const result = await authenticateWeb(request, env);
-        return Response.json({
-            ok: true,
-            data: {
-                authenticated: result.authenticated,
-                authMode: result.authMode,
-                requiresTotp: result.requiresTotp,
-                subject: result.subject,
-                r2Enabled: Boolean(env.R2_MEDIA),
-                cloudFallbackAllowed: env.VRC_ALLOW_CLOUD_FALLBACK !== 'false'
-            }
-        });
+        return Response.json(
+            {
+                ok: true,
+                data: {
+                    authenticated: result.authenticated,
+                    primaryAuthenticated: result.primaryAuthenticated,
+                    authMode: result.authMode,
+                    requiresTotp: result.requiresTotp,
+                    totpGateEnabled: result.totpGateEnabled,
+                    totpVerified: result.totpVerified,
+                    envTotpConfigured: result.envTotpConfigured,
+                    defaultTrustSeconds: result.defaultTrustSeconds,
+                    maxTrustDays: result.maxTrustDays,
+                    trustExpiresAt: result.trustExpiresAt,
+                    subject: result.subject,
+                    r2Enabled: Boolean(env.R2_MEDIA),
+                    cloudFallbackAllowed: env.VRC_ALLOW_CLOUD_FALLBACK !== 'false'
+                }
+            },
+            { headers: { 'Cache-Control': 'no-store' } }
+        );
     }
 
     if (url.pathname === '/api/auth/login' && request.method === 'POST') {
@@ -627,9 +1023,14 @@ export async function handleAuthRoutes(request: Request, env: Env, url: URL): Pr
         }
         const authMode = detectAuthMode(env);
         if (authMode === 'open_setup') {
+            const authState = await authenticateWeb(request, env);
             return Response.json({
                 ok: true,
-                data: { authenticated: true, authMode }
+                data: {
+                    authenticated: authState.authenticated,
+                    authMode,
+                    totpGateEnabled: authState.totpGateEnabled
+                }
             });
         }
         if (authMode !== 'passcode_session') {
@@ -661,74 +1062,49 @@ export async function handleAuthRoutes(request: Request, env: Env, url: URL): Pr
             );
         }
 
-        let body: { passcode?: string; totp?: string };
-        try {
-            const maxLoginBytes = 16 * 1024;
-            const contentLength = Number(request.headers.get('Content-Length') ?? '0');
-            if (Number.isFinite(contentLength) && contentLength > maxLoginBytes) {
-                await request.body?.cancel().catch(() => {});
-                return Response.json(
-                    { ok: false, error: { code: 'PAYLOAD_TOO_LARGE', message: 'Login payload too large' } },
-                    { status: 413 }
-                );
-            }
-            let rawText = '';
-            if (request.body) {
-                const reader = request.body.getReader();
-                const chunks: Uint8Array[] = [];
-                let total = 0;
-                try {
-                    while (true) {
-                        const { done, value } = await reader.read();
-                        if (done) break;
-                        if (!value || value.byteLength === 0) continue;
-                        total += value.byteLength;
-                        if (total > maxLoginBytes) {
-                            await reader.cancel().catch(() => {});
-                            return Response.json(
-                                { ok: false, error: { code: 'PAYLOAD_TOO_LARGE', message: 'Login payload too large' } },
-                                { status: 413 }
-                            );
-                        }
-                        chunks.push(value);
-                    }
-                } finally {
-                    reader.releaseLock();
-                }
-                const combined = new Uint8Array(total);
-                let off = 0;
-                for (const c of chunks) {
-                    combined.set(c, off);
-                    off += c.byteLength;
-                }
-                rawText = new TextDecoder().decode(combined);
-            }
-            const parsed = rawText ? JSON.parse(rawText) : {};
-            if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-                return Response.json(
-                    { ok: false, error: { code: 'BAD_REQUEST', message: 'Invalid JSON body' } },
-                    { status: 400 }
-                );
-            }
-            body = parsed as { passcode?: string; totp?: string };
-        } catch {
-            return Response.json(
-                { ok: false, error: { code: 'BAD_REQUEST', message: 'Invalid JSON body' } },
-                { status: 400 }
-            );
+        const parsedBody = await readBoundedJsonBody<{
+            passcode?: string;
+            totp?: string;
+            trustSeconds?: unknown;
+            trustDays?: unknown;
+        }>(request);
+        if (!parsedBody.ok) {
+            return parsedBody.response;
         }
+        const body = parsedBody.data;
 
         const passcodeOk = typeof body.passcode === 'string' && (await verifyPasscode(configured, body.passcode));
-        const totpSecret = env.ADMIN_TOTP_SECRET?.trim();
+        const envTotpSecret = env.ADMIN_TOTP_SECRET?.trim();
+        const cloudTotpCfg = await loadCloudTotpConfig(env);
+        const useCloudTotpInLogin = Boolean(!envTotpSecret && cloudTotpCfg?.enabled);
+
         let totpOk = true;
         let matchedTotpStep = 0;
-        if (totpSecret) {
+        let stepBucketKey = 'totp:last_step';
+        if (envTotpSecret) {
             const stepCheck =
                 typeof body.totp === 'string'
-                    ? await verifyTotpStep(totpSecret, body.totp)
+                    ? await verifyTotpStep(envTotpSecret, body.totp)
                     : { valid: false, step: 0 };
             totpOk = stepCheck.valid;
             matchedTotpStep = stepCheck.step;
+        } else if (useCloudTotpInLogin && cloudTotpCfg) {
+            stepBucketKey = 'totp_gate:last_step';
+            try {
+                const secret = await decryptAesGcm(
+                    getMasterKey(env),
+                    cloudTotpCfg.secretEnc.ciphertextB64,
+                    cloudTotpCfg.secretEnc.ivB64
+                );
+                const stepCheck =
+                    typeof body.totp === 'string'
+                        ? await verifyTotpStep(secret, body.totp)
+                        : { valid: false, step: 0 };
+                totpOk = stepCheck.valid;
+                matchedTotpStep = stepCheck.step;
+            } catch {
+                totpOk = false;
+            }
         }
 
         // Evaluate both passcode and TOTP before responding with a uniform error to eliminate passcode oracle.
@@ -741,18 +1117,9 @@ export async function handleAuthRoutes(request: Request, env: Env, url: URL): Pr
         }
 
         // Enforce single-use TOTP replay protection via atomic monotonic step claim in DB_CORE.
-        if (totpSecret && matchedTotpStep > 0) {
-            const claimRes = await env.DB_CORE.prepare(
-                `INSERT INTO cloud_auth_rate_limits (bucket_key, failures, locked_until, updated_at)
-                 VALUES ('totp:last_step', ?, '', ?)
-                 ON CONFLICT(bucket_key) DO UPDATE SET
-                    failures = excluded.failures,
-                    updated_at = excluded.updated_at
-                 WHERE excluded.failures > failures`
-            )
-                .bind(matchedTotpStep, new Date().toISOString())
-                .run();
-            if ((claimRes.meta?.changes ?? 0) !== 1) {
+        if ((envTotpSecret || useCloudTotpInLogin) && matchedTotpStep > 0) {
+            const claimed = await claimMonotonicTotpStep(env, stepBucketKey, matchedTotpStep);
+            if (!claimed) {
                 await recordAuthFailure(env, rateBucket);
                 return Response.json(
                     { ok: false, error: { code: 'INVALID_CREDENTIALS', message: 'Invalid credentials' } },
@@ -767,7 +1134,7 @@ export async function handleAuthRoutes(request: Request, env: Env, url: URL): Pr
         const expSec = Math.floor(Date.now() / 1000) + SESSION_TTL_SECONDS;
         const signed = await signSessionCookie(getMasterKey(env), sessionId, expSec);
         const isSecure = url.protocol === 'https:';
-        const cookieFlags = [
+        const sessionCookie = [
             `${SESSION_COOKIE_NAME}=${encodeURIComponent(signed)}`,
             'Path=/',
             `Max-Age=${SESSION_TTL_SECONDS}`,
@@ -776,9 +1143,598 @@ export async function handleAuthRoutes(request: Request, env: Env, url: URL): Pr
             ...(isSecure ? ['Secure'] : [])
         ].join('; ');
 
+        const headers = new Headers();
+        headers.append('Set-Cookie', sessionCookie);
+
+        let trustExpiresAt: string | null = null;
+        let trustSeconds = 0;
+        let sessionOnly = false;
+        if (useCloudTotpInLogin && cloudTotpCfg) {
+            const requestedSeconds = resolveRequestedTrustSeconds(body, cloudTotpCfg.defaultTrustSeconds);
+            const built = await build2faTrustCookieHeader(env, cloudTotpCfg, requestedSeconds, isSecure);
+            headers.append('Set-Cookie', built.setCookie);
+            trustExpiresAt = built.trustExpiresAt;
+            trustSeconds = built.trustSeconds;
+            sessionOnly = built.sessionOnly;
+        }
+
+        const stillNeedsCloud2fa = Boolean(cloudTotpCfg?.enabled && !useCloudTotpInLogin);
         return Response.json(
-            { ok: true, data: { authenticated: true, authMode: 'passcode_session' } },
-            { headers: { 'Set-Cookie': cookieFlags } }
+            {
+                ok: true,
+                data: {
+                    authenticated: !stillNeedsCloud2fa,
+                    authMode: 'passcode_session',
+                    totpGateEnabled: Boolean(cloudTotpCfg?.enabled),
+                    trustSeconds,
+                    sessionOnly,
+                    trustExpiresAt
+                }
+            },
+            { headers }
+        );
+    }
+
+    if (url.pathname === '/api/auth/2fa/verify' && request.method === 'POST') {
+        if (!isSameOriginRequest(request, url)) {
+            return Response.json(
+                { ok: false, error: { code: 'FORBIDDEN_ORIGIN', message: 'Cross-origin 2FA request blocked' } },
+                { status: 403 }
+            );
+        }
+        const primary = await authenticatePrimaryWeb(request, env);
+        if (!primary.primaryAuthenticated) {
+            return Response.json(
+                { ok: false, error: { code: 'UNAUTHORIZED', message: 'Primary authentication required' } },
+                { status: 401 }
+            );
+        }
+
+        const totpCfg = await loadCloudTotpConfig(env);
+        if (!totpCfg?.enabled) {
+            return Response.json({
+                ok: true,
+                data: { authenticated: true, totpGateEnabled: false }
+            });
+        }
+
+        const rateBucket = resolveClientRateBucket(request, 'totp_verify');
+        const rateCheck = await checkAuthRateLimit(env, rateBucket);
+        if (rateCheck.blocked) {
+            return Response.json(
+                {
+                    ok: false,
+                    error: {
+                        code: 'RATE_LIMITED',
+                        message: `Too many failed 2FA attempts. Try again in ${rateCheck.retryAfterSec}s.`
+                    }
+                },
+                { status: 429, headers: { 'Retry-After': String(rateCheck.retryAfterSec) } }
+            );
+        }
+
+        const parsedBody = await readBoundedJsonBody<{
+            code?: string;
+            totp?: string;
+            trustSeconds?: unknown;
+            trustDays?: unknown;
+        }>(request);
+        if (!parsedBody.ok) {
+            return parsedBody.response;
+        }
+        const body = parsedBody.data;
+        const candidateCode = typeof body.code === 'string' ? body.code : typeof body.totp === 'string' ? body.totp : '';
+
+        let secret: string;
+        try {
+            secret = await decryptAesGcm(
+                getMasterKey(env),
+                totpCfg.secretEnc.ciphertextB64,
+                totpCfg.secretEnc.ivB64
+            );
+        } catch {
+            return Response.json(
+                {
+                    ok: false,
+                    error: {
+                        code: 'TOTP_DECRYPT_FAILED',
+                        message: 'Failed to decrypt stored 2FA secret (check COOKIE_MASTER_KEY)'
+                    }
+                },
+                { status: 500 }
+            );
+        }
+
+        const stepCheck = await verifyTotpStep(secret, candidateCode);
+        if (!stepCheck.valid) {
+            await recordAuthFailure(env, rateBucket);
+            return Response.json(
+                { ok: false, error: { code: 'INVALID_TOTP', message: 'Invalid 6-digit verification code' } },
+                { status: 401 }
+            );
+        }
+
+        const claimed = await claimMonotonicTotpStep(env, 'totp_gate:last_step', stepCheck.step);
+        if (!claimed) {
+            await recordAuthFailure(env, rateBucket);
+            return Response.json(
+                {
+                    ok: false,
+                    error: {
+                        code: 'TOTP_CODE_REUSED',
+                        message: 'Verification code already used; wait for the next 6-digit code'
+                    }
+                },
+                { status: 401 }
+            );
+        }
+
+        await clearAuthRateLimit(env, rateBucket);
+
+        const requestedSeconds = resolveRequestedTrustSeconds(body, totpCfg.defaultTrustSeconds);
+        const built = await build2faTrustCookieHeader(env, totpCfg, requestedSeconds, url.protocol === 'https:');
+        return Response.json(
+            {
+                ok: true,
+                data: {
+                    authenticated: true,
+                    totpGateEnabled: true,
+                    trustSeconds: built.trustSeconds,
+                    sessionOnly: built.sessionOnly,
+                    trustExpiresAt: built.trustExpiresAt
+                }
+            },
+            {
+                headers: {
+                    'Set-Cookie': built.setCookie,
+                    'Cache-Control': 'no-store'
+                }
+            }
+        );
+    }
+
+    if (url.pathname === '/api/auth/2fa/status' && request.method === 'GET') {
+        const auth = await authenticateWeb(request, env);
+        if (!auth.authenticated) {
+            return Response.json(
+                { ok: false, error: { code: 'UNAUTHORIZED', message: 'Authentication required' } },
+                { status: 401 }
+            );
+        }
+        const totpCfg = await loadCloudTotpConfig(env);
+        return Response.json(
+            {
+                ok: true,
+                data: {
+                    enabled: Boolean(totpCfg?.enabled),
+                    defaultTrustSeconds: totpCfg
+                        ? clamp2faTrustSeconds(totpCfg.defaultTrustSeconds, DEFAULT_2FA_TRUST_SECONDS)
+                        : DEFAULT_2FA_TRUST_SECONDS,
+                    maxTrustDays: MAX_2FA_TRUST_DAYS,
+                    enabledAt: totpCfg?.enabledAt ?? '',
+                    trustExpiresAt: auth.trustExpiresAt,
+                    envTotpConfigured: auth.envTotpConfigured
+                }
+            },
+            { headers: { 'Cache-Control': 'no-store' } }
+        );
+    }
+
+    if (url.pathname === '/api/auth/2fa/setup' && request.method === 'POST') {
+        if (!isSameOriginRequest(request, url)) {
+            return Response.json(
+                { ok: false, error: { code: 'FORBIDDEN_ORIGIN', message: 'Cross-origin 2FA request blocked' } },
+                { status: 403 }
+            );
+        }
+        const auth = await authenticateWeb(request, env);
+        if (!auth.authenticated) {
+            return Response.json(
+                { ok: false, error: { code: 'UNAUTHORIZED', message: 'Authentication required' } },
+                { status: 401 }
+            );
+        }
+        const existing = await loadCloudTotpConfig(env);
+        if (existing?.enabled) {
+            return Response.json(
+                {
+                    ok: false,
+                    error: {
+                        code: 'ALREADY_ENABLED',
+                        message: '2FA is already enabled. Disable it with a valid code before re-binding.'
+                    }
+                },
+                { status: 409 }
+            );
+        }
+
+        const secret = generateTotpSecret(20);
+        const setupToken = randomHex(24);
+        const secretEnc = await encryptAesGcm(getMasterKey(env), secret);
+        await savePendingTotpSetup(env, {
+            setupToken,
+            secretEnc,
+            expiresAtMs: Date.now() + PENDING_TOTP_TTL_MS
+        });
+
+        const issuer = 'VRCX-Worker';
+        const accountName = url.host || 'cloud';
+        const label = `${encodeURIComponent(issuer)}:${encodeURIComponent(accountName)}`;
+        const otpauthUrl = `otpauth://totp/${label}?secret=${secret}&issuer=${encodeURIComponent(issuer)}&algorithm=SHA1&digits=6&period=30`;
+
+        return Response.json(
+            {
+                ok: true,
+                data: {
+                    setupToken,
+                    secret,
+                    otpauthUrl,
+                    issuer,
+                    accountName,
+                    expiresInSeconds: Math.floor(PENDING_TOTP_TTL_MS / 1000),
+                    defaultTrustSeconds: DEFAULT_2FA_TRUST_SECONDS,
+                    maxTrustDays: MAX_2FA_TRUST_DAYS
+                }
+            },
+            { headers: { 'Cache-Control': 'no-store' } }
+        );
+    }
+
+    if (url.pathname === '/api/auth/2fa/enable' && request.method === 'POST') {
+        if (!isSameOriginRequest(request, url)) {
+            return Response.json(
+                { ok: false, error: { code: 'FORBIDDEN_ORIGIN', message: 'Cross-origin 2FA request blocked' } },
+                { status: 403 }
+            );
+        }
+        const auth = await authenticateWeb(request, env);
+        if (!auth.authenticated) {
+            return Response.json(
+                { ok: false, error: { code: 'UNAUTHORIZED', message: 'Authentication required' } },
+                { status: 401 }
+            );
+        }
+        const existing = await loadCloudTotpConfig(env);
+        if (existing?.enabled) {
+            return Response.json(
+                { ok: false, error: { code: 'ALREADY_ENABLED', message: '2FA is already enabled' } },
+                { status: 409 }
+            );
+        }
+
+        const rateBucket = resolveClientRateBucket(request, 'totp_manage');
+        const rateCheck = await checkAuthRateLimit(env, rateBucket);
+        if (rateCheck.blocked) {
+            return Response.json(
+                {
+                    ok: false,
+                    error: {
+                        code: 'RATE_LIMITED',
+                        message: `Too many failed 2FA attempts. Try again in ${rateCheck.retryAfterSec}s.`
+                    }
+                },
+                { status: 429, headers: { 'Retry-After': String(rateCheck.retryAfterSec) } }
+            );
+        }
+
+        const parsedBody = await readBoundedJsonBody<{
+            setupToken?: string;
+            code?: string;
+            defaultTrustSeconds?: unknown;
+            defaultTrustDays?: unknown;
+        }>(request);
+        if (!parsedBody.ok) {
+            return parsedBody.response;
+        }
+        const body = parsedBody.data;
+        const setupToken = typeof body.setupToken === 'string' ? body.setupToken.trim() : '';
+        const code = typeof body.code === 'string' ? body.code : '';
+        if (!setupToken || !code.trim()) {
+            return Response.json(
+                { ok: false, error: { code: 'BAD_REQUEST', message: 'setupToken and 6-digit code are required' } },
+                { status: 400 }
+            );
+        }
+
+        const pending = await loadPendingTotpSetup(env);
+        if (!pending || pending.expiresAtMs <= Date.now() || !timingSafeEqual(pending.setupToken, setupToken)) {
+            return Response.json(
+                {
+                    ok: false,
+                    error: {
+                        code: 'SETUP_EXPIRED',
+                        message: '2FA setup session expired or invalid. Please start setup again.'
+                    }
+                },
+                { status: 400 }
+            );
+        }
+
+        let secret: string;
+        try {
+            secret = await decryptAesGcm(getMasterKey(env), pending.secretEnc.ciphertextB64, pending.secretEnc.ivB64);
+        } catch {
+            return Response.json(
+                { ok: false, error: { code: 'SETUP_EXPIRED', message: '2FA setup session could not be verified' } },
+                { status: 400 }
+            );
+        }
+
+        const stepCheck = await verifyTotpStep(secret, code);
+        if (!stepCheck.valid) {
+            await recordAuthFailure(env, rateBucket);
+            return Response.json(
+                { ok: false, error: { code: 'INVALID_TOTP', message: 'Invalid 6-digit verification code' } },
+                { status: 400 }
+            );
+        }
+
+        await clearAuthRateLimit(env, rateBucket);
+
+        const defaultTrustSeconds = resolveRequestedTrustSeconds(body, DEFAULT_2FA_TRUST_SECONDS);
+        const nowIso = new Date().toISOString();
+        const newConfig: StoredCloudTotpConfig = {
+            enabled: true,
+            secretEnc: pending.secretEnc,
+            cookieSignKey: randomHex(32),
+            trustEpoch: randomHex(12),
+            defaultTrustSeconds,
+            enabledAt: nowIso,
+            updatedAt: nowIso
+        };
+
+        await env.DB_CORE.batch([
+            env.DB_CORE.prepare(
+                `INSERT INTO cloud_bg_sync_state (state_key, payload_json, updated_at)
+                 VALUES (?, ?, ?)
+                 ON CONFLICT(state_key) DO UPDATE SET
+                    payload_json = excluded.payload_json,
+                    updated_at = excluded.updated_at`
+            ).bind(STATE_KEY_CLOUD_TOTP, JSON.stringify(newConfig), nowIso),
+            env.DB_CORE.prepare('DELETE FROM cloud_bg_sync_state WHERE state_key = ?').bind(
+                STATE_KEY_CLOUD_TOTP_PENDING
+            ),
+            env.DB_CORE.prepare(
+                `INSERT OR REPLACE INTO cloud_auth_rate_limits (bucket_key, failures, locked_until, updated_at)
+                 VALUES ('totp_gate:last_step', ?, '', ?)`
+            ).bind(stepCheck.step, nowIso)
+        ]);
+
+        const built = await build2faTrustCookieHeader(env, newConfig, defaultTrustSeconds, url.protocol === 'https:');
+        return Response.json(
+            {
+                ok: true,
+                data: {
+                    enabled: true,
+                    defaultTrustSeconds: newConfig.defaultTrustSeconds,
+                    maxTrustDays: MAX_2FA_TRUST_DAYS,
+                    enabledAt: newConfig.enabledAt,
+                    trustSeconds: built.trustSeconds,
+                    sessionOnly: built.sessionOnly,
+                    trustExpiresAt: built.trustExpiresAt
+                }
+            },
+            {
+                headers: {
+                    'Set-Cookie': built.setCookie,
+                    'Cache-Control': 'no-store'
+                }
+            }
+        );
+    }
+
+    if (url.pathname === '/api/auth/2fa/settings' && request.method === 'PUT') {
+        if (!isSameOriginRequest(request, url)) {
+            return Response.json(
+                { ok: false, error: { code: 'FORBIDDEN_ORIGIN', message: 'Cross-origin 2FA request blocked' } },
+                { status: 403 }
+            );
+        }
+        const auth = await authenticateWeb(request, env);
+        if (!auth.authenticated) {
+            return Response.json(
+                { ok: false, error: { code: 'UNAUTHORIZED', message: 'Authentication required' } },
+                { status: 401 }
+            );
+        }
+        const existing = await loadCloudTotpConfig(env);
+        if (!existing?.enabled) {
+            return Response.json(
+                { ok: false, error: { code: 'NOT_ENABLED', message: '2FA is currently disabled' } },
+                { status: 400 }
+            );
+        }
+
+        const parsedBody = await readBoundedJsonBody<{
+            defaultTrustSeconds?: unknown;
+            defaultTrustDays?: unknown;
+            applyToCurrentBrowser?: unknown;
+        }>(request);
+        if (!parsedBody.ok) {
+            return parsedBody.response;
+        }
+        const body = parsedBody.data;
+        const nextTrustSeconds = resolveRequestedTrustSeconds(body, existing.defaultTrustSeconds);
+        const updated: StoredCloudTotpConfig = {
+            ...existing,
+            defaultTrustSeconds: nextTrustSeconds
+        };
+        await saveCloudTotpConfig(env, updated);
+
+        const headers = new Headers({ 'Cache-Control': 'no-store' });
+        let trustExpiresAt: string | null = auth.trustExpiresAt || null;
+        let sessionOnly = false;
+        if (body.applyToCurrentBrowser === true) {
+            const built = await build2faTrustCookieHeader(env, updated, nextTrustSeconds, url.protocol === 'https:');
+            headers.append('Set-Cookie', built.setCookie);
+            trustExpiresAt = built.trustExpiresAt;
+            sessionOnly = built.sessionOnly;
+        }
+
+        return Response.json(
+            {
+                ok: true,
+                data: {
+                    enabled: true,
+                    defaultTrustSeconds: updated.defaultTrustSeconds,
+                    maxTrustDays: MAX_2FA_TRUST_DAYS,
+                    sessionOnly,
+                    trustExpiresAt
+                }
+            },
+            { headers }
+        );
+    }
+
+    if (url.pathname === '/api/auth/2fa/disable' && request.method === 'POST') {
+        if (!isSameOriginRequest(request, url)) {
+            return Response.json(
+                { ok: false, error: { code: 'FORBIDDEN_ORIGIN', message: 'Cross-origin 2FA request blocked' } },
+                { status: 403 }
+            );
+        }
+        const auth = await authenticateWeb(request, env);
+        if (!auth.authenticated) {
+            return Response.json(
+                { ok: false, error: { code: 'UNAUTHORIZED', message: 'Authentication required' } },
+                { status: 401 }
+            );
+        }
+        const existing = await loadCloudTotpConfig(env);
+        if (!existing?.enabled) {
+            return Response.json({ ok: true, data: { enabled: false } });
+        }
+
+        const rateBucket = resolveClientRateBucket(request, 'totp_manage');
+        const rateCheck = await checkAuthRateLimit(env, rateBucket);
+        if (rateCheck.blocked) {
+            return Response.json(
+                {
+                    ok: false,
+                    error: {
+                        code: 'RATE_LIMITED',
+                        message: `Too many failed 2FA attempts. Try again in ${rateCheck.retryAfterSec}s.`
+                    }
+                },
+                { status: 429, headers: { 'Retry-After': String(rateCheck.retryAfterSec) } }
+            );
+        }
+
+        const parsedBody = await readBoundedJsonBody<{ code?: string }>(request);
+        if (!parsedBody.ok) {
+            return parsedBody.response;
+        }
+        const code = typeof parsedBody.data.code === 'string' ? parsedBody.data.code : '';
+
+        let secret: string;
+        try {
+            secret = await decryptAesGcm(
+                getMasterKey(env),
+                existing.secretEnc.ciphertextB64,
+                existing.secretEnc.ivB64
+            );
+        } catch {
+            return Response.json(
+                { ok: false, error: { code: 'TOTP_DECRYPT_FAILED', message: 'Failed to verify stored 2FA secret' } },
+                { status: 500 }
+            );
+        }
+
+        const stepCheck = await verifyTotpStep(secret, code);
+        if (!stepCheck.valid) {
+            await recordAuthFailure(env, rateBucket);
+            return Response.json(
+                { ok: false, error: { code: 'INVALID_TOTP', message: 'Invalid 6-digit verification code' } },
+                { status: 400 }
+            );
+        }
+
+        const claimed = await claimMonotonicTotpStep(env, 'totp_gate:last_step', stepCheck.step);
+        if (!claimed) {
+            await recordAuthFailure(env, rateBucket);
+            return Response.json(
+                {
+                    ok: false,
+                    error: {
+                        code: 'TOTP_CODE_REUSED',
+                        message: 'Verification code already used; wait for the next 6-digit code'
+                    }
+                },
+                { status: 400 }
+            );
+        }
+
+        await clearAuthRateLimit(env, rateBucket);
+        await deleteCloudTotpState(env);
+
+        return Response.json(
+            { ok: true, data: { enabled: false } },
+            {
+                headers: {
+                    'Set-Cookie': buildClearCookieHeader(TOTP_TRUST_COOKIE_NAME, url.protocol === 'https:'),
+                    'Cache-Control': 'no-store'
+                }
+            }
+        );
+    }
+
+    if (url.pathname === '/api/auth/2fa/revoke-all' && request.method === 'POST') {
+        if (!isSameOriginRequest(request, url)) {
+            return Response.json(
+                { ok: false, error: { code: 'FORBIDDEN_ORIGIN', message: 'Cross-origin 2FA request blocked' } },
+                { status: 403 }
+            );
+        }
+        const auth = await authenticateWeb(request, env);
+        if (!auth.authenticated) {
+            return Response.json(
+                { ok: false, error: { code: 'UNAUTHORIZED', message: 'Authentication required' } },
+                { status: 401 }
+            );
+        }
+        const existing = await loadCloudTotpConfig(env);
+        if (!existing?.enabled) {
+            return Response.json(
+                { ok: false, error: { code: 'NOT_ENABLED', message: '2FA is currently disabled' } },
+                { status: 400 }
+            );
+        }
+
+        const parsedBody = await readBoundedJsonBody<{ keepCurrentBrowser?: unknown }>(request);
+        if (!parsedBody.ok) {
+            return parsedBody.response;
+        }
+        const keepCurrentBrowser = parsedBody.data.keepCurrentBrowser === true;
+        const rotated: StoredCloudTotpConfig = {
+            ...existing,
+            trustEpoch: randomHex(12)
+        };
+        await saveCloudTotpConfig(env, rotated);
+
+        const isSecure = url.protocol === 'https:';
+        if (keepCurrentBrowser) {
+            const built = await build2faTrustCookieHeader(env, rotated, rotated.defaultTrustSeconds, isSecure);
+            return Response.json(
+                {
+                    ok: true,
+                    data: {
+                        revokedAll: true,
+                        keepCurrentBrowser: true,
+                        trustExpiresAt: built.trustExpiresAt
+                    }
+                },
+                { headers: { 'Set-Cookie': built.setCookie, 'Cache-Control': 'no-store' } }
+            );
+        }
+
+        return Response.json(
+            { ok: true, data: { revokedAll: true, keepCurrentBrowser: false } },
+            {
+                headers: {
+                    'Set-Cookie': buildClearCookieHeader(TOTP_TRUST_COOKIE_NAME, isSecure),
+                    'Cache-Control': 'no-store'
+                }
+            }
         );
     }
 
@@ -795,22 +1751,40 @@ export async function handleAuthRoutes(request: Request, env: Env, url: URL): Pr
             try {
                 const verified = await verifySessionCookie(getMasterKey(env), token);
                 if (verified.valid && verified.sessionId) {
-                    await revokeSessionId(env, verified.sessionId);
+                    await revokeSessionId(env, verified.sessionId, SESSION_TTL_SECONDS);
                 }
             } catch {
                 // Ignore invalid session cookie during logout
             }
         }
+        const trustToken = cookies[TOTP_TRUST_COOKIE_NAME];
+        if (trustToken) {
+            try {
+                const totpCfg = await loadCloudTotpConfig(env);
+                if (totpCfg?.enabled) {
+                    const nowSec = Math.floor(Date.now() / 1000);
+                    const verified2fa = await verify2faTrustCookie(
+                        resolve2faCookieSignSecret(env, totpCfg),
+                        trustToken,
+                        totpCfg.trustEpoch,
+                        nowSec + MAX_2FA_TRUST_SECONDS + 60
+                    );
+                    if (verified2fa.valid && verified2fa.tokenId) {
+                        const remaining = verified2fa.expEpochSec
+                            ? Math.max(60, verified2fa.expEpochSec - nowSec)
+                            : MAX_2FA_TRUST_SECONDS;
+                        await revokeSessionId(env, verified2fa.tokenId, remaining);
+                    }
+                }
+            } catch {
+                // Ignore invalid 2FA trust cookie during logout
+            }
+        }
         const isSecure = url.protocol === 'https:';
-        const clearCookie = [
-            `${SESSION_COOKIE_NAME}=`,
-            'Path=/',
-            'Max-Age=0',
-            'HttpOnly',
-            'SameSite=Strict',
-            ...(isSecure ? ['Secure'] : [])
-        ].join('; ');
-        return Response.json({ ok: true }, { headers: { 'Set-Cookie': clearCookie } });
+        const headers = new Headers({ 'Cache-Control': 'no-store' });
+        headers.append('Set-Cookie', buildClearCookieHeader(SESSION_COOKIE_NAME, isSecure));
+        headers.append('Set-Cookie', buildClearCookieHeader(TOTP_TRUST_COOKIE_NAME, isSecure));
+        return Response.json({ ok: true }, { headers });
     }
 
     return null;

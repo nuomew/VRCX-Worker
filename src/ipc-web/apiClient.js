@@ -1,4 +1,4 @@
-import { cloudState, setWsAutoConnectHandler, syncGameRunningBridge } from './cloudState.js';
+import { clamp2faTrustSeconds, cloudState, setWsAutoConnectHandler, syncGameRunningBridge } from './cloudState.js';
 
 /** @type {WebSocket | null} */
 let hubSocket = null;
@@ -40,7 +40,60 @@ export function onCloudCommandResult(listener) {
     };
 }
 
-function handleCloudUnauthorized() {
+function applyAuthMeSnapshot(authData) {
+    if (!authData || typeof authData !== 'object') return;
+    if (authData.authMode) cloudState.authMode = authData.authMode;
+    if (authData.primaryAuthenticated !== undefined) {
+        cloudState.primaryAuthenticated = Boolean(authData.primaryAuthenticated);
+    }
+    cloudState.requiresTotp = Boolean(authData.requiresTotp);
+    if (authData.totpGateEnabled !== undefined) {
+        cloudState.totpGateEnabled = Boolean(authData.totpGateEnabled);
+    }
+    if (authData.totpVerified !== undefined) {
+        cloudState.totpVerified = Boolean(authData.totpVerified);
+    }
+    if (authData.envTotpConfigured !== undefined) {
+        cloudState.envTotpConfigured = Boolean(authData.envTotpConfigured);
+    }
+    if (authData.defaultTrustSeconds !== undefined) {
+        cloudState.default2faTrustSeconds = clamp2faTrustSeconds(authData.defaultTrustSeconds);
+    }
+    if (authData.trustExpiresAt !== undefined) {
+        cloudState.totpTrustExpiresAt = typeof authData.trustExpiresAt === 'string' ? authData.trustExpiresAt : '';
+    }
+}
+
+let unauthorizedProbeInFlight = false;
+
+function probeAuthStateAfterUnauthorized() {
+    if (unauthorizedProbeInFlight || typeof fetch !== 'function') return;
+    unauthorizedProbeInFlight = true;
+    fetch('/api/auth/me', {
+        credentials: 'include',
+        cache: 'no-store',
+        redirect: 'manual'
+    })
+        .then(async (res) => {
+            if (res.type === 'opaqueredirect' || (res.status >= 300 && res.status < 400)) {
+                cloudState.authMode = 'cloudflare_access';
+                cloudState.primaryAuthenticated = false;
+                return;
+            }
+            const json = await res.json().catch(() => null);
+            if (json?.data) {
+                applyAuthMeSnapshot(json.data);
+            }
+        })
+        .catch(() => {
+            // Non-fatal: unlock overlay still shows with last known state
+        })
+        .finally(() => {
+            unauthorizedProbeInFlight = false;
+        });
+}
+
+function handleCloudUnauthorized(probeAuth = false) {
     cloudState.authenticated = false;
     cloudState.authCheckFailed = false;
     cloudState.authCheckError = '';
@@ -57,6 +110,9 @@ function handleCloudUnauthorized() {
         } catch {
             // Ignore listener cleanup errors
         }
+    }
+    if (probeAuth) {
+        probeAuthStateAfterUnauthorized();
     }
 }
 
@@ -98,7 +154,7 @@ export async function cloudFetch(path, options = {}) {
     }
 
     if (res.status === 401 && !path.startsWith('/api/auth/')) {
-        handleCloudUnauthorized();
+        handleCloudUnauthorized(true);
         throw new Error('Cloud authentication required');
     }
 
@@ -262,8 +318,7 @@ export function connectCloudHubWs() {
                     const authJson = await authRes.json().catch(() => null);
                     const authData = authJson?.data;
                     if (authData && authData.authenticated === false) {
-                        if (authData.authMode) cloudState.authMode = authData.authMode;
-                        cloudState.requiresTotp = Boolean(authData.requiresTotp);
+                        applyAuthMeSnapshot(authData);
                         handleCloudUnauthorized();
                         return;
                     }
