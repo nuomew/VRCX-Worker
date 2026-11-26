@@ -3499,7 +3499,8 @@
             "confirm_disable_btn": "確認關閉",
             "enabled_toast": "2FA 已開啟，後續未信任的瀏覽器開啟頁面將須輸入 6 位數驗證碼。",
             "saved_trust_toast": "瀏覽器免驗證時長已儲存。",
-            "disabled_toast": "已關閉 2FA 驗證。"
+            "disabled_toast": "已關閉 2FA 驗證。",
+            "blocked_by_static_passcode": "目前已開啟靜態口令驗證。2FA 與靜態口令僅能同時開啟一個，請先關閉靜態口令後再開啟 2FA。"
         },
         "static_passcode": {
             "section_title": "靜態口令存取驗證",
@@ -3528,7 +3529,8 @@
             "mismatch_err": "兩次輸入的靜態口令不一致。",
             "enabled_toast": "靜態口令已開啟，後續未信任瀏覽器開啟頁面將須輸入靜態口令。",
             "changed_toast": "靜態口令已更新，其他已信任瀏覽器須重新驗證。",
-            "disabled_toast": "已關閉靜態口令驗證。"
+            "disabled_toast": "已關閉靜態口令驗證。",
+            "blocked_by_2fa": "目前已開啟 2FA 驗證。靜態口令與 2FA 僅能同時開啟一個，請先關閉 2FA 後再開啟靜態口令。"
         },
         "migration": {
             "tab_label": "遷移",

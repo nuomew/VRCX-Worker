@@ -1544,6 +1544,19 @@ export async function handleAuthRoutes(request: Request, env: Env, url: URL): Pr
                 { status: 409 }
             );
         }
+        const existingStatic = await loadCloudStaticPasscodeConfig(env);
+        if (existingStatic?.enabled) {
+            return Response.json(
+                {
+                    ok: false,
+                    error: {
+                        code: 'STATIC_PASSCODE_ALREADY_ENABLED',
+                        message: 'Static passphrase is already enabled. Disable it before enabling 2FA.'
+                    }
+                },
+                { status: 409 }
+            );
+        }
 
         const secret = generateTotpSecret(20);
         const setupToken = randomHex(24);
@@ -1595,6 +1608,19 @@ export async function handleAuthRoutes(request: Request, env: Env, url: URL): Pr
         if (existing?.enabled) {
             return Response.json(
                 { ok: false, error: { code: 'ALREADY_ENABLED', message: '2FA is already enabled' } },
+                { status: 409 }
+            );
+        }
+        const existingStatic = await loadCloudStaticPasscodeConfig(env);
+        if (existingStatic?.enabled) {
+            return Response.json(
+                {
+                    ok: false,
+                    error: {
+                        code: 'STATIC_PASSCODE_ALREADY_ENABLED',
+                        message: 'Static passphrase is already enabled. Disable it before enabling 2FA.'
+                    }
+                },
                 { status: 409 }
             );
         }
@@ -2144,6 +2170,19 @@ export async function handleAuthRoutes(request: Request, env: Env, url: URL): Pr
                     error: {
                         code: 'ALREADY_ENABLED',
                         message: 'Static passphrase is already enabled. Change or disable it instead.'
+                    }
+                },
+                { status: 409 }
+            );
+        }
+        const existingTotp = await loadCloudTotpConfig(env);
+        if (existingTotp?.enabled) {
+            return Response.json(
+                {
+                    ok: false,
+                    error: {
+                        code: 'TOTP_ALREADY_ENABLED',
+                        message: '2FA is already enabled. Disable 2FA before enabling static passphrase.'
                     }
                 },
                 { status: 409 }

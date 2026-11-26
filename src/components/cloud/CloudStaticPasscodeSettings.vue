@@ -25,7 +25,7 @@
                 <Button
                     v-if="!enabled && !showEnableForm"
                     size="sm"
-                    :disabled="loadingStatus"
+                    :disabled="loadingStatus || blockedByTotp"
                     @click="openEnableForm">
                     {{ t('cloud_hub.static_passcode.enable_btn') }}
                 </Button>
@@ -48,6 +48,12 @@
                 </template>
             </div>
         </SettingsItem>
+
+        <p
+            v-if="!enabled && blockedByTotp"
+            class="rounded-md border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
+            {{ t('cloud_hub.static_passcode.blocked_by_2fa') }}
+        </p>
 
         <!-- Enable setup card -->
         <form
@@ -345,6 +351,7 @@
 
     const loadingStatus = ref(false);
     const enabled = ref(Boolean(cloudState.staticPasscodeGateEnabled));
+    const blockedByTotp = computed(() => Boolean(cloudState.totpGateEnabled));
     const trustExpiresAt = ref(cloudState.staticPasscodeTrustExpiresAt || '');
     const trustPreset = ref('604800');
     const customTrustDays = ref(7);

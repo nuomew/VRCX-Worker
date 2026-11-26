@@ -3836,7 +3836,8 @@
             "confirm_disable_btn": "Confirm Disable",
             "enabled_toast": "2FA enabled. Future visits from untrusted browsers will require a 6-digit code.",
             "saved_trust_toast": "2FA browser trust duration saved.",
-            "disabled_toast": "2FA has been disabled."
+            "disabled_toast": "2FA has been disabled.",
+            "blocked_by_static_passcode": "Static passphrase is currently enabled. Only one of 2FA or static passphrase can be active at a time — disable static passphrase first to enable 2FA."
         },
         "static_passcode": {
             "section_title": "Static Passphrase Gate",
@@ -3865,7 +3866,8 @@
             "mismatch_err": "The two passphrases do not match.",
             "enabled_toast": "Static passphrase enabled. Untrusted browsers will now require it to open this page.",
             "changed_toast": "Static passphrase updated. Other trusted browsers must re-verify.",
-            "disabled_toast": "Static passphrase gate has been disabled."
+            "disabled_toast": "Static passphrase gate has been disabled.",
+            "blocked_by_2fa": "2FA is currently enabled. Only one of static passphrase or 2FA can be active at a time — disable 2FA first to enable static passphrase."
         },
         "migration": {
             "tab_label": "Migration",

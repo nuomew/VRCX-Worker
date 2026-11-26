@@ -21,7 +21,7 @@
                 <Button
                     v-if="!enabled && !setupState"
                     size="sm"
-                    :disabled="loadingStatus || startingSetup"
+                    :disabled="loadingStatus || startingSetup || blockedByStaticPasscode"
                     @click="startSetup">
                     {{ startingSetup ? t('cloud_hub.two_factor.generating') : t('cloud_hub.two_factor.enable_btn') }}
                 </Button>
@@ -35,6 +35,12 @@
                 </Button>
             </div>
         </SettingsItem>
+
+        <p
+            v-if="!enabled && blockedByStaticPasscode"
+            class="rounded-md border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
+            {{ t('cloud_hub.two_factor.blocked_by_static_passcode') }}
+        </p>
 
         <!-- Setup wizard card (shown only while binding a new TOTP secret before activation) -->
         <div
@@ -262,6 +268,7 @@
 
     const loadingStatus = ref(false);
     const enabled = ref(Boolean(cloudState.totpGateEnabled));
+    const blockedByStaticPasscode = computed(() => Boolean(cloudState.staticPasscodeGateEnabled));
     const trustExpiresAt = ref(cloudState.totpTrustExpiresAt || '');
     const trustPreset = ref('604800');
     const customTrustDays = ref(7);

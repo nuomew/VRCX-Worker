@@ -6315,60 +6315,16 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
                 ).status
             ).toBe(200);
 
-            // 9. Combined 2FA + Static Passphrase: single verify call unlocks both gates atomically
-            const setup2fa = (await (
-                await exports.default.fetch('http://example.com/api/auth/2fa/setup', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json', Origin: 'http://example.com', Cookie: rotatedCookie },
-                    body: '{}'
-                })
-            ).json()) as { data: { setupToken: string; secret: string } };
-            const baseNow = Date.now();
-            const enableTotpCode = await generateTotpCode(setup2fa.data.secret, baseNow - 30_000);
-            const enable2faRes = await exports.default.fetch('http://example.com/api/auth/2fa/enable', {
+            // 9. Mutual exclusion: while static passphrase is enabled, enabling 2FA MUST be rejected with 409
+            const blocked2faSetup = await exports.default.fetch('http://example.com/api/auth/2fa/setup', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json', Origin: 'http://example.com', Cookie: rotatedCookie },
-                body: JSON.stringify({ setupToken: setup2fa.data.setupToken, code: enableTotpCode })
+                body: '{}'
             });
-            expect(enable2faRes.status).toBe(200);
-
-            // Cookie with ONLY static passphrase is still 401 now that 2FA is also enabled
-            expect(
-                (
-                    await exports.default.fetch('http://example.com/api/bootstrap', {
-                        headers: { Cookie: rotatedCookie }
-                    })
-                ).status
-            ).toBe(401);
-
-            // Combined verify with pass2 + valid 6-digit code issues both cookies and grants full access
-            const combinedCode = await generateTotpCode(setup2fa.data.secret, baseNow);
-            const combinedRes = await exports.default.fetch('http://example.com/api/auth/static-passcode/verify', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
-                body: JSON.stringify({ passphrase: pass2, code: combinedCode, trustDays: 7 })
-            });
-            expect(combinedRes.status).toBe(200);
-            const combinedBody = (await combinedRes.json()) as {
-                data: { authenticated: boolean; totpVerified: boolean; staticPasscodeVerified: boolean };
-            };
-            expect(combinedBody.data.authenticated).toBe(true);
-            expect(combinedBody.data.totpVerified).toBe(true);
-            expect(combinedBody.data.staticPasscodeVerified).toBe(true);
-            const setCookies =
-                typeof combinedRes.headers.getSetCookie === 'function'
-                    ? combinedRes.headers.getSetCookie()
-                    : [combinedRes.headers.get('Set-Cookie') ?? ''];
-            const mergedCookieHeader = setCookies.map((c) => c.split(';')[0]).join('; ');
-            expect(mergedCookieHeader).toContain('vrcx_cloud_passcode_gate=');
-            expect(mergedCookieHeader).toContain('vrcx_cloud_2fa=');
-            expect(
-                (
-                    await exports.default.fetch('http://example.com/api/bootstrap', {
-                        headers: { Cookie: mergedCookieHeader }
-                    })
-                ).status
-            ).toBe(200);
+            expect(blocked2faSetup.status).toBe(409);
+            expect(((await blocked2faSetup.json()) as { error?: { code?: string } }).error?.code).toBe(
+                'STATIC_PASSCODE_ALREADY_ENABLED'
+            );
 
             // 10. Revoke-all & disable static passphrase (wrong passphrase rejected, right passphrase clears cookie)
             const revokeRes = await exports.default.fetch('http://example.com/api/auth/static-passcode/revoke-all', {
@@ -6376,31 +6332,54 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
                 headers: {
                     'Content-Type': 'application/json',
                     Origin: 'http://example.com',
-                    Cookie: mergedCookieHeader
+                    Cookie: rotatedCookie
                 },
                 body: JSON.stringify({ keepCurrentBrowser: true })
             });
             expect(revokeRes.status).toBe(200);
             const newStaticCookie = (revokeRes.headers.get('Set-Cookie') ?? '').split(';')[0]!;
-            const kept2faCookie = setCookies
-                .map((c) => c.split(';')[0]!)
-                .find((c) => c.startsWith('vrcx_cloud_2fa='))!;
-            const activeBothCookies = `${newStaticCookie}; ${kept2faCookie}`;
 
             const badDisable = await exports.default.fetch('http://example.com/api/auth/static-passcode/disable', {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json', Origin: 'http://example.com', Cookie: activeBothCookies },
+                headers: { 'Content-Type': 'application/json', Origin: 'http://example.com', Cookie: newStaticCookie },
                 body: JSON.stringify({ passphrase: pass1 })
             });
             expect(badDisable.status).toBe(400);
 
             const disableStatic = await exports.default.fetch('http://example.com/api/auth/static-passcode/disable', {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json', Origin: 'http://example.com', Cookie: activeBothCookies },
+                headers: { 'Content-Type': 'application/json', Origin: 'http://example.com', Cookie: newStaticCookie },
                 body: JSON.stringify({ passphrase: pass2 })
             });
             expect(disableStatic.status).toBe(200);
             expect(disableStatic.headers.get('Set-Cookie') ?? '').toContain('Max-Age=0');
+
+            // 11. Reverse mutual exclusion: after disabling static passphrase, 2FA can be enabled, and enabling static passphrase while 2FA is active MUST return 409
+            const setup2fa = (await (
+                await exports.default.fetch('http://example.com/api/auth/2fa/setup', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+                    body: '{}'
+                })
+            ).json()) as { data: { setupToken: string; secret: string } };
+            const enableTotpCode = await generateTotpCode(setup2fa.data.secret, Date.now());
+            const enable2faRes = await exports.default.fetch('http://example.com/api/auth/2fa/enable', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+                body: JSON.stringify({ setupToken: setup2fa.data.setupToken, code: enableTotpCode })
+            });
+            expect(enable2faRes.status).toBe(200);
+            const active2faCookie = (enable2faRes.headers.get('Set-Cookie') ?? '').split(';')[0]!;
+
+            const blockedStaticEnable = await exports.default.fetch('http://example.com/api/auth/static-passcode/enable', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Origin: 'http://example.com', Cookie: active2faCookie },
+                body: JSON.stringify({ passphrase: pass2, confirmPassphrase: pass2 })
+            });
+            expect(blockedStaticEnable.status).toBe(409);
+            expect(((await blockedStaticEnable.json()) as { error?: { code?: string } }).error?.code).toBe(
+                'TOTP_ALREADY_ENABLED'
+            );
         } finally {
             await env.DB_CORE.batch([
                 env.DB_CORE.prepare(
