@@ -418,31 +418,46 @@ export async function handleDbCleanupRoutes(
             totalRows: number;
         };
 
+        const listAllR2Backups = async (): Promise<BackupItem[]> => {
+            if (!env.R2_MEDIA) return [];
+            try {
+                const collected: BackupItem[] = [];
+                let cursor: string | undefined;
+                // R2 list() returns keys in ascending lexicographical order; paginate so newer backups
+                // past the first 25 are never hidden before descending sort.
+                for (let page = 0; page < 5; page++) {
+                    const listed = await env.R2_MEDIA.list({
+                        prefix: CLEANUP_BACKUP_PREFIX,
+                        limit: 1000,
+                        cursor,
+                        include: ['customMetadata']
+                    });
+                    for (const obj of listed.objects ?? []) {
+                        if (!SAFE_BACKUP_KEY_RE.test(obj.key)) continue;
+                        collected.push({
+                            key: obj.key,
+                            provider: 'r2',
+                            fileName: obj.key.slice(CLEANUP_BACKUP_PREFIX.length),
+                            bytes: obj.size,
+                            uploadedAt: obj.uploaded.toISOString(),
+                            months: Number(obj.customMetadata?.months ?? 0) || 0,
+                            cutoffIso: obj.customMetadata?.cutoffIso ?? '',
+                            totalRows: Number(obj.customMetadata?.totalRows ?? 0) || 0
+                        });
+                    }
+                    if (!listed.truncated || !listed.cursor) break;
+                    cursor = listed.cursor;
+                }
+                return collected;
+            } catch {
+                return [];
+            }
+        };
+
         const [r2Items, b2Items] = await Promise.all([
-            env.R2_MEDIA
-                ? env.R2_MEDIA.list({
-                      prefix: CLEANUP_BACKUP_PREFIX,
-                      limit: 25,
-                      include: ['customMetadata']
-                  })
-                      .then((listed): BackupItem[] =>
-                          (listed.objects ?? [])
-                              .filter((obj) => SAFE_BACKUP_KEY_RE.test(obj.key))
-                              .map((obj) => ({
-                                  key: obj.key,
-                                  provider: 'r2',
-                                  fileName: obj.key.slice(CLEANUP_BACKUP_PREFIX.length),
-                                  bytes: obj.size,
-                                  uploadedAt: obj.uploaded.toISOString(),
-                                  months: Number(obj.customMetadata?.months ?? 0) || 0,
-                                  cutoffIso: obj.customMetadata?.cutoffIso ?? '',
-                                  totalRows: Number(obj.customMetadata?.totalRows ?? 0) || 0
-                              }))
-                      )
-                      .catch((): BackupItem[] => [])
-                : Promise.resolve<BackupItem[]>([]),
+            listAllR2Backups(),
             b2Creds
-                ? listB2Objects(b2Creds, CLEANUP_BACKUP_PREFIX, 2)
+                ? listB2Objects(b2Creds, CLEANUP_BACKUP_PREFIX, 5)
                       .then(({ objects }): BackupItem[] =>
                           objects
                               .filter((obj) => SAFE_BACKUP_KEY_RE.test(obj.key))

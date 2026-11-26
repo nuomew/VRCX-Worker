@@ -88,16 +88,16 @@
                         <div class="flex flex-wrap items-center gap-2">
                             <select
                                 v-model="trustPreset"
-                                class="min-w-[200px] rounded-md border border-input bg-background px-2.5 py-1.5 text-xs text-foreground">
-                                <option value="0">{{ t('cloud_hub.two_factor.trust_session') }}</option>
-                                <option value="3600">{{ t('cloud_hub.two_factor.trust_1h') }}</option>
-                                <option value="43200">{{ t('cloud_hub.two_factor.trust_12h') }}</option>
-                                <option value="86400">{{ t('cloud_hub.two_factor.trust_1d') }}</option>
-                                <option value="259200">{{ t('cloud_hub.two_factor.trust_3d') }}</option>
-                                <option value="604800">{{ t('cloud_hub.two_factor.trust_7d') }}</option>
-                                <option value="1209600">{{ t('cloud_hub.two_factor.trust_14d') }}</option>
-                                <option value="2592000">{{ t('cloud_hub.two_factor.trust_30d') }}</option>
-                                <option value="custom">{{ t('cloud_hub.two_factor.trust_custom') }}</option>
+                                class="min-w-[200px] rounded-md border border-input bg-background px-2.5 py-1.5 text-xs text-foreground dark:[color-scheme:dark]">
+                                <option class="bg-card text-foreground" value="0">{{ t('cloud_hub.two_factor.trust_session') }}</option>
+                                <option class="bg-card text-foreground" value="3600">{{ t('cloud_hub.two_factor.trust_1h') }}</option>
+                                <option class="bg-card text-foreground" value="43200">{{ t('cloud_hub.two_factor.trust_12h') }}</option>
+                                <option class="bg-card text-foreground" value="86400">{{ t('cloud_hub.two_factor.trust_1d') }}</option>
+                                <option class="bg-card text-foreground" value="259200">{{ t('cloud_hub.two_factor.trust_3d') }}</option>
+                                <option class="bg-card text-foreground" value="604800">{{ t('cloud_hub.two_factor.trust_7d') }}</option>
+                                <option class="bg-card text-foreground" value="1209600">{{ t('cloud_hub.two_factor.trust_14d') }}</option>
+                                <option class="bg-card text-foreground" value="2592000">{{ t('cloud_hub.two_factor.trust_30d') }}</option>
+                                <option class="bg-card text-foreground" value="custom">{{ t('cloud_hub.two_factor.trust_custom') }}</option>
                             </select>
                             <div v-if="trustPreset === 'custom'" class="flex items-center gap-1.5">
                                 <input
@@ -174,16 +174,16 @@
                 <div class="flex flex-wrap items-center gap-2">
                     <select
                         v-model="trustPreset"
-                        class="min-w-[200px] rounded-md border border-input bg-background px-2.5 py-1.5 text-xs text-foreground">
-                        <option value="0">{{ t('cloud_hub.two_factor.trust_session') }}</option>
-                        <option value="3600">{{ t('cloud_hub.two_factor.trust_1h') }}</option>
-                        <option value="43200">{{ t('cloud_hub.two_factor.trust_12h') }}</option>
-                        <option value="86400">{{ t('cloud_hub.two_factor.trust_1d') }}</option>
-                        <option value="259200">{{ t('cloud_hub.two_factor.trust_3d') }}</option>
-                        <option value="604800">{{ t('cloud_hub.two_factor.trust_7d') }}</option>
-                        <option value="1209600">{{ t('cloud_hub.two_factor.trust_14d') }}</option>
-                        <option value="2592000">{{ t('cloud_hub.two_factor.trust_30d') }}</option>
-                        <option value="custom">{{ t('cloud_hub.two_factor.trust_custom') }}</option>
+                        class="min-w-[200px] rounded-md border border-input bg-background px-2.5 py-1.5 text-xs text-foreground dark:[color-scheme:dark]">
+                        <option class="bg-card text-foreground" value="0">{{ t('cloud_hub.two_factor.trust_session') }}</option>
+                        <option class="bg-card text-foreground" value="3600">{{ t('cloud_hub.two_factor.trust_1h') }}</option>
+                        <option class="bg-card text-foreground" value="43200">{{ t('cloud_hub.two_factor.trust_12h') }}</option>
+                        <option class="bg-card text-foreground" value="86400">{{ t('cloud_hub.two_factor.trust_1d') }}</option>
+                        <option class="bg-card text-foreground" value="259200">{{ t('cloud_hub.two_factor.trust_3d') }}</option>
+                        <option class="bg-card text-foreground" value="604800">{{ t('cloud_hub.two_factor.trust_7d') }}</option>
+                        <option class="bg-card text-foreground" value="1209600">{{ t('cloud_hub.two_factor.trust_14d') }}</option>
+                        <option class="bg-card text-foreground" value="2592000">{{ t('cloud_hub.two_factor.trust_30d') }}</option>
+                        <option class="bg-card text-foreground" value="custom">{{ t('cloud_hub.two_factor.trust_custom') }}</option>
                     </select>
                     <div v-if="trustPreset === 'custom'" class="flex items-center gap-1.5">
                         <input
@@ -251,7 +251,7 @@
 </template>
 
 <script setup>
-    import { computed, onMounted, ref } from 'vue';
+    import { computed, onMounted, ref, watch } from 'vue';
     import { useI18n } from 'vue-i18n';
     import { toast } from 'vue-sonner';
     import { Button } from '@/components/ui/button';
@@ -504,6 +504,12 @@
             revokingAll.value = false;
         }
     }
+
+    watch(blockedByStaticPasscode, (blocked) => {
+        if (blocked && setupState.value) {
+            cancelSetup();
+        }
+    });
 
     onMounted(() => {
         syncTrustPicker(cloudState.default2faTrustSeconds);

@@ -861,7 +861,12 @@
                 method: 'PUT',
                 json: { useWorkerDirectProxy: nextVal }
             });
-            applyStatusPayload(data, { forceFormSync: true });
+            // Preserve any unsaved credential/threshold edits in the form; only sync usage & proxy toggle.
+            applyStatusPayload(data);
+            if (data?.externalStorage) {
+                formUseWorkerDirectProxy.value = data.externalStorage.useWorkerDirectProxy !== false;
+                pendingDisableDirectProxyConfirm.value = false;
+            }
             const msg = t('cloud_hub.storage.saved_toast');
             statusNotice.value = msg;
             toast.success(msg);

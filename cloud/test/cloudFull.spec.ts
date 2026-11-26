@@ -6899,35 +6899,50 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
         const b2Store = new Map<string, { bytes: Uint8Array; contentType: string; lastModified: string }>();
         const originalFetch = globalThis.fetch;
         const b2Host = 's3.us-west-004.backblazeb2.com';
+        const b2EuHost = 's3.eu-central-003.backblazeb2.com';
         const b2Bucket = 'vrcx-test-b2';
         const b2VirtualHost = `${b2Bucket}.${b2Host}`;
         let createdDeviceId = '';
         let virtualHostHits = 0;
         let rangeFetchAttempts = 0;
+        let euTestHits = 0;
         let simulateMissingContentRangeOnce = false;
+        const createdR2BackupKeys: string[] = [];
 
         const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
             const targetUrl = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
             const parsed = new URL(targetUrl);
             const isVirtualHost = parsed.hostname === b2VirtualHost;
             const isPathHost = parsed.hostname === b2Host;
-            if (!isVirtualHost && !isPathHost) {
+            const isEuPathHost = parsed.hostname === b2EuHost;
+            if (!isVirtualHost && !isPathHost && !isEuPathHost) {
                 return originalFetch(input, init);
             }
             if (isVirtualHost) virtualHostHits++;
+            if (isEuPathHost) euTestHits++;
 
             // Verify every Backblaze B2 S3 request carries a valid AWS SigV4 Authorization header
             const headers = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined));
             const authHeader = headers.get('Authorization') ?? '';
+            const expectedRegion = isEuPathHost ? 'eu-central-003' : 'us-west-004';
             expect(authHeader.startsWith('AWS4-HMAC-SHA256 Credential=004testkeyid/')).toBe(true);
-            expect(authHeader).toContain('/us-west-004/s3/aws4_request');
+            expect(authHeader).toContain(`/${expectedRegion}/s3/aws4_request`);
             expect(headers.get('x-amz-date')).toMatch(/^\d{8}T\d{6}Z$/);
             const shaHeader = headers.get('x-amz-content-sha256') ?? '';
             expect(shaHeader === 'UNSIGNED-PAYLOAD' || /^[0-9a-f]{64}$/.test(shaHeader)).toBe(true);
 
-            // Stripped / unsignable Cloudflare & client headers must never leak into B2 signature
-            expect(headers.has('cf-connecting-ip')).toBe(false);
-            expect(headers.has('x-real-ip')).toBe(false);
+            // Non-allowlisted Cloudflare/proxy/browser/spoofed headers must NEVER be forwarded or signed into B2
+            for (const forbidden of [
+                'cf-connecting-ip',
+                'x-real-ip',
+                'x-forwarded-for',
+                'cdn-loop',
+                'sec-fetch-dest',
+                'x-amz-security-token'
+            ]) {
+                expect(headers.has(forbidden)).toBe(false);
+                expect(authHeader.toLowerCase()).not.toContain(forbidden);
+            }
             expect(authHeader).not.toContain(';range');
             expect(authHeader).not.toContain('range;');
 
@@ -7264,8 +7279,13 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
                     method: 'GET',
                     headers: {
                         Range: 'bytes=0-3',
+                        'If-None-Match': '"other-etag"',
                         'CF-Connecting-IP': '1.2.3.4',
-                        'X-Real-IP': '1.2.3.4'
+                        'X-Real-IP': '1.2.3.4',
+                        'X-Forwarded-For': '203.0.113.5',
+                        'CDN-Loop': 'cloudflare; loops=1',
+                        'Sec-Fetch-Dest': 'image',
+                        'X-Amz-Security-Token': 'spoofed-token'
                     }
                 }
             );
@@ -7379,6 +7399,56 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
                 ).status
             ).toBe(200);
 
+            // Round-2 Regression: POST /api/storage/test auto-reinfers region on cross-region endpoint switch
+            // (both when form submits stale saved region and when region field is cleared)
+            const euHitsBefore = euTestHits;
+            const crossRegionTestStale = await exports.default.fetch('http://example.com/api/storage/test', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+                body: JSON.stringify({
+                    endpoint: `https://${b2EuHost}`,
+                    region: 'us-west-004'
+                })
+            });
+            expect(crossRegionTestStale.status).toBe(200);
+            expect(((await crossRegionTestStale.json()) as { data: { region: string } }).data.region).toBe(
+                'eu-central-003'
+            );
+            const crossRegionTestEmpty = await exports.default.fetch('http://example.com/api/storage/test', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+                body: JSON.stringify({
+                    endpoint: `https://${b2EuHost}`,
+                    region: ''
+                })
+            });
+            expect(crossRegionTestEmpty.status).toBe(200);
+            expect(((await crossRegionTestEmpty.json()) as { data: { region: string } }).data.region).toBe(
+                'eu-central-003'
+            );
+            expect(euTestHits - euHitsBefore).toBe(2);
+
+            // Round-2 Regression: Explicit backupTarget='r2' stays on R2 even when R2 is past the overflow threshold
+            const oldR2Iso = new Date(Date.now() - 410 * 86_400_000).toISOString();
+            await env.DB_GAMELOG.prepare(
+                'INSERT OR IGNORE INTO gamelog_location (created_at, location, world_id, world_name, time, group_name) VALUES (?, ?, ?, ?, ?, ?)'
+            )
+                .bind(oldR2Iso, 'wrld_explicit_r2:1', 'wrld_explicit_r2', 'Explicit R2 Target', 120, '')
+                .run();
+            const explicitR2CleanRes = await exports.default.fetch('http://example.com/api/admin/cleanup', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+                body: JSON.stringify({ months: 6, mode: 'backup_and_delete', backupTarget: 'r2', includeLegacy: false })
+            });
+            expect(explicitR2CleanRes.status).toBe(200);
+            const explicitR2Json = (await explicitR2CleanRes.json()) as {
+                data: { backupProvider: string; backupKey: string; overflowed: boolean };
+            };
+            expect(explicitR2Json.data.backupProvider).toBe('r2');
+            expect(explicitR2Json.data.overflowed).toBe(false);
+            expect(explicitR2Json.data.backupKey.startsWith('backups/db-cleanup/')).toBe(true);
+            createdR2BackupKeys.push(explicitR2Json.data.backupKey);
+
             // Regression #7: Upstream network errors in B2 proxy return structured 502 instead of 500
             fetchSpy.mockImplementationOnce(async () => {
                 throw new Error('simulated upstream socket drop');
@@ -7414,7 +7484,75 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
                 ),
                 env.DB_CORE.prepare("DELETE FROM cloud_screenshots WHERE id = 'shot_b2_overflow_01'")
             ]);
-            await env.DB_GAMELOG.prepare("DELETE FROM gamelog_location WHERE world_id = 'wrld_b2_cleanup'").run();
+            for (const r2Key of createdR2BackupKeys) {
+                await env.R2_MEDIA?.delete(r2Key).catch(() => {});
+            }
+            await env.DB_GAMELOG.prepare(
+                "DELETE FROM gamelog_location WHERE world_id IN ('wrld_b2_cleanup', 'wrld_explicit_r2')"
+            ).run();
+        }
+    });
+
+    it('paginates R2 cleanup backups past 25 objects so newest backups remain visible, and reports accurate 2FA/static-passcode auth state', async () => {
+        const seededKeys: string[] = [];
+        try {
+            // 1. Seed 28 valid R2 backup objects with ascending timestamps (lexicographically ordered)
+            for (let i = 1; i <= 28; i++) {
+                const sec = String(i).padStart(2, '0');
+                const key = `backups/db-cleanup/vrcx-cleanup-20260101-0000${sec}-before-20250601-aa${sec}.json.gz`;
+                seededKeys.push(key);
+                await env.R2_MEDIA!.put(key, new Uint8Array([0x1f, 0x8b, i]), {
+                    httpMetadata: { contentType: 'application/gzip' }
+                });
+            }
+            const listRes = await exports.default.fetch('http://example.com/api/admin/cleanup/backups');
+            expect(listRes.status).toBe(200);
+            const listJson = (await listRes.json()) as {
+                data: { backups: Array<{ key: string; provider: string }> };
+            };
+            const newestKey = seededKeys[seededKeys.length - 1]!;
+            const secondNewestKey = seededKeys[seededKeys.length - 2]!;
+            expect(listJson.data.backups.some((b) => b.key === newestKey && b.provider === 'r2')).toBe(true);
+            expect(listJson.data.backups.some((b) => b.key === secondNewestKey && b.provider === 'r2')).toBe(true);
+
+            // 2. When 2FA is disabled but static passphrase is enabled and unverified, POST /api/auth/2fa/verify must report authenticated=false
+            const enableStaticRes = await exports.default.fetch('http://example.com/api/auth/static-passcode/enable', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+                body: JSON.stringify({
+                    passphrase: 'StrongGatePass2026',
+                    confirmPassphrase: 'StrongGatePass2026',
+                    defaultTrustSeconds: 3600
+                })
+            });
+            expect(enableStaticRes.status).toBe(200);
+
+            // Omit the static trust cookie to simulate an unverified browser hitting /api/auth/2fa/verify
+            const verify2faRes = await exports.default.fetch('http://example.com/api/auth/2fa/verify', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+                body: JSON.stringify({ code: '123456' })
+            });
+            expect(verify2faRes.status).toBe(200);
+            const verify2faJson = (await verify2faRes.json()) as {
+                data: {
+                    authenticated: boolean;
+                    totpGateEnabled: boolean;
+                    staticPasscodeGateEnabled: boolean;
+                    staticPasscodeVerified: boolean;
+                };
+            };
+            expect(verify2faJson.data.authenticated).toBe(false);
+            expect(verify2faJson.data.totpGateEnabled).toBe(false);
+            expect(verify2faJson.data.staticPasscodeGateEnabled).toBe(true);
+            expect(verify2faJson.data.staticPasscodeVerified).toBe(false);
+        } finally {
+            for (const key of seededKeys) {
+                await env.R2_MEDIA?.delete(key).catch(() => {});
+            }
+            await env.DB_CORE.prepare(
+                "DELETE FROM cloud_bg_sync_state WHERE state_key = 'cloud_static_passcode_config'"
+            ).run();
         }
     });
 });

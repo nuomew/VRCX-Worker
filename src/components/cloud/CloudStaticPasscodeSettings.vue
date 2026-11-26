@@ -333,7 +333,7 @@
 </template>
 
 <script setup>
-    import { computed, onMounted, ref } from 'vue';
+    import { computed, onMounted, ref, watch } from 'vue';
     import { useI18n } from 'vue-i18n';
     import { toast } from 'vue-sonner';
     import { Button } from '@/components/ui/button';
@@ -610,6 +610,12 @@
             revokingAll.value = false;
         }
     }
+
+    watch(blockedByTotp, (blocked) => {
+        if (blocked && showEnableForm.value) {
+            cancelEnableForm();
+        }
+    });
 
     onMounted(() => {
         syncTrustPicker(cloudState.staticPasscodeDefaultTrustSeconds);

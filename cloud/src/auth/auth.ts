@@ -1348,9 +1348,11 @@ export async function handleAuthRoutes(request: Request, env: Env, url: URL): Pr
             sessionOnly = built.sessionOnly;
         }
 
-        const staticPasscodeCfg = await loadCloudStaticPasscodeConfig(env);
-        const stillNeedsCloud2fa = Boolean(cloudTotpCfg?.enabled && !useCloudTotpInLogin);
-        const stillNeedsStaticPasscode = Boolean(staticPasscodeCfg?.enabled);
+        const existingTrust = await authenticateWeb(request, env);
+        const stillNeedsCloud2fa = Boolean(cloudTotpCfg?.enabled && !useCloudTotpInLogin && !existingTrust.totpVerified);
+        const stillNeedsStaticPasscode = Boolean(
+            existingTrust.staticPasscodeGateEnabled && !existingTrust.staticPasscodeVerified
+        );
         return Response.json(
             {
                 ok: true,
@@ -1358,7 +1360,7 @@ export async function handleAuthRoutes(request: Request, env: Env, url: URL): Pr
                     authenticated: !stillNeedsCloud2fa && !stillNeedsStaticPasscode,
                     authMode: 'passcode_session',
                     totpGateEnabled: Boolean(cloudTotpCfg?.enabled),
-                    staticPasscodeGateEnabled: stillNeedsStaticPasscode,
+                    staticPasscodeGateEnabled: existingTrust.staticPasscodeGateEnabled,
                     trustSeconds,
                     sessionOnly,
                     trustExpiresAt
@@ -1385,9 +1387,15 @@ export async function handleAuthRoutes(request: Request, env: Env, url: URL): Pr
 
         const totpCfg = await loadCloudTotpConfig(env);
         if (!totpCfg?.enabled) {
+            const currentAuth = await authenticateWeb(request, env);
             return Response.json({
                 ok: true,
-                data: { authenticated: true, totpGateEnabled: false }
+                data: {
+                    authenticated: currentAuth.authenticated,
+                    totpGateEnabled: false,
+                    staticPasscodeGateEnabled: currentAuth.staticPasscodeGateEnabled,
+                    staticPasscodeVerified: currentAuth.staticPasscodeVerified
+                }
             });
         }
 

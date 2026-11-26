@@ -563,19 +563,15 @@ export async function deleteB2Object(creds: ResolvedB2Credentials, logicalKey: s
 
 const RANGE_RETRY_ATTEMPTS = 3;
 
-// Headers stripped before forwarding to B2 (matching official cloudflare-b2 proxy + cookie isolation)
-const PROXY_STRIPPED_HEADERS = new Set([
-    'x-forwarded-proto',
-    'x-real-ip',
-    'accept-encoding',
-    'authorization',
-    'cookie',
-    'host',
-    'connection',
-    'upgrade',
-    'proxy-authorization',
-    'origin',
-    'referer'
+// Strict allowlist of read-only conditional/range headers forwarded to B2.
+// Never forward or sign edge/proxy/browser headers (e.g. x-forwarded-for, cdn-loop, sec-*)
+// because Cloudflare's outbound edge rewrites transport headers and causes AWS SigV4 403 SignatureDoesNotMatch.
+const PROXY_ALLOWED_FORWARD_HEADERS = new Set([
+    'range',
+    'if-match',
+    'if-none-match',
+    'if-modified-since',
+    'if-unmodified-since'
 ]);
 
 // Headers excluded from AWS SigV4 SignedHeaders calculation (matching aws4fetch UNSIGNABLE_HEADERS)
@@ -723,7 +719,7 @@ export async function proxyB2DirectFetch(
     if (incomingRequest) {
         for (const [rawName, val] of incomingRequest.headers.entries()) {
             const name = rawName.toLowerCase();
-            if (name.startsWith('cf-') || PROXY_STRIPPED_HEADERS.has(name)) continue;
+            if (!PROXY_ALLOWED_FORWARD_HEADERS.has(name)) continue;
             forwardHeaders.set(name, val);
         }
     }
@@ -1143,10 +1139,10 @@ export async function storeObjectWithOverflow(
         };
     }
 
-    // Check R2 availability and overflow threshold when external B2 storage is enabled
+    // Check R2 availability and overflow threshold when external B2 storage is enabled (only for target='auto')
     if (env.R2_MEDIA) {
         let shouldOverflowToB2 = false;
-        if (b2Creds) {
+        if (target === 'auto' && b2Creds) {
             const r2Usage = await measureR2Usage(env, { forceRefresh: false });
             if (r2Usage.usedBytes + bytes.byteLength >= extCfg.r2OverflowThresholdBytes) {
                 shouldOverflowToB2 = true;

@@ -372,11 +372,22 @@
             let href = '';
             let objectUrl = '';
             let inferredExt = 'png';
+            let cloudMimeExt = '';
             if (url.startsWith('/api/media/')) {
                 const blob = await fetchCloudMediaBlob(url);
-                if (blob.type === 'image/webp') inferredExt = 'webp';
-                else if (blob.type === 'image/jpeg') inferredExt = 'jpg';
-                else if (blob.type === 'image/gif') inferredExt = 'gif';
+                if (blob.type === 'image/webp') {
+                    inferredExt = 'webp';
+                    cloudMimeExt = 'webp';
+                } else if (blob.type === 'image/jpeg') {
+                    inferredExt = 'jpg';
+                    cloudMimeExt = 'jpg';
+                } else if (blob.type === 'image/gif') {
+                    inferredExt = 'gif';
+                    cloudMimeExt = 'gif';
+                } else if (blob.type === 'image/png') {
+                    inferredExt = 'png';
+                    cloudMimeExt = 'png';
+                }
                 objectUrl = URL.createObjectURL(blob);
                 href = objectUrl;
             } else {
@@ -398,6 +409,22 @@
 
             const fileId = extractFileId(url);
             let name = fileName;
+            // Keep downloaded filename extension aligned with actual stored cloud media MIME
+            // (e.g. compressed WebP uploads originally captured as `.png`).
+            if (name && cloudMimeExt) {
+                const extMatch = name.match(/\.([a-z0-9]+)$/i);
+                if (extMatch) {
+                    const currentExt = extMatch[1].toLowerCase() === 'jpeg' ? 'jpg' : extMatch[1].toLowerCase();
+                    if (
+                        ['png', 'jpg', 'webp', 'gif'].includes(currentExt) &&
+                        currentExt !== cloudMimeExt
+                    ) {
+                        name = `${name.slice(0, -extMatch[0].length)}.${cloudMimeExt}`;
+                    }
+                } else {
+                    name = `${name}.${cloudMimeExt}`;
+                }
+            }
             if (!name && fileId) name = `${fileId}.${inferredExt}`;
             if (!name) name = `${url.split('/').pop()}.${inferredExt}`;
             if (!name) name = `image.${inferredExt}`;

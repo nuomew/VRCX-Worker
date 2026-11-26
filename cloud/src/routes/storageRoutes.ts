@@ -274,8 +274,12 @@ export async function handleStorageRoutes(request: Request, env: Env, url: URL):
             );
         }
 
-        const rawRegion = typeof raw.region === 'string' && raw.region.trim() ? raw.region.trim() : existing.region;
-        const region = rawRegion || ep.inferredRegion;
+        const explicitRegion = typeof raw.region === 'string' ? raw.region.trim() : '';
+        const endpointChanged = Boolean(existing.endpoint) && ep.endpoint !== existing.endpoint;
+        const rawRegion = explicitRegion || (endpointChanged ? '' : existing.region);
+        // Auto-infer the new endpoint's region when switching regional endpoints without specifying a new region.
+        const region =
+            !rawRegion || (endpointChanged && rawRegion === existing.region) ? ep.inferredRegion : rawRegion;
         if (!isValidRegion(region)) {
             return Response.json(
                 { ok: false, error: { code: 'INVALID_REGION', message: 'Invalid region' } },
