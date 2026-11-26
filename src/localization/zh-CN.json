@@ -3701,7 +3701,7 @@
             "devices": "Win 伴侣 (HTTP 同步)",
             "synced_devices": "同步设备",
             "commands": "远程控制",
-            "quota": "免费配额与连通检测"
+            "quota": "连通检测"
         },
         "devices": {
             "heading": "Windows 伴侣定时 HTTP 同步 (VRCX.Agent)",
@@ -3788,7 +3788,7 @@
             "cleanup_direct_btn": "直接清理",
             "cleanup_backup_r2_btn": "清理并备份到 R2",
             "cleanup_backup_b2_btn": "清理并备份到 B2",
-            "cleanup_r2_unbound": "需先绑定 R2_MEDIA 或在设置 → 存储开启 Backblaze B2",
+            "cleanup_r2_unbound": "需先绑定 R2_MEDIA 或在下方开启 Backblaze B2",
             "cleanup_confirm_direct_desc": "确认直接删除 {months} 个月前的 {rows} 条历史日志 / 动态 / 通知记录？（备注、收藏、设置与登录信息不会被删除）",
             "cleanup_confirm_backup_desc": "确认先将 {months} 个月前的 {rows} 条历史数据压缩备份至 R2_MEDIA，备份成功后再从 D1 清理？",
             "cleanup_confirm_backup_b2_desc": "确认先将 {months} 个月前的 {rows} 条历史数据压缩备份至 Backblaze B2，备份成功后再从 D1 清理？",
@@ -3804,7 +3804,8 @@
         },
         "storage": {
             "tab_label": "存储",
-            "section_title": "云端存储（R2 与 Backblaze B2）",
+            "db_section_title": "云端数据库（D1 空间与清理）",
+            "section_title": "对象存储（R2 与 Backblaze B2）",
             "r2_title": "Cloudflare R2 存储",
             "status_bound": "已绑定",
             "status_unbound": "未绑定",
@@ -3850,7 +3851,7 @@
             "sync_interval_saved_toast": "云端同步间隔已设为 {seconds} 秒（网页端与云端后台同步生效）",
             "sync_interval_failed_toast": "保存同步间隔失败：{error}",
             "hub_label": "VRCX 云端中心",
-            "hub_desc": "Windows 伴侣 HTTP 同步、远程控制与免费配额监控",
+            "hub_desc": "Windows 伴侣 HTTP 同步、远程控制与连通检测",
             "open_hub": "打开云端中心",
             "derivative_notice_prefix": "VRCX-Worker — 基于上游 ",
             "derivative_notice_suffix": " 由 nuomew（诺喵）二次开发的 Cloudflare Workers 云端托管版本（MIT 协议）。"

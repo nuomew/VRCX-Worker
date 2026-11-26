@@ -3703,7 +3703,7 @@
             "devices": "Win Agent (HTTP Sync)",
             "synced_devices": "Synced Devices",
             "commands": "Remote Control",
-            "quota": "Free-Tier Quota & WAF"
+            "quota": "Connectivity"
         },
         "devices": {
             "heading": "Windows Companion HTTP Sync (VRCX.Agent)",
@@ -3790,7 +3790,7 @@
             "cleanup_direct_btn": "Clean Directly",
             "cleanup_backup_r2_btn": "Backup to R2 & Clean",
             "cleanup_backup_b2_btn": "Backup to B2 & Clean",
-            "cleanup_r2_unbound": "Bind R2_MEDIA or enable Backblaze B2 in Settings -> Storage",
+            "cleanup_r2_unbound": "Bind R2_MEDIA or enable Backblaze B2 below",
             "cleanup_confirm_direct_desc": "Permanently delete {rows} historical log/feed/notification rows older than {months} month(s)? (Memos, favorites, settings, and credentials are never deleted.)",
             "cleanup_confirm_backup_desc": "Back up {rows} historical rows older than {months} month(s) as gzip JSON into R2_MEDIA first, then delete them from D1?",
             "cleanup_confirm_backup_b2_desc": "Back up {rows} historical rows older than {months} month(s) as gzip JSON into Backblaze B2 first, then delete them from D1?",
@@ -3806,7 +3806,8 @@
         },
         "storage": {
             "tab_label": "Storage",
-            "section_title": "Cloud Storage (R2 & Backblaze B2)",
+            "db_section_title": "Cloud Databases (D1 Usage & Cleanup)",
+            "section_title": "Object Storage (R2 & Backblaze B2)",
             "r2_title": "Cloudflare R2",
             "status_bound": "Bound",
             "status_unbound": "Not Bound",
@@ -3852,7 +3853,7 @@
             "sync_interval_saved_toast": "Cloud sync interval set to {seconds}s (applies to Web & background feed sync)",
             "sync_interval_failed_toast": "Failed to save sync interval: {error}",
             "hub_label": "VRCX Cloud Hub",
-            "hub_desc": "Win Agent HTTP sync, remote controls & free-tier quota",
+            "hub_desc": "Win Agent HTTP sync, remote controls & connectivity diagnostics",
             "open_hub": "Open Cloud Hub",
             "derivative_notice_prefix": "VRCX-Worker — Cloudflare Workers cloud edition derived from upstream ",
             "derivative_notice_suffix": " by nuomew (MIT)."

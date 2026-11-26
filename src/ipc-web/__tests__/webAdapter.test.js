@@ -2836,7 +2836,7 @@ describe('WEB cloud adapter (stateless)', () => {
         expect(Object.keys(zhTwJson.default.cloud_hub.quota).sort()).toEqual(enQuotaKeys);
 
         const enStorageKeys = Object.keys(enJson.default.cloud_hub.storage).sort();
-        expect(enStorageKeys.length).toBeGreaterThanOrEqual(33);
+        expect(enStorageKeys.length).toBeGreaterThanOrEqual(34);
         expect(Object.keys(zhCnJson.default.cloud_hub.storage).sort()).toEqual(enStorageKeys);
         expect(Object.keys(zhTwJson.default.cloud_hub.storage).sort()).toEqual(enStorageKeys);
     });
