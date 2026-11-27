@@ -856,10 +856,13 @@
     const {
         translationApi,
         translationApiKey,
+        translationGoogleApiKey,
         translationApiType,
         translationApiEndpoint,
         translationApiModel,
         translationApiPrompt,
+        translationCloudflareModel,
+        translationCloudflarePrompt,
         workersAiQuota: storeWorkersAiQuota
     } = storeToRefs(advancedSettingsStore);
 
@@ -973,12 +976,19 @@
         if (type === 'openai') {
             return Boolean(translationApiEndpoint.value && translationApiModel.value);
         }
-        return Boolean(translationApiKey.value);
+        return Boolean(translationGoogleApiKey?.value || translationApiKey.value);
     });
 
     const shouldTranslateOnSend = computed(
         () => prefs.translateEnabled && prefs.displayMode !== 'source_only' && isTranslationConfigured.value
     );
+
+    const activeCloudflareModel = computed(() => {
+        const dedicated = String(translationCloudflareModel?.value || '').trim();
+        if (dedicated) return dedicated;
+        const legacy = String(translationApiModel.value || '').trim();
+        return legacy.startsWith('@') ? legacy : DEFAULT_CLOUDFLARE_AI_MODEL;
+    });
 
     const translationEngineLabel = computed(() => {
         if (!translationApi.value) {
@@ -986,7 +996,7 @@
         }
         const type = translationApiType.value || 'google';
         if (type === 'cloudflare') {
-            const fullModel = (translationApiModel.value || DEFAULT_CLOUDFLARE_AI_MODEL).trim();
+            const fullModel = activeCloudflareModel.value;
             const shortName = fullModel.split('/').pop() || fullModel;
             return `Workers AI · ${shortName}`;
         }
@@ -1073,7 +1083,7 @@
     });
 
     const workersAiEstimatedRemainingMsgs = computed(() => {
-        const activeModel = (translationApiModel.value || DEFAULT_CLOUDFLARE_AI_MODEL).trim().toLowerCase();
+        const activeModel = activeCloudflareModel.value.toLowerCase();
         const preset = CLOUDFLARE_AI_TRANSLATION_PRESETS.find((p) => p.id.toLowerCase() === activeModel);
         const perMsg = preset?.neuronsPerMsg || 1.66;
         if (perMsg <= 0) return null;
@@ -1499,8 +1509,12 @@
                 ? {
                       type: 'cloudflare',
                       sourceLang: prefs.sourceLang,
-                      model: (translationApiModel.value || DEFAULT_CLOUDFLARE_AI_MODEL).trim(),
-                      prompt: buildChatTranslationPrompt(prefs.sourceLang, targetLang, translationApiPrompt.value)
+                      model: activeCloudflareModel.value,
+                      prompt: buildChatTranslationPrompt(
+                          prefs.sourceLang,
+                          targetLang,
+                          translationCloudflarePrompt?.value || ''
+                      )
                   }
                 : type === 'openai'
                   ? {

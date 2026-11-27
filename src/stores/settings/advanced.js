@@ -49,11 +49,14 @@ export const useAdvancedSettingsStore = defineStore('AdvancedSettings', () => {
     const youTubeApiKey = ref('');
     const translationApi = ref(false);
     const translationApiKey = ref('');
+    const translationGoogleApiKey = ref('');
     const translationApiType = ref('google'); // 'cloudflare' | 'google' | 'openai'
     const workersAiQuota = ref(null);
     const translationApiEndpoint = ref('https://api.openai.com/v1/chat/completions');
     const translationApiModel = ref('gpt-4o-mini');
     const translationApiPrompt = ref('');
+    const translationCloudflareModel = ref('@cf/zai-org/glm-4.7-flash');
+    const translationCloudflarePrompt = ref('');
     const progressPie = ref(false);
     const progressPieFilter = ref(true);
     const showConfirmationOnSwitchAvatar = ref(false);
@@ -116,10 +119,13 @@ export const useAdvancedSettingsStore = defineStore('AdvancedSettings', () => {
             youTubeApiKeyConfig,
             translationApiConfig,
             translationApiKeyConfig,
+            translationGoogleApiKeyConfig,
             translationApiTypeConfig,
             translationApiEndpointConfig,
             translationApiModelConfig,
             translationApiPromptConfig,
+            translationCloudflareModelConfig,
+            translationCloudflarePromptConfig,
             progressPieConfig,
             progressPieFilterConfig,
             showConfirmationOnSwitchAvatarConfig,
@@ -153,10 +159,13 @@ export const useAdvancedSettingsStore = defineStore('AdvancedSettings', () => {
             configRepository.getString('VRCX_youtubeAPIKey', ''),
             configRepository.getBool('VRCX_translationAPI', false),
             configRepository.getString('VRCX_translationAPIKey', ''),
+            configRepository.getString('VRCX_translationGoogleApiKey', ''),
             configRepository.getString('VRCX_translationAPIType', 'google'),
             configRepository.getString('VRCX_translationAPIEndpoint', ''),
             configRepository.getString('VRCX_translationAPIModel', ''),
             configRepository.getString('VRCX_translationAPIPrompt', ''),
+            configRepository.getString('VRCX_translationCloudflareModel', ''),
+            configRepository.getString('VRCX_translationCloudflarePrompt', ''),
             configRepository.getBool('VRCX_progressPie', false),
             configRepository.getBool('VRCX_progressPieFilter', true),
             configRepository.getBool('VRCX_showConfirmationOnSwitchAvatar', false),
@@ -196,10 +205,18 @@ export const useAdvancedSettingsStore = defineStore('AdvancedSettings', () => {
         youTubeApiKey.value = youTubeApiKeyConfig;
         translationApi.value = translationApiConfig;
         translationApiKey.value = translationApiKeyConfig;
+        translationGoogleApiKey.value =
+            translationGoogleApiKeyConfig || (translationApiTypeConfig === 'google' ? translationApiKeyConfig : '');
         translationApiType.value = translationApiTypeConfig;
         translationApiEndpoint.value = translationApiEndpointConfig;
         translationApiModel.value = translationApiModelConfig;
         translationApiPrompt.value = translationApiPromptConfig;
+        translationCloudflareModel.value =
+            translationCloudflareModelConfig ||
+            (translationApiModelConfig && translationApiModelConfig.trim().startsWith('@')
+                ? translationApiModelConfig.trim()
+                : '@cf/zai-org/glm-4.7-flash');
+        translationCloudflarePrompt.value = translationCloudflarePromptConfig || '';
         progressPie.value = progressPieConfig;
         progressPieFilter.value = progressPieFilterConfig;
         showConfirmationOnSwitchAvatar.value = showConfirmationOnSwitchAvatarConfig;
@@ -319,6 +336,10 @@ export const useAdvancedSettingsStore = defineStore('AdvancedSettings', () => {
         translationApiKey.value = value;
         await configRepository.setString('VRCX_translationAPIKey', translationApiKey.value);
     }
+    async function setTranslationGoogleApiKey(value) {
+        translationGoogleApiKey.value = value;
+        await configRepository.setString('VRCX_translationGoogleApiKey', translationGoogleApiKey.value);
+    }
     async function setTranslationApiType(value) {
         translationApiType.value = value || 'google';
         await configRepository.setString('VRCX_translationAPIType', translationApiType.value);
@@ -334,6 +355,14 @@ export const useAdvancedSettingsStore = defineStore('AdvancedSettings', () => {
     async function setTranslationApiPrompt(value) {
         translationApiPrompt.value = value;
         await configRepository.setString('VRCX_translationAPIPrompt', translationApiPrompt.value);
+    }
+    async function setTranslationCloudflareModel(value) {
+        translationCloudflareModel.value = (value || '').trim() || '@cf/zai-org/glm-4.7-flash';
+        await configRepository.setString('VRCX_translationCloudflareModel', translationCloudflareModel.value);
+    }
+    async function setTranslationCloudflarePrompt(value) {
+        translationCloudflarePrompt.value = value || '';
+        await configRepository.setString('VRCX_translationCloudflarePrompt', translationCloudflarePrompt.value);
     }
 
     function setWorkersAiQuota(quota) {
@@ -706,12 +735,12 @@ export const useAdvancedSettingsStore = defineStore('AdvancedSettings', () => {
         if (provider === 'cloudflare') {
             const model =
                 (typeof overrides?.model === 'string' ? overrides.model.trim() : '') ||
-                (typeof translationApiModel.value === 'string' ? translationApiModel.value.trim() : '') ||
+                (typeof translationCloudflareModel.value === 'string' ? translationCloudflareModel.value.trim() : '') ||
                 '@cf/zai-org/glm-4.7-flash';
             const prompt =
                 typeof overrides?.prompt === 'string'
                     ? overrides.prompt.trim()
-                    : (translationApiPrompt.value || '').trim();
+                    : (translationCloudflarePrompt.value || '').trim();
             const sourceLang = typeof overrides?.sourceLang === 'string' ? overrides.sourceLang.trim() : 'auto';
 
             try {
@@ -738,7 +767,7 @@ export const useAdvancedSettingsStore = defineStore('AdvancedSettings', () => {
         }
 
         if (provider === 'google') {
-            const keyToUse = overrides?.key ?? translationApiKey.value;
+            const keyToUse = overrides?.key ?? (translationGoogleApiKey.value || translationApiKey.value);
             if (!keyToUse) {
                 toast.warning('No Translation API key configured');
                 return null;
@@ -991,10 +1020,13 @@ export const useAdvancedSettingsStore = defineStore('AdvancedSettings', () => {
         translationApi,
         youTubeApiKey,
         translationApiKey,
+        translationGoogleApiKey,
         translationApiType,
         translationApiEndpoint,
         translationApiModel,
         translationApiPrompt,
+        translationCloudflareModel,
+        translationCloudflarePrompt,
         workersAiQuota,
         setWorkersAiQuota,
         progressPie,
@@ -1035,10 +1067,13 @@ export const useAdvancedSettingsStore = defineStore('AdvancedSettings', () => {
         setTranslationApi,
         setYouTubeApiKey,
         setTranslationApiKey,
+        setTranslationGoogleApiKey,
         setTranslationApiType,
         setTranslationApiEndpoint,
         setTranslationApiModel,
         setTranslationApiPrompt,
+        setTranslationCloudflareModel,
+        setTranslationCloudflarePrompt,
         setProgressPie,
         setProgressPieFilter,
         setShowConfirmationOnSwitchAvatar,

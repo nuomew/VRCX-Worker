@@ -87,7 +87,7 @@
                         <FieldLabel>{{ t('dialog.translation_api.cloudflare.model') }}</FieldLabel>
                         <FieldContent>
                             <InputGroupField
-                                v-model="form.translationApiModel"
+                                v-model="form.cloudflareModel"
                                 :placeholder="DEFAULT_CLOUDFLARE_AI_MODEL"
                                 clearable />
                         </FieldContent>
@@ -112,7 +112,7 @@
                     <Field>
                         <FieldLabel>{{ t('dialog.translation_api.openai.prompt_optional') }}</FieldLabel>
                         <FieldContent>
-                            <InputGroupTextareaField v-model="form.translationApiPrompt" :rows="3" clearable />
+                            <InputGroupTextareaField v-model="form.cloudflarePrompt" :rows="3" clearable />
                         </FieldContent>
                     </Field>
                 </FieldGroup>
@@ -124,7 +124,7 @@
                         <FieldLabel>{{ t('dialog.translation_api.description') }}</FieldLabel>
                         <FieldContent>
                             <InputGroupField
-                                v-model="form.translationApiKey"
+                                v-model="form.googleApiKey"
                                 type="password"
                                 show-password
                                 placeholder="AIzaSy..."
@@ -261,10 +261,13 @@
         bioLanguage,
         translationApi,
         translationApiKey,
+        translationGoogleApiKey,
         translationApiType,
         translationApiEndpoint,
         translationApiModel,
-        translationApiPrompt
+        translationApiPrompt,
+        translationCloudflareModel,
+        translationCloudflarePrompt
     } = storeToRefs(advancedSettingsStore);
 
     const {
@@ -272,10 +275,13 @@
         translateText,
         fetchAvailableModels,
         setTranslationApiKey,
+        setTranslationGoogleApiKey,
         setTranslationApiType,
         setTranslationApiEndpoint,
         setTranslationApiModel,
-        setTranslationApiPrompt
+        setTranslationApiPrompt,
+        setTranslationCloudflareModel,
+        setTranslationCloudflarePrompt
     } = advancedSettingsStore;
 
     const { t, locale } = useI18n();
@@ -294,11 +300,8 @@
     const emit = defineEmits(['update:isTranslationApiDialogVisible']);
 
     function handleTranslationApiTypeChange(value) {
-        const nextType = String(value);
-        form.translationApiType = nextType;
-        if (nextType === 'cloudflare' && (!form.translationApiModel || !form.translationApiModel.trim().startsWith('@'))) {
-            form.translationApiModel = DEFAULT_CLOUDFLARE_AI_MODEL;
-        }
+        // Switching provider only toggles the active tab; each provider's form fields stay completely isolated.
+        form.translationApiType = String(value);
     }
 
     const form = reactive({
@@ -306,11 +309,14 @@
         translationApiEndpoint: 'https://api.openai.com/v1/chat/completions',
         translationApiModel: '',
         translationApiPrompt: '',
-        translationApiKey: ''
+        translationApiKey: '',
+        googleApiKey: '',
+        cloudflareModel: DEFAULT_CLOUDFLARE_AI_MODEL,
+        cloudflarePrompt: ''
     });
 
     const activeCloudflarePreset = computed(() => {
-        const trimmed = String(form.translationApiModel || '').trim();
+        const trimmed = String(form.cloudflareModel || '').trim();
         return CLOUDFLARE_AI_TRANSLATION_PRESETS.find((item) => item.id === trimmed) || null;
     });
 
@@ -319,17 +325,24 @@
     function handleCloudflarePresetChange(value) {
         const val = String(value || '');
         if (val && val !== '__custom__') {
-            form.translationApiModel = val;
+            form.cloudflareModel = val;
         }
     }
 
     const loadFormFromStore = () => {
-        form.translationApiType = translationApiType.value || 'google';
+        const activeType = translationApiType.value || 'google';
+        form.translationApiType = activeType;
         form.translationApiEndpoint = translationApiEndpoint.value || 'https://api.openai.com/v1/chat/completions';
-        form.translationApiModel =
-            translationApiModel.value || (form.translationApiType === 'cloudflare' ? DEFAULT_CLOUDFLARE_AI_MODEL : '');
+        form.translationApiModel = translationApiModel.value || '';
         form.translationApiPrompt = translationApiPrompt.value || '';
         form.translationApiKey = translationApiKey.value || '';
+        form.googleApiKey =
+            translationGoogleApiKey?.value || (activeType === 'google' ? translationApiKey.value || '' : '');
+        const storedCfModel = String(translationCloudflareModel?.value || '').trim();
+        const legacyCfModel = String(translationApiModel.value || '').trim();
+        form.cloudflareModel =
+            storedCfModel || (legacyCfModel.startsWith('@') ? legacyCfModel : DEFAULT_CLOUDFLARE_AI_MODEL);
+        form.cloudflarePrompt = String(translationCloudflarePrompt?.value || '');
         availableModels.value = [];
     };
 
@@ -349,23 +362,33 @@
                 toast.warning(t('dialog.translation_api.msg_fill_endpoint_model'));
                 return;
             }
-        }
-        if (form.translationApiType === 'cloudflare') {
-            const trimmedModel = String(form.translationApiModel || '').trim();
-            if (!trimmedModel) {
-                form.translationApiModel = DEFAULT_CLOUDFLARE_AI_MODEL;
-            } else {
-                form.translationApiModel = trimmedModel;
+            await Promise.all([
+                setTranslationApiType('openai'),
+                setTranslationApiEndpoint(form.translationApiEndpoint),
+                setTranslationApiModel(form.translationApiModel),
+                setTranslationApiPrompt(form.translationApiPrompt),
+                setTranslationApiKey(form.translationApiKey)
+            ]);
+        } else if (form.translationApiType === 'cloudflare') {
+            const trimmedModel = String(form.cloudflareModel || '').trim() || DEFAULT_CLOUDFLARE_AI_MODEL;
+            form.cloudflareModel = trimmedModel;
+            const saves = [setTranslationApiType('cloudflare')];
+            if (typeof setTranslationCloudflareModel === 'function') {
+                saves.push(setTranslationCloudflareModel(trimmedModel));
             }
+            if (typeof setTranslationCloudflarePrompt === 'function') {
+                saves.push(setTranslationCloudflarePrompt(form.cloudflarePrompt));
+            }
+            await Promise.all(saves);
+        } else {
+            const saves = [setTranslationApiType('google')];
+            if (typeof setTranslationGoogleApiKey === 'function') {
+                saves.push(setTranslationGoogleApiKey(form.googleApiKey));
+            } else if (typeof setTranslationApiKey === 'function') {
+                saves.push(setTranslationApiKey(form.googleApiKey));
+            }
+            await Promise.all(saves);
         }
-
-        await Promise.all([
-            setTranslationApiType(form.translationApiType),
-            setTranslationApiEndpoint(form.translationApiEndpoint),
-            setTranslationApiModel(form.translationApiModel),
-            setTranslationApiPrompt(form.translationApiPrompt),
-            setTranslationApiKey(form.translationApiKey)
-        ]);
 
         // Auto-enable the global translation switch when saving built-in Workers AI so chat/bio translation works immediately
         if (
@@ -410,14 +433,14 @@
 
     async function testTranslationConfig() {
         if (form.translationApiType === 'cloudflare') {
-            const model = String(form.translationApiModel || '').trim() || DEFAULT_CLOUDFLARE_AI_MODEL;
+            const model = String(form.cloudflareModel || '').trim() || DEFAULT_CLOUDFLARE_AI_MODEL;
             try {
                 const testText = 'Hello world';
                 const target = isZhLocale.value ? 'zh-CN' : 'fr';
                 const data = await translateText(testText, target, {
                     type: 'cloudflare',
                     model,
-                    prompt: form.translationApiPrompt,
+                    prompt: form.cloudflarePrompt,
                     allowWhenDisabled: true
                 });
                 if (data) {

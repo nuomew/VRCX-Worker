@@ -18,7 +18,9 @@ const mocks = vi.hoisted(() => ({
     setTranslationApiType: vi.fn().mockResolvedValue(undefined),
     setTranslationApiEndpoint: vi.fn().mockResolvedValue(undefined),
     setTranslationApiModel: vi.fn().mockResolvedValue(undefined),
-    setTranslationApiPrompt: vi.fn().mockResolvedValue(undefined)
+    setTranslationApiPrompt: vi.fn().mockResolvedValue(undefined),
+    setTranslationCloudflareModel: vi.fn().mockResolvedValue(undefined),
+    setTranslationCloudflarePrompt: vi.fn().mockResolvedValue(undefined)
 }));
 
 const bioLanguage = ref('en');
@@ -27,6 +29,8 @@ const translationApiType = ref('google');
 const translationApiEndpoint = ref('');
 const translationApiModel = ref('');
 const translationApiPrompt = ref('');
+const translationCloudflareModel = ref('@cf/zai-org/glm-4.7-flash');
+const translationCloudflarePrompt = ref('');
 
 vi.mock('pinia', () => ({
     storeToRefs: () => ({
@@ -35,7 +39,9 @@ vi.mock('pinia', () => ({
         translationApiType,
         translationApiEndpoint,
         translationApiModel,
-        translationApiPrompt
+        translationApiPrompt,
+        translationCloudflareModel,
+        translationCloudflarePrompt
     }),
     defineStore: (id, fn) => fn
 }));
@@ -56,7 +62,9 @@ vi.mock('../../../../stores', () => ({
         setTranslationApiType: mocks.setTranslationApiType,
         setTranslationApiEndpoint: mocks.setTranslationApiEndpoint,
         setTranslationApiModel: mocks.setTranslationApiModel,
-        setTranslationApiPrompt: mocks.setTranslationApiPrompt
+        setTranslationApiPrompt: mocks.setTranslationApiPrompt,
+        setTranslationCloudflareModel: mocks.setTranslationCloudflareModel,
+        setTranslationCloudflarePrompt: mocks.setTranslationCloudflarePrompt
     })
 }));
 
@@ -121,6 +129,7 @@ function mountComponent(propsOverrides = {}) {
                         '<textarea data-testid="textarea" :value="modelValue" @input="$emit(\'update:modelValue\', $event.target.value)"></textarea>'
                 },
                 Select: {
+                    name: 'Select',
                     props: ['modelValue'],
                     emits: ['update:modelValue'],
                     template:
@@ -161,6 +170,8 @@ describe('TranslationApiDialog.vue', () => {
         translationApiEndpoint.value = '';
         translationApiModel.value = '';
         translationApiPrompt.value = '';
+        translationCloudflareModel.value = '@cf/zai-org/glm-4.7-flash';
+        translationCloudflarePrompt.value = '';
         vi.clearAllMocks();
     });
 
@@ -453,7 +464,50 @@ describe('TranslationApiDialog.vue', () => {
             await flushPromises();
 
             expect(mocks.setTranslationApiType).toHaveBeenCalledWith('cloudflare');
-            expect(mocks.setTranslationApiModel).toHaveBeenCalledWith('@cf/deepseek-ai/deepseek-v4.1-flash-1017');
+            expect(mocks.setTranslationCloudflareModel).toHaveBeenCalledWith('@cf/deepseek-ai/deepseek-v4.1-flash-1017');
+            expect(mocks.setTranslationApiModel).not.toHaveBeenCalled();
+            expect(mocks.setTranslationApiEndpoint).not.toHaveBeenCalled();
+            expect(mocks.setTranslationApiKey).not.toHaveBeenCalled();
+            expect(mocks.setTranslationApiPrompt).not.toHaveBeenCalled();
+        });
+
+        test('preserves all OpenAI fields intact when switching OpenAI -> Workers AI (save) -> back to OpenAI', async () => {
+            translationApiType.value = 'openai';
+            translationApiEndpoint.value = 'https://my-openai.example/v1/chat/completions';
+            translationApiKey.value = 'sk-preserve-me';
+            translationApiModel.value = 'gpt-4.1-mini';
+            translationApiPrompt.value = 'Keep my OpenAI prompt';
+
+            const wrapper = mountComponent();
+            await nextTick();
+
+            // Switch from OpenAI to Cloudflare Workers AI
+            const providerSelect = wrapper.findAllComponents({ name: 'Select' })[1];
+            providerSelect.vm.$emit('update:modelValue', 'cloudflare');
+            await nextTick();
+
+            // Save Workers AI without overwriting any OpenAI store values
+            const saveBtn = wrapper.findAll('button').find((b) => b.text().includes('dialog.translation_api.save'));
+            await saveBtn.trigger('click');
+            await flushPromises();
+
+            expect(mocks.setTranslationApiType).toHaveBeenCalledWith('cloudflare');
+            expect(mocks.setTranslationCloudflareModel).toHaveBeenCalledWith('@cf/zai-org/glm-4.7-flash');
+            expect(mocks.setTranslationApiEndpoint).not.toHaveBeenCalled();
+            expect(mocks.setTranslationApiKey).not.toHaveBeenCalled();
+            expect(mocks.setTranslationApiModel).not.toHaveBeenCalled();
+            expect(mocks.setTranslationApiPrompt).not.toHaveBeenCalled();
+
+            // Switch back to OpenAI inside the dialog and confirm every OpenAI field is still intact
+            providerSelect.vm.$emit('update:modelValue', 'openai');
+            await nextTick();
+            const inputs = wrapper.findAll('[data-testid="input-field"]');
+            const values = inputs.map((el) => el.element.value);
+            expect(values).toContain('https://my-openai.example/v1/chat/completions');
+            expect(values).toContain('sk-preserve-me');
+            expect(values).toContain('gpt-4.1-mini');
+            const textarea = wrapper.find('[data-testid="textarea"]');
+            expect(textarea.element.value).toBe('Keep my OpenAI prompt');
         });
     });
 
