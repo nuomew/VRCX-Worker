@@ -45,6 +45,7 @@
     },
     "dependencies": {
         "hazardous": "^0.3.0",
+        "mysql2": "^3.24.6",
         "node-api-dotnet": "^0.9.31"
     },
     "devDependencies": {
