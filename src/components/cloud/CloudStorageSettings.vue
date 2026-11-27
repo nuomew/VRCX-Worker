@@ -390,9 +390,7 @@
                                     :disabled="
                                         migratingMysql ||
                                         savingMysqlConfig ||
-                                        !mysqlSavedEnabled ||
-                                        mysqlSavedMode !== 'full_migrate' ||
-                                        mysqlFormDirty ||
+                                        !mysqlConfigReady ||
                                         mysqlD1PendingTotal === 0
                                     "
                                     @click="startMysqlMigration">
@@ -413,8 +411,13 @@
                                     {{ t('cloud_hub.storage.mysql_pause_migrate_btn') }}
                                 </Button>
                                 <span
-                                    v-if="!mysqlSavedEnabled || mysqlSavedMode !== 'full_migrate' || mysqlFormDirty"
+                                    v-if="!mysqlConfigReady"
                                     class="text-[11px] text-amber-600 dark:text-amber-400">
+                                    {{ t('cloud_hub.storage.mysql_config_incomplete_hint') }}
+                                </span>
+                                <span
+                                    v-else-if="!mysqlSavedEnabled || mysqlSavedMode !== 'full_migrate' || mysqlFormDirty"
+                                    class="text-[11px] text-muted-foreground">
                                     {{ t('cloud_hub.storage.mysql_save_before_migrate_hint') }}
                                 </span>
                             </div>
@@ -1329,12 +1332,21 @@
         }
     }
 
+    const mysqlConfigReady = computed(() => {
+        if (mysqlFormConnType.value === 'hyperdrive') {
+            return mysqlHyperdriveBound.value;
+        }
+        return Boolean(
+            mysqlFormHost.value.trim() && mysqlFormDatabase.value.trim() && mysqlFormUsername.value.trim()
+        );
+    });
+
     function pauseMysqlMigration() {
         pauseMysqlRequested.value = true;
     }
 
     async function startMysqlMigration() {
-        if (migratingMysql.value || savingMysqlConfig.value) return;
+        if (migratingMysql.value || savingMysqlConfig.value || !mysqlConfigReady.value) return;
         migratingMysql.value = true;
         pauseMysqlRequested.value = false;
         mysqlError.value = '';
@@ -1345,6 +1357,27 @@
         let batchMovedRows = 0;
         let finished = false;
         try {
+            // Auto-persist MySQL Mode (enabled + full_migrate) to D1 config before starting one-click migration.
+            if (!mysqlSavedEnabled.value || mysqlSavedMode.value !== 'full_migrate' || mysqlFormDirty.value) {
+                const cfgData = await cloudFetch('/api/storage/mysql/config', {
+                    method: 'PUT',
+                    json: {
+                        enabled: true,
+                        mode: 'full_migrate',
+                        connectionType: mysqlFormConnType.value,
+                        host: mysqlFormHost.value.trim(),
+                        port: Number(mysqlFormPort.value) || 3306,
+                        database: mysqlFormDatabase.value.trim(),
+                        username: mysqlFormUsername.value.trim(),
+                        sslMode: mysqlFormSslMode.value,
+                        tablePrefix: mysqlFormTablePrefix.value.trim(),
+                        ...(mysqlFormPassword.value ? { password: mysqlFormPassword.value } : {})
+                    }
+                });
+                mysqlFormPassword.value = '';
+                applyMysqlStatusPayload(cfgData, { forceFormSync: true });
+            }
+
             for (let round = 0; round < 200; round++) {
                 if (pauseMysqlRequested.value) {
                     mysqlNotice.value = t('cloud_hub.storage.mysql_migrate_paused_toast', {
