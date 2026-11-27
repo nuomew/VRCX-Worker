@@ -42,6 +42,182 @@ const VALID_DISPLAY_MODES = new Set([
 ]);
 const CHAT_ID_RE = /^[A-Za-z0-9_-]{4,64}$/;
 const LANG_CODE_RE = /^[A-Za-z0-9_-]{1,24}$/;
+const WORKERS_AI_MODEL_RE = /^@[a-z0-9][a-z0-9._-]{0,31}\/[a-z0-9][a-z0-9._-]{0,63}\/[a-z0-9][a-z0-9._-]{0,95}$/i;
+const MAX_TRANSLATE_INPUT_CHARS = 4000;
+const MAX_TRANSLATE_PROMPT_CHARS = 1200;
+const TRANSLATE_CACHE_MAX_ENTRIES = 200;
+const TRANSLATE_CACHE_TTL_MS = 10 * 60_000;
+
+export const DEFAULT_WORKERS_AI_TRANSLATION_MODEL = '@cf/zai-org/glm-4.7-flash';
+
+export interface WorkersAiTranslationPreset {
+    id: string;
+    label: string;
+    tier: 'free' | 'paid';
+    kind: 'llm' | 'm2m100';
+}
+
+export const WORKERS_AI_TRANSLATION_PRESETS: readonly WorkersAiTranslationPreset[] = Object.freeze([
+    {
+        id: '@cf/zai-org/glm-4.7-flash',
+        label: 'GLM-4.7-Flash (Recommended · Free ~6,000 msg/day)',
+        tier: 'free',
+        kind: 'llm'
+    },
+    {
+        id: '@cf/meta/llama-3.1-8b-instruct-fp8-fast',
+        label: 'Llama 3.1 8B FP8 Fast (Free ~6,000 msg/day)',
+        tier: 'free',
+        kind: 'llm'
+    },
+    {
+        id: '@cf/meta/llama-3.2-3b-instruct',
+        label: 'Llama 3.2 3B Instruct (Free ~7,000 msg/day)',
+        tier: 'free',
+        kind: 'llm'
+    },
+    {
+        id: '@cf/meta/m2m100-1.2b',
+        label: 'Meta M2M100 1.2B (Free · Dedicated MT ~5,000+ msg/day)',
+        tier: 'free',
+        kind: 'm2m100'
+    },
+    {
+        id: '@cf/zai-org/glm-5.3-flash',
+        label: 'GLM-5.3-Flash (Requires Workers Paid / Credits)',
+        tier: 'paid',
+        kind: 'llm'
+    },
+    {
+        id: '@cf/deepseek-ai/deepseek-v4.1-flash-1017',
+        label: 'DeepSeek-V4.1-Flash-1017 (Requires Workers Paid / Credits)',
+        tier: 'paid',
+        kind: 'llm'
+    }
+]);
+
+export type WorkersAiRunner = (model: string, input: Record<string, unknown>) => Promise<unknown>;
+
+let testWorkersAiRunner: WorkersAiRunner | null = null;
+const translationMemoryCache = new Map<string, { text: string; expiresAt: number }>();
+
+/**
+ * Test-only hook for injecting a deterministic Workers AI runner in Vitest / Miniflare.
+ */
+export function setWorkersAiRunnerForTests(runner: WorkersAiRunner | null): void {
+    testWorkersAiRunner = runner;
+    translationMemoryCache.clear();
+}
+
+const LANG_ENGLISH_NAMES: Record<string, string> = {
+    'zh-CN': 'Simplified Chinese',
+    'zh-TW': 'Traditional Chinese',
+    zh: 'Chinese',
+    en: 'English',
+    ja: 'Japanese',
+    ko: 'Korean',
+    ru: 'Russian',
+    es: 'Spanish',
+    fr: 'French',
+    de: 'German',
+    pt: 'Portuguese',
+    th: 'Thai',
+    vi: 'Vietnamese',
+    id: 'Indonesian',
+    pl: 'Polish',
+    hu: 'Hungarian',
+    cs: 'Czech',
+    it: 'Italian',
+    nl: 'Dutch',
+    tr: 'Turkish',
+    ar: 'Arabic'
+};
+
+function toM2m100LangCode(code: string): string {
+    const clean = code.trim().toLowerCase();
+    if (!clean || clean === 'auto') return '';
+    const primary = clean.split(/[-_]/)[0] ?? '';
+    return /^[a-z]{2,3}$/.test(primary) ? primary : '';
+}
+
+function buildCompactTranslationSystemPrompt(sourceLang: string, targetLang: string, customPrompt: string): string {
+    if (customPrompt) return customPrompt;
+    const targetName = LANG_ENGLISH_NAMES[targetLang] ?? targetLang;
+    const fromPart =
+        sourceLang && sourceLang !== 'auto'
+            ? ` from ${LANG_ENGLISH_NAMES[sourceLang] ?? sourceLang}`
+            : '';
+    return `Translate the user's message${fromPart} into natural ${targetName}. Preserve tone and emoji. Output ONLY the translated text without quotes, notes, or explanation.`;
+}
+
+function extractWorkersAiTranslationText(raw: unknown): string {
+    if (typeof raw === 'string') {
+        return raw;
+    }
+    if (!raw || typeof raw !== 'object') {
+        return '';
+    }
+    const obj = raw as Record<string, unknown>;
+    if (typeof obj.translated_text === 'string') {
+        return obj.translated_text;
+    }
+    if (typeof obj.response === 'string') {
+        return obj.response;
+    }
+    if (Array.isArray(obj.choices) && obj.choices.length > 0) {
+        const first = obj.choices[0] as Record<string, unknown> | undefined;
+        const msg = first?.message as Record<string, unknown> | undefined;
+        if (typeof msg?.content === 'string') {
+            return msg.content;
+        }
+        if (typeof first?.text === 'string') {
+            return first.text;
+        }
+    }
+    if (obj.result && typeof obj.result === 'object') {
+        return extractWorkersAiTranslationText(obj.result);
+    }
+    return '';
+}
+
+function cleanTranslatedOutput(raw: string): string {
+    // Strip any reasoning/thinking tags if a reasoning-capable model emitted them
+    let text = raw.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+    // Strip a single balanced pair of wrapping quotes if the LLM quoted the entire translation
+    if (
+        text.length >= 2 &&
+        ((text.startsWith('"') && text.endsWith('"')) || (text.startsWith('「') && text.endsWith('」')))
+    ) {
+        const inner = text.slice(1, -1).trim();
+        if (inner) text = inner;
+    }
+    return text;
+}
+
+function getCachedTranslation(key: string, nowMs: number): string | null {
+    const entry = translationMemoryCache.get(key);
+    if (!entry) return null;
+    if (entry.expiresAt <= nowMs) {
+        translationMemoryCache.delete(key);
+        return null;
+    }
+    // Refresh LRU order
+    translationMemoryCache.delete(key);
+    translationMemoryCache.set(key, entry);
+    return entry.text;
+}
+
+function setCachedTranslation(key: string, text: string, nowMs: number): void {
+    if (translationMemoryCache.has(key)) {
+        translationMemoryCache.delete(key);
+    }
+    translationMemoryCache.set(key, { text, expiresAt: nowMs + TRANSLATE_CACHE_TTL_MS });
+    while (translationMemoryCache.size > TRANSLATE_CACHE_MAX_ENTRIES) {
+        const oldestKey = translationMemoryCache.keys().next().value;
+        if (oldestKey === undefined) break;
+        translationMemoryCache.delete(oldestKey);
+    }
+}
 
 export interface ChatTranslatorCloudConfig {
     oscEnabled: boolean;
@@ -1432,6 +1608,188 @@ export async function handleChatOscWebRoutes(request: Request, env: Env, url: UR
         ]);
         await broadcastChatEvent(env, 'chat.cleared', {});
         return Response.json({ ok: true, data: { cleared: true } });
+    }
+
+    // 6. Built-in Cloudflare Workers AI translation presets & availability
+    if (url.pathname === '/api/chat/translate/models' && request.method === 'GET') {
+        return Response.json(
+            {
+                ok: true,
+                data: {
+                    aiBound: Boolean(testWorkersAiRunner || env.AI),
+                    defaultModel: DEFAULT_WORKERS_AI_TRANSLATION_MODEL,
+                    presets: WORKERS_AI_TRANSLATION_PRESETS
+                }
+            },
+            { headers: { 'Cache-Control': 'no-store' } }
+        );
+    }
+
+    // 7. Built-in Cloudflare Workers AI translation endpoint (zero API key, authenticated Web session only)
+    if (url.pathname === '/api/chat/translate/workers-ai' && request.method === 'POST') {
+        const aiRunner: WorkersAiRunner | null =
+            testWorkersAiRunner ??
+            (env.AI
+                ? (model, input) =>
+                      (env.AI as unknown as { run: (m: string, inp: Record<string, unknown>) => Promise<unknown> }).run(
+                          model,
+                          input
+                      )
+                : null);
+
+        if (!aiRunner) {
+            return Response.json(
+                {
+                    ok: false,
+                    error: {
+                        code: 'WORKERS_AI_UNBOUND',
+                        message:
+                            'Cloudflare Workers AI binding (AI) is not configured on this deployment. Redeploy with "ai": { "binding": "AI" } in wrangler.jsonc.'
+                    }
+                },
+                { status: 503 }
+            );
+        }
+
+        const rawBody = await request.json().catch(() => null);
+        if (!rawBody || typeof rawBody !== 'object' || Array.isArray(rawBody)) {
+            return Response.json(
+                { ok: false, error: { code: 'BAD_REQUEST', message: 'Invalid JSON body' } },
+                { status: 400 }
+            );
+        }
+        const body = rawBody as Record<string, unknown>;
+        const text = sanitizeChatTextField(body.text, MAX_TRANSLATE_INPUT_CHARS);
+        if (!text) {
+            return Response.json(
+                { ok: false, error: { code: 'BAD_REQUEST', message: 'text is required' } },
+                { status: 400 }
+            );
+        }
+
+        const targetLang = normalizeLangCode(body.targetLang, '');
+        if (!targetLang || targetLang === 'auto') {
+            return Response.json(
+                { ok: false, error: { code: 'BAD_REQUEST', message: 'Valid targetLang is required' } },
+                { status: 400 }
+            );
+        }
+        const sourceLang = normalizeLangCode(body.sourceLang, 'auto') || 'auto';
+        const customPrompt =
+            typeof body.prompt === 'string'
+                ? sanitizeChatTextField(body.prompt, MAX_TRANSLATE_PROMPT_CHARS)
+                : '';
+
+        const rawModel = typeof body.model === 'string' ? body.model.trim() : '';
+        const model = rawModel || DEFAULT_WORKERS_AI_TRANSLATION_MODEL;
+        if (!WORKERS_AI_MODEL_RE.test(model)) {
+            return Response.json(
+                {
+                    ok: false,
+                    error: {
+                        code: 'INVALID_MODEL',
+                        message:
+                            'Invalid Workers AI model ID. Expected format like @cf/zai-org/glm-4.7-flash or @cf/meta/llama-3.1-8b-instruct-fp8-fast.'
+                    }
+                },
+                { status: 400 }
+            );
+        }
+
+        const nowMs = Date.now();
+        const cacheKey = `${model}|${sourceLang}|${targetLang}|${customPrompt}|${text}`;
+        const cached = getCachedTranslation(cacheKey, nowMs);
+        if (cached) {
+            return Response.json(
+                { ok: true, data: { translatedText: cached, model, cached: true } },
+                { headers: { 'Cache-Control': 'no-store' } }
+            );
+        }
+
+        const lowerModel = model.toLowerCase();
+        const isM2m100 = lowerModel.includes('m2m100');
+
+        try {
+            let aiRawResult: unknown;
+            if (isM2m100) {
+                const targetIso = toM2m100LangCode(targetLang);
+                if (!targetIso) {
+                    return Response.json(
+                        {
+                            ok: false,
+                            error: { code: 'UNSUPPORTED_LANGUAGE', message: `Unsupported M2M100 language: ${targetLang}` }
+                        },
+                        { status: 400 }
+                    );
+                }
+                const sourceIso = toM2m100LangCode(sourceLang);
+                const m2mPayload: Record<string, unknown> = {
+                    text,
+                    target_lang: targetIso
+                };
+                if (sourceIso && sourceIso !== targetIso) {
+                    m2mPayload.source_lang = sourceIso;
+                }
+                aiRawResult = await aiRunner(model, m2mPayload);
+            } else {
+                const systemPrompt = buildCompactTranslationSystemPrompt(sourceLang, targetLang, customPrompt);
+                const llmPayload: Record<string, unknown> = {
+                    messages: [
+                        { role: 'system', content: systemPrompt },
+                        { role: 'user', content: text }
+                    ],
+                    temperature: 0.2,
+                    max_tokens: 512
+                };
+                // Disable default chain-of-thought reasoning on reasoning-first models (e.g. DeepSeek V4.1 Flash)
+                // to keep latency low and avoid burning Neurons on hidden thinking tokens.
+                const usedReasoningEffort = lowerModel.includes('deepseek-v4') || lowerModel.includes('glm-5');
+                if (usedReasoningEffort) {
+                    llmPayload.reasoning_effort = 'none';
+                }
+                try {
+                    aiRawResult = await aiRunner(model, llmPayload);
+                } catch (firstErr) {
+                    const firstMsg = firstErr instanceof Error ? firstErr.message : String(firstErr);
+                    if (usedReasoningEffort && /reasoning_effort|additional properties|unexpected/i.test(firstMsg)) {
+                        delete llmPayload.reasoning_effort;
+                        aiRawResult = await aiRunner(model, llmPayload);
+                    } else {
+                        throw firstErr;
+                    }
+                }
+            }
+
+            const translatedText = cleanTranslatedOutput(extractWorkersAiTranslationText(aiRawResult));
+            if (!translatedText) {
+                return Response.json(
+                    {
+                        ok: false,
+                        error: { code: 'EMPTY_TRANSLATION', message: 'Workers AI returned an empty translation result' }
+                    },
+                    { status: 502 }
+                );
+            }
+
+            setCachedTranslation(cacheKey, translatedText, nowMs);
+            return Response.json(
+                { ok: true, data: { translatedText, model, cached: false } },
+                { headers: { 'Cache-Control': 'no-store' } }
+            );
+        } catch (err) {
+            const rawMsg = err instanceof Error ? err.message : String(err);
+            const isPaidOnly = /\b(403|paid plan|upgrade|billing|credits|quota|neurons)\b/i.test(rawMsg);
+            return Response.json(
+                {
+                    ok: false,
+                    error: {
+                        code: isPaidOnly ? 'WORKERS_AI_PLAN_OR_QUOTA' : 'WORKERS_AI_ERROR',
+                        message: rawMsg.slice(0, 320) || 'Workers AI translation request failed'
+                    }
+                },
+                { status: isPaidOnly ? 402 : 502 }
+            );
+        }
     }
 
     return null;

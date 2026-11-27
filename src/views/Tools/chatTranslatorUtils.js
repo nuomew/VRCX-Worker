@@ -3,6 +3,46 @@ export const VRC_OSC_MAX_LINES = 9;
 export const DEFAULT_OSC_SEND_PORT = 9000;
 export const DEFAULT_OSC_LISTEN_PORT = 9002;
 export const CHAT_TRANSLATOR_PREFS_KEY = 'VRCX_chatTranslatorPrefs';
+export const DEFAULT_CLOUDFLARE_AI_MODEL = '@cf/zai-org/glm-4.7-flash';
+
+export const CLOUDFLARE_AI_TRANSLATION_PRESETS = Object.freeze([
+    {
+        id: '@cf/zai-org/glm-4.7-flash',
+        label: 'GLM-4.7-Flash (Free · Recommended)',
+        labelZh: 'GLM-4.7-Flash（免费推荐 · ~6,000 句/天）',
+        tier: 'free'
+    },
+    {
+        id: '@cf/meta/llama-3.1-8b-instruct-fp8-fast',
+        label: 'Llama 3.1 8B FP8 Fast (Free)',
+        labelZh: 'Llama 3.1 8B FP8 Fast（免费 · ~6,000 句/天）',
+        tier: 'free'
+    },
+    {
+        id: '@cf/meta/llama-3.2-3b-instruct',
+        label: 'Llama 3.2 3B Instruct (Free)',
+        labelZh: 'Llama 3.2 3B（免费极速 · ~7,000 句/天）',
+        tier: 'free'
+    },
+    {
+        id: '@cf/meta/m2m100-1.2b',
+        label: 'Meta M2M100 1.2B (Free · Dedicated MT)',
+        labelZh: 'Meta M2M100 1.2B（免费 · 专用机器翻译 ~5,000+ 句/天）',
+        tier: 'free'
+    },
+    {
+        id: '@cf/zai-org/glm-5.3-flash',
+        label: 'GLM-5.3-Flash (Paid Plan / Credits)',
+        labelZh: 'GLM-5.3-Flash（需 Workers Paid 或预充额度）',
+        tier: 'paid'
+    },
+    {
+        id: '@cf/deepseek-ai/deepseek-v4.1-flash-1017',
+        label: 'DeepSeek-V4.1-Flash-1017 (Paid Plan / Credits)',
+        labelZh: 'DeepSeek-V4.1-Flash-1017（需 Workers Paid 或预充额度）',
+        tier: 'paid'
+    }
+]);
 
 export const CHAT_TRANSLATOR_LANGUAGES = Object.freeze([
     { code: 'zh-CN', label: '简体中文', englishName: 'Simplified Chinese' },

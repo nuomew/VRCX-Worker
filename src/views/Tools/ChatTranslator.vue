@@ -738,6 +738,7 @@
         CHAT_TRANSLATOR_LANGUAGES,
         CHAT_TRANSLATOR_PREFS_KEY,
         composeOscChatboxPayload,
+        DEFAULT_CLOUDFLARE_AI_MODEL,
         DEFAULT_OSC_LISTEN_PORT,
         DEFAULT_OSC_SEND_PORT,
         getChatLanguageLabel,
@@ -862,6 +863,9 @@
     const isTranslationConfigured = computed(() => {
         if (!translationApi.value) return false;
         const type = translationApiType.value || 'google';
+        if (type === 'cloudflare') {
+            return isWebMode;
+        }
         if (type === 'openai') {
             return Boolean(translationApiEndpoint.value && translationApiModel.value);
         }
@@ -877,6 +881,11 @@
             return t('view.tools.chat_translator.engine_disabled');
         }
         const type = translationApiType.value || 'google';
+        if (type === 'cloudflare') {
+            const fullModel = (translationApiModel.value || DEFAULT_CLOUDFLARE_AI_MODEL).trim();
+            const shortName = fullModel.split('/').pop() || fullModel;
+            return `Workers AI · ${shortName}`;
+        }
         if (type === 'openai') {
             return `OpenAI · ${translationApiModel.value || '?'}`;
         }
@@ -1287,12 +1296,19 @@
         if (!trimmed) return null;
         const type = translationApiType.value || 'google';
         const overrides =
-            type === 'openai'
+            type === 'cloudflare'
                 ? {
-                      type: 'openai',
+                      type: 'cloudflare',
+                      sourceLang: prefs.sourceLang,
+                      model: (translationApiModel.value || DEFAULT_CLOUDFLARE_AI_MODEL).trim(),
                       prompt: buildChatTranslationPrompt(prefs.sourceLang, targetLang, translationApiPrompt.value)
                   }
-                : { type: 'google' };
+                : type === 'openai'
+                  ? {
+                        type: 'openai',
+                        prompt: buildChatTranslationPrompt(prefs.sourceLang, targetLang, translationApiPrompt.value)
+                    }
+                  : { type: 'google' };
         return advancedSettingsStore.translateText(trimmed, targetLang, overrides);
     }
 

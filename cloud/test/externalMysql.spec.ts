@@ -7,6 +7,7 @@ import {
     defaultExternalDbConfig,
     defaultExternalDbMigrationState,
     invalidateExternalDbConfigCache,
+    measureExternalMysqlUsage,
     MYSQL_CHUNK_AUTO_INCREMENT_START,
     saveExternalDbConfig,
     saveExternalDbMigrationState,
@@ -14,10 +15,12 @@ import {
     validateMysqlHost,
     validateMysqlTablePrefix,
     type MysqlConnectionLike,
-    type MysqlExecResult
+    type MysqlExecResult,
+    type ResolvedMysqlConnectionParams
 } from '../src/db/externalMysql';
-import { rewriteManagedSqlForMysql } from '../src/db/externalMysqlProxy';
+import { createHybridMysqlD1Database, rewriteManagedSqlForMysql } from '../src/db/externalMysqlProxy';
 import { ensureSchemaReady } from '../src/db/schemaBootstrap';
+import { measureD1PendingMigration } from '../src/routes/externalMysqlRoutes';
 
 const env = rawEnv as unknown as Env;
 const exports = rawExports as unknown as { default: Fetcher };
@@ -34,6 +37,8 @@ class FakeMysql57Server {
     tables = new Map<string, { autoInc: number; rows: Array<Record<string, unknown>> }>();
     executedSqls: string[] = [];
     failNextConnect = false;
+    lowercaseInfoSchemaNames = false;
+    onBeforeExecute: ((sql: string, params: unknown[]) => void) | null = null;
     activeConnections = 0;
 
     createConnection(): MysqlConnectionLike {
@@ -48,6 +53,7 @@ class FakeMysql57Server {
             async execute(rawSql: string, params: unknown[] = []): Promise<MysqlExecResult> {
                 if (closed) throw new Error('Connection closed');
                 const sql = rawSql.trim();
+                self.onBeforeExecute?.(sql, params);
                 self.executedSqls.push(sql);
 
                 // Strict MySQL 5.7 dialect guardrails
@@ -93,12 +99,15 @@ class FakeMysql57Server {
 
                 // information_schema.TABLES size lookup
                 if (/FROM\s+information_schema\.TABLES/i.test(sql)) {
-                    const targetNames = new Set(params.slice(1).map((x) => String(x)));
+                    const targetNames = new Set(params.slice(1).map((x) => String(x).toLowerCase()));
                     const out: Array<Record<string, unknown>> = [];
                     for (const [name, t] of self.tables.entries()) {
-                        if (!targetNames.has(name)) continue;
+                        if (!targetNames.has(name.toLowerCase())) continue;
                         const bytes = t.rows.reduce((sum, r) => sum + JSON.stringify(r).length + 64, 16384);
-                        out.push({ table_name: name, total_bytes: bytes });
+                        out.push({
+                            table_name: self.lowercaseInfoSchemaNames ? name.toLowerCase() : name,
+                            total_bytes: bytes
+                        });
                     }
                     return { rows: out, affectedRows: 0, insertId: 0 };
                 }
@@ -1496,6 +1505,370 @@ describe('External MySQL 5.7+ Database Integration (Hybrid New-Writes Mode & Ful
                 ),
                 env.DB_GAMELOG.prepare('DELETE FROM gamelog_archive_chunks')
             ]);
+        }
+    });
+
+    it('batches measureD1PendingMigration to <= 6 D1 subrequests instead of 39 per-table calls', async () => {
+        await ensureSchemaReady(env);
+        let batchCalls = 0;
+        let singleExecCalls = 0;
+        const wrapSpyDb = (raw: D1Database | undefined): D1Database | undefined => {
+            if (!raw) return undefined;
+            return {
+                prepare(sql: string) {
+                    const stmt = raw.prepare(sql);
+                    return {
+                        bind(...args: unknown[]) {
+                            const bound = stmt.bind(...args);
+                            return {
+                                first: (...a: unknown[]) => {
+                                    singleExecCalls++;
+                                    return (bound.first as (...x: unknown[]) => Promise<unknown>)(...a);
+                                },
+                                all: (...a: unknown[]) => {
+                                    singleExecCalls++;
+                                    return (bound.all as (...x: unknown[]) => Promise<unknown>)(...a);
+                                },
+                                run: (...a: unknown[]) => {
+                                    singleExecCalls++;
+                                    return (bound.run as (...x: unknown[]) => Promise<unknown>)(...a);
+                                },
+                                raw: (...a: unknown[]) => {
+                                    singleExecCalls++;
+                                    return (bound.raw as (...x: unknown[]) => Promise<unknown>)(...a);
+                                },
+                                __rawStmt: bound
+                            } as unknown as D1PreparedStatement;
+                        },
+                        first: (...a: unknown[]) => {
+                            singleExecCalls++;
+                            return (stmt.first as (...x: unknown[]) => Promise<unknown>)(...a);
+                        },
+                        all: (...a: unknown[]) => {
+                            singleExecCalls++;
+                            return (stmt.all as (...x: unknown[]) => Promise<unknown>)(...a);
+                        },
+                        run: (...a: unknown[]) => {
+                            singleExecCalls++;
+                            return (stmt.run as (...x: unknown[]) => Promise<unknown>)(...a);
+                        },
+                        raw: (...a: unknown[]) => {
+                            singleExecCalls++;
+                            return (stmt.raw as (...x: unknown[]) => Promise<unknown>)(...a);
+                        },
+                        __rawStmt: stmt
+                    } as unknown as D1PreparedStatement;
+                },
+                batch(stmts: D1PreparedStatement[]) {
+                    batchCalls++;
+                    const unwrapped = stmts.map(
+                        (s) => ((s as unknown as { __rawStmt?: D1PreparedStatement }).__rawStmt ?? s)
+                    );
+                    return raw.batch(unwrapped);
+                },
+                exec: raw.exec.bind(raw),
+                dump: raw.dump.bind(raw)
+            } as unknown as D1Database;
+        };
+
+        const spyEnv: Env = {
+            ...env,
+            DB_CORE: wrapSpyDb(env.DB_CORE)!,
+            DB_GAMELOG: wrapSpyDb(env.DB_GAMELOG)!,
+            DB_FEED: wrapSpyDb(env.DB_FEED)!,
+            DB_CACHE: wrapSpyDb(env.DB_CACHE),
+            DB_LEGACY: wrapSpyDb(env.DB_LEGACY),
+            DB_CHAT: wrapSpyDb(env.DB_CHAT)
+        };
+
+        const summary = await measureD1PendingMigration(spyEnv);
+        expect(typeof summary.totalChunks).toBe('number');
+        expect(typeof summary.totalRollupRows).toBe('number');
+        expect(singleExecCalls).toBe(0);
+        expect(batchCalls).toBeGreaterThanOrEqual(1);
+        expect(batchCalls).toBeLessThanOrEqual(6);
+    });
+
+    it('migrates rollups slice-by-slice without double-counting on interrupted retry, pre-aggregates colliding 191-char keys, and records totalRollupMoved', async () => {
+        await ensureSchemaReady(env);
+        const fakeMysql = new FakeMysql57Server();
+        setMysqlConnectionFactoryForTests(async () => fakeMysql.createConnection());
+        const headers = { 'Content-Type': 'application/json', Origin: 'http://example.com' };
+
+        const worldIds = Array.from({ length: 30 }, (_, idx) => `wrld_slice_${String(idx).padStart(2, '0')}`);
+        const sharedPrefix = `name:${'x'.repeat(186)}`; // 191 chars exactly
+        const longUserA = `${sharedPrefix}_suffix_a`;
+        const longUserB = `${sharedPrefix}_suffix_b`;
+
+        try {
+            await env.DB_GAMELOG.batch([
+                ...worldIds.map((wid) =>
+                    env.DB_GAMELOG.prepare(
+                        `INSERT OR REPLACE INTO gamelog_world_rollup (world_id, world_name, visit_count, total_time, last_visit)
+                         VALUES (?, ?, 2, 100, '2026-06-01T10:00:00.000Z')`
+                    ).bind(wid, `World ${wid}`)
+                ),
+                env.DB_GAMELOG.prepare(
+                    `INSERT OR REPLACE INTO gamelog_user_rollup (user_id, display_name, join_count, time_spent, last_seen, second_last_seen)
+                     VALUES (?, 'LongNameOld', 3, 150, '2026-06-01T10:00:00.000Z', '2026-05-01T10:00:00.000Z')`
+                ).bind(longUserA),
+                env.DB_GAMELOG.prepare(
+                    `INSERT OR REPLACE INTO gamelog_user_rollup (user_id, display_name, join_count, time_spent, last_seen, second_last_seen)
+                     VALUES (?, 'LongNameNew', 4, 250, '2026-06-02T10:00:00.000Z', '2026-05-15T10:00:00.000Z')`
+                ).bind(longUserB)
+            ]);
+
+            expect(
+                (
+                    await exports.default.fetch('http://example.com/api/storage/mysql/config', {
+                        method: 'PUT',
+                        headers,
+                        body: JSON.stringify({
+                            enabled: true,
+                            mode: 'full_migrate',
+                            connectionType: 'direct',
+                            host: 'mysql57.example.com',
+                            port: 3306,
+                            database: 'vrcx_prod',
+                            username: 'vrcx_user',
+                            password: 'SliceRetryPassword123',
+                            sslMode: 'disabled',
+                            tablePrefix: 'vrcx_'
+                        })
+                    })
+                ).status
+            ).toBe(200);
+
+            // Simulate transient failure on the 2nd 25-row world rollup slice
+            let worldInsertCount = 0;
+            fakeMysql.onBeforeExecute = (sql) => {
+                if (/INSERT\s+INTO\s+`vrcx_gamelog_world_rollup`/i.test(sql)) {
+                    worldInsertCount++;
+                    if (worldInsertCount === 2) {
+                        throw new Error('Simulated transient MySQL drop on slice 2');
+                    }
+                }
+            };
+
+            const failedRes = await exports.default.fetch('http://example.com/api/storage/mysql/migrate', {
+                method: 'POST',
+                headers,
+                body: JSON.stringify({ maxChunks: 4 })
+            });
+            expect(failedRes.status).toBe(500);
+            // First 25 worlds must already be deleted from D1 so retry cannot double-add them
+            const remainingWorldsMid = Number(
+                (await env.DB_GAMELOG.prepare('SELECT COUNT(*) AS cnt FROM gamelog_world_rollup').first<{ cnt: number }>())
+                    ?.cnt ?? -1
+            );
+            expect(remainingWorldsMid).toBe(5);
+
+            // Retry with transient fault cleared
+            fakeMysql.onBeforeExecute = null;
+            let finalMigration: { totalRollupMoved?: number; d1Drained?: boolean } = {};
+            for (let round = 0; round < 5; round++) {
+                const retryRes = await exports.default.fetch('http://example.com/api/storage/mysql/migrate', {
+                    method: 'POST',
+                    headers,
+                    body: JSON.stringify({ maxChunks: 4 })
+                });
+                expect(retryRes.status).toBe(200);
+                const body = (await retryRes.json()) as {
+                    data: { done: boolean; migration: { totalRollupMoved?: number; d1Drained?: boolean } };
+                };
+                finalMigration = body.data.migration;
+                if (body.data.done) break;
+            }
+            expect(finalMigration.d1Drained).toBe(true);
+            expect(finalMigration.totalRollupMoved).toBe(32);
+
+            // Every single world (both first 25 and retried 5) MUST have exact visit_count === 2 & total_time === 100
+            const mysqlWorldRows = fakeMysql.tables.get('vrcx_gamelog_world_rollup')?.rows ?? [];
+            expect(mysqlWorldRows.length).toBe(30);
+            for (const wid of worldIds) {
+                const row = mysqlWorldRows.find((r) => r.world_id === wid);
+                expect(row?.visit_count).toBe(2);
+                expect(row?.total_time).toBe(100);
+            }
+
+            // Colliding 191-char user keys MUST be summed (3+4=7, 150+250=400) rather than overwritten
+            const mysqlUserRows = fakeMysql.tables.get('vrcx_gamelog_user_rollup')?.rows ?? [];
+            const mergedLong = mysqlUserRows.find((r) => r.user_id === sharedPrefix);
+            expect(mergedLong?.join_count).toBe(7);
+            expect(mergedLong?.time_spent).toBe(400);
+            expect(mergedLong?.display_name).toBe('LongNameNew');
+            expect(mergedLong?.last_seen).toBe('2026-06-02T10:00:00.000Z');
+            expect(mergedLong?.second_last_seen).toBe('2026-06-01T10:00:00.000Z');
+        } finally {
+            fakeMysql.onBeforeExecute = null;
+            setMysqlConnectionFactoryForTests(null);
+            await saveExternalDbConfig(env, defaultExternalDbConfig());
+            await saveExternalDbMigrationState(env, defaultExternalDbMigrationState());
+            await env.DB_GAMELOG.batch([
+                env.DB_GAMELOG.prepare('DELETE FROM gamelog_world_rollup'),
+                env.DB_GAMELOG.prepare('DELETE FROM gamelog_user_rollup')
+            ]);
+        }
+    });
+
+    it('never forwards saved MySQL password to a different host/port/username on /test or /config', async () => {
+        await ensureSchemaReady(env);
+        const capturedPasswords: Array<{ host: string; password: string }> = [];
+        const fakeMysql = new FakeMysql57Server();
+        setMysqlConnectionFactoryForTests(async (params: ResolvedMysqlConnectionParams) => {
+            capturedPasswords.push({ host: params.host, password: params.password });
+            return fakeMysql.createConnection();
+        });
+        const headers = { 'Content-Type': 'application/json', Origin: 'http://example.com' };
+
+        try {
+            // 1. Save initial MySQL config with secret password for host A
+            expect(
+                (
+                    await exports.default.fetch('http://example.com/api/storage/mysql/config', {
+                        method: 'PUT',
+                        headers,
+                        body: JSON.stringify({
+                            enabled: true,
+                            mode: 'new_writes_only',
+                            connectionType: 'direct',
+                            host: 'db-a.example.com',
+                            port: 3306,
+                            database: 'vrcx_a',
+                            username: 'user_a',
+                            password: 'TopSecretPasswordA',
+                            sslMode: 'disabled',
+                            tablePrefix: 'vrcx_'
+                        })
+                    })
+                ).status
+            ).toBe(200);
+
+            // 2. Testing a DIFFERENT host without providing a new password MUST be rejected without opening any connection
+            const attackTestRes = await exports.default.fetch('http://example.com/api/storage/mysql/test', {
+                method: 'POST',
+                headers,
+                body: JSON.stringify({
+                    connectionType: 'direct',
+                    host: 'attacker.example.com',
+                    port: 3306,
+                    database: 'vrcx_a',
+                    username: 'user_a',
+                    sslMode: 'disabled',
+                    tablePrefix: 'vrcx_'
+                })
+            });
+            expect(attackTestRes.status).toBe(400);
+            const attackJson = (await attackTestRes.json()) as { error?: { code?: string } };
+            expect(attackJson.error?.code).toBe('PASSWORD_REQUIRED_FOR_NEW_TARGET');
+            expect(capturedPasswords.length).toBe(0);
+
+            // 3. Testing the SAME host/port/username without re-entering password still works
+            const sameTargetTestRes = await exports.default.fetch('http://example.com/api/storage/mysql/test', {
+                method: 'POST',
+                headers,
+                body: JSON.stringify({
+                    connectionType: 'direct',
+                    host: 'db-a.example.com',
+                    port: 3306,
+                    database: 'vrcx_a',
+                    username: 'user_a',
+                    sslMode: 'disabled',
+                    tablePrefix: 'vrcx_'
+                })
+            });
+            expect(sameTargetTestRes.status).toBe(200);
+            expect(capturedPasswords.some((c) => c.host === 'db-a.example.com' && c.password === 'TopSecretPasswordA')).toBe(
+                true
+            );
+
+            // 4. Saving a different host in /config without a new password clears the saved password instead of copying it
+            const changeHostRes = await exports.default.fetch('http://example.com/api/storage/mysql/config', {
+                method: 'PUT',
+                headers,
+                body: JSON.stringify({
+                    enabled: false,
+                    host: 'db-b.example.com'
+                })
+            });
+            expect(changeHostRes.status).toBe(200);
+            const changeHostJson = (await changeHostRes.json()) as { data: { config: { hasPassword: boolean } } };
+            expect(changeHostJson.data.config.hasPassword).toBe(false);
+        } finally {
+            setMysqlConnectionFactoryForTests(null);
+            await saveExternalDbConfig(env, defaultExternalDbConfig());
+            await saveExternalDbMigrationState(env, defaultExternalDbMigrationState());
+        }
+    });
+
+    it('matches lowercase information_schema table names for uppercase tablePrefix and keeps user rollup injected sort columns summed', async () => {
+        await ensureSchemaReady(env);
+        const fakeMysql = new FakeMysql57Server();
+        fakeMysql.lowercaseInfoSchemaNames = true; // Simulate Windows/macOS lower_case_table_names=1
+        setMysqlConnectionFactoryForTests(async () => fakeMysql.createConnection());
+
+        try {
+            const params: ResolvedMysqlConnectionParams = {
+                connectionType: 'direct',
+                host: 'mysql57.example.com',
+                port: 3306,
+                database: 'vrcx_win',
+                username: 'root',
+                password: 'pw',
+                sslMode: 'disabled',
+                tablePrefix: 'VRCX_'
+            };
+
+            const usage = await measureExternalMysqlUsage(params);
+            expect(usage.connected).toBe(true);
+            expect(usage.tables.feed_archive_chunks?.bytes).toBeGreaterThan(0);
+            expect(usage.tables.gamelog_user_rollup?.bytes).toBeGreaterThan(0);
+            expect(usage.tables.gamelog_world_rollup?.bytes).toBeGreaterThan(0);
+            expect(usage.tables.legacy_gamelog_user_rollup?.bytes).toBeGreaterThan(0);
+            expect(usage.tables.legacy_gamelog_world_rollup?.bytes).toBeGreaterThan(0);
+            expect(usage.tables.vrc_api_cache?.bytes).toBeGreaterThan(0);
+
+            // Test mergeDualRollupRows for gamelog_user_rollup sorting by unselected `time_spent`
+            await env.DB_GAMELOG.batch([
+                env.DB_GAMELOG.prepare(
+                    `INSERT OR REPLACE INTO gamelog_user_rollup (user_id, display_name, join_count, time_spent, last_seen, second_last_seen)
+                     VALUES ('usr_sort_a', 'UserA', 1, 600, '2026-01-01T00:00:00.000Z', '')`
+                ),
+                env.DB_GAMELOG.prepare(
+                    `INSERT OR REPLACE INTO gamelog_user_rollup (user_id, display_name, join_count, time_spent, last_seen, second_last_seen)
+                     VALUES ('usr_sort_b', 'UserB', 1, 700, '2026-01-01T00:00:00.000Z', '')`
+                )
+            ]);
+            // Add +500 time_spent to usr_sort_a in MySQL so merged total A (1100) > B (700)
+            const { ExternalMysqlSession } = await import('../src/db/externalMysql');
+            const session = new ExternalMysqlSession(params, 'new_writes_only', false);
+            try {
+                const hybridGamelog = createHybridMysqlD1Database(env.DB_GAMELOG, session, 'gamelog');
+                await hybridGamelog
+                    .prepare(
+                        `INSERT OR REPLACE INTO gamelog_user_rollup (user_id, display_name, join_count, time_spent, last_seen, second_last_seen)
+                         VALUES (?, ?, ?, ?, ?, ?)`
+                    )
+                    .bind('usr_sort_a', 'UserA', 2, 500, '2026-02-01T00:00:00.000Z', '')
+                    .run();
+                // SELECT omits `time_spent`, relying on injectedAliases to sort by merged `time_spent DESC`
+                const sorted = await hybridGamelog
+                    .prepare(
+                        `SELECT user_id, display_name
+                         FROM gamelog_user_rollup
+                         WHERE user_id IN ('usr_sort_a', 'usr_sort_b')
+                         ORDER BY time_spent DESC`
+                    )
+                    .all<{ user_id: string; display_name: string }>();
+                expect((sorted.results ?? []).map((r) => r.user_id)).toEqual(['usr_sort_a', 'usr_sort_b']);
+            } finally {
+                await session.close();
+            }
+        } finally {
+            setMysqlConnectionFactoryForTests(null);
+            await env.DB_GAMELOG.prepare(
+                "DELETE FROM gamelog_user_rollup WHERE user_id IN ('usr_sort_a', 'usr_sort_b')"
+            ).run();
         }
     });
 });

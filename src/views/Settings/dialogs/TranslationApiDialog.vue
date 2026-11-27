@@ -32,6 +32,11 @@
                             </SelectTrigger>
                             <SelectContent>
                                 <SelectGroup>
+                                    <SelectItem
+                                        value="cloudflare"
+                                        :text-value="t('dialog.translation_api.mode_cloudflare')">
+                                        {{ t('dialog.translation_api.mode_cloudflare') }}
+                                    </SelectItem>
                                     <SelectItem value="google" :text-value="t('dialog.translation_api.mode_google')">
                                         {{ t('dialog.translation_api.mode_google') }}
                                     </SelectItem>
@@ -44,6 +49,58 @@
                     </FieldContent>
                 </Field>
             </FieldGroup>
+
+            <template v-if="form.translationApiType === 'cloudflare'">
+                <FieldGroup>
+                    <div
+                        class="rounded-md border border-border/70 bg-muted/30 px-3 py-2 text-xs text-muted-foreground leading-relaxed">
+                        {{ t('dialog.translation_api.cloudflare.hint') }}
+                    </div>
+
+                    <Field>
+                        <FieldLabel>{{ t('dialog.translation_api.cloudflare.preset') }}</FieldLabel>
+                        <FieldContent>
+                            <Select
+                                :model-value="selectedCloudflarePreset"
+                                @update:modelValue="handleCloudflarePresetChange">
+                                <SelectTrigger size="sm" style="width: 100%">
+                                    <SelectValue :placeholder="t('dialog.translation_api.cloudflare.preset')" />
+                                </SelectTrigger>
+                                <SelectContent>
+                                    <SelectGroup>
+                                        <SelectItem
+                                            v-for="preset in CLOUDFLARE_AI_TRANSLATION_PRESETS"
+                                            :key="preset.id"
+                                            :value="preset.id">
+                                            {{ isZhLocale ? preset.labelZh : preset.label }}
+                                        </SelectItem>
+                                        <SelectItem value="__custom__">
+                                            {{ t('dialog.translation_api.cloudflare.custom_option') }}
+                                        </SelectItem>
+                                    </SelectGroup>
+                                </SelectContent>
+                            </Select>
+                        </FieldContent>
+                    </Field>
+
+                    <Field>
+                        <FieldLabel>{{ t('dialog.translation_api.cloudflare.model') }}</FieldLabel>
+                        <FieldContent>
+                            <InputGroupField
+                                v-model="form.translationApiModel"
+                                :placeholder="DEFAULT_CLOUDFLARE_AI_MODEL"
+                                clearable />
+                        </FieldContent>
+                    </Field>
+
+                    <Field>
+                        <FieldLabel>{{ t('dialog.translation_api.openai.prompt_optional') }}</FieldLabel>
+                        <FieldContent>
+                            <InputGroupTextareaField v-model="form.translationApiPrompt" :rows="3" clearable />
+                        </FieldContent>
+                    </Field>
+                </FieldGroup>
+            </template>
 
             <template v-if="form.translationApiType === 'google'">
                 <FieldGroup>
@@ -149,7 +206,10 @@
                     ">
                     {{ t('dialog.translation_api.guide') }}
                 </Button>
-                <Button variant="outline" v-if="form.translationApiType === 'openai'" @click="testOpenAiTranslation">
+                <Button
+                    variant="outline"
+                    v-if="form.translationApiType === 'openai' || form.translationApiType === 'cloudflare'"
+                    @click="testTranslationConfig">
                     {{ t('dialog.translation_api.test') }}
                 </Button>
                 <Button @click="saveTranslationApiConfig">
@@ -164,7 +224,7 @@
     import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
     import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
     import { Field, FieldContent, FieldGroup, FieldLabel } from '@/components/ui/field';
-    import { reactive, ref, watch } from 'vue';
+    import { computed, reactive, ref, watch } from 'vue';
     import { InputGroupField, InputGroupTextareaField } from '@/components/ui/input-group';
     import { Button } from '@/components/ui/button';
     import { storeToRefs } from 'pinia';
@@ -174,11 +234,16 @@
     import { getLanguageName, languageCodes } from '../../../localization';
     import { openExternalLink } from '../../../shared/utils';
     import { useAdvancedSettingsStore } from '../../../stores';
+    import {
+        CLOUDFLARE_AI_TRANSLATION_PRESETS,
+        DEFAULT_CLOUDFLARE_AI_MODEL
+    } from '../../Tools/chatTranslatorUtils';
 
     const advancedSettingsStore = useAdvancedSettingsStore();
 
     const {
         bioLanguage,
+        translationApi,
         translationApiKey,
         translationApiType,
         translationApiEndpoint,
@@ -197,10 +262,11 @@
         setTranslationApiPrompt
     } = advancedSettingsStore;
 
-    const { t } = useI18n();
+    const { t, locale } = useI18n();
 
     const isFetchingModels = ref(false);
     const availableModels = ref([]);
+    const isZhLocale = computed(() => String(locale?.value || '').toLowerCase().startsWith('zh'));
 
     const props = defineProps({
         isTranslationApiDialogVisible: {
@@ -212,7 +278,11 @@
     const emit = defineEmits(['update:isTranslationApiDialogVisible']);
 
     function handleTranslationApiTypeChange(value) {
-        form.translationApiType = String(value);
+        const nextType = String(value);
+        form.translationApiType = nextType;
+        if (nextType === 'cloudflare' && (!form.translationApiModel || !form.translationApiModel.trim().startsWith('@'))) {
+            form.translationApiModel = DEFAULT_CLOUDFLARE_AI_MODEL;
+        }
     }
 
     const form = reactive({
@@ -223,10 +293,23 @@
         translationApiKey: ''
     });
 
+    const selectedCloudflarePreset = computed(() => {
+        const trimmed = String(form.translationApiModel || '').trim();
+        return CLOUDFLARE_AI_TRANSLATION_PRESETS.some((item) => item.id === trimmed) ? trimmed : '__custom__';
+    });
+
+    function handleCloudflarePresetChange(value) {
+        const val = String(value || '');
+        if (val && val !== '__custom__') {
+            form.translationApiModel = val;
+        }
+    }
+
     const loadFormFromStore = () => {
         form.translationApiType = translationApiType.value || 'google';
         form.translationApiEndpoint = translationApiEndpoint.value || 'https://api.openai.com/v1/chat/completions';
-        form.translationApiModel = translationApiModel.value || '';
+        form.translationApiModel =
+            translationApiModel.value || (form.translationApiType === 'cloudflare' ? DEFAULT_CLOUDFLARE_AI_MODEL : '');
         form.translationApiPrompt = translationApiPrompt.value || '';
         form.translationApiKey = translationApiKey.value || '';
         availableModels.value = [];
@@ -249,6 +332,14 @@
                 return;
             }
         }
+        if (form.translationApiType === 'cloudflare') {
+            const trimmedModel = String(form.translationApiModel || '').trim();
+            if (!trimmedModel) {
+                form.translationApiModel = DEFAULT_CLOUDFLARE_AI_MODEL;
+            } else {
+                form.translationApiModel = trimmedModel;
+            }
+        }
 
         await Promise.all([
             setTranslationApiType(form.translationApiType),
@@ -257,6 +348,16 @@
             setTranslationApiPrompt(form.translationApiPrompt),
             setTranslationApiKey(form.translationApiKey)
         ]);
+
+        // Auto-enable the global translation switch when saving built-in Workers AI so chat/bio translation works immediately
+        if (
+            form.translationApiType === 'cloudflare' &&
+            translationApi &&
+            !translationApi.value &&
+            typeof advancedSettingsStore.setTranslationApi === 'function'
+        ) {
+            await advancedSettingsStore.setTranslationApi();
+        }
 
         toast.success(t('dialog.translation_api.msg_settings_saved'));
         closeDialog();
@@ -289,7 +390,30 @@
         }
     }
 
-    async function testOpenAiTranslation() {
+    async function testTranslationConfig() {
+        if (form.translationApiType === 'cloudflare') {
+            const model = String(form.translationApiModel || '').trim() || DEFAULT_CLOUDFLARE_AI_MODEL;
+            try {
+                const testText = 'Hello world';
+                const target = isZhLocale.value ? 'zh-CN' : 'fr';
+                const data = await translateText(testText, target, {
+                    type: 'cloudflare',
+                    model,
+                    prompt: form.translationApiPrompt,
+                    allowWhenDisabled: true
+                });
+                if (data) {
+                    toast.success(`${t('dialog.translation_api.msg_test_success')}: ${data}`);
+                } else {
+                    toast.error(t('dialog.translation_api.msg_test_failed'));
+                }
+            } catch (err) {
+                console.error('[TranslationAPI] Workers AI test failed', err);
+                toast.error(t('dialog.translation_api.msg_test_failed'));
+            }
+            return;
+        }
+
         if (form.translationApiType !== 'openai') {
             return;
         }

@@ -9,6 +9,8 @@ export interface Env {
     /** Dedicated chat translator D1 shard (vrcx-chat) storing OSC chat history & cloud-managed OSC settings. */
     DB_CHAT?: D1Database;
     AGENT_HUB: DurableObjectNamespace;
+    /** Built-in Cloudflare Workers AI binding for zero-key chat & bio translation. */
+    AI?: Ai;
     R2_MEDIA?: R2Bucket;
     /** Optional Cloudflare Hyperdrive binding for pooled edge connections to an external MySQL 5.7+ database. */
     HYPERDRIVE?: Hyperdrive;

@@ -211,6 +211,22 @@ export async function tryLoadPlayerList() {
             userStore.applyUserDialogLocation();
             instanceStore.applyWorldDialogInstances();
             instanceStore.applyGroupDialogInstances();
+        } else if (
+            isWebMode &&
+            (locationStore.lastLocation.location || locationStore.lastLocation.playerList.size > 0)
+        ) {
+            // In Web mode (e.g. Quest / agentless), clear stale room & player list once user leaves or goes offline
+            locationStore.setLastLocation({
+                date: 0,
+                location: '',
+                name: '',
+                playerList: new Map(),
+                friendList: new Map()
+            });
+            runUpdateCurrentUserLocationFlow();
+            vrStore.updateVRLastLocation();
+            instanceStore.getCurrentInstanceUserList();
+            userStore.applyUserDialogLocation();
         }
     })().finally(() => {
         inFlightPlayerListLoad = null;

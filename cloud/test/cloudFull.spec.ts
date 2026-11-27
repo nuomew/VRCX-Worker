@@ -11,6 +11,7 @@ import {
 } from '../src/db/compactArchive';
 import type { Env } from '../src/env';
 import worker from '../src/index';
+import { setWorkersAiRunnerForTests } from '../src/routes/chatOscRoutes';
 import { incrementCounter } from '../src/routes/coreData';
 import { computeForwardMonthsCutoff, computeMonthsCutoff } from '../src/routes/dbCleanup';
 import { mergeSetCookies } from '../src/routes/vrcProxy';
@@ -10233,6 +10234,146 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
             expect(prev2.data.totalRows).toBe(2);
         } finally {
             await env.DB_FEED.prepare('DELETE FROM feed_archive_chunks').run().catch(() => {});
+        }
+    });
+
+    it('provides built-in Cloudflare Workers AI translation presets, supports custom models, disables reasoning overhead, caches repeats, and maps plan errors', async () => {
+        const headers = { 'Content-Type': 'application/json', Origin: 'http://example.com' };
+
+        // 1. Unbound AI returns 503 cleanly
+        setWorkersAiRunnerForTests(null);
+        const unboundRes = await exports.default.fetch('http://example.com/api/chat/translate/workers-ai', {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({ text: 'Hello', targetLang: 'zh-CN' })
+        });
+        expect(unboundRes.status).toBe(503);
+        const unboundJson = (await unboundRes.json()) as { error?: { code?: string } };
+        expect(unboundJson.error?.code).toBe('WORKERS_AI_UNBOUND');
+
+        // 2. Models endpoint exposes default free model + selectable presets (including paid frontier models)
+        const calls: Array<{ model: string; input: Record<string, unknown> }> = [];
+        setWorkersAiRunnerForTests(async (model, input) => {
+            calls.push({ model, input });
+            if (model === '@cf/meta/m2m100-1.2b') {
+                return { translated_text: '你好世界' };
+            }
+            if (model === '@cf/zai-org/glm-5.3-flash') {
+                throw new Error('403 Forbidden: Workers Paid plan required for this model');
+            }
+            if (model === '@cf/deepseek-ai/deepseek-v4.1-flash-1017') {
+                return {
+                    choices: [
+                        {
+                            message: {
+                                content: '<think>reasoning hidden</think>\n"こんにちは世界"'
+                            }
+                        }
+                    ]
+                };
+            }
+            return { response: '"你好，VRChat！"' };
+        });
+
+        try {
+            const modelsRes = await exports.default.fetch('http://example.com/api/chat/translate/models');
+            expect(modelsRes.status).toBe(200);
+            const modelsJson = (await modelsRes.json()) as {
+                data: { aiBound: boolean; defaultModel: string; presets: Array<{ id: string; tier: string }> };
+            };
+            expect(modelsJson.data.aiBound).toBe(true);
+            expect(modelsJson.data.defaultModel).toBe('@cf/zai-org/glm-4.7-flash');
+            expect(modelsJson.data.presets.some((p) => p.id === '@cf/zai-org/glm-4.7-flash' && p.tier === 'free')).toBe(
+                true
+            );
+            expect(
+                modelsJson.data.presets.some(
+                    (p) => p.id === '@cf/deepseek-ai/deepseek-v4.1-flash-1017' && p.tier === 'paid'
+                )
+            ).toBe(true);
+
+            // 3. Default LLM model translates, strips wrapping quotes, and caches identical repeat calls (0 extra Neurons)
+            const t1 = await exports.default.fetch('http://example.com/api/chat/translate/workers-ai', {
+                method: 'POST',
+                headers,
+                body: JSON.stringify({ text: 'Hello VRChat!', targetLang: 'zh-CN' })
+            });
+            expect(t1.status).toBe(200);
+            const j1 = (await t1.json()) as { data: { translatedText: string; model: string; cached: boolean } };
+            expect(j1.data.translatedText).toBe('你好，VRChat！');
+            expect(j1.data.model).toBe('@cf/zai-org/glm-4.7-flash');
+            expect(j1.data.cached).toBe(false);
+            expect(calls.length).toBe(1);
+
+            const t1Cached = await exports.default.fetch('http://example.com/api/chat/translate/workers-ai', {
+                method: 'POST',
+                headers,
+                body: JSON.stringify({ text: 'Hello VRChat!', targetLang: 'zh-CN' })
+            });
+            expect(t1Cached.status).toBe(200);
+            const j1Cached = (await t1Cached.json()) as { data: { translatedText: string; cached: boolean } };
+            expect(j1Cached.data.translatedText).toBe('你好，VRChat！');
+            expect(j1Cached.data.cached).toBe(true);
+            expect(calls.length).toBe(1);
+
+            // 4. Custom model DeepSeek-V4.1-Flash passes reasoning_effort='none', strips <think>, and parses choices[]
+            const tDeepSeek = await exports.default.fetch('http://example.com/api/chat/translate/workers-ai', {
+                method: 'POST',
+                headers,
+                body: JSON.stringify({
+                    text: 'Hello world',
+                    targetLang: 'ja',
+                    model: '@cf/deepseek-ai/deepseek-v4.1-flash-1017'
+                })
+            });
+            expect(tDeepSeek.status).toBe(200);
+            const jDeepSeek = (await tDeepSeek.json()) as { data: { translatedText: string } };
+            expect(jDeepSeek.data.translatedText).toBe('こんにちは世界');
+            expect(calls[calls.length - 1]?.input.reasoning_effort).toBe('none');
+
+            // 5. Dedicated M2M100 model normalizes zh-CN -> zh and reads translated_text
+            const tM2m = await exports.default.fetch('http://example.com/api/chat/translate/workers-ai', {
+                method: 'POST',
+                headers,
+                body: JSON.stringify({
+                    text: 'Hello world',
+                    sourceLang: 'en',
+                    targetLang: 'zh-CN',
+                    model: '@cf/meta/m2m100-1.2b'
+                })
+            });
+            expect(tM2m.status).toBe(200);
+            const jM2m = (await tM2m.json()) as { data: { translatedText: string } };
+            expect(jM2m.data.translatedText).toBe('你好世界');
+            expect(calls[calls.length - 1]?.input).toEqual({
+                text: 'Hello world',
+                source_lang: 'en',
+                target_lang: 'zh'
+            });
+
+            // 6. Invalid custom model ID is rejected with 400
+            const badModelRes = await exports.default.fetch('http://example.com/api/chat/translate/workers-ai', {
+                method: 'POST',
+                headers,
+                body: JSON.stringify({ text: 'Hi', targetLang: 'en', model: 'not-a-valid-cf-model' })
+            });
+            expect(badModelRes.status).toBe(400);
+
+            // 7. Paid-plan / quota error maps to 402 WORKERS_AI_PLAN_OR_QUOTA
+            const paidErrRes = await exports.default.fetch('http://example.com/api/chat/translate/workers-ai', {
+                method: 'POST',
+                headers,
+                body: JSON.stringify({
+                    text: 'Hi',
+                    targetLang: 'zh-CN',
+                    model: '@cf/zai-org/glm-5.3-flash'
+                })
+            });
+            expect(paidErrRes.status).toBe(402);
+            const paidErrJson = (await paidErrRes.json()) as { error?: { code?: string } };
+            expect(paidErrJson.error?.code).toBe('WORKERS_AI_PLAN_OR_QUOTA');
+        } finally {
+            setWorkersAiRunnerForTests(null);
         }
     });
 });

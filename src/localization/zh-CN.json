@@ -2717,6 +2717,7 @@
             "description": "输入你的 Google 翻译 API 密钥",
             "guide": "查看教程（英语）",
             "mode": "提供商",
+            "mode_cloudflare": "Cloudflare Workers AI（内置免密钥）",
             "mode_google": "Google 翻译",
             "mode_openai": "OpenAI",
             "test": "测试",
@@ -2725,6 +2726,12 @@
             "msg_settings_saved": "翻译设置已保存",
             "msg_test_success": "测试成功",
             "msg_test_failed": "测试失败",
+            "cloudflare": {
+                "hint": "直接调用本 Worker 内置的 Cloudflare Workers AI，无需 API 密钥（Workers 免费计划每天送 10,000 Neurons）。标注「需 Workers Paid」的前沿模型（如 GLM-5.3-Flash / DeepSeek-V4.1-Flash）需要付费计划或预充 AI Gateway 额度。",
+                "preset": "快捷预设模型",
+                "model": "Workers AI 模型 ID（支持手动自定义）",
+                "custom_option": "自定义模型 ID..."
+            },
             "openai": {
                 "endpoint": "API 端点",
                 "api_key": "API 密钥（可选）",

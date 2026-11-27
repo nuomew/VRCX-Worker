@@ -838,11 +838,17 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
                 });
             }
 
-            // Catch up any DB_GAMELOG join/leave events for this exact room newer than the snapshot timestamp
+            // Catch up any DB_GAMELOG join/leave events for this exact room around/after the snapshot timestamp.
+            // Use a 30s grace lookback so slight PC-vs-Worker clock skew never drops an immediately-preceding join;
+            // OnPlayerLeft guards against removing a player whose snapshot joinedAt is strictly newer than the leave.
+            const snapMs = Date.parse(activeSnapshot.updatedAt);
+            const catchupSinceIso = Number.isFinite(snapMs)
+                ? new Date(Math.max(cutoffMs, snapMs - 30_000)).toISOString()
+                : activeSnapshot.updatedAt;
             const newerHotJl = await env.DB_GAMELOG.prepare(
                 'SELECT * FROM gamelog_join_leave WHERE location = ? AND created_at > ? ORDER BY created_at ASC, id ASC LIMIT 200'
             )
-                .bind(activeSnapshot.location, activeSnapshot.updatedAt)
+                .bind(activeSnapshot.location, catchupSinceIso)
                 .all<Record<string, unknown>>()
                 .then((r) => r.results ?? [])
                 .catch(() => [] as Array<Record<string, unknown>>);
@@ -853,7 +859,7 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
                 ...recentJlChunks.join_leave.filter(
                     (row) =>
                         String(row.location ?? '') === activeSnapshot!.location &&
-                        String(row.created_at ?? '') > activeSnapshot!.updatedAt
+                        String(row.created_at ?? '') > catchupSinceIso
                 )
             ]) {
                 const dk = `${String(r.created_at ?? '')}|${String(r.type ?? '')}|${String(r.display_name ?? '')}`;
@@ -873,15 +879,26 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
                 if (!k) continue;
                 if (r.type === 'OnPlayerJoined') {
                     // Remove any legacy displayName-keyed duplicate before inserting by userId
+                    const prev =
+                        mergedByKey.get(k) ?? (uid && dname ? mergedByKey.get(dname.toLowerCase()) : undefined);
                     if (uid && dname) mergedByKey.delete(dname.toLowerCase());
-                    mergedByKey.set(k, { displayName: dname, userId: uid, joinedAt: ts });
+                    const effectiveJoinedAt = prev?.joinedAt && prev.joinedAt < ts ? prev.joinedAt : ts;
+                    mergedByKey.set(k, {
+                        displayName: dname || prev?.displayName || '',
+                        userId: uid || prev?.userId || '',
+                        joinedAt: effectiveJoinedAt
+                    });
                 } else if (r.type === 'OnPlayerLeft') {
-                    mergedByKey.delete(k);
+                    const direct = mergedByKey.get(k);
+                    if (direct && (!direct.joinedAt || ts >= direct.joinedAt)) {
+                        mergedByKey.delete(k);
+                    }
                     if (dname || uid) {
                         for (const [mk, mv] of mergedByKey.entries()) {
                             if (
-                                (uid && mv.userId === uid) ||
-                                (dname && mv.displayName.toLowerCase() === dname.toLowerCase())
+                                ((uid && mv.userId === uid) ||
+                                    (dname && mv.displayName.toLowerCase() === dname.toLowerCase())) &&
+                                (!mv.joinedAt || ts >= mv.joinedAt)
                             ) {
                                 mergedByKey.delete(mk);
                             }

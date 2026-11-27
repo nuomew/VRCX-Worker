@@ -2719,6 +2719,7 @@
             "description": "Enter your Google translate API Key",
             "guide": "Guide",
             "mode": "Provider",
+            "mode_cloudflare": "Cloudflare Workers AI (Built-in)",
             "mode_google": "Google Translate",
             "mode_openai": "OpenAI",
             "test": "Test",
@@ -2727,6 +2728,12 @@
             "msg_settings_saved": "Translation settings saved",
             "msg_test_success": "Test succeeded",
             "msg_test_failed": "Test failed",
+            "cloudflare": {
+                "hint": "Uses your Worker's built-in Cloudflare Workers AI binding with no API key required (10,000 free Neurons/day on Workers Free). Models marked Paid require Workers Paid or prepaid AI Gateway credits.",
+                "preset": "Preset Model",
+                "model": "Workers AI Model ID (Customizable)",
+                "custom_option": "Custom model ID..."
+            },
             "openai": {
                 "endpoint": "API Endpoint",
                 "api_key": "API Key (Optional)",

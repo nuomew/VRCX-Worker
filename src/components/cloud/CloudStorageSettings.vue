@@ -1322,7 +1322,7 @@
             mysqlNotice.value = t('cloud_hub.storage.mysql_test_ok', {
                 version: data?.mysqlVersion || '5.7+',
                 ms: data?.latencyMs ?? 0,
-                tables: data?.tablesReady ?? 8
+                tables: data?.tablesReady ?? 12
             });
             toast.success(mysqlNotice.value);
         } catch (err) {
@@ -1392,7 +1392,11 @@
                     json: { maxChunks: 8, maxCacheRows: 80 }
                 });
                 batchMovedChunks += Number(res?.movedChunks || 0);
-                batchMovedRows += Number(res?.movedRows || 0) + Number(res?.compactedSingleRows || 0);
+                batchMovedRows +=
+                    Number(res?.movedRows || 0) +
+                    Number(res?.compactedSingleRows || 0) +
+                    Number(res?.movedRollupRows || 0) +
+                    Number(res?.movedCacheRows || 0);
                 if (res?.remaining) mysqlD1Pending.value = res.remaining;
                 if (res?.migration) mysqlMigrationState.value = res.migration;
                 if (res?.done) {
@@ -1401,9 +1405,13 @@
                 }
             }
             if (finished) {
+                const stateTotalRows =
+                    Number(mysqlMigrationState.value?.totalRowsMoved || 0) +
+                    Number(mysqlMigrationState.value?.totalRollupMoved || 0) +
+                    Number(mysqlMigrationState.value?.totalCacheMoved || 0);
                 mysqlNotice.value = t('cloud_hub.storage.mysql_migrate_done_toast', {
                     chunks: Number(mysqlMigrationState.value?.totalChunksMoved || batchMovedChunks).toLocaleString(),
-                    rows: Number(mysqlMigrationState.value?.totalRowsMoved || batchMovedRows).toLocaleString()
+                    rows: Math.max(stateTotalRows, batchMovedRows).toLocaleString()
                 });
                 toast.success(mysqlNotice.value);
             } else if (!pauseMysqlRequested.value) {

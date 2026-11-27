@@ -689,12 +689,43 @@ export const useAdvancedSettingsStore = defineStore('AdvancedSettings', () => {
     }
 
     async function translateText(text, targetLang, overrides) {
-        if (!translationApi.value) {
+        if (!translationApi.value && !overrides?.allowWhenDisabled) {
             toast.warning('Translation API disabled');
             return null;
         }
 
         const provider = overrides?.type || translationApiType.value || 'google';
+
+        if (provider === 'cloudflare') {
+            const model =
+                (typeof overrides?.model === 'string' ? overrides.model.trim() : '') ||
+                (typeof translationApiModel.value === 'string' ? translationApiModel.value.trim() : '') ||
+                '@cf/zai-org/glm-4.7-flash';
+            const prompt =
+                typeof overrides?.prompt === 'string'
+                    ? overrides.prompt.trim()
+                    : (translationApiPrompt.value || '').trim();
+            const sourceLang = typeof overrides?.sourceLang === 'string' ? overrides.sourceLang.trim() : 'auto';
+
+            try {
+                const { cloudFetch } = await import('../../ipc-web/apiClient');
+                const data = await cloudFetch('/api/chat/translate/workers-ai', {
+                    method: 'POST',
+                    json: {
+                        text,
+                        targetLang,
+                        sourceLang,
+                        model,
+                        ...(prompt ? { prompt } : {})
+                    }
+                });
+                const translated = data?.translatedText;
+                return typeof translated === 'string' && translated.trim() ? translated.trim() : null;
+            } catch (err) {
+                toast.error(`Workers AI translation failed: ${err?.message || err}`);
+                return null;
+            }
+        }
 
         if (provider === 'google') {
             const keyToUse = overrides?.key ?? translationApiKey.value;

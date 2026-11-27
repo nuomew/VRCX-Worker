@@ -559,10 +559,16 @@ function mergeDualRollupRows(
                 const cName = String(r.world_name ?? '');
                 next.world_name = curVisit >= prevVisit && cName ? cName : pName || cName;
             }
-            // Keep injected sort columns in sync with summed counters
+            // Keep injected sort columns in sync with merged counters/timestamps
             for (const alias of injectedAliases) {
-                if (alias in next && (typeof next[alias] === 'number' || typeof r[alias] === 'number')) {
-                    next[alias] = (Number(prev[alias] ?? 0) || 0) + (Number(r[alias] ?? 0) || 0);
+                if (alias in next || alias in r) {
+                    if (typeof prev[alias] === 'number' || typeof r[alias] === 'number') {
+                        next[alias] = (Number(prev[alias] ?? 0) || 0) + (Number(r[alias] ?? 0) || 0);
+                    } else if (typeof prev[alias] === 'string' || typeof r[alias] === 'string') {
+                        const ps = String(prev[alias] ?? '');
+                        const cs = String(r[alias] ?? '');
+                        next[alias] = cs > ps ? cs : ps;
+                    }
                 }
             }
             byKey.set(k, next);
@@ -594,6 +600,18 @@ function mergeDualRollupRows(
                 const pName = String(prev.display_name ?? '');
                 const cName = String(r.display_name ?? '');
                 next.display_name = curLast >= prevLast && cName ? cName : pName || cName;
+            }
+            // Keep injected sort columns in sync with merged counters/timestamps
+            for (const alias of injectedAliases) {
+                if (alias in next || alias in r) {
+                    if (typeof prev[alias] === 'number' || typeof r[alias] === 'number') {
+                        next[alias] = (Number(prev[alias] ?? 0) || 0) + (Number(r[alias] ?? 0) || 0);
+                    } else if (typeof prev[alias] === 'string' || typeof r[alias] === 'string') {
+                        const ps = String(prev[alias] ?? '');
+                        const cs = String(r[alias] ?? '');
+                        next[alias] = cs > ps ? cs : ps;
+                    }
+                }
             }
             byKey.set(k, next);
         }

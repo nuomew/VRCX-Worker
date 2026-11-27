@@ -570,7 +570,12 @@
 
         translateLoading.value = true;
         try {
-            const providerLabel = translationApiType.value === 'openai' ? 'OpenAI' : 'Google';
+            const providerLabel =
+                translationApiType.value === 'cloudflare'
+                    ? 'Cloudflare Workers AI'
+                    : translationApiType.value === 'openai'
+                      ? 'OpenAI'
+                      : 'Google';
             const translated = await translateText(`${bio}\n\nTranslated by ${providerLabel}`, targetLang);
             if (!translated) {
                 throw new Error('No translation returned');

@@ -97,82 +97,140 @@ const SINGLE_ROW_LEGACY_COUNTS: ReadonlyArray<{
     { shard: 'legacy', table: 'notifications_v2', hotTailExempt: 5 }
 ];
 
+interface ShardCountQuery {
+    sql: string;
+    binds?: unknown[];
+    onRow: (row: Record<string, unknown> | null) => void;
+}
+
+async function executeShardCountBatch(db: D1Database, queries: ShardCountQuery[]): Promise<void> {
+    if (queries.length === 0) return;
+    try {
+        const stmts = queries.map((q) => {
+            const stmt = db.prepare(q.sql);
+            return q.binds && q.binds.length > 0 ? stmt.bind(...q.binds) : stmt;
+        });
+        const batchRes = await db.batch(stmts);
+        for (let i = 0; i < queries.length; i++) {
+            const first = (batchRes[i]?.results?.[0] ?? null) as Record<string, unknown> | null;
+            queries[i]!.onRow(first);
+        }
+        return;
+    } catch {
+        // Fallback only when a shard in a minimal test fixture omits one of the optional tables
+    }
+    await Promise.all(
+        queries.map(async (q) => {
+            try {
+                const stmt = db.prepare(q.sql);
+                const row = await (q.binds && q.binds.length > 0 ? stmt.bind(...q.binds) : stmt).first<
+                    Record<string, unknown>
+                >();
+                q.onRow(row ?? null);
+            } catch {
+                q.onRow(null);
+            }
+        })
+    );
+}
+
+async function countPendingLegacySingleRows(rawEnv: Env): Promise<number> {
+    const byDb = new Map<D1Database, ShardCountQuery[]>();
+    let totalLegacySingleRows = 0;
+    for (const item of SINGLE_ROW_LEGACY_COUNTS) {
+        const db = getRawShardDb(rawEnv, item.shard);
+        if (!db) continue;
+        let list = byDb.get(db);
+        if (!list) {
+            list = [];
+            byDb.set(db, list);
+        }
+        list.push({
+            sql: `SELECT COUNT(*) AS cnt FROM ${item.table}`,
+            onRow: (row) => {
+                const cnt = Math.max(0, Number(row?.cnt ?? 0) || 0);
+                totalLegacySingleRows += Math.max(0, cnt - (item.hotTailExempt ?? 0));
+            }
+        });
+    }
+    await Promise.all(Array.from(byDb.entries()).map(([db, queries]) => executeShardCountBatch(db, queries)));
+    return totalLegacySingleRows;
+}
+
 /**
- * Counts remaining D1 archive chunks, cache rows, and uncompacted legacy single-row history rows
- * still stored inside native Cloudflare D1 shards.
+ * Counts remaining D1 archive chunks, cache rows, rollup rows, and uncompacted legacy single-row history rows
+ * still stored inside native Cloudflare D1 shards using at most 1 batched round-trip per D1 binding (<= 6 subrequests).
  */
 export async function measureD1PendingMigration(env: Env): Promise<D1PendingMigrationSummary> {
     const rawEnv = getRawD1Env(env);
     const tables: Record<string, { chunks: number; rows: number }> = {};
     let totalChunks = 0;
     let totalChunkRows = 0;
+    let totalCacheRows = 0;
+    let totalLegacySingleRows = 0;
+    let totalRollupRows = 0;
 
-    await Promise.all(
-        MANAGED_ARCHIVE_TABLES.map(async (spec) => {
-            const db = getRawShardDb(rawEnv, spec.shard);
-            if (!db) {
-                tables[spec.table] = { chunks: 0, rows: 0 };
-                return;
-            }
-            try {
-                const row = await db
-                    .prepare(`SELECT COUNT(*) AS chunk_cnt, COALESCE(SUM(row_count), 0) AS row_cnt FROM ${spec.table}`)
-                    .first<{ chunk_cnt?: number; row_cnt?: number }>();
+    const byDb = new Map<D1Database, ShardCountQuery[]>();
+    const enqueue = (db: D1Database | null, query: ShardCountQuery) => {
+        if (!db) return;
+        let list = byDb.get(db);
+        if (!list) {
+            list = [];
+            byDb.set(db, list);
+        }
+        list.push(query);
+    };
+
+    for (const spec of MANAGED_ARCHIVE_TABLES) {
+        tables[spec.table] = { chunks: 0, rows: 0 };
+        const db = getRawShardDb(rawEnv, spec.shard);
+        enqueue(db, {
+            sql: `SELECT COUNT(*) AS chunk_cnt, COALESCE(SUM(row_count), 0) AS row_cnt FROM ${spec.table}`,
+            onRow: (row) => {
                 const chunks = Math.max(0, Number(row?.chunk_cnt ?? 0) || 0);
                 const rows = Math.max(0, Number(row?.row_cnt ?? 0) || 0);
                 tables[spec.table] = { chunks, rows };
                 totalChunks += chunks;
                 totalChunkRows += rows;
-            } catch {
-                tables[spec.table] = { chunks: 0, rows: 0 };
             }
-        })
-    );
-
-    let totalCacheRows = 0;
-    try {
-        const cacheDb = getCacheDb(rawEnv);
-        const nowMs = Date.now();
-        const cRow = await cacheDb
-            .prepare('SELECT COUNT(*) AS cnt FROM vrc_api_cache WHERE expires_at > ?')
-            .bind(nowMs)
-            .first<{ cnt?: number }>();
-        totalCacheRows = Math.max(0, Number(cRow?.cnt ?? 0) || 0);
-    } catch {
-        totalCacheRows = 0;
+        });
     }
 
-    let totalLegacySingleRows = 0;
-    await Promise.all(
-        SINGLE_ROW_LEGACY_COUNTS.map(async (item) => {
-            const db = getRawShardDb(rawEnv, item.shard);
-            if (!db) return;
-            try {
-                const r = await db.prepare(`SELECT COUNT(*) AS cnt FROM ${item.table}`).first<{ cnt?: number }>();
-                const cnt = Math.max(0, Number(r?.cnt ?? 0) || 0);
-                const migratable = Math.max(0, cnt - (item.hotTailExempt ?? 0));
-                totalLegacySingleRows += migratable;
-            } catch {
-                // Table not present on shard
-            }
-        })
-    );
+    const cacheDb = getCacheDb(rawEnv);
+    const nowMs = Date.now();
+    enqueue(cacheDb, {
+        sql: 'SELECT COUNT(*) AS cnt FROM vrc_api_cache WHERE expires_at > ?',
+        binds: [nowMs],
+        onRow: (row) => {
+            totalCacheRows = Math.max(0, Number(row?.cnt ?? 0) || 0);
+        }
+    });
 
-    let totalRollupRows = 0;
-    await Promise.all(
-        MANAGED_ROLLUP_TABLES.map(async (rSpec) => {
-            const db = getRawShardDb(rawEnv, rSpec.shard);
-            if (!db) return;
-            try {
-                const r = await db.prepare(`SELECT COUNT(*) AS cnt FROM ${rSpec.table}`).first<{ cnt?: number }>();
-                const cnt = Math.max(0, Number(r?.cnt ?? 0) || 0);
+    for (const item of SINGLE_ROW_LEGACY_COUNTS) {
+        const db = getRawShardDb(rawEnv, item.shard);
+        enqueue(db, {
+            sql: `SELECT COUNT(*) AS cnt FROM ${item.table}`,
+            onRow: (row) => {
+                const cnt = Math.max(0, Number(row?.cnt ?? 0) || 0);
+                totalLegacySingleRows += Math.max(0, cnt - (item.hotTailExempt ?? 0));
+            }
+        });
+    }
+
+    for (const rSpec of MANAGED_ROLLUP_TABLES) {
+        tables[rSpec.physicalTable] = { chunks: 0, rows: 0 };
+        const db = getRawShardDb(rawEnv, rSpec.shard);
+        enqueue(db, {
+            sql: `SELECT COUNT(*) AS cnt FROM ${rSpec.table}`,
+            onRow: (row) => {
+                const cnt = Math.max(0, Number(row?.cnt ?? 0) || 0);
                 tables[rSpec.physicalTable] = { chunks: cnt, rows: cnt };
                 totalRollupRows += cnt;
-            } catch {
-                tables[rSpec.physicalTable] = { chunks: 0, rows: 0 };
             }
-        })
-    );
+        });
+    }
+
+    await Promise.all(Array.from(byDb.entries()).map(([db, queries]) => executeShardCountBatch(db, queries)));
 
     return {
         totalChunks,
@@ -243,8 +301,8 @@ export async function runExternalMysqlMigrationBatch(
     let movedCacheRows = 0;
 
     // Step 1: Compact any remaining legacy single-row history rows straight into MySQL via hybrid env
-    const preCheck = await measureD1PendingMigration(rawEnv);
-    if (preCheck.totalLegacySingleRows > 0) {
+    const pendingLegacySingleRows = await countPendingLegacySingleRows(rawEnv);
+    if (pendingLegacySingleRows > 0) {
         state.phase = 'compact_single_rows';
         const session = new ExternalMysqlSession(connParams, config.mode, false);
         const hybridEnv: Env = {
@@ -412,16 +470,53 @@ export async function runExternalMysqlMigrationBatch(
 
                     for (let i = 0; i < rows.length; i += 25) {
                         const slice = rows.slice(i, i + 25);
-                        const ph = slice.map(() => '(?, ?, ?, ?, ?)').join(', ');
-                        const binds: unknown[] = [];
+                        // Pre-aggregate keys that collide after 191-char truncation before writing to MySQL
+                        const aggMap = new Map<
+                            string,
+                            {
+                                worldId: string;
+                                worldName: string;
+                                visitCount: number;
+                                totalTime: number;
+                                lastVisit: string;
+                                rawIds: string[];
+                            }
+                        >();
                         for (const r of slice) {
-                            binds.push(
-                                String(r.world_id ?? '').slice(0, 191),
-                                String(r.world_name ?? ''),
-                                Math.max(0, Number(r.visit_count ?? 0) || 0),
-                                Math.max(0, Number(r.total_time ?? 0) || 0),
-                                String(r.last_visit ?? '')
-                            );
+                            const rawId = String(r.world_id ?? '');
+                            const k = rawId.slice(0, 191);
+                            const vCnt = Math.max(0, Number(r.visit_count ?? 0) || 0);
+                            const tTime = Math.max(0, Number(r.total_time ?? 0) || 0);
+                            const lVisit = String(r.last_visit ?? '');
+                            const wName = String(r.world_name ?? '');
+                            const prev = aggMap.get(k);
+                            if (!prev) {
+                                aggMap.set(k, {
+                                    worldId: k,
+                                    worldName: wName,
+                                    visitCount: vCnt,
+                                    totalTime: tTime,
+                                    lastVisit: lVisit,
+                                    rawIds: [rawId]
+                                });
+                            } else {
+                                prev.visitCount += vCnt;
+                                prev.totalTime += tTime;
+                                if (wName && (!prev.worldName || lVisit >= prev.lastVisit)) {
+                                    prev.worldName = wName;
+                                }
+                                if (lVisit > prev.lastVisit) {
+                                    prev.lastVisit = lVisit;
+                                }
+                                prev.rawIds.push(rawId);
+                            }
+                        }
+
+                        const aggEntries = Array.from(aggMap.values());
+                        const ph = aggEntries.map(() => '(?, ?, ?, ?, ?)').join(', ');
+                        const binds: unknown[] = [];
+                        for (const item of aggEntries) {
+                            binds.push(item.worldId, item.worldName, item.visitCount, item.totalTime, item.lastVisit);
                         }
                         await conn.execute(
                             `INSERT INTO \`${qRollup}\` (\`world_id\`, \`world_name\`, \`visit_count\`, \`total_time\`, \`last_visit\`)
@@ -443,25 +538,32 @@ export async function runExternalMysqlMigrationBatch(
                                 END`,
                             binds
                         );
-                    }
-                    const keys = rows.map((r) => String(r.world_id ?? '').slice(0, 191));
-                    const verifyPh = keys.map(() => '?').join(', ');
-                    const verifyRes = await conn.execute(
-                        `SELECT \`world_id\` FROM \`${qRollup}\` WHERE \`world_id\` IN (${verifyPh})`,
-                        keys
-                    );
-                    const verified = new Set(verifyRes.rows.map((r) => String(r.world_id ?? '')));
-                    const toDelete = rows.filter((r) => verified.has(String(r.world_id ?? '').slice(0, 191)));
-                    for (let i = 0; i < toDelete.length; i += 25) {
-                        const batch = toDelete.slice(i, i + 25);
-                        await d1.batch(
-                            batch.map((r) =>
-                                d1.prepare('DELETE FROM gamelog_world_rollup WHERE world_id = ?').bind(r.world_id)
-                            )
+
+                        // Verify & delete this exact 25-row slice from D1 immediately so a later slice failure
+                        // never re-adds already-migrated rollup counts on retry.
+                        const sliceKeys = aggEntries.map((e) => e.worldId);
+                        const verifyPh = sliceKeys.map(() => '?').join(', ');
+                        const verifyRes = await conn.execute(
+                            `SELECT \`world_id\` FROM \`${qRollup}\` WHERE \`world_id\` IN (${verifyPh})`,
+                            sliceKeys
                         );
+                        const verified = new Set(verifyRes.rows.map((r) => String(r.world_id ?? '')));
+                        const deleteRawIds: string[] = [];
+                        for (const entry of aggEntries) {
+                            if (verified.has(entry.worldId)) {
+                                deleteRawIds.push(...entry.rawIds);
+                            }
+                        }
+                        if (deleteRawIds.length > 0) {
+                            await d1.batch(
+                                deleteRawIds.map((rawId) =>
+                                    d1.prepare('DELETE FROM gamelog_world_rollup WHERE world_id = ?').bind(rawId)
+                                )
+                            );
+                            movedRollupRows += deleteRawIds.length;
+                            rollupBudget -= deleteRawIds.length;
+                        }
                     }
-                    movedRollupRows += toDelete.length;
-                    rollupBudget -= toDelete.length;
                 } else {
                     const res = await d1
                         .prepare(
@@ -485,18 +587,75 @@ export async function runExternalMysqlMigrationBatch(
                     state.phase = 'move_chunks';
                     state.lastTable = rSpec.physicalTable;
 
-                    const normKeys = rows.map((r) => String(r.user_id ?? '').slice(0, 191));
-                    const existingMap = new Map<
-                        string,
-                        { display_name: string; join_count: number; time_spent: number; last_seen: string; second_last_seen: string }
-                    >();
-                    for (let i = 0; i < normKeys.length; i += 50) {
-                        const sliceKeys = normKeys.slice(i, i + 50);
-                        const ph = sliceKeys.map(() => '?').join(', ');
+                    for (let i = 0; i < rows.length; i += 25) {
+                        const slice = rows.slice(i, i + 25);
+                        // Pre-aggregate keys that collide after 191-char truncation before reading/merging MySQL
+                        const aggMap = new Map<
+                            string,
+                            {
+                                userId: string;
+                                displayName: string;
+                                joinCount: number;
+                                timeSpent: number;
+                                lastSeen: string;
+                                secondLastSeen: string;
+                                rawIds: string[];
+                            }
+                        >();
+                        for (const r of slice) {
+                            const rawId = String(r.user_id ?? '');
+                            const k = rawId.slice(0, 191);
+                            const jCnt = Math.max(0, Number(r.join_count ?? 0) || 0);
+                            const tSpent = Math.max(0, Number(r.time_spent ?? 0) || 0);
+                            const lSeen = String(r.last_seen ?? '').trim();
+                            const sSeen = String(r.second_last_seen ?? '').trim();
+                            const dName = String(r.display_name ?? '');
+                            const prev = aggMap.get(k);
+                            if (!prev) {
+                                const tsList = Array.from(new Set([lSeen, sSeen].filter(Boolean))).sort((a, b) =>
+                                    b < a ? -1 : b > a ? 1 : 0
+                                );
+                                aggMap.set(k, {
+                                    userId: k,
+                                    displayName: dName,
+                                    joinCount: jCnt,
+                                    timeSpent: tSpent,
+                                    lastSeen: tsList[0] ?? '',
+                                    secondLastSeen: tsList[1] ?? '',
+                                    rawIds: [rawId]
+                                });
+                            } else {
+                                const tsList = Array.from(
+                                    new Set([prev.lastSeen, prev.secondLastSeen, lSeen, sSeen].filter(Boolean))
+                                ).sort((a, b) => (b < a ? -1 : b > a ? 1 : 0));
+                                if (dName && (!prev.displayName || lSeen >= prev.lastSeen)) {
+                                    prev.displayName = dName;
+                                }
+                                prev.joinCount += jCnt;
+                                prev.timeSpent += tSpent;
+                                prev.lastSeen = tsList[0] ?? '';
+                                prev.secondLastSeen = tsList[1] ?? '';
+                                prev.rawIds.push(rawId);
+                            }
+                        }
+
+                        const aggEntries = Array.from(aggMap.values());
+                        const sliceKeys = aggEntries.map((e) => e.userId);
+                        const existingMap = new Map<
+                            string,
+                            {
+                                display_name: string;
+                                join_count: number;
+                                time_spent: number;
+                                last_seen: string;
+                                second_last_seen: string;
+                            }
+                        >();
+                        const exPh = sliceKeys.map(() => '?').join(', ');
                         const exRes = await conn.execute(
                             `SELECT \`user_id\`, \`display_name\`, \`join_count\`, \`time_spent\`, \`last_seen\`, \`second_last_seen\`
                              FROM \`${qRollup}\`
-                             WHERE \`user_id\` IN (${ph})`,
+                             WHERE \`user_id\` IN (${exPh})`,
                             sliceKeys
                         );
                         for (const er of exRes.rows) {
@@ -508,66 +667,65 @@ export async function runExternalMysqlMigrationBatch(
                                 second_last_seen: String(er.second_last_seen ?? '')
                             });
                         }
-                    }
 
-                    const mergedBatch: Array<[string, string, number, number, string, string]> = [];
-                    for (const r of rows) {
-                        const k = String(r.user_id ?? '').slice(0, 191);
-                        const prev = existingMap.get(k);
-                        const tsList = Array.from(
-                            new Set(
-                                [prev?.last_seen, prev?.second_last_seen, r.last_seen, r.second_last_seen]
-                                    .map((x) => String(x ?? '').trim())
-                                    .filter(Boolean)
-                            )
-                        ).sort((a, b) => (b < a ? -1 : b > a ? 1 : 0));
-                        const top1 = tsList[0] ?? '';
-                        const top2 = tsList[1] ?? '';
-                        const dName = String(r.display_name ?? '');
-                        const pName = prev?.display_name ?? '';
-                        const mergedName =
-                            dName && (!pName || String(r.last_seen ?? '') >= (prev?.last_seen ?? ''))
-                                ? dName
-                                : pName || dName;
-                        mergedBatch.push([
-                            k,
-                            mergedName,
-                            (prev?.join_count ?? 0) + Math.max(0, Number(r.join_count ?? 0) || 0),
-                            (prev?.time_spent ?? 0) + Math.max(0, Number(r.time_spent ?? 0) || 0),
-                            top1,
-                            top2
-                        ]);
-                    }
+                        const mergedBatch: Array<[string, string, number, number, string, string]> = [];
+                        for (const entry of aggEntries) {
+                            const prev = existingMap.get(entry.userId);
+                            const tsList = Array.from(
+                                new Set(
+                                    [prev?.last_seen, prev?.second_last_seen, entry.lastSeen, entry.secondLastSeen]
+                                        .map((x) => String(x ?? '').trim())
+                                        .filter(Boolean)
+                                )
+                            ).sort((a, b) => (b < a ? -1 : b > a ? 1 : 0));
+                            const top1 = tsList[0] ?? '';
+                            const top2 = tsList[1] ?? '';
+                            const pName = prev?.display_name ?? '';
+                            const mergedName =
+                                entry.displayName && (!pName || entry.lastSeen >= (prev?.last_seen ?? ''))
+                                    ? entry.displayName
+                                    : pName || entry.displayName;
+                            mergedBatch.push([
+                                entry.userId,
+                                mergedName,
+                                (prev?.join_count ?? 0) + entry.joinCount,
+                                (prev?.time_spent ?? 0) + entry.timeSpent,
+                                top1,
+                                top2
+                            ]);
+                        }
 
-                    for (let i = 0; i < mergedBatch.length; i += 25) {
-                        const slice = mergedBatch.slice(i, i + 25);
-                        const ph = slice.map(() => '(?, ?, ?, ?, ?, ?)').join(', ');
+                        const ph = mergedBatch.map(() => '(?, ?, ?, ?, ?, ?)').join(', ');
                         const binds: unknown[] = [];
-                        for (const item of slice) binds.push(...item);
+                        for (const item of mergedBatch) binds.push(...item);
                         await conn.execute(
                             `REPLACE INTO \`${qRollup}\` (\`user_id\`, \`display_name\`, \`join_count\`, \`time_spent\`, \`last_seen\`, \`second_last_seen\`)
                              VALUES ${ph}`,
                             binds
                         );
-                    }
 
-                    const verifyPh = normKeys.map(() => '?').join(', ');
-                    const verifyRes = await conn.execute(
-                        `SELECT \`user_id\` FROM \`${qRollup}\` WHERE \`user_id\` IN (${verifyPh})`,
-                        normKeys
-                    );
-                    const verified = new Set(verifyRes.rows.map((r) => String(r.user_id ?? '')));
-                    const toDelete = rows.filter((r) => verified.has(String(r.user_id ?? '').slice(0, 191)));
-                    for (let i = 0; i < toDelete.length; i += 25) {
-                        const batch = toDelete.slice(i, i + 25);
-                        await d1.batch(
-                            batch.map((r) =>
-                                d1.prepare('DELETE FROM gamelog_user_rollup WHERE user_id = ?').bind(r.user_id)
-                            )
+                        // Verify & delete this exact 25-row slice from D1 immediately so retries never double-count
+                        const verifyRes = await conn.execute(
+                            `SELECT \`user_id\` FROM \`${qRollup}\` WHERE \`user_id\` IN (${exPh})`,
+                            sliceKeys
                         );
+                        const verified = new Set(verifyRes.rows.map((r) => String(r.user_id ?? '')));
+                        const deleteRawIds: string[] = [];
+                        for (const entry of aggEntries) {
+                            if (verified.has(entry.userId)) {
+                                deleteRawIds.push(...entry.rawIds);
+                            }
+                        }
+                        if (deleteRawIds.length > 0) {
+                            await d1.batch(
+                                deleteRawIds.map((rawId) =>
+                                    d1.prepare('DELETE FROM gamelog_user_rollup WHERE user_id = ?').bind(rawId)
+                                )
+                            );
+                            movedRollupRows += deleteRawIds.length;
+                            rollupBudget -= deleteRawIds.length;
+                        }
                     }
-                    movedRollupRows += toDelete.length;
-                    rollupBudget -= toDelete.length;
                 }
             }
         }
@@ -634,6 +792,11 @@ export async function runExternalMysqlMigrationBatch(
             }
         }
     } catch (err) {
+        // Persist counters for slices already durably written to MySQL and deleted from D1 before the error
+        state.totalChunksMoved += movedChunks;
+        state.totalRowsMoved += movedRows;
+        state.totalRollupMoved += movedRollupRows;
+        state.totalCacheMoved += movedCacheRows;
         state.status = 'error';
         state.lastError = err instanceof Error ? err.message : 'Migration batch failed';
         await saveExternalDbMigrationState(rawEnv, state);
@@ -644,6 +807,7 @@ export async function runExternalMysqlMigrationBatch(
 
     state.totalChunksMoved += movedChunks;
     state.totalRowsMoved += movedRows;
+    state.totalRollupMoved += movedRollupRows;
     state.totalCacheMoved += movedCacheRows;
 
     const remaining = await measureD1PendingMigration(rawEnv);
@@ -841,7 +1005,14 @@ export async function handleExternalMysqlRoutes(request: Request, env: Env, url:
             );
         }
 
-        let passwordEnc = parsed.clearPassword ? '' : existing.passwordEnc;
+        const sameAuthTarget =
+            parsed.next.connectionType === 'direct' &&
+            existing.connectionType === 'direct' &&
+            parsed.next.host === existing.host &&
+            parsed.next.port === existing.port &&
+            parsed.next.username === existing.username;
+
+        let passwordEnc = !parsed.clearPassword && sameAuthTarget ? existing.passwordEnc : '';
         if (parsed.rawPasswordInput) {
             passwordEnc = await encryptMysqlPassword(rawEnv, parsed.rawPasswordInput);
         }
@@ -925,9 +1096,26 @@ export async function handleExternalMysqlRoutes(request: Request, env: Env, url:
                 tablePrefix: parsed.next.tablePrefix
             };
         } else {
+            const sameAuthTarget =
+                existing.connectionType === 'direct' &&
+                parsed.next.host === existing.host &&
+                parsed.next.port === existing.port &&
+                parsed.next.username === existing.username;
+            if (!parsed.rawPasswordInput && !parsed.clearPassword && existing.passwordEnc && !sameAuthTarget) {
+                return Response.json(
+                    {
+                        ok: false,
+                        error: {
+                            code: 'PASSWORD_REQUIRED_FOR_NEW_TARGET',
+                            message: 'Re-enter the MySQL password when changing host, port, or username'
+                        }
+                    },
+                    { status: 400 }
+                );
+            }
             const tempCfg: StoredExternalDbConfig = {
                 ...parsed.next,
-                passwordEnc: parsed.clearPassword ? '' : existing.passwordEnc,
+                passwordEnc: !parsed.clearPassword && sameAuthTarget ? existing.passwordEnc : '',
                 updatedAt: ''
             };
             const baseResolved = await resolveExternalDbConnectionParams(rawEnv, tempCfg);

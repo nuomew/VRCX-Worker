@@ -407,6 +407,54 @@ describe('TranslationApiDialog.vue', () => {
         });
     });
 
+    describe('cloudflare workers ai mode', () => {
+        test('renders cloudflare provider option and preset/custom model inputs', async () => {
+            translationApiType.value = 'cloudflare';
+            translationApiModel.value = '@cf/zai-org/glm-4.7-flash';
+            const wrapper = mountComponent();
+            await nextTick();
+
+            expect(wrapper.text()).toContain('dialog.translation_api.mode_cloudflare');
+            expect(wrapper.text()).toContain('dialog.translation_api.cloudflare.hint');
+            expect(wrapper.text()).toContain('dialog.translation_api.cloudflare.preset');
+            expect(wrapper.text()).toContain('dialog.translation_api.cloudflare.model');
+            expect(wrapper.text()).toContain('dialog.translation_api.test');
+        });
+
+        test('allows entering a custom Workers AI model ID, testing, and saving it', async () => {
+            translationApiType.value = 'cloudflare';
+            translationApiModel.value = '@cf/zai-org/glm-4.7-flash';
+            mocks.translateText.mockResolvedValue('Bonjour le monde');
+            const wrapper = mountComponent();
+            await nextTick();
+
+            const modelInput = wrapper.find('[data-testid="input-field"]');
+            await modelInput.setValue('@cf/deepseek-ai/deepseek-v4.1-flash-1017');
+            await nextTick();
+
+            const testBtn = wrapper.findAll('button').find((b) => b.text().includes('dialog.translation_api.test'));
+            await testBtn.trigger('click');
+            await flushPromises();
+
+            expect(mocks.translateText).toHaveBeenCalledWith(
+                'Hello world',
+                'fr',
+                expect.objectContaining({
+                    type: 'cloudflare',
+                    model: '@cf/deepseek-ai/deepseek-v4.1-flash-1017',
+                    allowWhenDisabled: true
+                })
+            );
+
+            const saveBtn = wrapper.findAll('button').find((b) => b.text().includes('dialog.translation_api.save'));
+            await saveBtn.trigger('click');
+            await flushPromises();
+
+            expect(mocks.setTranslationApiType).toHaveBeenCalledWith('cloudflare');
+            expect(mocks.setTranslationApiModel).toHaveBeenCalledWith('@cf/deepseek-ai/deepseek-v4.1-flash-1017');
+        });
+    });
+
     describe('form loading', () => {
         test('loads form values from store when dialog opens', async () => {
             translationApiType.value = 'openai';

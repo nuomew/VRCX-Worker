@@ -129,6 +129,7 @@ export interface ExternalDbMigrationState {
     d1Drained: boolean;
     totalChunksMoved: number;
     totalRowsMoved: number;
+    totalRollupMoved: number;
     totalCacheMoved: number;
     totalSingleRowsCompacted: number;
     lastTable: string;
@@ -219,6 +220,7 @@ export function defaultExternalDbMigrationState(): ExternalDbMigrationState {
         d1Drained: false,
         totalChunksMoved: 0,
         totalRowsMoved: 0,
+        totalRollupMoved: 0,
         totalCacheMoved: 0,
         totalSingleRowsCompacted: 0,
         lastTable: '',
@@ -498,6 +500,7 @@ function parseMigrationStateJson(raw: string | undefined): ExternalDbMigrationSt
             d1Drained: parsed.d1Drained === true,
             totalChunksMoved: Math.max(0, Number(parsed.totalChunksMoved ?? 0) || 0),
             totalRowsMoved: Math.max(0, Number(parsed.totalRowsMoved ?? 0) || 0),
+            totalRollupMoved: Math.max(0, Number(parsed.totalRollupMoved ?? 0) || 0),
             totalCacheMoved: Math.max(0, Number(parsed.totalCacheMoved ?? 0) || 0),
             totalSingleRowsCompacted: Math.max(0, Number(parsed.totalSingleRowsCompacted ?? 0) || 0),
             lastTable: typeof parsed.lastTable === 'string' ? parsed.lastTable : '',
@@ -931,7 +934,7 @@ export async function testExternalMysqlConnection(
 
 /**
  * Measures real-time MySQL 5.7+ table storage usage (bytes, chunk counts, logical row counts)
- * across all 8 managed tables without leaking credentials.
+ * across all 12 managed tables without leaking credentials.
  */
 export async function measureExternalMysqlUsage(
     params: ResolvedMysqlConnectionParams
@@ -942,6 +945,9 @@ export async function measureExternalMysqlUsage(
         tables[spec.table] = { chunks: 0, rows: 0, bytes: 0 };
     }
     tables.vrc_api_cache = { chunks: 0, rows: 0, bytes: 0 };
+    for (const rSpec of MANAGED_ROLLUP_TABLES) {
+        tables[rSpec.physicalTable] = { chunks: 0, rows: 0, bytes: 0 };
+    }
 
     let conn: MysqlConnectionLike | null = null;
     try {
@@ -967,9 +973,11 @@ export async function measureExternalMysqlUsage(
                 [params.database, ...qualifiedNames]
             );
             for (const row of infoRes.rows) {
-                const name = String(row.table_name ?? '');
+                const name = String(row.table_name ?? '').toLowerCase();
                 const bytes = Math.max(0, Number(row.total_bytes ?? 0) || 0);
-                sizeByQualified.set(name, bytes);
+                if (name) {
+                    sizeByQualified.set(name, bytes);
+                }
                 usedBytes += bytes;
             }
         } catch {
@@ -986,7 +994,7 @@ export async function measureExternalMysqlUsage(
             );
             const chunkCnt = Math.max(0, Number(statRes.rows[0]?.chunk_cnt ?? 0) || 0);
             const rowCnt = Math.max(0, Number(statRes.rows[0]?.row_cnt ?? 0) || 0);
-            const bytes = sizeByQualified.get(tbl) ?? 0;
+            const bytes = sizeByQualified.get(tbl.toLowerCase()) ?? 0;
             tables[spec.table] = { chunks: chunkCnt, rows: rowCnt, bytes };
             totalChunks += chunkCnt;
             totalLogicalRows += rowCnt;
@@ -998,7 +1006,7 @@ export async function measureExternalMysqlUsage(
         tables.vrc_api_cache = {
             chunks: cacheRows,
             rows: cacheRows,
-            bytes: sizeByQualified.get(cacheTbl) ?? 0
+            bytes: sizeByQualified.get(cacheTbl.toLowerCase()) ?? 0
         };
 
         for (const rSpec of MANAGED_ROLLUP_TABLES) {
@@ -1008,7 +1016,7 @@ export async function measureExternalMysqlUsage(
             tables[rSpec.physicalTable] = {
                 chunks: rCnt,
                 rows: rCnt,
-                bytes: sizeByQualified.get(rTbl) ?? 0
+                bytes: sizeByQualified.get(rTbl.toLowerCase()) ?? 0
             };
         }
 
