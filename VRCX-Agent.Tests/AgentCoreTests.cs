@@ -1324,6 +1324,38 @@ public sealed class AgentCoreTests
     }
 
     [Fact]
+    public void VrcLogParser_ParsesLegacyUserIdsParenthesizedNamesAndRemovesByUserId()
+    {
+        var parser = new VrcLogParser();
+        Assert.Null(parser.ParseLine("2026.11.27 10:00:00 Log        -  [RoomManager] Entering Room: Legacy Shrine"));
+        GameLogEventItem? loc = parser.ParseLine("2026.11.27 10:00:01 Log        -  [RoomManager] Joining wrld_55555555-5555-5555-5555-555555555555:5005~region(jp)");
+        Assert.NotNull(loc);
+        Assert.Equal("Legacy Shrine", loc!.WorldName);
+
+        // Legacy 10-char VRChat user ID (non-usr_ prefix) + parenthesized display name without ID + standard usr_ ID
+        GameLogEventItem? legacyJoin = parser.ParseLine("2026.11.27 10:00:05 Debug      -  [Behaviour] OnPlayerJoined OldTimer (8JoV9XEdpo)");
+        Assert.NotNull(legacyJoin);
+        Assert.Equal("OldTimer", legacyJoin!.DisplayName);
+        Assert.Equal("8JoV9XEdpo", legacyJoin.UserId);
+
+        GameLogEventItem? parenNameJoin = parser.ParseLine("2026.11.27 10:00:06 Debug      -  [Behaviour] OnPlayerJoined Sakura (AFK)");
+        Assert.NotNull(parenNameJoin);
+        Assert.Equal("Sakura (AFK)", parenNameJoin!.DisplayName);
+        Assert.Equal(string.Empty, parenNameJoin.UserId);
+
+        // Ignored synthetic OnPlayerJoined:Unnamed & OnPlayerLeftRoom lines must not pollute player list
+        Assert.Null(parser.ParseLine("2026.11.27 10:00:07 Log        -  [Behaviour] OnPlayerJoined:Unnamed"));
+        Assert.Equal(2, parser.CurrentPlayerCount);
+
+        // OnPlayerLeft with changed display name still removes by matching UserId
+        GameLogEventItem? legacyLeft = parser.ParseLine("2026.11.27 10:01:00 Debug      -  [Behaviour] OnPlayerLeft OldTimerRenamed (8JoV9XEdpo)");
+        Assert.NotNull(legacyLeft);
+        Assert.Equal(1, parser.CurrentPlayerCount);
+        Assert.Single(parser.SnapshotCurrentPlayerDetails());
+        Assert.Equal("Sakura (AFK)", parser.SnapshotCurrentPlayerDetails()[0].DisplayName);
+    }
+
+    [Fact]
     public void CommandValidator_AllowsRegionalAwsS3AndGoogleTranslateAndYouTubeHosts()
     {
         Assert.True(CommandValidator.IsAllowedVrcUrl("https://s3.us-west-2.amazonaws.com/bucket/file.png"));

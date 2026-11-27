@@ -17,23 +17,27 @@ public sealed class VrcLogParser
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
     private static readonly Regex JoiningWorldRegex = new(
-        @"^\[Behaviour\]\s+Joining\s+((?:wrld|wld)_[A-Za-z0-9-]+:.+)$",
+        @"\[(?:Behaviour|RoomManager)\]\s+Joining\s+((?:wrld|wld)_[A-Za-z0-9-]+:\S+)",
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
     private static readonly Regex EnteringRoomRegex = new(
-        @"^\[Behaviour\]\s+Entering Room:\s+(.+)$",
+        @"\[(?:Behaviour|RoomManager)\]\s+Entering Room:\s+(.+)$",
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
     private static readonly Regex LeftRoomRegex = new(
-        @"^\[Behaviour\]\s+OnLeftRoom\b",
+        @"\[Behaviour\]\s+OnLeftRoom\b",
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
     private static readonly Regex PlayerJoinedRegex = new(
-        @"^\[Behaviour\]\s+OnPlayerJoined\s+(.+?)(?:\s+\((usr_[A-Za-z0-9-]+)\))?$",
+        @"\[(?:Behaviour|NetworkManager)\]\s+OnPlayerJoined\s+(.+)$",
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
     private static readonly Regex PlayerLeftRegex = new(
-        @"^\[Behaviour\]\s+OnPlayerLeft\s+(.+?)(?:\s+\((usr_[A-Za-z0-9-]+)\))?$",
+        @"\[(?:Behaviour|NetworkManager)\]\s+OnPlayerLeft\s+(.+)$",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+
+    private static readonly Regex LegacyOrUsrIdRegex = new(
+        @"^(?:usr_[A-Za-z0-9-]+|[A-Za-z0-9]{10})$",
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
     private static readonly Regex VideoPlayRegex = new(
@@ -300,50 +304,70 @@ public sealed class VrcLogParser
             return supersededPending;
         }
 
-        // 3. OnPlayerJoined
-        Match pjMatch = PlayerJoinedRegex.Match(body);
-        if (pjMatch.Success)
+        // 3. OnPlayerJoined (aligned with upstream Dotnet/LogWatcher.cs: supports usr_* & legacy 10-char IDs)
+        if (!body.Contains("] OnPlayerJoined:", StringComparison.Ordinal))
         {
-            string displayName = pjMatch.Groups[1].Value.Trim();
-            string userId = pjMatch.Groups[2].Success ? pjMatch.Groups[2].Value.Trim() : string.Empty;
-            _currentPlayers[displayName] = (userId, isoTs);
-
-            if (IsFloodDuplicate($"Join:{displayName}:{userId}", eventTime, TimeSpan.FromSeconds(3)))
+            Match pjMatch = PlayerJoinedRegex.Match(body);
+            if (pjMatch.Success)
             {
-                return null;
+                (string displayName, string userId) = ParsePlayerInfo(pjMatch.Groups[1].Value);
+                if (!string.IsNullOrEmpty(displayName) || !string.IsNullOrEmpty(userId))
+                {
+                    if (!string.IsNullOrEmpty(userId))
+                    {
+                        RemoveCurrentPlayerByUserId(userId, exceptDisplayName: displayName);
+                    }
+                    string dictKey = !string.IsNullOrEmpty(displayName) ? displayName : userId;
+                    _currentPlayers[dictKey] = (userId, isoTs);
+
+                    if (IsFloodDuplicate($"Join:{displayName}:{userId}", eventTime, TimeSpan.FromSeconds(3)))
+                    {
+                        return null;
+                    }
+
+                    return new GameLogEventItem
+                    {
+                        Type = "OnPlayerJoined",
+                        CreatedAt = isoTs,
+                        DisplayName = displayName,
+                        UserId = userId,
+                        Location = _currentLocation
+                    };
+                }
             }
-
-            return new GameLogEventItem
-            {
-                Type = "OnPlayerJoined",
-                CreatedAt = isoTs,
-                DisplayName = displayName,
-                UserId = userId,
-                Location = _currentLocation
-            };
         }
 
         // 4. OnPlayerLeft
-        Match plMatch = PlayerLeftRegex.Match(body);
-        if (plMatch.Success)
+        if (!body.Contains("] OnPlayerLeftRoom", StringComparison.Ordinal) &&
+            !body.Contains("] OnPlayerLeft:", StringComparison.Ordinal))
         {
-            string displayName = plMatch.Groups[1].Value.Trim();
-            string userId = plMatch.Groups[2].Success ? plMatch.Groups[2].Value.Trim() : string.Empty;
-            _currentPlayers.Remove(displayName);
-
-            if (IsFloodDuplicate($"Left:{displayName}:{userId}", eventTime, TimeSpan.FromSeconds(3)))
+            Match plMatch = PlayerLeftRegex.Match(body);
+            if (plMatch.Success)
             {
-                return null;
+                (string displayName, string userId) = ParsePlayerInfo(plMatch.Groups[1].Value);
+                if (!string.IsNullOrEmpty(displayName) || !string.IsNullOrEmpty(userId))
+                {
+                    bool removed = !string.IsNullOrEmpty(displayName) && _currentPlayers.Remove(displayName);
+                    if (!removed && !string.IsNullOrEmpty(userId))
+                    {
+                        RemoveCurrentPlayerByUserId(userId, exceptDisplayName: null);
+                    }
+
+                    if (IsFloodDuplicate($"Left:{displayName}:{userId}", eventTime, TimeSpan.FromSeconds(3)))
+                    {
+                        return null;
+                    }
+
+                    return new GameLogEventItem
+                    {
+                        Type = "OnPlayerLeft",
+                        CreatedAt = isoTs,
+                        DisplayName = displayName,
+                        UserId = userId,
+                        Location = _currentLocation
+                    };
+                }
             }
-
-            return new GameLogEventItem
-            {
-                Type = "OnPlayerLeft",
-                CreatedAt = isoTs,
-                DisplayName = displayName,
-                UserId = userId,
-                Location = _currentLocation
-            };
         }
 
         // 5. VideoPlay
@@ -425,6 +449,59 @@ public sealed class VrcLogParser
         }
 
         return null;
+    }
+
+    private static (string DisplayName, string UserId) ParsePlayerInfo(string raw)
+    {
+        string trimmed = raw.Trim();
+        if (string.IsNullOrEmpty(trimmed))
+        {
+            return (string.Empty, string.Empty);
+        }
+
+        // Match upstream Dotnet/LogWatcher.cs ParseUserInfo while keeping parenthesized display names intact
+        // unless the trailing (...) token is a valid VRChat user ID (`usr_*` or legacy 10-char alphanumeric ID).
+        int openIdx = trimmed.LastIndexOf(" (", StringComparison.Ordinal);
+        if (openIdx >= 0)
+        {
+            int closeIdx = trimmed.IndexOf(')', openIdx + 2);
+            if (closeIdx > openIdx + 2)
+            {
+                string candidateId = trimmed.Substring(openIdx + 2, closeIdx - (openIdx + 2)).Trim();
+                if (LegacyOrUsrIdRegex.IsMatch(candidateId))
+                {
+                    return (trimmed.Substring(0, openIdx).Trim(), candidateId);
+                }
+            }
+        }
+        return (trimmed, string.Empty);
+    }
+
+    private void RemoveCurrentPlayerByUserId(string userId, string? exceptDisplayName)
+    {
+        if (string.IsNullOrEmpty(userId)) return;
+        List<string>? toRemove = null;
+        foreach (var kvp in _currentPlayers)
+        {
+            if (!string.Equals(kvp.Value.UserId, userId, StringComparison.Ordinal))
+            {
+                continue;
+            }
+            if (!string.IsNullOrEmpty(exceptDisplayName) &&
+                string.Equals(kvp.Key, exceptDisplayName, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+            toRemove ??= new List<string>();
+            toRemove.Add(kvp.Key);
+        }
+        if (toRemove != null)
+        {
+            foreach (string key in toRemove)
+            {
+                _currentPlayers.Remove(key);
+            }
+        }
     }
 
     private bool IsFloodDuplicate(string key, DateTimeOffset ts, TimeSpan window)

@@ -59,31 +59,33 @@ export async function tryLoadPlayerList() {
         const instanceStore = useInstanceStore();
         const vrStore = useVrStore();
 
-        if (!gameStore.isGameRunning) {
+        const isWebMode = typeof WEB !== 'undefined' && WEB;
+        if (!gameStore.isGameRunning && !isWebMode) {
             return;
         }
         console.log('Loading player list from game log...');
         let ctx;
         let i;
-        const data = await database.getGamelogDatabase();
-        if (!Array.isArray(data) || data.length === 0) {
-            return;
-        }
+        const data = gameStore.isGameRunning ? await database.getGamelogDatabase() : [];
         let lastLocationIndex = -1;
-        for (i = data.length - 1; i > -1; i--) {
-            ctx = data[i];
-            if (ctx.type === 'Location') {
-                locationStore.setLastLocation({
-                    date: Date.parse(ctx.created_at),
-                    location: ctx.location,
-                    name: ctx.worldName,
-                    playerList: new Map(),
-                    friendList: new Map()
-                });
-                lastLocationIndex = i;
-                break;
+        if (Array.isArray(data) && data.length > 0) {
+            for (i = data.length - 1; i > -1; i--) {
+                ctx = data[i];
+                if (ctx.type === 'Location') {
+                    locationStore.setLastLocation({
+                        date: Date.parse(ctx.created_at),
+                        location: ctx.location,
+                        name: ctx.worldName,
+                        playerList: new Map(),
+                        friendList: new Map()
+                    });
+                    lastLocationIndex = i;
+                    break;
+                }
             }
         }
+        const recentlyLeftUserIds = new Set();
+        const recentLeftCutoffMs = Date.now() - 120_000;
         if (lastLocationIndex >= 0) {
             for (i = lastLocationIndex + 1; i < data.length; i++) {
                 ctx = data[i];
@@ -99,6 +101,9 @@ export async function tryLoadPlayerList() {
                     const playerKey = ctx.userId || ctx.displayName;
                     if (!playerKey) {
                         continue;
+                    }
+                    if (ctx.userId) {
+                        recentlyLeftUserIds.delete(ctx.userId);
                     }
                     const userMap = {
                         displayName: ctx.displayName,
@@ -116,6 +121,10 @@ export async function tryLoadPlayerList() {
                     const deleted = playerKey ? locationStore.lastLocation.playerList.delete(playerKey) : false;
                     if (ctx.userId) {
                         locationStore.lastLocation.friendList.delete(ctx.userId);
+                        const leftMs = Date.parse(ctx.created_at);
+                        if (Number.isFinite(leftMs) && leftMs >= recentLeftCutoffMs) {
+                            recentlyLeftUserIds.add(ctx.userId);
+                        }
                     }
                     if (!deleted && ctx.displayName) {
                         for (const [k, v] of locationStore.lastLocation.playerList.entries()) {
@@ -127,7 +136,62 @@ export async function tryLoadPlayerList() {
                     }
                 }
             }
-            if (typeof WEB === 'undefined' || !WEB) {
+        } else if (isWebMode && userStore.currentUser?.$locationTag) {
+            const apiLoc = parseLocation(userStore.currentUser.$locationTag);
+            if (apiLoc.isRealInstance) {
+                const selfLocAt = Number(userStore.currentUser.$location_at) || Date.now();
+                locationStore.setLastLocation({
+                    date: selfLocAt,
+                    location: userStore.currentUser.$locationTag,
+                    name: '',
+                    playerList: new Map(),
+                    friendList: new Map()
+                });
+                if (userStore.currentUser.id) {
+                    locationStore.lastLocation.playerList.set(userStore.currentUser.id, {
+                        displayName: userStore.currentUser.displayName || '',
+                        userId: userStore.currentUser.id,
+                        joinTime: selfLocAt,
+                        lastAvatar: ''
+                    });
+                }
+                lastLocationIndex = 0;
+            }
+        }
+
+        if (lastLocationIndex >= 0) {
+            // In Web mode, also reconcile online friends whose live VRChat location matches this exact instance
+            // so same-room friends are reflected in both the header count and PlayerList table even during sync lag.
+            if (isWebMode) {
+                const activeLoc = locationStore.lastLocation.location || '';
+                const parsedActive = parseLocation(activeLoc);
+                if (parsedActive.isRealInstance) {
+                    for (const friend of friendStore.friends.values()) {
+                        const fRef = friend?.ref;
+                        if (
+                            !fRef ||
+                            !fRef.id ||
+                            fRef.id === userStore.currentUser.id ||
+                            friend.state !== 'online' ||
+                            fRef.location !== activeLoc ||
+                            recentlyLeftUserIds.has(fRef.id)
+                        ) {
+                            continue;
+                        }
+                        if (!locationStore.lastLocation.playerList.has(fRef.id)) {
+                            const fMap = {
+                                displayName: fRef.displayName || friend.name || '',
+                                userId: fRef.id,
+                                joinTime: Number(fRef.$location_at) || Date.now(),
+                                lastAvatar: ''
+                            };
+                            locationStore.lastLocation.playerList.set(fRef.id, fMap);
+                            locationStore.lastLocation.friendList.set(fRef.id, fMap);
+                        }
+                    }
+                }
+            }
+            if (!isWebMode) {
                 locationStore.lastLocation.playerList.forEach((ref1) => {
                     if (ref1.userId && typeof ref1.userId === 'string') {
                         if (!userStore.cachedUsers.has(ref1.userId)) {

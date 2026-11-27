@@ -1070,6 +1070,7 @@ export async function handleAgentPublicRoutes(request: Request, env: Env, url: U
                 ...restState,
                 vrcRunning: vrcNow,
                 steamVrRunning: steamNow,
+                stateSyncedAt: nowIso,
                 ...(vrcStartedAt ? { vrcStartedAt } : {}),
                 ...(steamVrStartedAt ? { steamVrStartedAt } : {})
             };

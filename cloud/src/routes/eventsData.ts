@@ -622,7 +622,8 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
     if (url.pathname === '/api/gamelog/current-instance' && request.method === 'GET') {
         const nowMs = Date.now();
         const nowIso = new Date(nowMs).toISOString();
-        const cutoffMs = nowMs - 24 * 3600_000;
+        // Support multi-day AFK/sleep instances (up to 7 days) instead of truncating rooms & players at 24h.
+        const cutoffMs = nowMs - 7 * 24 * 3600_000;
         const cutoffIso = new Date(cutoffMs).toISOString();
 
         const [cfgRes, devicesRes, statesRes, wsHintRes] = await env.DB_CORE.batch([
@@ -670,6 +671,27 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
             updatedAt: string;
             currentPlayers: Array<{ displayName: string; userId: string; joinedAt?: string }> | null;
         }
+        const pickBetterSnapshot = (
+            prev: ActiveDeviceSnapshot | null,
+            next: ActiveDeviceSnapshot
+        ): ActiveDeviceSnapshot => {
+            if (!prev) return next;
+            const prevHasLoc = Boolean(prev.location);
+            const nextHasLoc = Boolean(next.location);
+            if (nextHasLoc !== prevHasLoc) {
+                return nextHasLoc ? next : prev;
+            }
+            const prevCount = prev.currentPlayers?.length ?? 0;
+            const nextCount = next.currentPlayers?.length ?? 0;
+            // Prefer a device with populated room players over an empty snapshot when both report running VRChat.
+            if (prevCount === 0 && nextCount > 0) return next;
+            if (prevCount > 0 && nextCount === 0) return prev;
+            if (next.updatedAt !== prev.updatedAt) {
+                return next.updatedAt > prev.updatedAt ? next : prev;
+            }
+            return nextCount > prevCount ? next : prev;
+        };
+
         let activeSnapshot: ActiveDeviceSnapshot | null = null;
         for (const rawRow of (statesRes?.results ?? []) as Array<{
             device_id?: string;
@@ -693,14 +715,15 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
                           }))
                           .filter((p) => Boolean(p.displayName || p.userId))
                     : null;
-                const updatedAt = rawRow.updated_at || nowIso;
-                if (
-                    !activeSnapshot ||
-                    (Boolean(loc) && !activeSnapshot.location) ||
-                    (Boolean(loc) === Boolean(activeSnapshot.location) && updatedAt > activeSnapshot.updatedAt)
-                ) {
-                    activeSnapshot = { location: loc, worldName, updatedAt, currentPlayers: players };
-                }
+                // Prefer stateSyncedAt (set only by real Agent state uploads) over updated_at (which OSC ticks touch).
+                const updatedAt =
+                    (typeof st.stateSyncedAt === 'string' && st.stateSyncedAt) || rawRow.updated_at || nowIso;
+                activeSnapshot = pickBetterSnapshot(activeSnapshot, {
+                    location: loc,
+                    worldName,
+                    updatedAt,
+                    currentPlayers: players
+                });
             } catch {
                 // Skip malformed device state
             }
@@ -739,14 +762,15 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
                                   }))
                                   .filter((p) => Boolean(p.displayName || p.userId))
                             : null;
-                        const updatedAt = typeof entry.updatedAt === 'string' && entry.updatedAt ? entry.updatedAt : nowIso;
-                        if (
-                            !activeSnapshot ||
-                            (Boolean(loc) && !activeSnapshot.location) ||
-                            (Boolean(loc) === Boolean(activeSnapshot.location) && updatedAt > activeSnapshot.updatedAt)
-                        ) {
-                            activeSnapshot = { location: loc, worldName, updatedAt, currentPlayers: players };
-                        }
+                        const updatedAt =
+                            (typeof st.stateSyncedAt === 'string' && st.stateSyncedAt) ||
+                            (typeof entry.updatedAt === 'string' && entry.updatedAt ? entry.updatedAt : nowIso);
+                        activeSnapshot = pickBetterSnapshot(activeSnapshot, {
+                            location: loc,
+                            worldName,
+                            updatedAt,
+                            currentPlayers: players
+                        });
                     }
                 }
             } catch {
@@ -754,36 +778,43 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
             }
         }
 
-        const [[latestLocRes, latestJlRes], recentChunks] = await Promise.all([
+        // Fetch location and join_leave chunks independently so high-volume join/leave chunks never starve
+        // the latest Location chunk, and query up to 7 days of join_leave chunks for multi-day AFK rooms.
+        const [[latestLocRes, latestJlRes], latestLocChunks, recentJlChunks] = await Promise.all([
             env.DB_GAMELOG.batch([
                 env.DB_GAMELOG.prepare('SELECT * FROM gamelog_location ORDER BY created_at DESC LIMIT 1'),
                 env.DB_GAMELOG.prepare('SELECT * FROM gamelog_join_leave ORDER BY created_at DESC LIMIT 1')
             ]),
-            readGameLogChunksAsDbRows(env.DB_GAMELOG, 'gamelog_archive_chunks', ['location', 'join_leave'], {
+            readGameLogChunksAsDbRows(env.DB_GAMELOG, 'gamelog_archive_chunks', ['location'], {
+                limitChunks: 2
+            }),
+            readGameLogChunksAsDbRows(env.DB_GAMELOG, 'gamelog_archive_chunks', ['join_leave'], {
                 sinceIso: cutoffIso,
-                limitChunks: 6
+                limitChunks: 12
             })
         ]);
         const locCandidates: Array<Record<string, unknown>> = [
             ...((latestLocRes?.results ?? []) as Array<Record<string, unknown>>),
-            ...recentChunks.location
+            ...latestLocChunks.location
         ].sort((a, b) => String(b.created_at ?? '').localeCompare(String(a.created_at ?? '')));
         const jlLatestCandidates: Array<Record<string, unknown>> = [
             ...((latestJlRes?.results ?? []) as Array<Record<string, unknown>>),
-            ...recentChunks.join_leave
+            ...recentJlChunks.join_leave
         ].sort((a, b) => String(b.created_at ?? '').localeCompare(String(a.created_at ?? '')));
         const latestLoc = locCandidates[0] ?? null;
         const latestJl = jlLatestCandidates[0] ?? null;
 
         const latestLocCreatedAt = typeof latestLoc?.created_at === 'string' ? latestLoc.created_at : '';
-        const latestLocValid24h = Boolean(latestLocCreatedAt && latestLocCreatedAt >= cutoffIso);
+        const latestLocValid = Boolean(latestLocCreatedAt && latestLocCreatedAt >= cutoffIso);
         const latestLocTag = typeof latestLoc?.location === 'string' ? latestLoc.location.trim() : '';
         const latestJlCreatedAt = typeof latestJl?.created_at === 'string' ? latestJl.created_at : '';
-        const latestJlValid24h = Boolean(latestJlCreatedAt && latestJlCreatedAt >= cutoffIso);
+        const latestJlValid = Boolean(latestJlCreatedAt && latestJlCreatedAt >= cutoffIso);
         const latestJlTag = typeof latestJl?.location === 'string' ? latestJl.location.trim() : '';
 
-        // Path A: Online v1.10.5+ Agent provided an authoritative live currentPlayers snapshot for an active room.
-        if (activeSnapshot?.location && activeSnapshot.currentPlayers !== null) {
+        // Path A: Online v1.10.5+ Agent provided a non-empty live currentPlayers snapshot for an active room.
+        // Also reconcile any newer DB_GAMELOG join/leave events for the same room ingested after snapshot updatedAt
+        // so players who joined right after the last state upload appear immediately.
+        if (activeSnapshot?.location && activeSnapshot.currentPlayers && activeSnapshot.currentPlayers.length > 0) {
             const rawWorldId = activeSnapshot.location.split(':')[0] ?? '';
             const worldId = rawWorldId.startsWith('wrld_') ? rawWorldId : '';
             const earliestJoin = activeSnapshot.currentPlayers
@@ -791,10 +822,74 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
                 .filter(Boolean)
                 .sort()[0];
             const latestLocMatches =
-                latestLocValid24h && (!latestLocTag || latestLocTag === activeSnapshot.location);
+                latestLocValid && (!latestLocTag || latestLocTag === activeSnapshot.location);
             const locCreatedAt = latestLocMatches
                 ? latestLocCreatedAt
                 : earliestJoin || activeSnapshot.updatedAt;
+
+            const mergedByKey = new Map<string, { displayName: string; userId: string; joinedAt: string }>();
+            for (const p of activeSnapshot.currentPlayers) {
+                const k = p.userId || p.displayName.toLowerCase();
+                if (!k) continue;
+                mergedByKey.set(k, {
+                    displayName: p.displayName,
+                    userId: p.userId,
+                    joinedAt: p.joinedAt || locCreatedAt
+                });
+            }
+
+            // Catch up any DB_GAMELOG join/leave events for this exact room newer than the snapshot timestamp
+            const newerHotJl = await env.DB_GAMELOG.prepare(
+                'SELECT * FROM gamelog_join_leave WHERE location = ? AND created_at > ? ORDER BY created_at ASC, id ASC LIMIT 200'
+            )
+                .bind(activeSnapshot.location, activeSnapshot.updatedAt)
+                .all<Record<string, unknown>>()
+                .then((r) => r.results ?? [])
+                .catch(() => [] as Array<Record<string, unknown>>);
+            const newerJlSeen = new Set<string>();
+            const newerJlRows: Array<Record<string, unknown>> = [];
+            for (const r of [
+                ...newerHotJl,
+                ...recentJlChunks.join_leave.filter(
+                    (row) =>
+                        String(row.location ?? '') === activeSnapshot!.location &&
+                        String(row.created_at ?? '') > activeSnapshot!.updatedAt
+                )
+            ]) {
+                const dk = `${String(r.created_at ?? '')}|${String(r.type ?? '')}|${String(r.display_name ?? '')}`;
+                if (newerJlSeen.has(dk)) continue;
+                newerJlSeen.add(dk);
+                newerJlRows.push(r);
+            }
+            newerJlRows.sort((a, b) => {
+                const cmp = String(a.created_at ?? '').localeCompare(String(b.created_at ?? ''));
+                return cmp !== 0 ? cmp : Number(a.id ?? 0) - Number(b.id ?? 0);
+            });
+            for (const r of newerJlRows) {
+                const uid = String(r.user_id ?? '').trim();
+                const dname = String(r.display_name ?? '').trim();
+                const ts = String(r.created_at ?? '').trim() || locCreatedAt;
+                const k = uid || dname.toLowerCase();
+                if (!k) continue;
+                if (r.type === 'OnPlayerJoined') {
+                    // Remove any legacy displayName-keyed duplicate before inserting by userId
+                    if (uid && dname) mergedByKey.delete(dname.toLowerCase());
+                    mergedByKey.set(k, { displayName: dname, userId: uid, joinedAt: ts });
+                } else if (r.type === 'OnPlayerLeft') {
+                    mergedByKey.delete(k);
+                    if (dname || uid) {
+                        for (const [mk, mv] of mergedByKey.entries()) {
+                            if (
+                                (uid && mv.userId === uid) ||
+                                (dname && mv.displayName.toLowerCase() === dname.toLowerCase())
+                            ) {
+                                mergedByKey.delete(mk);
+                            }
+                        }
+                    }
+                }
+            }
+
             const out: Array<Record<string, unknown>> = [
                 {
                     rowId: latestLocMatches ? Number(latestLoc?.id ?? 0) : 0,
@@ -808,7 +903,7 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
                     groupName: latestLocMatches ? String(latestLoc?.group_name ?? '') : ''
                 }
             ];
-            const sortedPlayers = [...activeSnapshot.currentPlayers].sort((a, b) =>
+            const sortedPlayers = Array.from(mergedByKey.values()).sort((a, b) =>
                 String(a.joinedAt || locCreatedAt).localeCompare(String(b.joinedAt || locCreatedAt))
             );
             for (const p of sortedPlayers) {
@@ -825,14 +920,14 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
             return Response.json({ ok: true, data: out });
         }
 
-        // Path B: Replay DB_GAMELOG join/leave events chronologically (also handles legacy v1.10.4 empty/shifted Location rows).
+        // Path B: Replay DB_GAMELOG join/leave events chronologically (also handles empty snapshots, offline/legacy agents, and multi-day rooms).
         let resolvedLocation = activeSnapshot?.location || '';
-        if (!resolvedLocation && latestJlValid24h && latestJlTag) {
-            if (!latestLocValid24h || !latestLocTag || latestJlCreatedAt >= latestLocCreatedAt) {
+        if (!resolvedLocation && latestJlValid && latestJlTag) {
+            if (!latestLocValid || !latestLocTag || latestJlCreatedAt >= latestLocCreatedAt) {
                 resolvedLocation = latestJlTag;
             }
         }
-        if (!resolvedLocation && latestLocValid24h && latestLocTag) {
+        if (!resolvedLocation && latestLocValid && latestLocTag) {
             resolvedLocation = latestLocTag;
         }
         if (!resolvedLocation) {
@@ -841,15 +936,15 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
 
         // Only anchor lower bound to latestLocCreatedAt when latestLoc actually belongs to resolvedLocation
         // (prevents an unrelated empty-location row from an older room from polluting or truncating this room).
-        const latestLocExactMatch = latestLocValid24h && latestLocTag === resolvedLocation;
+        const latestLocExactMatch = latestLocValid && latestLocTag === resolvedLocation;
         const locTimeMs = latestLocExactMatch ? Date.parse(latestLocCreatedAt) : NaN;
         const querySinceIso = Number.isFinite(locTimeMs)
             ? new Date(Math.max(locTimeMs - 2000, cutoffMs)).toISOString()
             : cutoffIso;
 
-        // Query newest 500 join/leave events strictly for resolvedLocation (hot table + recent compact chunks)
+        // Query newest 1000 join/leave events strictly for resolvedLocation (hot table + recent compact chunks)
         const byLocRes = await env.DB_GAMELOG.prepare(
-            'SELECT * FROM gamelog_join_leave WHERE location = ? AND created_at >= ? ORDER BY created_at DESC, id DESC LIMIT 500'
+            'SELECT * FROM gamelog_join_leave WHERE location = ? AND created_at >= ? ORDER BY created_at DESC, id DESC LIMIT 1000'
         )
             .bind(resolvedLocation, querySinceIso)
             .all<Record<string, unknown>>();
@@ -858,7 +953,7 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
         const combinedJl: Array<Record<string, unknown>> = [];
         for (const row of [
             ...(byLocRes.results ?? []),
-            ...recentChunks.join_leave.filter(
+            ...recentJlChunks.join_leave.filter(
                 (r) => String(r.location ?? '') === resolvedLocation && String(r.created_at ?? '') >= querySinceIso
             )
         ]) {
@@ -872,7 +967,7 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
                 const cmp = String(b.created_at ?? '').localeCompare(String(a.created_at ?? ''));
                 return cmp !== 0 ? cmp : Number(b.id ?? 0) - Number(a.id ?? 0);
             })
-            .slice(0, 500)
+            .slice(0, 1000)
             .sort((a, b) => {
                 const cmp = String(a.created_at ?? '').localeCompare(String(b.created_at ?? ''));
                 return cmp !== 0 ? cmp : Number(a.id ?? 0) - Number(b.id ?? 0);
@@ -880,7 +975,7 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
 
         // Legacy v1.10.4 compatibility: only fall back to empty-location join/leave rows when the latest
         // Location row itself had an empty tag or matched resolvedLocation and no tagged rows exist yet.
-        if (jlRows.length === 0 && latestLocValid24h && (!latestLocTag || latestLocTag === resolvedLocation)) {
+        if (jlRows.length === 0 && latestLocValid && (!latestLocTag || latestLocTag === resolvedLocation)) {
             const legacySinceMs = Date.parse(latestLocCreatedAt);
             const legacySinceIso = Number.isFinite(legacySinceMs)
                 ? new Date(Math.max(legacySinceMs - 2000, cutoffMs)).toISOString()
@@ -894,7 +989,7 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
             const emptyCombined: Array<Record<string, unknown>> = [];
             for (const row of [
                 ...(legacyRes.results ?? []),
-                ...recentChunks.join_leave.filter(
+                ...recentJlChunks.join_leave.filter(
                     (r) => String(r.location ?? '') === '' && String(r.created_at ?? '') >= legacySinceIso
                 )
             ]) {
@@ -911,7 +1006,7 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
 
         const rawWorldId = resolvedLocation.split(':')[0] ?? '';
         const worldId = rawWorldId.startsWith('wrld_') ? rawWorldId : '';
-        const latestLocMatches = latestLocValid24h && (!latestLocTag || latestLocTag === resolvedLocation);
+        const latestLocMatches = latestLocValid && (!latestLocTag || latestLocTag === resolvedLocation);
         const locCreatedAt =
             (latestLocMatches ? latestLocCreatedAt : '') ||
             (typeof jlRows[0]?.created_at === 'string' ? jlRows[0].created_at : '') ||

@@ -1319,19 +1319,33 @@ export const useInstanceStore = defineStore('Instance', () => {
         };
 
         const playersInInstance = locationStore.lastLocation.playerList;
-        if (playersInInstance.size > 0) {
+        const isWebMode = typeof WEB !== 'undefined' && WEB;
+        const activeLocTag =
+            locationStore.lastLocation.location ||
+            (isWebMode && isRealInstance(userStore.currentUser?.$locationTag)
+                ? userStore.currentUser.$locationTag
+                : '');
+        const hasWebInstanceFallback = isWebMode && isRealInstance(activeLocTag);
+
+        if (playersInInstance.size > 0 || hasWebInstanceFallback) {
             let ref = userStore.cachedUsers.get(userStore.currentUser.id);
             let profileRef = userStore.cachedProfiles.get(userStore.currentUser.id);
-            if (typeof ref !== 'undefined' && playersInInstance.has(ref.id)) {
+            if (typeof ref !== 'undefined' && (playersInInstance.has(ref.id) || hasWebInstanceFallback)) {
                 pushUser(ref, profileRef);
             }
             for (const player of playersInInstance.values()) {
                 // if friend isn't in instance add them
-                if (player.displayName === userStore.currentUser.displayName) {
+                if (
+                    player.displayName === userStore.currentUser.displayName ||
+                    (player.userId && player.userId === userStore.currentUser.id)
+                ) {
                     continue;
                 }
                 const addUser = !users.some(function (user) {
-                    return player.displayName === user.displayName;
+                    return (
+                        (player.userId && user.ref?.id === player.userId) ||
+                        (player.displayName && player.displayName === user.displayName)
+                    );
                 });
                 if (addUser) {
                     ref = userStore.cachedUsers.get(player.userId);
@@ -1352,6 +1366,29 @@ export const useInstanceStore = defineStore('Instance', () => {
                             $online_for: joinTime
                         };
                         pushUser(ref, profileRef);
+                    }
+                }
+            }
+            // In Cloud Web mode, supplement with online VRChat friends currently in the exact same real instance
+            // so friends already in the room are never hidden by agent sync lag, multi-day AFK logs, or agentless/Quest play.
+            if (hasWebInstanceFallback && friendStore?.friends) {
+                for (const friend of friendStore.friends.values()) {
+                    const fRef = friend?.ref;
+                    if (!fRef || !fRef.id || fRef.id === userStore.currentUser.id) {
+                        continue;
+                    }
+                    if (friend.state !== 'online') {
+                        continue;
+                    }
+                    const friendLoc = fRef.location || '';
+                    if (!friendLoc || friendLoc !== activeLocTag) {
+                        continue;
+                    }
+                    const alreadyIncluded = users.some(
+                        (u) => u.ref?.id === fRef.id || (fRef.displayName && u.displayName === fRef.displayName)
+                    );
+                    if (!alreadyIncluded) {
+                        pushUser(fRef, userStore.cachedProfiles.get(fRef.id));
                     }
                 }
             }

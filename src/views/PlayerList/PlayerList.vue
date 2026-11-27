@@ -184,7 +184,7 @@
 </template>
 
 <script setup>
-    import { computed, onActivated, onMounted, ref, watch } from 'vue';
+    import { computed, onActivated, onBeforeUnmount, onDeactivated, onMounted, ref, watch } from 'vue';
     import { Apple, Home, Image, Monitor, Smartphone } from 'lucide-vue-next';
     import { storeToRefs } from 'pinia';
     import { useI18n } from 'vue-i18n';
@@ -343,11 +343,30 @@
     };
 
     const isWeb = typeof WEB !== 'undefined' && WEB;
+    let webPlayerListRefreshTimer = null;
+
+    function startWebPlayerListRefresh() {
+        if (!isWeb) return;
+        stopWebPlayerListRefresh();
+        webPlayerListRefreshTimer = setInterval(() => {
+            if (typeof document === 'undefined' || document.visibilityState === 'visible') {
+                tryLoadPlayerList();
+            }
+        }, 30_000);
+    }
+
+    function stopWebPlayerListRefresh() {
+        if (webPlayerListRefreshTimer !== null) {
+            clearInterval(webPlayerListRefreshTimer);
+            webPlayerListRefreshTimer = null;
+        }
+    }
 
     onMounted(() => {
         getCurrentInstanceUserList();
         if (isWeb) {
             tryLoadPlayerList();
+            startWebPlayerListRefresh();
         }
     });
 
@@ -355,6 +374,15 @@
         getCurrentInstanceUserList();
         if (isWeb) {
             tryLoadPlayerList();
+            startWebPlayerListRefresh();
         }
+    });
+
+    onDeactivated(() => {
+        stopWebPlayerListRefresh();
+    });
+
+    onBeforeUnmount(() => {
+        stopWebPlayerListRefresh();
     });
 </script>

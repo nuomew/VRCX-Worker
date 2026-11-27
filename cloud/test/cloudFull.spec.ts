@@ -1238,6 +1238,102 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
         expect(snapJson.data[0]?.location).toBe(v105Room);
         expect(snapJson.data[0]?.worldName).toBe('Moonlight Cafe');
         expect(snapJson.data.slice(1).map((r) => r.userId)).toEqual(['usr_miku', 'usr_rin']);
+
+        // 3. Reconcile newer DB_GAMELOG join/leave events ingested after snapshot updatedAt (so newly joined players appear immediately)
+        const afterSnapTs = new Date(Date.now() + 5_000).toISOString();
+        await exports.default.fetch('http://example.com/api/gamelog', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                items: [
+                    {
+                        type: 'OnPlayerJoined',
+                        created_at: afterSnapTs,
+                        displayName: 'Luka',
+                        userId: 'usr_luka',
+                        location: v105Room
+                    }
+                ]
+            })
+        });
+        const catchupRes = await exports.default.fetch('http://example.com/api/gamelog/current-instance');
+        expect(catchupRes.status).toBe(200);
+        const catchupJson = (await catchupRes.json()) as {
+            ok: boolean;
+            data: Array<{ type: string; userId?: string }>;
+        };
+        expect(catchupJson.data.slice(1).map((r) => r.userId)).toEqual(['usr_miku', 'usr_rin', 'usr_luka']);
+
+        // 4. Multi-day (>42h) AFK room regression + empty snapshot fallback to Path B (must NOT truncate at 24h)
+        const multiDayRoom = 'wrld_cccccccc-cccc-cccc-cccc-cccccccccccc:42424~region(jp)';
+        const t42hAgo = new Date(now - 42.5 * 3600_000).toISOString();
+        const t42hPlus10s = new Date(now - 42.5 * 3600_000 + 10_000).toISOString();
+        const t30hAgo = new Date(now - 30 * 3600_000).toISOString();
+        await env.DB_GAMELOG.batch([
+            env.DB_GAMELOG.prepare('DELETE FROM gamelog_location'),
+            env.DB_GAMELOG.prepare('DELETE FROM gamelog_join_leave'),
+            env.DB_GAMELOG.prepare('DELETE FROM gamelog_archive_chunks')
+        ]);
+        await exports.default.fetch('http://example.com/api/gamelog', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                items: [
+                    {
+                        type: 'Location',
+                        created_at: t42hAgo,
+                        location: multiDayRoom,
+                        worldId: 'wrld_cccccccc-cccc-cccc-cccc-cccccccccccc',
+                        worldName: 'Sleep World 42h'
+                    },
+                    {
+                        type: 'OnPlayerJoined',
+                        created_at: t42hPlus10s,
+                        displayName: 'SelfAFK',
+                        userId: 'usr_self_afk',
+                        location: multiDayRoom
+                    },
+                    {
+                        type: 'OnPlayerJoined',
+                        created_at: t30hAgo,
+                        displayName: 'BuddyAFK',
+                        userId: 'usr_buddy_afk',
+                        location: multiDayRoom
+                    }
+                ]
+            })
+        });
+        // Simulate an online agent whose live snapshot temporarily has empty currentPlayers: []
+        await exports.default.fetch('http://example.com/api/agent/sync', {
+            method: 'POST',
+            headers: {
+                Authorization: `Bearer ${keyJson.data.syncKey}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                deviceId: keyJson.data.deviceId,
+                deviceName: 'Test-PC-PlayerList',
+                agentVersion: '1.14.2',
+                state: {
+                    vrcRunning: true,
+                    currentLocation: multiDayRoom,
+                    currentWorldId: 'wrld_cccccccc-cccc-cccc-cccc-cccccccccccc',
+                    currentWorldName: 'Sleep World 42h',
+                    playerCount: 0,
+                    currentPlayers: []
+                }
+            })
+        });
+
+        const multiDayRes = await exports.default.fetch('http://example.com/api/gamelog/current-instance');
+        expect(multiDayRes.status).toBe(200);
+        const multiDayJson = (await multiDayRes.json()) as {
+            ok: boolean;
+            data: Array<{ type: string; location: string; userId?: string }>;
+        };
+        expect(multiDayJson.data[0]?.type).toBe('Location');
+        expect(multiDayJson.data[0]?.location).toBe(multiDayRoom);
+        expect(multiDayJson.data.slice(1).map((r) => r.userId)).toEqual(['usr_self_afk', 'usr_buddy_afk']);
     });
 
     it('isolates VRChat API response cache and RSS snapshots in dedicated DB_CACHE and serves /api/rss/feed + /api/rss/sync', async () => {

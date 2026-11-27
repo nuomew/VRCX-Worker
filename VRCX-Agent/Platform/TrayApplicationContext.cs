@@ -89,6 +89,7 @@ public sealed class TrayApplicationContext : ApplicationContext
     private string _lastSentStateSignature = string.Empty;
     private long _configGeneration;
     private int _rerunForcedSyncRequested;
+    private int _roomOrPlayerStateDirty;
     private long _lastWorkingSetTrimMonoMs;
 
     private AgentConfig GetConfigSnapshot()
@@ -156,6 +157,7 @@ public sealed class TrayApplicationContext : ApplicationContext
         VRCX.Discord.Instance.Init();
 
         _logCollector.ScreenshotCaptured += OnScreenshotCaptured;
+        _logCollector.WorldStateChanged += () => Interlocked.Exchange(ref _roomOrPlayerStateDirty, 1);
 
         _statusMenuItem = new ToolStripMenuItem(AgentStrings.TrayStatusStarting) { Enabled = false };
         _proxyModeItem = new ToolStripMenuItem(AgentStrings.MenuMainlandProxyMode)
@@ -350,14 +352,24 @@ public sealed class TrayApplicationContext : ApplicationContext
                     }
                 }
 
-                // Trigger an immediate state push when VRChat or SteamVR starts/stops (debounced >= 5s via monotonic clock)
-                // so the Web StatusBar turns green right away; idle cycles strictly obey SyncScheduleGate with zero extra traffic.
+                // Trigger an immediate state push when VRChat/SteamVR starts/stops (>= 5s debounce),
+                // or when live room/player membership changes (>= 10s debounce so busy rooms batch into 1 upload).
                 long lastSuccessMono = Interlocked.Read(ref _lastSyncSuccessMonoMs);
-                bool immediateStatePush = procChanged
-                    && (lastSuccessMono <= 0 || (Environment.TickCount64 - lastSuccessMono) >= 5_000L);
+                long sinceLastSyncMs = lastSuccessMono <= 0 ? long.MaxValue : (Environment.TickCount64 - lastSuccessMono);
+                bool immediateProcPush = procChanged && sinceLastSyncMs >= 5_000L;
+                bool roomOrPlayerPush = false;
+                if (Volatile.Read(ref _roomOrPlayerStateDirty) == 1 && vrcRunning && sinceLastSyncMs >= 10_000L)
+                {
+                    roomOrPlayerPush = Interlocked.Exchange(ref _roomOrPlayerStateDirty, 0) == 1;
+                }
+                bool immediateStatePush = immediateProcPush || roomOrPlayerPush;
 
                 if (cfg.IsConfigured && (immediateStatePush || _scheduleGate.IsDueNow()))
                 {
+                    if (!roomOrPlayerPush)
+                    {
+                        Interlocked.Exchange(ref _roomOrPlayerStateDirty, 0);
+                    }
                     await RunSyncCycleAsync(force: immediateStatePush, ct).ConfigureAwait(false);
                 }
             }

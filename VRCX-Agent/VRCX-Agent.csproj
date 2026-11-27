@@ -11,7 +11,7 @@
     <RootNamespace>VRCX.Agent</RootNamespace>
     <Product>VRCX Cloud Agent</Product>
     <Description>Lightweight Windows companion tray agent for VRCX Cloud (zero CEF/Electron)</Description>
-    <Version>1.14.1</Version>
+    <Version>1.14.2</Version>
     <RuntimeIdentifier Condition="'$(RuntimeIdentifier)' == ''">win-x64</RuntimeIdentifier>
     <SelfContained Condition="'$(SelfContained)' == ''">false</SelfContained>
     <ApplicationIcon>..\images\VRCX.ico</ApplicationIcon>
