@@ -761,13 +761,33 @@ export const useAdvancedSettingsStore = defineStore('AdvancedSettings', () => {
                 const translated = data?.translatedText;
                 return typeof translated === 'string' && translated.trim() ? translated.trim() : null;
             } catch (err) {
+                if (err?.code === 'WORKERS_AI_QUOTA_EXHAUSTED') {
+                    if (err.quota && typeof err.quota === 'object') {
+                        workersAiQuota.value = err.quota;
+                    } else {
+                        const prev =
+                            workersAiQuota.value && typeof workersAiQuota.value === 'object'
+                                ? workersAiQuota.value
+                                : {};
+                        const dailyFreeNeurons =
+                            Number(prev.dailyFreeNeurons) > 0 ? Number(prev.dailyFreeNeurons) : 10000;
+                        workersAiQuota.value = {
+                            ...prev,
+                            dailyFreeNeurons,
+                            usedNeurons: dailyFreeNeurons,
+                            remainingNeurons: 0,
+                            remainingPercent: 0,
+                            exhausted: true
+                        };
+                    }
+                }
                 toast.error(`Workers AI translation failed: ${err?.message || err}`);
                 return null;
             }
         }
 
         if (provider === 'google') {
-            const keyToUse = overrides?.key ?? (translationGoogleApiKey.value || translationApiKey.value);
+            const keyToUse = overrides?.key ?? translationGoogleApiKey.value;
             if (!keyToUse) {
                 toast.warning('No Translation API key configured');
                 return null;

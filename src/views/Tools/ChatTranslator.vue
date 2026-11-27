@@ -976,7 +976,7 @@
         if (type === 'openai') {
             return Boolean(translationApiEndpoint.value && translationApiModel.value);
         }
-        return Boolean(translationGoogleApiKey?.value || translationApiKey.value);
+        return Boolean(translationGoogleApiKey ? translationGoogleApiKey.value : translationApiKey.value);
     });
 
     const shouldTranslateOnSend = computed(

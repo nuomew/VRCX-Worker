@@ -89,8 +89,6 @@ const WORKERS_AI_NEURON_RATES: Record<string, { inPerM: number; outPerM: number 
 };
 const DEFAULT_WORKERS_AI_NEURON_RATE = { inPerM: 6_000, outPerM: 36_000 };
 
-let quotaMemoryByDb = new WeakMap<D1Database, StoredWorkersAiDailyQuota>();
-
 function getUtcDateKey(nowMs: number): string {
     return new Date(nowMs).toISOString().slice(0, 10);
 }
@@ -111,6 +109,27 @@ function createEmptyDailyQuota(utcDate: string): StoredWorkersAiDailyQuota {
         outputTokensToday: 0,
         exhausted: false
     };
+}
+
+function parseStoredDailyQuota(raw: string | undefined, utcDate: string): StoredWorkersAiDailyQuota {
+    if (!raw) return createEmptyDailyQuota(utcDate);
+    try {
+        const parsed = JSON.parse(raw) as Partial<StoredWorkersAiDailyQuota>;
+        if (parsed && parsed.utcDate === utcDate) {
+            return {
+                utcDate,
+                usedNeurons: Math.max(0, Number(parsed.usedNeurons ?? 0) || 0),
+                requestsToday: Math.max(0, Math.floor(Number(parsed.requestsToday ?? 0) || 0)),
+                cachedHitsToday: Math.max(0, Math.floor(Number(parsed.cachedHitsToday ?? 0) || 0)),
+                inputTokensToday: Math.max(0, Math.floor(Number(parsed.inputTokensToday ?? 0) || 0)),
+                outputTokensToday: Math.max(0, Math.floor(Number(parsed.outputTokensToday ?? 0) || 0)),
+                exhausted: parsed.exhausted === true
+            };
+        }
+    } catch {
+        // Ignore malformed row and start fresh for today
+    }
+    return createEmptyDailyQuota(utcDate);
 }
 
 function toWorkersAiDailyQuotaDto(
@@ -200,59 +219,96 @@ async function loadStoredWorkersAiDailyQuota(
 ): Promise<StoredWorkersAiDailyQuota> {
     const utcDate = getUtcDateKey(nowMs);
     const chatDb = getChatDb(env);
-    const mem = quotaMemoryByDb.get(chatDb);
-    if (mem && mem.utcDate === utcDate) {
-        return { ...mem };
-    }
     try {
         const row = await chatDb
             .prepare('SELECT payload_json FROM cloud_chat_config WHERE config_key = ? LIMIT 1')
             .bind(WORKERS_AI_QUOTA_CONFIG_KEY)
             .first<{ payload_json?: string }>();
-        if (row?.payload_json) {
-            const parsed = JSON.parse(row.payload_json) as Partial<StoredWorkersAiDailyQuota>;
-            if (parsed && parsed.utcDate === utcDate) {
-                const loaded: StoredWorkersAiDailyQuota = {
-                    utcDate,
-                    usedNeurons: Math.max(0, Number(parsed.usedNeurons ?? 0) || 0),
-                    requestsToday: Math.max(0, Math.floor(Number(parsed.requestsToday ?? 0) || 0)),
-                    cachedHitsToday: Math.max(0, Math.floor(Number(parsed.cachedHitsToday ?? 0) || 0)),
-                    inputTokensToday: Math.max(0, Math.floor(Number(parsed.inputTokensToday ?? 0) || 0)),
-                    outputTokensToday: Math.max(0, Math.floor(Number(parsed.outputTokensToday ?? 0) || 0)),
-                    exhausted: parsed.exhausted === true
-                };
-                quotaMemoryByDb.set(chatDb, loaded);
-                return { ...loaded };
-            }
-        }
+        return parseStoredDailyQuota(row?.payload_json, utcDate);
     } catch {
-        // Fallback to empty quota if table not yet created
+        return createEmptyDailyQuota(utcDate);
     }
-    const fresh = createEmptyDailyQuota(utcDate);
-    quotaMemoryByDb.set(chatDb, fresh);
-    return { ...fresh };
 }
 
-async function saveStoredWorkersAiDailyQuota(
+/**
+ * Atomically increments today's Workers AI Neurons ledger in D1 (single batch round-trip)
+ * so concurrent translations or multi-isolate Worker invocations never overwrite or regress totals.
+ */
+async function updateWorkersAiDailyQuotaAtomic(
     env: Env,
-    stored: StoredWorkersAiDailyQuota,
-    nowIso: string
-): Promise<void> {
+    nowMs: number,
+    delta: {
+        neurons?: number;
+        requests?: number;
+        cachedHits?: number;
+        inputTokens?: number;
+        outputTokens?: number;
+        exhausted?: boolean;
+    }
+): Promise<StoredWorkersAiDailyQuota> {
+    const utcDate = getUtcDateKey(nowMs);
+    const nowIso = new Date(nowMs).toISOString();
+    const neurons = Math.max(0, Math.round((delta.neurons ?? 0) * 100) / 100);
+    const requests = Math.max(0, Math.floor(delta.requests ?? 0));
+    const cachedHits = Math.max(0, Math.floor(delta.cachedHits ?? 0));
+    const inputTokens = Math.max(0, Math.floor(delta.inputTokens ?? 0));
+    const outputTokens = Math.max(0, Math.floor(delta.outputTokens ?? 0));
+    const exhaustedFlag = delta.exhausted ? 1 : 0;
+
+    const initialRow: StoredWorkersAiDailyQuota = {
+        utcDate,
+        usedNeurons: neurons,
+        requestsToday: requests,
+        cachedHitsToday: cachedHits,
+        inputTokensToday: inputTokens,
+        outputTokensToday: outputTokens,
+        exhausted: delta.exhausted === true
+    };
     const chatDb = getChatDb(env);
-    quotaMemoryByDb.set(chatDb, { ...stored });
     try {
-        await chatDb
-            .prepare(
-                `INSERT INTO cloud_chat_config (config_key, payload_json, updated_at)
-                 VALUES (?, ?, ?)
-                 ON CONFLICT(config_key) DO UPDATE SET
-                    payload_json = excluded.payload_json,
-                    updated_at = excluded.updated_at`
-            )
-            .bind(WORKERS_AI_QUOTA_CONFIG_KEY, JSON.stringify(stored), nowIso)
-            .run();
+        const batchRes = await chatDb.batch([
+            chatDb
+                .prepare(
+                    `INSERT INTO cloud_chat_config (config_key, payload_json, updated_at)
+                     VALUES (?, ?, ?)
+                     ON CONFLICT(config_key) DO UPDATE SET
+                        payload_json = CASE
+                            WHEN json_extract(payload_json, '$.utcDate') = ? THEN json_set(
+                                payload_json,
+                                '$.usedNeurons', ROUND(COALESCE(CAST(json_extract(payload_json, '$.usedNeurons') AS REAL), 0) + ?, 2),
+                                '$.requestsToday', COALESCE(CAST(json_extract(payload_json, '$.requestsToday') AS INTEGER), 0) + ?,
+                                '$.cachedHitsToday', COALESCE(CAST(json_extract(payload_json, '$.cachedHitsToday') AS INTEGER), 0) + ?,
+                                '$.inputTokensToday', COALESCE(CAST(json_extract(payload_json, '$.inputTokensToday') AS INTEGER), 0) + ?,
+                                '$.outputTokensToday', COALESCE(CAST(json_extract(payload_json, '$.outputTokensToday') AS INTEGER), 0) + ?,
+                                '$.exhausted', CASE
+                                    WHEN json_extract(payload_json, '$.exhausted') = 1 OR ? = 1 THEN json('true')
+                                    ELSE json('false')
+                                END
+                            )
+                            ELSE excluded.payload_json
+                        END,
+                        updated_at = excluded.updated_at`
+                )
+                .bind(
+                    WORKERS_AI_QUOTA_CONFIG_KEY,
+                    JSON.stringify(initialRow),
+                    nowIso,
+                    utcDate,
+                    neurons,
+                    requests,
+                    cachedHits,
+                    inputTokens,
+                    outputTokens,
+                    exhaustedFlag
+                ),
+            chatDb
+                .prepare('SELECT payload_json FROM cloud_chat_config WHERE config_key = ? LIMIT 1')
+                .bind(WORKERS_AI_QUOTA_CONFIG_KEY)
+        ]);
+        const row = (batchRes[1]?.results?.[0] ?? null) as { payload_json?: string } | null;
+        return parseStoredDailyQuota(row?.payload_json, utcDate);
     } catch {
-        // Non-fatal in minimal fixtures
+        return initialRow;
     }
 }
 
@@ -318,7 +374,6 @@ const translationMemoryCache = new Map<string, { text: string; expiresAt: number
 export function setWorkersAiRunnerForTests(runner: WorkersAiRunner | null): void {
     testWorkersAiRunner = runner;
     translationMemoryCache.clear();
-    quotaMemoryByDb = new WeakMap<D1Database, StoredWorkersAiDailyQuota>();
 }
 
 const LANG_ENGLISH_NAMES: Record<string, string> = {
@@ -393,8 +448,8 @@ function extractWorkersAiTranslationText(raw: unknown): string {
 }
 
 function cleanTranslatedOutput(raw: string): string {
-    // Strip any reasoning/thinking tags if a reasoning-capable model emitted them
-    let text = raw.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+    // Strip both complete <think>...</think> blocks and truncated unclosed <think>... tails
+    let text = raw.replace(/<think>[\s\S]*?<\/think>/gi, '').replace(/<think>[\s\S]*$/gi, '').trim();
     // Strip a single balanced pair of wrapping quotes if the LLM quoted the entire translation
     if (
         text.length >= 2 &&
@@ -1913,13 +1968,10 @@ export async function handleChatOscWebRoutes(request: Request, env: Env, url: UR
         }
 
         const nowMs = Date.now();
-        const nowIso = new Date(nowMs).toISOString();
         const cacheKey = `${model}|${sourceLang}|${targetLang}|${customPrompt}|${text}`;
         const cached = getCachedTranslation(cacheKey, nowMs);
         if (cached) {
-            const stored = await loadStoredWorkersAiDailyQuota(env, nowMs);
-            stored.cachedHitsToday += 1;
-            quotaMemoryByDb.set(getChatDb(env), { ...stored });
+            const stored = await updateWorkersAiDailyQuotaAtomic(env, nowMs, { cachedHits: 1 });
             const quota = toWorkersAiDailyQuotaDto(stored, true, nowMs);
             return Response.json(
                 { ok: true, data: { translatedText: cached, model, cached: true, quota } },
@@ -1963,18 +2015,32 @@ export async function handleChatOscWebRoutes(request: Request, env: Env, url: UR
                     temperature: 0.2,
                     max_tokens: 512
                 };
-                // Disable default chain-of-thought reasoning on reasoning-first models (e.g. DeepSeek V4.1 Flash)
-                // to keep latency low and avoid burning Neurons on hidden thinking tokens.
+                // Disable default chain-of-thought reasoning on reasoning-capable models (DeepSeek V4, GLM-4.7/5, Qwen3/QwQ)
+                // to prevent wasting output Neurons or exhausting max_tokens before producing content.
                 const usedReasoningEffort = lowerModel.includes('deepseek-v4') || lowerModel.includes('glm-5');
+                const usedDisableThinking =
+                    lowerModel.includes('glm-4.7') ||
+                    lowerModel.includes('qwen3') ||
+                    lowerModel.includes('qwq') ||
+                    lowerModel.includes('deepseek-r1');
                 if (usedReasoningEffort) {
                     llmPayload.reasoning_effort = 'none';
+                }
+                if (usedDisableThinking) {
+                    llmPayload.chat_template_kwargs = { enable_thinking: false };
                 }
                 try {
                     aiRawResult = await aiRunner(model, llmPayload);
                 } catch (firstErr) {
                     const firstMsg = firstErr instanceof Error ? firstErr.message : String(firstErr);
-                    if (usedReasoningEffort && /reasoning_effort|additional properties|unexpected/i.test(firstMsg)) {
+                    if (
+                        (usedReasoningEffort || usedDisableThinking) &&
+                        /reasoning_effort|chat_template_kwargs|enable_thinking|additional properties|unexpected|invalid/i.test(
+                            firstMsg
+                        )
+                    ) {
                         delete llmPayload.reasoning_effort;
+                        delete llmPayload.chat_template_kwargs;
                         aiRawResult = await aiRunner(model, llmPayload);
                     } else {
                         throw firstErr;
@@ -2000,12 +2066,12 @@ export async function handleChatOscWebRoutes(request: Request, env: Env, url: UR
             const outputTokens = rawUsage?.outputTokens ?? estimateTextTokens(translatedText);
             const neuronsDelta = calculateNeuronsForCall(model, inputTokens, outputTokens);
 
-            const stored = await loadStoredWorkersAiDailyQuota(env, nowMs);
-            stored.usedNeurons = Math.round((stored.usedNeurons + neuronsDelta) * 100) / 100;
-            stored.requestsToday += 1;
-            stored.inputTokensToday += inputTokens;
-            stored.outputTokensToday += outputTokens;
-            await saveStoredWorkersAiDailyQuota(env, stored, nowIso);
+            const stored = await updateWorkersAiDailyQuotaAtomic(env, nowMs, {
+                neurons: neuronsDelta,
+                requests: 1,
+                inputTokens,
+                outputTokens
+            });
             const quota = toWorkersAiDailyQuotaDto(stored, true, nowMs);
 
             setCachedTranslation(cacheKey, translatedText, nowMs);
@@ -2015,21 +2081,27 @@ export async function handleChatOscWebRoutes(request: Request, env: Env, url: UR
             );
         } catch (err) {
             const rawMsg = err instanceof Error ? err.message : String(err);
-            const isPaidOnly = /\b(403|paid plan|upgrade|billing|credits|quota|neurons)\b/i.test(rawMsg);
             const isDailyQuotaExhausted = /\b(daily.*limit|free.*allocation|neurons.*limit|quota.*exceeded)\b/i.test(
                 rawMsg
             );
+            const isPaidOnly =
+                isDailyQuotaExhausted || /\b(403|paid plan|upgrade|billing|credits|quota|neurons)\b/i.test(rawMsg);
+            let quota: WorkersAiDailyQuotaDto | undefined;
             if (isDailyQuotaExhausted) {
-                const stored = await loadStoredWorkersAiDailyQuota(env, nowMs);
-                stored.exhausted = true;
-                await saveStoredWorkersAiDailyQuota(env, stored, nowIso);
+                const stored = await updateWorkersAiDailyQuotaAtomic(env, nowMs, { exhausted: true });
+                quota = toWorkersAiDailyQuotaDto(stored, true, nowMs);
             }
             return Response.json(
                 {
                     ok: false,
                     error: {
-                        code: isPaidOnly ? 'WORKERS_AI_PLAN_OR_QUOTA' : 'WORKERS_AI_ERROR',
-                        message: rawMsg.slice(0, 320) || 'Workers AI translation request failed'
+                        code: isDailyQuotaExhausted
+                            ? 'WORKERS_AI_QUOTA_EXHAUSTED'
+                            : isPaidOnly
+                              ? 'WORKERS_AI_PLAN_OR_QUOTA'
+                              : 'WORKERS_AI_ERROR',
+                        message: rawMsg.slice(0, 320) || 'Workers AI translation request failed',
+                        ...(quota ? { quota } : {})
                     }
                 },
                 { status: isPaidOnly ? 402 : 502 }

@@ -183,6 +183,10 @@ export async function cloudFetch(path, options = {}) {
         err.code = parsed?.error?.code || `HTTP_${res.status}`;
         // @ts-ignore
         err.status = res.status;
+        if (parsed?.error?.quota && typeof parsed.error.quota === 'object') {
+            // @ts-ignore attach latest quota snapshot on quota-related errors
+            err.quota = parsed.error.quota;
+        }
         throw err;
     }
 

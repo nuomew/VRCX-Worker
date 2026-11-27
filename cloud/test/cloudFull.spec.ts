@@ -10261,6 +10261,12 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
             if (model === '@cf/zai-org/glm-5.3-flash') {
                 throw new Error('403 Forbidden: Workers Paid plan required for this model');
             }
+            if (model === '@cf/qwen/qwen3-truncated-test') {
+                return { response: '<think>unterminated chain of thought without closing tag' };
+            }
+            if (model === '@cf/qwen/qwen3-exhausted-test') {
+                throw new Error('429 Free allocation daily limit neurons quota exceeded');
+            }
             if (model === '@cf/deepseek-ai/deepseek-v4.1-flash-1017') {
                 return {
                     choices: [
@@ -10340,6 +10346,30 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
             expect(j1.data.quota.remainingPercent).toBeCloseTo(99.5, 1);
             expect(j1.data.quota.requestsToday).toBe(1);
             expect(calls.length).toBe(1);
+            expect(calls[0]?.input.chat_template_kwargs).toEqual({ enable_thinking: false });
+
+            // Verify concurrent calls atomically sum Neurons in D1 without losing either delta
+            const [c1, c2] = await Promise.all([
+                exports.default.fetch('http://example.com/api/chat/translate/workers-ai', {
+                    method: 'POST',
+                    headers,
+                    body: JSON.stringify({ text: 'Concurrent A', targetLang: 'zh-CN' })
+                }),
+                exports.default.fetch('http://example.com/api/chat/translate/workers-ai', {
+                    method: 'POST',
+                    headers,
+                    body: JSON.stringify({ text: 'Concurrent B', targetLang: 'zh-CN' })
+                })
+            ]);
+            expect(c1.status).toBe(200);
+            expect(c2.status).toBe(200);
+            const afterConcurrent = (await (
+                await exports.default.fetch('http://example.com/api/chat/messages?limit=5')
+            ).json()) as {
+                data: { workersAiQuota?: { requestsToday: number; usedNeurons: number } };
+            };
+            expect(afterConcurrent.data.workersAiQuota?.requestsToday).toBe(3);
+            expect(afterConcurrent.data.workersAiQuota?.usedNeurons).toBeCloseTo(47.4 * 3, 1);
 
             const t1Cached = await exports.default.fetch('http://example.com/api/chat/translate/workers-ai', {
                 method: 'POST',
@@ -10356,9 +10386,9 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
             };
             expect(j1Cached.data.translatedText).toBe('你好，VRChat！');
             expect(j1Cached.data.cached).toBe(true);
-            expect(j1Cached.data.quota.usedNeurons).toBeCloseTo(47.4, 1);
+            expect(j1Cached.data.quota.usedNeurons).toBeCloseTo(47.4 * 3, 1);
             expect(j1Cached.data.quota.cachedHitsToday).toBe(1);
-            expect(calls.length).toBe(1);
+            expect(calls.length).toBe(3);
 
             // Verify GET /api/chat/messages returns persisted workersAiQuota with 0 extra requests
             const chatMsgRes = await exports.default.fetch('http://example.com/api/chat/messages?limit=5');
@@ -10367,8 +10397,22 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
                 data: { workersAiQuota?: { dailyFreeNeurons: number; usedNeurons: number; remainingPercent: number } };
             };
             expect(chatMsgJson.data.workersAiQuota?.dailyFreeNeurons).toBe(10000);
-            expect(chatMsgJson.data.workersAiQuota?.usedNeurons).toBeCloseTo(47.4, 1);
-            expect(chatMsgJson.data.workersAiQuota?.remainingPercent).toBeCloseTo(99.5, 1);
+            expect(chatMsgJson.data.workersAiQuota?.usedNeurons).toBeCloseTo(47.4 * 3, 1);
+            expect(chatMsgJson.data.workersAiQuota?.remainingPercent).toBeCloseTo(98.6, 1);
+
+            // Unclosed truncated <think> tail must never leak to VRChat chatbox (returns 502 EMPTY_TRANSLATION)
+            const truncRes = await exports.default.fetch('http://example.com/api/chat/translate/workers-ai', {
+                method: 'POST',
+                headers,
+                body: JSON.stringify({
+                    text: 'Hello',
+                    targetLang: 'zh-CN',
+                    model: '@cf/qwen/qwen3-truncated-test'
+                })
+            });
+            expect(truncRes.status).toBe(502);
+            const truncJson = (await truncRes.json()) as { error?: { code?: string } };
+            expect(truncJson.error?.code).toBe('EMPTY_TRANSLATION');
 
             // 4. Custom model DeepSeek-V4.1-Flash passes reasoning_effort='none', strips <think>, and parses choices[]
             const tDeepSeek = await exports.default.fetch('http://example.com/api/chat/translate/workers-ai', {
@@ -10426,8 +10470,29 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
             expect(paidErrRes.status).toBe(402);
             const paidErrJson = (await paidErrRes.json()) as { error?: { code?: string } };
             expect(paidErrJson.error?.code).toBe('WORKERS_AI_PLAN_OR_QUOTA');
+
+            // 8. Daily free quota exhaustion maps to WORKERS_AI_QUOTA_EXHAUSTED and includes 0% quota payload
+            const exhaustedRes = await exports.default.fetch('http://example.com/api/chat/translate/workers-ai', {
+                method: 'POST',
+                headers,
+                body: JSON.stringify({
+                    text: 'Hi exhausted',
+                    targetLang: 'zh-CN',
+                    model: '@cf/qwen/qwen3-exhausted-test'
+                })
+            });
+            expect(exhaustedRes.status).toBe(402);
+            const exhaustedJson = (await exhaustedRes.json()) as {
+                error?: { code?: string; quota?: { exhausted: boolean; remainingPercent: number } };
+            };
+            expect(exhaustedJson.error?.code).toBe('WORKERS_AI_QUOTA_EXHAUSTED');
+            expect(exhaustedJson.error?.quota?.exhausted).toBe(true);
+            expect(exhaustedJson.error?.quota?.remainingPercent).toBe(0);
         } finally {
             setWorkersAiRunnerForTests(null);
+            await env.DB_CHAT?.prepare("DELETE FROM cloud_chat_config WHERE config_key = 'workers_ai_daily_quota'")
+                .run()
+                .catch(() => {});
         }
     });
 });

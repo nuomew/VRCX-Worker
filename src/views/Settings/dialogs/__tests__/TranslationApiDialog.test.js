@@ -197,10 +197,11 @@ describe('TranslationApiDialog.vue', () => {
             expect(wrapper.text()).toContain('dialog.translation_api.mode');
         });
 
-        test('renders google and openai options', () => {
+        test('renders google and openai options (hides cloudflare in non-WEB desktop mode)', () => {
             const wrapper = mountComponent();
             expect(wrapper.text()).toContain('dialog.translation_api.mode_google');
             expect(wrapper.text()).toContain('dialog.translation_api.mode_openai');
+            expect(wrapper.text()).not.toContain('dialog.translation_api.mode_cloudflare');
         });
 
         test('does not render when not visible', () => {

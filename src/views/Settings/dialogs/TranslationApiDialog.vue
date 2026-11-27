@@ -33,6 +33,7 @@
                             <SelectContent>
                                 <SelectGroup>
                                     <SelectItem
+                                        v-if="isWebMode || form.translationApiType === 'cloudflare'"
                                         value="cloudflare"
                                         :text-value="t('dialog.translation_api.mode_cloudflare')">
                                         {{ t('dialog.translation_api.mode_cloudflare') }}
@@ -286,6 +287,7 @@
 
     const { t, locale } = useI18n();
 
+    const isWebMode = typeof WEB !== 'undefined' && WEB;
     const isFetchingModels = ref(false);
     const availableModels = ref([]);
     const isZhLocale = computed(() => String(locale?.value || '').toLowerCase().startsWith('zh'));
