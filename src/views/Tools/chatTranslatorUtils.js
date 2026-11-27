@@ -8,38 +8,50 @@ export const DEFAULT_CLOUDFLARE_AI_MODEL = '@cf/zai-org/glm-4.7-flash';
 export const CLOUDFLARE_AI_TRANSLATION_PRESETS = Object.freeze([
     {
         id: '@cf/zai-org/glm-4.7-flash',
-        label: 'GLM-4.7-Flash (Free · Recommended)',
-        labelZh: 'GLM-4.7-Flash（免费推荐 · ~6,000 句/天）',
+        label: 'GLM-4.7-Flash (Free · ~630k tok / ~6,000 msgs/day)',
+        labelZh: 'GLM-4.7-Flash（免费推荐 · ~63万 tok / 约 6,000 句/天）',
+        quotaDetail: 'Free 10k Neurons/day (~630k tok -> ~6,000 msgs/day) · 5.5k in / 36.4k out Neurons per 1M tok',
+        quotaDetailZh: '免费 10,000 Neurons/天：约 63 万 tok → 约 6,000 句/天（输入 5.5k / 输出 36.4k Neurons 每百万 tok）',
         tier: 'free'
     },
     {
         id: '@cf/meta/llama-3.1-8b-instruct-fp8-fast',
-        label: 'Llama 3.1 8B FP8 Fast (Free)',
-        labelZh: 'Llama 3.1 8B FP8 Fast（免费 · ~6,000 句/天）',
+        label: 'Llama 3.1 8B FP8 Fast (Free · ~690k tok / ~6,600 msgs/day)',
+        labelZh: 'Llama 3.1 8B FP8 Fast（免费 · ~69万 tok / 约 6,600 句/天）',
+        quotaDetail: 'Free 10k Neurons/day (~690k tok -> ~6,600 msgs/day) · 4.1k in / 34.9k out Neurons per 1M tok',
+        quotaDetailZh: '免费 10,000 Neurons/天：约 69 万 tok → 约 6,600 句/天（输入 4.1k / 输出 34.9k Neurons 每百万 tok）',
         tier: 'free'
     },
     {
         id: '@cf/meta/llama-3.2-3b-instruct',
-        label: 'Llama 3.2 3B Instruct (Free)',
-        labelZh: 'Llama 3.2 3B（免费极速 · ~7,000 句/天）',
+        label: 'Llama 3.2 3B (Free · ~750k tok / ~7,200 msgs/day)',
+        labelZh: 'Llama 3.2 3B（免费极速 · ~75万 tok / 约 7,200 句/天）',
+        quotaDetail: 'Free 10k Neurons/day (~750k tok -> ~7,200 msgs/day) · 4.6k in / 30.5k out Neurons per 1M tok',
+        quotaDetailZh: '免费 10,000 Neurons/天：约 75 万 tok → 约 7,200 句/天（输入 4.6k / 输出 30.5k Neurons 每百万 tok）',
         tier: 'free'
     },
     {
         id: '@cf/meta/m2m100-1.2b',
-        label: 'Meta M2M100 1.2B (Free · Dedicated MT)',
-        labelZh: 'Meta M2M100 1.2B（免费 · 专用机器翻译 ~5,000+ 句/天）',
+        label: 'Meta M2M100 1.2B (Free MT · ~320k tok / ~5,300 msgs/day)',
+        labelZh: 'Meta M2M100 1.2B（免费直译 · ~32万 tok / 约 5,300 句/天）',
+        quotaDetail: 'Free 10k Neurons/day (~320k tok -> ~5,300 msgs/day, no prompt) · 31.1k in / 31.1k out Neurons per 1M tok',
+        quotaDetailZh: '免费 10,000 Neurons/天：约 32 万 tok → 约 5,300 句/天（无需提示词，输入/输出各 31.1k Neurons 每百万 tok）',
         tier: 'free'
     },
     {
         id: '@cf/zai-org/glm-5.3-flash',
-        label: 'GLM-5.3-Flash (Paid Plan / Credits)',
-        labelZh: 'GLM-5.3-Flash（需 Workers Paid 或预充额度）',
+        label: 'GLM-5.3-Flash (Paid · ~410k tok / ~3,900 msgs per 10k Neurons)',
+        labelZh: 'GLM-5.3-Flash（需付费 · ~41万 tok / 约 3,900 句）',
+        quotaDetail: 'Requires Workers Paid / Credits · $0.15 in / $0.50 out per 1M tok (~410k tok -> ~3,900 msgs per 10k Neurons; ~3.75M tok -> ~35,700 msgs per $1)',
+        quotaDetailZh: '需 Workers Paid / 预充额度（$0.15 输入 / $0.50 输出每百万 tok）：每 10k Neurons 约 41 万 tok → 约 3,900 句；每 $1 约 375 万 tok → 约 35,700 句',
         tier: 'paid'
     },
     {
         id: '@cf/deepseek-ai/deepseek-v4.1-flash-1017',
-        label: 'DeepSeek-V4.1-Flash-1017 (Paid Plan / Credits)',
-        labelZh: 'DeepSeek-V4.1-Flash-1017（需 Workers Paid 或预充额度）',
+        label: 'DeepSeek-V4.1-Flash-1017 (Paid · ~180k tok / ~1,700 msgs per 10k Neurons)',
+        labelZh: 'DeepSeek-V4.1-Flash-1017（需付费 · ~18万 tok / 约 1,700 句）',
+        quotaDetail: 'Requires Workers Paid / Credits · $0.30 in / $1.20 out per 1M tok (~180k tok -> ~1,700 msgs per 10k Neurons; ~1.67M tok -> ~15,800 msgs per $1)',
+        quotaDetailZh: '需 Workers Paid / 预充额度（$0.30 输入 / $1.20 输出每百万 tok，已关思考）：每 10k Neurons 约 18 万 tok → 约 1,700 句；每 $1 约 167 万 tok → 约 15,800 句',
         tier: 'paid'
     }
 ]);

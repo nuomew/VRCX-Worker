@@ -93,6 +93,22 @@
                         </FieldContent>
                     </Field>
 
+                    <div
+                        data-testid="cloudflare-quota-info"
+                        class="rounded-md border px-3 py-2 text-xs leading-relaxed"
+                        :class="
+                            activeCloudflarePreset?.tier === 'paid'
+                                ? 'border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-300'
+                                : 'border-emerald-500/35 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300'
+                        ">
+                        <template v-if="activeCloudflarePreset">
+                            {{ isZhLocale ? activeCloudflarePreset.quotaDetailZh : activeCloudflarePreset.quotaDetail }}
+                        </template>
+                        <template v-else>
+                            {{ t('dialog.translation_api.cloudflare.custom_quota_hint') }}
+                        </template>
+                    </div>
+
                     <Field>
                         <FieldLabel>{{ t('dialog.translation_api.openai.prompt_optional') }}</FieldLabel>
                         <FieldContent>
@@ -293,10 +309,12 @@
         translationApiKey: ''
     });
 
-    const selectedCloudflarePreset = computed(() => {
+    const activeCloudflarePreset = computed(() => {
         const trimmed = String(form.translationApiModel || '').trim();
-        return CLOUDFLARE_AI_TRANSLATION_PRESETS.some((item) => item.id === trimmed) ? trimmed : '__custom__';
+        return CLOUDFLARE_AI_TRANSLATION_PRESETS.find((item) => item.id === trimmed) || null;
     });
+
+    const selectedCloudflarePreset = computed(() => activeCloudflarePreset.value?.id || '__custom__');
 
     function handleCloudflarePresetChange(value) {
         const val = String(value || '');

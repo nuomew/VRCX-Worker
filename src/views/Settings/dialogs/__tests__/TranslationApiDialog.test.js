@@ -419,6 +419,8 @@ describe('TranslationApiDialog.vue', () => {
             expect(wrapper.text()).toContain('dialog.translation_api.cloudflare.preset');
             expect(wrapper.text()).toContain('dialog.translation_api.cloudflare.model');
             expect(wrapper.text()).toContain('dialog.translation_api.test');
+            expect(wrapper.find('[data-testid="cloudflare-quota-info"]').text()).toContain('630k tok');
+            expect(wrapper.find('[data-testid="cloudflare-quota-info"]').text()).toContain('6,000 msgs');
         });
 
         test('allows entering a custom Workers AI model ID, testing, and saving it', async () => {

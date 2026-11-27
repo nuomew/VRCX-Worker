@@ -60,37 +60,37 @@ export interface WorkersAiTranslationPreset {
 export const WORKERS_AI_TRANSLATION_PRESETS: readonly WorkersAiTranslationPreset[] = Object.freeze([
     {
         id: '@cf/zai-org/glm-4.7-flash',
-        label: 'GLM-4.7-Flash (Recommended · Free ~6,000 msg/day)',
+        label: 'GLM-4.7-Flash (Free · ~630k tok / ~6,000 msgs/day)',
         tier: 'free',
         kind: 'llm'
     },
     {
         id: '@cf/meta/llama-3.1-8b-instruct-fp8-fast',
-        label: 'Llama 3.1 8B FP8 Fast (Free ~6,000 msg/day)',
+        label: 'Llama 3.1 8B FP8 Fast (Free · ~690k tok / ~6,600 msgs/day)',
         tier: 'free',
         kind: 'llm'
     },
     {
         id: '@cf/meta/llama-3.2-3b-instruct',
-        label: 'Llama 3.2 3B Instruct (Free ~7,000 msg/day)',
+        label: 'Llama 3.2 3B Instruct (Free · ~750k tok / ~7,200 msgs/day)',
         tier: 'free',
         kind: 'llm'
     },
     {
         id: '@cf/meta/m2m100-1.2b',
-        label: 'Meta M2M100 1.2B (Free · Dedicated MT ~5,000+ msg/day)',
+        label: 'Meta M2M100 1.2B (Free · ~320k tok / ~5,300 msgs/day)',
         tier: 'free',
         kind: 'm2m100'
     },
     {
         id: '@cf/zai-org/glm-5.3-flash',
-        label: 'GLM-5.3-Flash (Requires Workers Paid / Credits)',
+        label: 'GLM-5.3-Flash (Paid · ~410k tok / ~3,900 msgs per 10k Neurons)',
         tier: 'paid',
         kind: 'llm'
     },
     {
         id: '@cf/deepseek-ai/deepseek-v4.1-flash-1017',
-        label: 'DeepSeek-V4.1-Flash-1017 (Requires Workers Paid / Credits)',
+        label: 'DeepSeek-V4.1-Flash-1017 (Paid · ~180k tok / ~1,700 msgs per 10k Neurons)',
         tier: 'paid',
         kind: 'llm'
     }

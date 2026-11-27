@@ -2732,7 +2732,8 @@
                 "hint": "Uses your Worker's built-in Cloudflare Workers AI binding with no API key required (10,000 free Neurons/day on Workers Free). Models marked Paid require Workers Paid or prepaid AI Gateway credits.",
                 "preset": "Preset Model",
                 "model": "Workers AI Model ID (Customizable)",
-                "custom_option": "Custom model ID..."
+                "custom_option": "Custom model ID...",
+                "custom_quota_hint": "Custom model: VRChat chat uses ~105 tok/msg (~70 in + ~35 out). Actual daily capacity depends on the model's Neurons/token rate on Cloudflare Workers AI."
             },
             "openai": {
                 "endpoint": "API Endpoint",
