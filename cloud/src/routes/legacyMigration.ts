@@ -946,8 +946,18 @@ function asStr(val: unknown, maxLen = 16_384): string {
  * (preserving MySQL/D1 error codes without leaking credentials, host IPs, or row payloads).
  */
 function formatSafeMigrationBatchError(err: unknown, category: string, stage: 'ingest' | 'state'): string {
-    const code = typeof (err as { code?: unknown } | null)?.code === 'string' ? (err as { code: string }).code : '';
-    const errno = Number((err as { errno?: unknown } | null)?.errno ?? 0);
+    const errObj = (err && typeof err === 'object' ? err : null) as {
+        code?: unknown;
+        errno?: unknown;
+        mysqlStage?: unknown;
+        mysqlSqlBytes?: unknown;
+    } | null;
+    const code = typeof errObj?.code === 'string' ? errObj.code : '';
+    const errno = Number(errObj?.errno ?? 0);
+    const mysqlStage = typeof errObj?.mysqlStage === 'string' ? errObj.mysqlStage : '';
+    const mysqlSqlBytes = typeof errObj?.mysqlSqlBytes === 'number' && Number.isFinite(errObj.mysqlSqlBytes)
+        ? Math.max(0, Math.round(errObj.mysqlSqlBytes))
+        : -1;
     const rawMsg = err instanceof Error ? err.message : String(err ?? 'Unknown error');
     const cleanMsg = rawMsg
         // Redact quoted host/user/value literals or IPv4 addresses to avoid leaking credentials/PII
@@ -958,7 +968,16 @@ function formatSafeMigrationBatchError(err: unknown, category: string, stage: 'i
         .slice(0, 220);
     const tag = `${category || 'unknown'}/${stage}`;
     const errCode = code ? (errno > 0 ? `${code} (${errno})` : code) : errno > 0 ? `ERRNO ${errno}` : '';
-    return errCode ? `[${tag}] ${errCode}: ${cleanMsg || 'Database error'}` : `[${tag}] ${cleanMsg || 'Database error'}`;
+    const detailParts: string[] = [];
+    if (mysqlStage) detailParts.push(`op=${mysqlStage}`);
+    if (mysqlSqlBytes >= 0) {
+        const kb = (mysqlSqlBytes / 1024).toFixed(1);
+        detailParts.push(`~${kb} KiB`);
+    }
+    const detailSuffix = detailParts.length > 0 ? ` (${detailParts.join(', ')})` : '';
+    return errCode
+        ? `[${tag}] ${errCode}${detailSuffix}: ${cleanMsg || 'Database error'}`
+        : `[${tag}]${detailSuffix} ${cleanMsg || 'Database error'}`;
 }
 
 function asFiniteInt(val: unknown, fallback = 0): number {
@@ -1058,11 +1077,17 @@ function sanitizeCategoryInventoryList(raw: unknown): LegacyCategoryInventory[] 
     return out;
 }
 
+// Smaller raw chunk ceiling when offloading to public external MySQL 5.7+ so each gzip-compressed
+// SQL packet stays ~8-25 KiB (well below strict shared-host max_allowed_packet and resilient across public TCP links).
+const EXTERNAL_MYSQL_CHUNK_MAX_BYTES = 128 * 1024;
+
 async function ingestLegacyCategoryBatch(
     legacyDb: D1Database,
     category: LegacyCategory,
-    items: Array<Record<string, unknown>>
+    items: Array<Record<string, unknown>>,
+    options: { externalMysqlActive?: boolean } = {}
 ): Promise<{ inserted: number; skipped: number; legacyDbBytes: number }> {
+    const effectiveChunkMaxBytes = options.externalMysqlActive ? EXTERNAL_MYSQL_CHUNK_MAX_BYTES : COMPACT_CHUNK_MAX_BYTES;
     const stmts: D1PreparedStatement[] = [];
     const gamelogLocationRows: unknown[][] = [];
     const gamelogJoinLeaveRows: unknown[][] = [];
@@ -1485,7 +1510,7 @@ async function ingestLegacyCategoryBatch(
             dedupKeyFn: (t) => feedTupleDedupKey(bucket.kind, t),
             fallbackIso: nowIso,
             maxRows: COMPACT_CHUNK_MAX_ROWS,
-            maxJsonBytes: COMPACT_CHUNK_MAX_BYTES,
+            maxJsonBytes: effectiveChunkMaxBytes,
             negateRowIds: true
         });
         inserted += res.inserted;
@@ -1511,7 +1536,7 @@ async function ingestLegacyCategoryBatch(
             dedupKeyFn: (t) => gamelogTupleDedupKey(bucket.kind, t),
             fallbackIso: nowIso,
             maxRows: COMPACT_CHUNK_MAX_ROWS,
-            maxJsonBytes: COMPACT_CHUNK_MAX_BYTES,
+            maxJsonBytes: effectiveChunkMaxBytes,
             negateRowIds: true
         });
         inserted += res.inserted;
@@ -1562,7 +1587,7 @@ async function ingestLegacyCategoryBatch(
             dedupKeyFn: (t) => coreTupleDedupKey(bucket.kind, t),
             fallbackIso: nowIso,
             maxRows: COMPACT_CHUNK_MAX_ROWS,
-            maxJsonBytes: COMPACT_CHUNK_MAX_BYTES,
+            maxJsonBytes: effectiveChunkMaxBytes,
             negateRowIds: true
         });
         inserted += res.inserted;
@@ -1860,7 +1885,8 @@ export async function handleLegacyMigrationAgentRoutes(
                 const result = await ingestLegacyCategoryBatch(
                     legacyDb,
                     category,
-                    rawItems.filter(isPlainObject)
+                    rawItems.filter(isPlainObject),
+                    { externalMysqlActive }
                 );
                 inserted = result.inserted;
                 skipped = result.skipped;

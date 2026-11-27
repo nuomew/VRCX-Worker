@@ -1157,15 +1157,48 @@ function isTransientMysqlDisconnectError(err: unknown): boolean {
         code === 'PROTOCOL_CONNECTION_LOST' ||
         code === 'ECONNRESET' ||
         code === 'EPIPE' ||
-        /connection lost|connection closed|closed state|broken pipe|econnreset/i.test(msg)
+        code === 'ETIMEDOUT' ||
+        /connection lost|connection closed|closed state|broken pipe|econnreset|server has gone away/i.test(msg)
     );
+}
+
+function estimateMysqlQueryBytes(sql: string, params: unknown[]): number {
+    let bytes = sql.length;
+    for (const p of params) {
+        if (typeof p === 'string') {
+            bytes += p.length;
+        } else if (p instanceof Uint8Array) {
+            bytes += p.byteLength;
+        } else if (p !== null && p !== undefined) {
+            bytes += String(p).length;
+        }
+    }
+    return bytes;
+}
+
+function detectMysqlSqlStage(sql: string): string {
+    const trimmed = sql.trimStart().slice(0, 16).toUpperCase();
+    if (trimmed.startsWith('SELECT')) return 'select';
+    if (trimmed.startsWith('INSERT') || trimmed.startsWith('REPLACE')) return 'insert';
+    if (trimmed.startsWith('UPDATE')) return 'update';
+    if (trimmed.startsWith('DELETE')) return 'delete';
+    return 'query';
+}
+
+function attachMysqlErrorContext(err: unknown, stage: string, sqlBytes: number): unknown {
+    if (err && typeof err === 'object') {
+        const obj = err as { mysqlStage?: string; mysqlSqlBytes?: number };
+        if (!obj.mysqlStage) obj.mysqlStage = stage;
+        if (obj.mysqlSqlBytes === undefined) obj.mysqlSqlBytes = sqlBytes;
+    }
+    return err;
 }
 
 /**
  * Request-scoped lazy MySQL connection session.
  * Opens at most one TCP connection per Worker request (and zero connections if the request only touches D1),
- * serializes concurrent queries safely on the single connection, retries transient InnoDB lock/disconnect errors,
- * and guarantees cleanup via `close()`.
+ * serializes concurrent queries safely on the single connection, retries transient InnoDB lock/disconnect errors
+ * (including handshake/connect drops) with jittered backoff, and guarantees cleanup via `close()`.
  */
 export class ExternalMysqlSession {
     readonly params: ResolvedMysqlConnectionParams;
@@ -1199,10 +1232,19 @@ export class ExternalMysqlSession {
         if (this.conn) return this.conn;
         if (!this.connectPromise) {
             this.connectPromise = (async () => {
-                const c = await openMysqlConnection(this.params);
+                let c: MysqlConnectionLike;
+                try {
+                    c = await openMysqlConnection(this.params);
+                } catch (err) {
+                    throw attachMysqlErrorContext(err, 'connect', 0);
+                }
                 this.conn = c;
                 if (!this.schemaEnsured) {
-                    await ensureMysqlSchemaOnConnection(c, this.params, false);
+                    try {
+                        await ensureMysqlSchemaOnConnection(c, this.params, false);
+                    } catch (err) {
+                        throw attachMysqlErrorContext(err, 'schema', 0);
+                    }
                     this.schemaEnsured = true;
                 }
                 return c;
@@ -1211,28 +1253,36 @@ export class ExternalMysqlSession {
         try {
             return await this.connectPromise;
         } catch (err) {
-            this.connectPromise = null;
-            this.conn = null;
+            await this.resetBrokenConnection();
             throw err;
         }
     }
 
     async query(sql: string, params: unknown[] = []): Promise<MysqlExecResult> {
+        const queryStage = detectMysqlSqlStage(sql);
+        const sqlBytes = estimateMysqlQueryBytes(sql, params);
         const run = async (): Promise<MysqlExecResult> => {
-            const maxAttempts = 3;
+            const maxAttempts = 4;
             for (let attempt = 0; attempt < maxAttempts; attempt++) {
-                const conn = await this.getConnection();
                 try {
-                    return await conn.execute(sql, params);
+                    const conn = await this.getConnection();
+                    try {
+                        return await conn.execute(sql, params);
+                    } catch (execErr) {
+                        throw attachMysqlErrorContext(execErr, queryStage, sqlBytes);
+                    }
                 } catch (err) {
                     const isLast = attempt >= maxAttempts - 1 || this.closed;
                     if (!isLast && isTransientMysqlLockError(err)) {
-                        const backoffMs = 40 * (attempt + 1) + Math.floor(Math.random() * 40);
+                        const backoffMs = 50 * (attempt + 1) + Math.floor(Math.random() * 50);
                         await new Promise((resolve) => setTimeout(resolve, backoffMs));
                         continue;
                     }
                     if (!isLast && isTransientMysqlDisconnectError(err)) {
                         await this.resetBrokenConnection();
+                        // Back off briefly before reconnecting so rate-limited or congested MySQL hosts can recover
+                        const backoffMs = 150 * Math.pow(2, attempt) + Math.floor(Math.random() * 80);
+                        await new Promise((resolve) => setTimeout(resolve, backoffMs));
                         continue;
                     }
                     throw err;

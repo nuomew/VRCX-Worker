@@ -2179,7 +2179,16 @@ describe('External MySQL 5.7+ Database Integration (Hybrid New-Writes Mode & Ful
         await ensureSchemaReady(env);
         const legacyDb = env.DB_LEGACY!;
         const fakeMysql = new FakeMysql57Server();
-        setMysqlConnectionFactoryForTests(async () => fakeMysql.createConnection());
+        let failNextHandshakeDisconnect = false;
+        setMysqlConnectionFactoryForTests(async () => {
+            if (failNextHandshakeDisconnect) {
+                failNextHandshakeDisconnect = false;
+                throw Object.assign(new Error('Connection lost: The server closed the connection.'), {
+                    code: 'PROTOCOL_CONNECTION_LOST'
+                });
+            }
+            return fakeMysql.createConnection();
+        });
         const headers = { 'Content-Type': 'application/json', Origin: 'http://example.com' };
         const hasLoneSurrogate = (s: string): boolean => {
             for (let i = 0; i < s.length; i++) {
@@ -2360,7 +2369,8 @@ describe('External MySQL 5.7+ Database Integration (Hybrid New-Writes Mode & Ful
                 }
             };
 
-            // 1. Upload dirty desktop records (non-ASCII >40-char timestamp, non-ASCII world_id, lone surrogate + >256/512 emoji strings)
+            // 1. Upload dirty desktop records (with an initial handshake PROTOCOL_CONNECTION_LOST that must retry and recover)
+            failNextHandshakeDisconnect = true;
             const dirtyRes = await exports.default.fetch('http://example.com/api/agent/migration/batch', {
                 method: 'POST',
                 headers: agentHeaders,
@@ -2394,11 +2404,12 @@ describe('External MySQL 5.7+ Database Integration (Hybrid New-Writes Mode & Ful
             const dirtyJson = (await dirtyRes.json()) as { ok: boolean; data: { inserted: number } };
             expect(dirtyJson.ok).toBe(true);
             expect(dirtyJson.data.inserted).toBe(2);
+            expect(failNextHandshakeDisconnect).toBe(false);
             expect(injectedDeadlock).toBe(true);
             expect(injectedDisconnect).toBe(true);
             expect(sawReplaceIntoRollup).toBe(false);
 
-            // 2. Persistent MySQL failure surfaces sanitized, actionable error code instead of opaque "Unexpected server error"
+            // 2. Persistent MySQL failure surfaces sanitized, actionable error code + op stage + payload KiB
             fakeMysql.onBeforeExecute = () => {
                 throw Object.assign(new Error('Got a packet bigger than max_allowed_packet from 203.0.113.42:3306'), {
                     code: 'ER_NET_PACKET_TOO_LARGE',
@@ -2428,6 +2439,7 @@ describe('External MySQL 5.7+ Database Integration (Hybrid New-Writes Mode & Ful
             expect(errJson.error.code).toBe('MIGRATION_BATCH_FAILED');
             expect(errJson.error.message).toContain('[gamelog/ingest]');
             expect(errJson.error.message).toContain('ER_NET_PACKET_TOO_LARGE (1153)');
+            expect(errJson.error.message).toMatch(/\(op=\w+, ~\d+\.\d KiB\)/);
             expect(errJson.error.message).not.toContain('203.0.113.42');
             expect(errJson.error.message).toContain('<host>');
         } finally {
