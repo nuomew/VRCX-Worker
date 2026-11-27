@@ -728,6 +728,10 @@ export function createHybridMysqlD1Database(rawD1: D1Database, session: External
     return hybrid as D1Database;
 }
 
+export function isExternalMysqlActiveOnEnv(env: Env): boolean {
+    return getRawD1Env(env) !== env;
+}
+
 /**
  * Runs a Worker handler inside a request-scoped external MySQL hybrid Env.
  * - Zero overhead when external MySQL is disabled (returns immediately using original `env`).

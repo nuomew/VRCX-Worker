@@ -1050,4 +1050,172 @@ describe('External MySQL 5.7+ Database Integration (Hybrid New-Writes Mode & Ful
             ]);
         }
     });
+
+    it('exports merged D1 + MySQL 5.7 active & legacy chunks cleanly via /api/migration/export and clears legacy MySQL chunks on DELETE /api/migration/data', async () => {
+        await ensureSchemaReady(env);
+        const fakeMysql = new FakeMysql57Server();
+        setMysqlConnectionFactoryForTests(async () => fakeMysql.createConnection());
+        const headers = { 'Content-Type': 'application/json', Origin: 'http://example.com' };
+        const legacyDb = env.DB_LEGACY!;
+
+        try {
+            // 1. Seed 1 active GameLog row in D1 before enabling MySQL
+            expect(
+                (
+                    await exports.default.fetch('http://example.com/api/gamelog', {
+                        method: 'POST',
+                        headers,
+                        body: JSON.stringify({
+                            items: [
+                                {
+                                    type: 'Location',
+                                    created_at: '2025-07-01T00:00:00.000Z',
+                                    location: 'wrld_exp_d1:1',
+                                    worldId: 'wrld_exp_d1',
+                                    worldName: 'Export D1 World',
+                                    time: 30,
+                                    groupName: ''
+                                }
+                            ]
+                        })
+                    })
+                ).status
+            ).toBe(200);
+
+            // 2. Enable MySQL 5.7 (Compatibility Mode)
+            expect(
+                (
+                    await exports.default.fetch('http://example.com/api/storage/mysql/config', {
+                        method: 'PUT',
+                        headers,
+                        body: JSON.stringify({
+                            enabled: true,
+                            mode: 'new_writes_only',
+                            connectionType: 'direct',
+                            host: 'mysql57.example.com',
+                            port: 3306,
+                            database: 'vrcx_prod',
+                            username: 'vrcx_user',
+                            password: 'ExportTestPassword123',
+                            sslMode: 'disabled',
+                            tablePrefix: 'vrcx_'
+                        })
+                    })
+                ).status
+            ).toBe(200);
+
+            // 3. Write 1 new active GameLog row -> lands in MySQL 5.7
+            expect(
+                (
+                    await exports.default.fetch('http://example.com/api/gamelog', {
+                        method: 'POST',
+                        headers,
+                        body: JSON.stringify({
+                            items: [
+                                {
+                                    type: 'Location',
+                                    created_at: '2026-07-02T00:00:00.000Z',
+                                    location: 'wrld_exp_mysql:2',
+                                    worldId: 'wrld_exp_mysql',
+                                    worldName: 'Export MySQL World',
+                                    time: 45,
+                                    groupName: ''
+                                }
+                            ]
+                        })
+                    })
+                ).status
+            ).toBe(200);
+
+            // 4. Simulate desktop legacy history chunk imported directly into MySQL 5.7 (`vrcx_legacy_gamelog_chunks`)
+            const legacyPayload = JSON.stringify([
+                ['2024-08-01T00:00:00.000Z', 'wrld_exp_legacy_mysql:3', 'wrld_exp_legacy_mysql', 'Legacy MySQL World', 90, '']
+            ]);
+            const legacyTbl = fakeMysql.tables.get('vrcx_legacy_gamelog_chunks')!;
+            legacyTbl.rows.push({
+                id: legacyTbl.autoInc++,
+                chunk_key: 'location_legacy_mysql_test_01',
+                gamelog_kind: 'location',
+                min_created_at: '2024-08-01T00:00:00.000Z',
+                max_created_at: '2024-08-01T00:00:00.000Z',
+                row_count: 1,
+                payload_json: legacyPayload
+            });
+
+            // 5. ZIP Export summary counts MUST include both D1 + MySQL active AND MySQL legacy chunks
+            const summaryRes = await exports.default.fetch('http://example.com/api/migration/export?summary=1');
+            expect(summaryRes.status).toBe(200);
+            const summaryJson = (await summaryRes.json()) as {
+                ok: boolean;
+                data: {
+                    hasLegacyData: boolean;
+                    tables: Array<{ name: string; activeCount: number; legacyCount: number }>;
+                };
+            };
+            expect(summaryJson.ok).toBe(true);
+            expect(summaryJson.data.hasLegacyData).toBe(true);
+            const glSummary = summaryJson.data.tables.find((t) => t.name === 'gamelog_location');
+            expect(glSummary?.activeCount).toBeGreaterThanOrEqual(2);
+            expect(glSummary?.legacyCount).toBeGreaterThanOrEqual(1);
+
+            // 6. Paginated export of active gamelog_location yields BOTH D1 and MySQL rows
+            const exportedActiveWorlds: string[] = [];
+            let cursor = 0;
+            for (let page = 0; page < 5; page++) {
+                const pageRes = await exports.default.fetch(
+                    `http://example.com/api/migration/export?table=gamelog_location&source=active&afterRowId=${cursor}&limit=100`
+                );
+                expect(pageRes.status).toBe(200);
+                const pageJson = (await pageRes.json()) as {
+                    data: { rows: Array<{ world_id?: string }>; nextAfterRowId: number; hasMore: boolean };
+                };
+                for (const r of pageJson.data.rows) {
+                    if (r.world_id) exportedActiveWorlds.push(r.world_id);
+                }
+                if (!pageJson.data.hasMore) break;
+                cursor = pageJson.data.nextAfterRowId;
+            }
+            expect(exportedActiveWorlds).toContain('wrld_exp_d1');
+            expect(exportedActiveWorlds).toContain('wrld_exp_mysql');
+
+            // 7. Paginated export of legacy gamelog_location yields the MySQL legacy chunk row
+            const exportedLegacyWorlds: string[] = [];
+            let legacyCursor = 0;
+            for (let page = 0; page < 5; page++) {
+                const pageRes = await exports.default.fetch(
+                    `http://example.com/api/migration/export?table=gamelog_location&source=legacy&afterRowId=${legacyCursor}&limit=100`
+                );
+                expect(pageRes.status).toBe(200);
+                const pageJson = (await pageRes.json()) as {
+                    data: { rows: Array<{ world_id?: string }>; nextAfterRowId: number; hasMore: boolean };
+                };
+                for (const r of pageJson.data.rows) {
+                    if (r.world_id) exportedLegacyWorlds.push(r.world_id);
+                }
+                if (!pageJson.data.hasMore) break;
+                legacyCursor = pageJson.data.nextAfterRowId;
+            }
+            expect(exportedLegacyWorlds).toContain('wrld_exp_legacy_mysql');
+
+            // 8. DELETE /api/migration/data?category=gamelog clears legacy_gamelog_chunks in MySQL 5.7 too
+            const clearRes = await exports.default.fetch('http://example.com/api/migration/data?category=gamelog', {
+                method: 'DELETE',
+                headers
+            });
+            expect(clearRes.status).toBe(200);
+            expect((fakeMysql.tables.get('vrcx_legacy_gamelog_chunks')?.rows ?? []).length).toBe(0);
+            expect(fakeMysql.activeConnections).toBe(0);
+        } finally {
+            setMysqlConnectionFactoryForTests(null);
+            await saveExternalDbConfig(env, defaultExternalDbConfig());
+            await saveExternalDbMigrationState(env, defaultExternalDbMigrationState());
+            await env.DB_GAMELOG.batch([
+                env.DB_GAMELOG.prepare(
+                    "DELETE FROM gamelog_world_rollup WHERE world_id IN ('wrld_exp_d1', 'wrld_exp_mysql')"
+                ),
+                env.DB_GAMELOG.prepare('DELETE FROM gamelog_archive_chunks')
+            ]);
+            await legacyDb.prepare('DELETE FROM legacy_gamelog_chunks').run().catch(() => {});
+        }
+    });
 });

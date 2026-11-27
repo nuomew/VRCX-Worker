@@ -24,6 +24,7 @@ import {
     type GameLogChunkKind,
     gamelogTupleDedupKey
 } from '../db/compactArchive';
+import { isExternalMysqlActiveOnEnv } from '../db/externalMysqlProxy';
 import { getLegacyDb } from '../db/schemaBootstrap';
 import type { Env } from '../env';
 import {
@@ -43,6 +44,13 @@ export { decodeFeedChunkRows as decodeLegacyFeedChunkRows };
 
 export const LEGACY_DB_FREE_LIMIT_BYTES = 500 * 1024 * 1024;
 export const LEGACY_DB_SOFT_STOP_BYTES = 480 * 1024 * 1024;
+const LEGACY_DB_HARD_CEILING_BYTES = 496 * 1024 * 1024;
+const MYSQL_OFFLOADED_LEGACY_CATEGORIES: ReadonlySet<string> = new Set([
+    'gamelog',
+    'feed',
+    'notifications',
+    'friend_log'
+]);
 const MAX_INVENTORY_BODY_BYTES = 128 * 1024;
 const MAX_BATCH_BODY_BYTES = 4 * 1024 * 1024;
 const MAX_BATCH_ITEMS = 1000;
@@ -1766,9 +1774,14 @@ export async function handleLegacyMigrationAgentRoutes(
                     { status: 400 }
                 );
             }
+            const externalMysqlActive = isExternalMysqlActiveOnEnv(env);
+            const effectiveStopBytes =
+                externalMysqlActive && MYSQL_OFFLOADED_LEGACY_CATEGORIES.has(category)
+                    ? LEGACY_DB_HARD_CEILING_BYTES
+                    : LEGACY_DB_SOFT_STOP_BYTES;
             const preProbe = await legacyDb.prepare('SELECT 1 AS ok').all();
             const currentSize = preProbe.meta?.size_after ?? 0;
-            if (currentSize >= LEGACY_DB_SOFT_STOP_BYTES && rawItems.length > 0) {
+            if (currentSize >= effectiveStopBytes && rawItems.length > 0) {
                 const stoppedJob: LegacyMigrationJob = {
                     ...existingJob,
                     status: 'stopped_quota_limit',
@@ -1851,7 +1864,12 @@ export async function handleLegacyMigrationAgentRoutes(
             );
         }
 
-        const quotaReached = legacyDbBytes >= LEGACY_DB_SOFT_STOP_BYTES;
+        const batchExternalMysqlActive = isExternalMysqlActiveOnEnv(env);
+        const batchOffloaded =
+            batchExternalMysqlActive &&
+            Boolean(categoryRaw) &&
+            MYSQL_OFFLOADED_LEGACY_CATEGORIES.has(categoryRaw as LegacyCategory);
+        const quotaReached = legacyDbBytes >= (batchOffloaded ? LEGACY_DB_HARD_CEILING_BYTES : LEGACY_DB_SOFT_STOP_BYTES);
         const allDone = body.allDone === true;
         const categoryDone = body.categoryDone === true && Boolean(categoryRaw) && LEGACY_CATEGORY_SET.has(categoryRaw);
         const nextStatus: LegacyMigrationJob['status'] = quotaReached
@@ -2251,7 +2269,11 @@ export async function handleLegacyMigrationWebRoutes(
             readLegacyState<LegacyDesktopInventory>(legacyDb, STATE_KEY_INVENTORY)
         ]);
         const currentBytes = probe.meta?.size_after ?? 0;
-        if (currentBytes >= LEGACY_DB_SOFT_STOP_BYTES) {
+        const startOffloadedOnly =
+            isExternalMysqlActiveOnEnv(env) &&
+            categories.every((c) => MYSQL_OFFLOADED_LEGACY_CATEGORIES.has(c));
+        const startStopBytes = startOffloadedOnly ? LEGACY_DB_HARD_CEILING_BYTES : LEGACY_DB_SOFT_STOP_BYTES;
+        if (currentBytes >= startStopBytes) {
             return Response.json(
                 {
                     ok: false,
