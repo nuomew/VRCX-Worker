@@ -63,6 +63,12 @@ class FakeMysql57Server {
                 if (/DELETE\s+FROM\s+[`\w]+\s+WHERE\s+cache_key\s+IN\s*\(\s*SELECT/i.test(sql)) {
                     throw new Error(`MySQL 5.7 Error 1093/1235 self-subquery DELETE rejected: ${sql}`);
                 }
+                if (/\browid\b/i.test(sql)) {
+                    throw new Error(`MySQL 5.7 ER_BAD_FIELD_ERROR Unknown column 'rowid': ${sql}`);
+                }
+                if (/^SELECT\s+[^*,\n]+,\s*\*\s+FROM\b/i.test(sql)) {
+                    throw new Error(`MySQL 5.7 Syntax Error 1064: '*' must come first in SELECT list: ${sql}`);
+                }
 
                 if (/^SELECT\s+VERSION\(\)/i.test(sql)) {
                     return { rows: [{ version: '5.7.44-log' }], affectedRows: 0, insertId: 0 };
@@ -228,9 +234,18 @@ class FakeMysql57Server {
                             arr.push(r);
                             groups.set(k, arr);
                         }
+                        let groupOutKey = groupCol;
+                        const aliasRe = new RegExp(`^` + '`?' + groupCol + '`?' + `\\s+AS\\s+` + '`?(\\w+)`?$', 'i');
+                        for (const p of splitTopLevelComma(selectExpr)) {
+                            const am = aliasRe.exec(p.trim());
+                            if (am) {
+                                groupOutKey = am[1]!;
+                                break;
+                            }
+                        }
                         const out: Array<Record<string, unknown>> = [];
                         for (const [k, gRows] of groups.entries()) {
-                            const rec: Record<string, unknown> = { [groupCol]: k };
+                            const rec: Record<string, unknown> = { [groupOutKey]: k };
                             applyAggregates(selectExpr, gRows, rec);
                             out.push(rec);
                         }
@@ -408,6 +423,10 @@ function projectColumns(selectExpr: string, rows: Array<Record<string, unknown>>
     return rows.map((r) => {
         const out: Record<string, unknown> = {};
         for (const p of parts) {
+            if (p.trim() === '*') {
+                Object.assign(out, r);
+                continue;
+            }
             const asMatch = /^([\s\S]+?)\s+AS\s+`?(\w+)`?\s*$/i.exec(p);
             if (asMatch) {
                 const expr = asMatch[1]!.trim().replace(/^`|`$/g, '');
@@ -862,6 +881,173 @@ describe('External MySQL 5.7+ Database Integration (Hybrid New-Writes Mode & Ful
             await cacheDb
                 .prepare("DELETE FROM vrc_api_cache WHERE cache_key = 'https://api.vrchat.cloud/api/1/config?mysql_test=1'")
                 .run();
+        }
+    });
+
+    it('preserves MySQL 5.7 data across disable/re-enable toggles and applies database cleanup (preview, backup_and_delete, direct delete) cleanly to MySQL 5.7', async () => {
+        await ensureSchemaReady(env);
+        const fakeMysql = new FakeMysql57Server();
+        setMysqlConnectionFactoryForTests(async () => fakeMysql.createConnection());
+        const headers = { 'Content-Type': 'application/json', Origin: 'http://example.com' };
+        const createdBackupKeys: string[] = [];
+
+        try {
+            // Enable MySQL 5.7 (Compatibility Mode)
+            const cfgRes = await exports.default.fetch('http://example.com/api/storage/mysql/config', {
+                method: 'PUT',
+                headers,
+                body: JSON.stringify({
+                    enabled: true,
+                    mode: 'new_writes_only',
+                    connectionType: 'direct',
+                    host: 'mysql57.example.com',
+                    port: 3306,
+                    database: 'vrcx_prod',
+                    username: 'vrcx_user',
+                    password: 'CleanupTestPassword123',
+                    sslMode: 'disabled',
+                    tablePrefix: 'vrcx_'
+                })
+            });
+            expect(cfgRes.status).toBe(200);
+
+            // Insert 3 GameLog records spanning 2025-10-01, 2025-10-15, and 2025-11-10 directly into MySQL 5.7
+            const insertRes = await exports.default.fetch('http://example.com/api/gamelog', {
+                method: 'POST',
+                headers,
+                body: JSON.stringify({
+                    items: [
+                        {
+                            type: 'Location',
+                            created_at: '2025-10-01T00:00:00.000Z',
+                            location: 'wrld_mysql_clean_oct1:1',
+                            worldId: 'wrld_mysql_clean_oct1',
+                            worldName: 'Oct 1 World',
+                            time: 60,
+                            groupName: ''
+                        },
+                        {
+                            type: 'Location',
+                            created_at: '2025-10-15T00:00:00.000Z',
+                            location: 'wrld_mysql_clean_oct15:2',
+                            worldId: 'wrld_mysql_clean_oct15',
+                            worldName: 'Oct 15 World',
+                            time: 120,
+                            groupName: ''
+                        },
+                        {
+                            type: 'Location',
+                            created_at: '2025-11-10T00:00:00.000Z',
+                            location: 'wrld_mysql_keep_nov10:3',
+                            worldId: 'wrld_mysql_keep_nov10',
+                            worldName: 'Nov 10 Keep World',
+                            time: 180,
+                            groupName: ''
+                        }
+                    ]
+                })
+            });
+            expect(insertRes.status).toBe(200);
+
+            // 1. Disabling MySQL MUST NOT delete MySQL data; re-enabling immediately restores visibility
+            const offRes = await exports.default.fetch('http://example.com/api/storage/mysql/config', {
+                method: 'PUT',
+                headers,
+                body: JSON.stringify({ enabled: false })
+            });
+            expect(offRes.status).toBe(200);
+            expect((fakeMysql.tables.get('vrcx_gamelog_archive_chunks')?.rows ?? []).length).toBe(1);
+
+            const hiddenWhileOff = (await (
+                await exports.default.fetch('http://example.com/api/gamelog?types=Location&limit=50')
+            ).json()) as { data: Array<{ worldId?: string }> };
+            expect(hiddenWhileOff.data.some((x) => x.worldId === 'wrld_mysql_clean_oct1')).toBe(false);
+
+            const onAgainRes = await exports.default.fetch('http://example.com/api/storage/mysql/config', {
+                method: 'PUT',
+                headers,
+                body: JSON.stringify({ enabled: true })
+            });
+            expect(onAgainRes.status).toBe(200);
+
+            const restoredAfterOn = (await (
+                await exports.default.fetch('http://example.com/api/gamelog?types=Location&limit=50')
+            ).json()) as { data: Array<{ worldId?: string }> };
+            expect(restoredAfterOn.data.map((x) => x.worldId)).toEqual(
+                expect.arrayContaining(['wrld_mysql_clean_oct1', 'wrld_mysql_clean_oct15', 'wrld_mysql_keep_nov10'])
+            );
+
+            // 2. Cleanup preview counts MySQL 5.7 oldest 1-month window [2025-10-01, 2025-11-01) => 2 rows
+            const previewRes = await exports.default.fetch('http://example.com/api/admin/cleanup/preview?months=1');
+            expect(previewRes.status).toBe(200);
+            const previewJson = (await previewRes.json()) as {
+                ok: boolean;
+                data: { oldestIso: string; cutoffIso: string; totalRows: number; shards: { gamelog: number } };
+            };
+            expect(previewJson.ok).toBe(true);
+            expect(previewJson.data.oldestIso).toBe('2025-10-01T00:00:00.000Z');
+            expect(previewJson.data.cutoffIso).toBe('2025-11-01T00:00:00.000Z');
+            expect(previewJson.data.shards.gamelog).toBe(2);
+
+            // 3. Cleanup backup_and_delete backs up MySQL 5.7 rows to R2 and trims ONLY Oct rows while keeping Nov 10
+            const backupDelRes = await exports.default.fetch('http://example.com/api/admin/cleanup', {
+                method: 'POST',
+                headers,
+                body: JSON.stringify({
+                    months: 1,
+                    mode: 'backup_and_delete',
+                    includeLegacy: false,
+                    cutoffIso: previewJson.data.cutoffIso
+                })
+            });
+            expect(backupDelRes.status).toBe(200);
+            const backupDelJson = (await backupDelRes.json()) as {
+                ok: boolean;
+                data: { deletedRows: number; backedUpRows: number; backupKey: string };
+            };
+            expect(backupDelJson.ok).toBe(true);
+            expect(backupDelJson.data.deletedRows).toBe(2);
+            expect(backupDelJson.data.backedUpRows).toBe(2);
+            expect(backupDelJson.data.backupKey).toContain('backups/db-cleanup/');
+            createdBackupKeys.push(backupDelJson.data.backupKey);
+
+            // Verify Oct rows removed from MySQL 5.7 while Nov 10 row survives intact
+            const afterBackupDel = (await (
+                await exports.default.fetch('http://example.com/api/gamelog?types=Location&limit=50')
+            ).json()) as { data: Array<{ worldId?: string }> };
+            const survivingIds = afterBackupDel.data.map((x) => x.worldId);
+            expect(survivingIds).not.toContain('wrld_mysql_clean_oct1');
+            expect(survivingIds).not.toContain('wrld_mysql_clean_oct15');
+            expect(survivingIds).toContain('wrld_mysql_keep_nov10');
+
+            // 4. Direct delete mode cleans remaining whole MySQL 5.7 chunk (2025-11-10 + 1m => < 2025-12-10)
+            const directDelRes = await exports.default.fetch('http://example.com/api/admin/cleanup', {
+                method: 'POST',
+                headers,
+                body: JSON.stringify({ months: 1, mode: 'delete', includeLegacy: false })
+            });
+            expect(directDelRes.status).toBe(200);
+            const directDelJson = (await directDelRes.json()) as {
+                ok: boolean;
+                data: { deletedRows: number };
+            };
+            expect(directDelJson.ok).toBe(true);
+            expect(directDelJson.data.deletedRows).toBe(1);
+            expect((fakeMysql.tables.get('vrcx_gamelog_archive_chunks')?.rows ?? []).length).toBe(0);
+            expect(fakeMysql.activeConnections).toBe(0);
+        } finally {
+            setMysqlConnectionFactoryForTests(null);
+            for (const key of createdBackupKeys) {
+                await env.R2_MEDIA?.delete(key).catch(() => {});
+            }
+            await saveExternalDbConfig(env, defaultExternalDbConfig());
+            await saveExternalDbMigrationState(env, defaultExternalDbMigrationState());
+            await env.DB_GAMELOG.batch([
+                env.DB_GAMELOG.prepare(
+                    "DELETE FROM gamelog_world_rollup WHERE world_id IN ('wrld_mysql_clean_oct1', 'wrld_mysql_clean_oct15', 'wrld_mysql_keep_nov10')"
+                ),
+                env.DB_GAMELOG.prepare('DELETE FROM gamelog_archive_chunks')
+            ]);
         }
     });
 });

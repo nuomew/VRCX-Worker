@@ -320,7 +320,7 @@ function detectScalarAggregates(sql: string): { isAggregate: boolean; groupByCol
     }
 
     const groupMatch = /\bGROUP\s+BY\s+[`"]?([a-zA-Z_][a-zA-Z0-9_]*)[`"]?/i.exec(cleaned);
-    const groupByCol = groupMatch ? groupMatch[1]! : null;
+    let groupByCol = groupMatch ? groupMatch[1]! : null;
 
     // Split top-level expressions
     let depth = 0;
@@ -338,6 +338,21 @@ function detectScalarAggregates(sql: string): { isAggregate: boolean; groupByCol
         cur += ch;
     }
     if (cur.trim()) exprs.push(cur.trim());
+
+    // Resolve alias when GROUP BY column is aliased in SELECT (e.g. `gamelog_kind AS kind_val`)
+    if (groupByCol) {
+        const aliasRe = new RegExp(
+            `^[\\\`"]?${groupByCol}[\\\`"]?\\s+AS\\s+[\\\`"]?([a-zA-Z_][a-zA-Z0-9_]*)[\\\`"]?$`,
+            'i'
+        );
+        for (const expr of exprs) {
+            const mAlias = aliasRe.exec(expr);
+            if (mAlias) {
+                groupByCol = mAlias[1]!;
+                break;
+            }
+        }
+    }
 
     const specs: AggregateSpec[] = [];
     for (const expr of exprs) {

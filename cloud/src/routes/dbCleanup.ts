@@ -1324,26 +1324,34 @@ export async function handleDbCleanupRoutes(
         const feedSpecs = CLEANUP_TABLES.filter((t) => t.shard === 'feed');
         const chunkSliceLimit = Math.max(4, Math.min(16, Math.ceil(batchLimit / 200)));
 
+        const buildBackupSelectSql = (s: CleanupTableSpec) =>
+            s.isChunkTable
+                ? `SELECT *, id AS _rid FROM ${s.table} WHERE ${s.whereSql} ORDER BY id ASC LIMIT ?`
+                : `SELECT rowid AS _rid, * FROM ${s.table} WHERE ${s.whereSql} ORDER BY rowid ASC LIMIT ?`;
+
         const [coreRowsRes, gamelogRowsRes, feedRowsRes, legacyRowsRes] = await Promise.all([
             env.DB_CORE.batch(
                 coreSpecs.map((s) =>
-                    env.DB_CORE.prepare(
-                        `SELECT rowid AS _rid, * FROM ${s.table} WHERE ${s.whereSql} ORDER BY rowid ASC LIMIT ?`
-                    ).bind(getCutoffParam(s, cutoffIso, cutoffMs), (s.isChunkTable ? chunkSliceLimit : batchLimit) + 1)
+                    env.DB_CORE.prepare(buildBackupSelectSql(s)).bind(
+                        getCutoffParam(s, cutoffIso, cutoffMs),
+                        (s.isChunkTable ? chunkSliceLimit : batchLimit) + 1
+                    )
                 )
             ),
             env.DB_GAMELOG.batch(
                 gamelogSpecs.map((s) =>
-                    env.DB_GAMELOG.prepare(
-                        `SELECT rowid AS _rid, * FROM ${s.table} WHERE ${s.whereSql} ORDER BY rowid ASC LIMIT ?`
-                    ).bind(getCutoffParam(s, cutoffIso, cutoffMs), (s.isChunkTable ? chunkSliceLimit : batchLimit) + 1)
+                    env.DB_GAMELOG.prepare(buildBackupSelectSql(s)).bind(
+                        getCutoffParam(s, cutoffIso, cutoffMs),
+                        (s.isChunkTable ? chunkSliceLimit : batchLimit) + 1
+                    )
                 )
             ),
             env.DB_FEED.batch(
                 feedSpecs.map((s) =>
-                    env.DB_FEED.prepare(
-                        `SELECT rowid AS _rid, * FROM ${s.table} WHERE ${s.whereSql} ORDER BY rowid ASC LIMIT ?`
-                    ).bind(getCutoffParam(s, cutoffIso, cutoffMs), (s.isChunkTable ? chunkSliceLimit : batchLimit) + 1)
+                    env.DB_FEED.prepare(buildBackupSelectSql(s)).bind(
+                        getCutoffParam(s, cutoffIso, cutoffMs),
+                        (s.isChunkTable ? chunkSliceLimit : batchLimit) + 1
+                    )
                 )
             ),
             legacyDb
@@ -1351,9 +1359,7 @@ export async function handleDbCleanupRoutes(
                       .batch(
                           LEGACY_CLEANUP_TABLES.map((s) =>
                               legacyDb
-                                  .prepare(
-                                      `SELECT rowid AS _rid, * FROM ${s.table} WHERE ${s.whereSql} ORDER BY rowid ASC LIMIT ?`
-                                  )
+                                  .prepare(buildBackupSelectSql(s))
                                   .bind(
                                       getCutoffParam(s, cutoffIso, cutoffMs),
                                       (s.isChunkTable ? chunkSliceLimit : batchLimit) + 1
@@ -1603,11 +1609,12 @@ export async function handleDbCleanupRoutes(
             const list = targetsByShard[shardName];
             if (!db || list.length === 0) return;
             const res = await db.batch(
-                list.map((item) =>
-                    db
-                        .prepare(`DELETE FROM ${item.spec.table} WHERE rowid <= ? AND ${item.spec.whereSql}`)
-                        .bind(item.maxRid, getCutoffParam(item.spec, cutoffIso, cutoffMs))
-                )
+                list.map((item) => {
+                    const idCol = item.spec.isChunkTable ? 'id' : 'rowid';
+                    return db
+                        .prepare(`DELETE FROM ${item.spec.table} WHERE ${idCol} <= ? AND ${item.spec.whereSql}`)
+                        .bind(item.maxRid, getCutoffParam(item.spec, cutoffIso, cutoffMs));
+                })
             );
             list.forEach((item, i) => {
                 const changes = Math.max(0, Number(res[i]?.meta?.changes ?? 0));
