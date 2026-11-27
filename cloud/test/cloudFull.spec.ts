@@ -12,7 +12,7 @@ import {
 import type { Env } from '../src/env';
 import worker from '../src/index';
 import { incrementCounter } from '../src/routes/coreData';
-import { computeMonthsCutoff } from '../src/routes/dbCleanup';
+import { computeForwardMonthsCutoff, computeMonthsCutoff } from '../src/routes/dbCleanup';
 import { mergeSetCookies } from '../src/routes/vrcProxy';
 import {
     classifyVrcCacheUrl,
@@ -6750,7 +6750,7 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
         expect(computeMonthsCutoff(1, new Date('2026-03-31T12:00:00.000Z')).cutoffIso).toBe('2026-02-28T12:00:00.000Z');
         expect(computeMonthsCutoff(1, new Date('2024-03-31T12:00:00.000Z')).cutoffIso).toBe('2024-02-29T12:00:00.000Z');
 
-        const oldIso = new Date(Date.now() - 540 * 86_400_000).toISOString(); // ~18 months ago
+        const oldIso = '2018-06-01T00:00:00.000Z'; // earliest historical baseline in shared test DB
         const recentIso = new Date(Date.now() - 86_400_000).toISOString(); // 1 day ago
         const oldMs = Date.parse(oldIso);
         const recentMs = Date.parse(recentIso);
@@ -7286,7 +7286,7 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
             expect(new Uint8Array(await readShotRes.arrayBuffer())).toEqual(fakePng);
 
             // 5. DB cleanup directly backs up to Backblaze B2, appears in combined backup list, and downloads cleanly
-            const oldIso = new Date(Date.now() - 400 * 86_400_000).toISOString();
+            const oldIso = '2018-01-01T00:00:00.000Z';
             await env.DB_GAMELOG.prepare(
                 'INSERT OR IGNORE INTO gamelog_location (created_at, location, world_id, world_name, time, group_name) VALUES (?, ?, ?, ?, ?, ?)'
             )
@@ -9993,6 +9993,150 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
                 chatDb.prepare('DELETE FROM cloud_chat_messages'),
                 chatDb.prepare('DELETE FROM chat_archive_chunks')
             ]).catch(() => {});
+        }
+    });
+
+    it('cleans historical data forward from the oldest record timestamp (e.g. 2025-10-01 + 1 month => 2025-10-01..2025-11-01) while strictly preserving newer records', async () => {
+        // 1. Unit checks for exact calendar-month forward calculation & 24h recent-data guard
+        const fwdExact = computeForwardMonthsCutoff(
+            '2025-10-01T00:00:00.000Z',
+            1,
+            new Date('2026-11-27T10:00:00.000Z')
+        );
+        expect(fwdExact?.oldestIso).toBe('2025-10-01T00:00:00.000Z');
+        expect(fwdExact?.cutoffIso).toBe('2025-11-01T00:00:00.000Z');
+        expect(fwdExact?.clampedToRecentGuard).toBe(false);
+
+        const fwdClampMonthEnd = computeForwardMonthsCutoff(
+            '2025-01-31T12:00:00.000Z',
+            1,
+            new Date('2026-11-27T10:00:00.000Z')
+        );
+        expect(fwdClampMonthEnd?.cutoffIso).toBe('2025-02-28T12:00:00.000Z');
+
+        const fwdGuard = computeForwardMonthsCutoff(
+            '2026-11-20T10:00:00.000Z',
+            1,
+            new Date('2026-11-27T10:00:00.000Z')
+        );
+        expect(fwdGuard?.clampedToRecentGuard).toBe(true);
+        expect(fwdGuard?.cutoffIso).toBe('2026-11-26T10:00:00.000Z');
+
+        // 2. End-to-end forward window cleanup on real compact chunks:
+        //    Oldest starts at 2025-10-01; selecting 1 month deletes ONLY [2025-10-01, 2025-11-01)
+        //    and preserves 2025-11-01, 2025-11-15, and today's fresh records.
+        const octStart = '2025-10-01T08:00:00.000Z';
+        const octMid = '2025-10-15T12:00:00.000Z';
+        const novStart = '2025-11-01T08:00:00.000Z';
+        const novMid = '2025-11-15T12:00:00.000Z';
+        const todayIso = new Date(Date.now() - 60_000).toISOString();
+
+        try {
+            await env.DB_FEED.batch([
+                env.DB_FEED.prepare('DELETE FROM feed_gps'),
+                env.DB_FEED.prepare('DELETE FROM feed_online_offline'),
+                env.DB_FEED.prepare('DELETE FROM feed_status'),
+                env.DB_FEED.prepare('DELETE FROM feed_bio'),
+                env.DB_FEED.prepare('DELETE FROM feed_archive_chunks'),
+                env.DB_FEED.prepare('DELETE FROM activity_sessions_v2')
+            ]);
+            await env.DB_GAMELOG.batch([
+                env.DB_GAMELOG.prepare('DELETE FROM gamelog_location'),
+                env.DB_GAMELOG.prepare('DELETE FROM gamelog_join_leave'),
+                env.DB_GAMELOG.prepare('DELETE FROM gamelog_portal_spawn'),
+                env.DB_GAMELOG.prepare('DELETE FROM gamelog_video_play'),
+                env.DB_GAMELOG.prepare('DELETE FROM gamelog_event'),
+                env.DB_GAMELOG.prepare('DELETE FROM gamelog_external'),
+                env.DB_GAMELOG.prepare('DELETE FROM gamelog_archive_chunks')
+            ]);
+            await env.DB_CORE.batch([
+                env.DB_CORE.prepare('DELETE FROM notifications'),
+                env.DB_CORE.prepare('DELETE FROM notifications_v2'),
+                env.DB_CORE.prepare('DELETE FROM friend_log_history'),
+                env.DB_CORE.prepare('DELETE FROM core_archive_chunks'),
+                env.DB_CORE.prepare("DELETE FROM cloud_commands WHERE status != 'pending'")
+            ]);
+
+            await exports.default.fetch('http://example.com/api/feed', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+                body: JSON.stringify({
+                    items: [
+                        { type: 'GPS', created_at: octStart, userId: 'usr_fwd', displayName: 'FwdPal', location: 'wrld_fwd:oct1', worldName: 'Oct 1 World' },
+                        { type: 'GPS', created_at: octMid, userId: 'usr_fwd', displayName: 'FwdPal', location: 'wrld_fwd:oct15', worldName: 'Oct 15 World' },
+                        { type: 'GPS', created_at: novStart, userId: 'usr_fwd', displayName: 'FwdPal', location: 'wrld_fwd:nov1', worldName: 'Nov 1 World' },
+                        { type: 'GPS', created_at: novMid, userId: 'usr_fwd', displayName: 'FwdPal', location: 'wrld_fwd:nov15', worldName: 'Nov 15 World' },
+                        { type: 'GPS', created_at: todayIso, userId: 'usr_fwd', displayName: 'FwdPal', location: 'wrld_fwd:today', worldName: 'Today World' }
+                    ]
+                })
+            });
+
+            // Preview 1 month from oldest => exact [2025-10-01T08:00:00.000Z, 2025-11-01T08:00:00.000Z) matching ONLY 2 Oct rows
+            const prev1 = (await (
+                await exports.default.fetch('http://example.com/api/admin/cleanup/preview?months=1&includeLegacy=0')
+            ).json()) as {
+                data: { oldestIso: string; cutoffIso: string; clampedToRecentGuard: boolean; totalRows: number; shards: { feed: number } };
+            };
+            expect(prev1.data.oldestIso).toBe(octStart);
+            expect(prev1.data.cutoffIso).toBe(novStart);
+            expect(prev1.data.clampedToRecentGuard).toBe(false);
+            expect(prev1.data.shards.feed).toBe(2);
+            expect(prev1.data.totalRows).toBe(2);
+
+            // Execute cleanup with locked cutoffIso => deletes ONLY the 2 Oct rows; Nov 1, Nov 15, and Today stay untouched
+            const del1 = (await (
+                await exports.default.fetch('http://example.com/api/admin/cleanup', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+                    body: JSON.stringify({
+                        months: 1,
+                        mode: 'delete',
+                        includeLegacy: false,
+                        cutoffIso: prev1.data.cutoffIso
+                    })
+                })
+            ).json()) as { data: { deletedRows: number; cutoffIso: string } };
+            expect(del1.data.deletedRows).toBe(2);
+            expect(del1.data.cutoffIso).toBe(novStart);
+
+            // Repeating the same locked cutoffIso deletes 0 additional rows (multi-round safety against drift)
+            const delRepeat = (await (
+                await exports.default.fetch('http://example.com/api/admin/cleanup', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+                    body: JSON.stringify({
+                        months: 1,
+                        mode: 'delete',
+                        includeLegacy: false,
+                        cutoffIso: prev1.data.cutoffIso
+                    })
+                })
+            ).json()) as { data: { deletedRows: number } };
+            expect(delRepeat.data.deletedRows).toBe(0);
+
+            const remainingFeed = (await (
+                await exports.default.fetch('http://example.com/api/feed/query', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+                    body: JSON.stringify({ types: ['GPS'], limit: 20 })
+                })
+            ).json()) as { data: Array<{ location?: string }> };
+            const locs = remainingFeed.data.map((r) => r.location);
+            expect(locs).not.toContain('wrld_fwd:oct1');
+            expect(locs).not.toContain('wrld_fwd:oct15');
+            expect(locs).toContain('wrld_fwd:nov1');
+            expect(locs).toContain('wrld_fwd:nov15');
+            expect(locs).toContain('wrld_fwd:today');
+
+            // Next preview automatically advances window start to 2025-11-01 -> 2025-12-01 (2 Nov rows)
+            const prev2 = (await (
+                await exports.default.fetch('http://example.com/api/admin/cleanup/preview?months=1&includeLegacy=0')
+            ).json()) as { data: { oldestIso: string; cutoffIso: string; totalRows: number } };
+            expect(prev2.data.oldestIso).toBe(novStart);
+            expect(prev2.data.cutoffIso).toBe('2025-12-01T08:00:00.000Z');
+            expect(prev2.data.totalRows).toBe(2);
+        } finally {
+            await env.DB_FEED.prepare('DELETE FROM feed_archive_chunks').run().catch(() => {});
         }
     });
 });

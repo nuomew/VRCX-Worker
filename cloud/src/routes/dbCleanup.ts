@@ -35,6 +35,11 @@ import { incrementCountersBatch } from './coreData';
 export const MIN_CLEANUP_MONTHS = 1;
 export const MAX_CLEANUP_MONTHS = 120;
 export const CLEANUP_BACKUP_PREFIX = 'backups/db-cleanup/';
+// Always protect at least the newest 24 hours of live records so forward cleanup never wipes fresh data.
+export const CLEANUP_RECENT_GUARD_MS = 24 * 60 * 60_000;
+// Ignore sentinel/corrupt timestamps before VRChat existed (e.g. 1970-01-01 epoch-0 rows) when computing oldestIso.
+const MIN_VALID_HISTORY_ISO = '2014-01-01T00:00:00.000Z';
+const MIN_VALID_HISTORY_MS = Date.UTC(2014, 0, 1);
 
 const SAFE_BACKUP_KEY_RE = /^(?:b2:)?backups\/db-cleanup\/[A-Za-z0-9._-]+\.json\.gz$/;
 const DEFAULT_BACKUP_BATCH_LIMIT_PER_TABLE = 1500;
@@ -397,6 +402,151 @@ export function computeMonthsCutoff(months: number, now: Date = new Date()): { c
     };
 }
 
+/**
+ * Computes exact UTC calendar-month cutoff moving FORWARD from the oldest record timestamp
+ * (e.g. oldest 2025-10-01 + 1 month => cleans [2025-10-01, 2025-11-01) while keeping all newer rows).
+ * Clamps strictly to `now - 24h` so recent live data is never wiped even if history span < months.
+ */
+export function computeForwardMonthsCutoff(
+    oldestIso: string,
+    months: number,
+    now: Date = new Date()
+): {
+    oldestIso: string;
+    oldestMs: number;
+    cutoffIso: string;
+    cutoffMs: number;
+    clampedToRecentGuard: boolean;
+} | null {
+    const oldestMs = Date.parse(oldestIso);
+    if (!Number.isFinite(oldestMs) || oldestMs <= 0) return null;
+    const base = new Date(oldestMs);
+    const totalMonths = base.getUTCFullYear() * 12 + base.getUTCMonth() + months;
+    const targetYear = Math.floor(totalMonths / 12);
+    const targetMonth = ((totalMonths % 12) + 12) % 12;
+    const maxDayInTarget = new Date(Date.UTC(targetYear, targetMonth + 1, 0)).getUTCDate();
+    const clampedDay = Math.min(base.getUTCDate(), maxDayInTarget);
+    const rawCutoffMs = Date.UTC(
+        targetYear,
+        targetMonth,
+        clampedDay,
+        base.getUTCHours(),
+        base.getUTCMinutes(),
+        base.getUTCSeconds(),
+        base.getUTCMilliseconds()
+    );
+    const recentGuardMs = now.getTime() - CLEANUP_RECENT_GUARD_MS;
+    if (rawCutoffMs > recentGuardMs) {
+        const clampedMs = Math.max(oldestMs, recentGuardMs);
+        return {
+            oldestIso: new Date(oldestMs).toISOString(),
+            oldestMs,
+            cutoffIso: new Date(clampedMs).toISOString(),
+            cutoffMs: clampedMs,
+            clampedToRecentGuard: true
+        };
+    }
+    return {
+        oldestIso: new Date(oldestMs).toISOString(),
+        oldestMs,
+        cutoffIso: new Date(rawCutoffMs).toISOString(),
+        cutoffMs: rawCutoffMs,
+        clampedToRecentGuard: false
+    };
+}
+
+/**
+ * Finds the global earliest timestamp across all cleanable historical tables & compact chunks
+ * (in DB_CORE, DB_GAMELOG, DB_FEED, and optionally DB_LEGACY) using bounded indexed MIN queries.
+ */
+async function findOldestCleanableTimestamp(
+    env: Env,
+    legacyDb: D1Database | null
+): Promise<{ oldestIso: string; oldestMs: number } | null> {
+    const buildMinSql = (s: CleanupTableSpec): { sql: string; bind: string | number } => {
+        if (s.isChunkTable) {
+            return {
+                sql: `SELECT MIN(min_created_at) AS min_ts FROM ${s.table} WHERE min_created_at >= ?`,
+                bind: MIN_VALID_HISTORY_ISO
+            };
+        }
+        if (s.cutoffKind === 'ms') {
+            return {
+                sql: `SELECT MIN(end_at) AS min_ts FROM ${s.table} WHERE is_open_tail = 0 AND end_at >= ?`,
+                bind: MIN_VALID_HISTORY_MS
+            };
+        }
+        if (s.table === 'cloud_commands') {
+            return {
+                sql: `SELECT MIN(created_at) AS min_ts FROM ${s.table} WHERE status != 'pending' AND created_at >= ?`,
+                bind: MIN_VALID_HISTORY_ISO
+            };
+        }
+        return {
+            sql: `SELECT MIN(created_at) AS min_ts FROM ${s.table} WHERE created_at >= ?`,
+            bind: MIN_VALID_HISTORY_ISO
+        };
+    };
+
+    const coreSpecs = CLEANUP_TABLES.filter((t) => t.shard === 'core');
+    const gamelogSpecs = CLEANUP_TABLES.filter((t) => t.shard === 'gamelog');
+    const feedSpecs = CLEANUP_TABLES.filter((t) => t.shard === 'feed');
+
+    const [coreRes, gamelogRes, feedRes, legacyRes] = await Promise.all([
+        env.DB_CORE.batch(
+            coreSpecs.map((s) => {
+                const q = buildMinSql(s);
+                return env.DB_CORE.prepare(q.sql).bind(q.bind);
+            })
+        ).catch(() => []),
+        env.DB_GAMELOG.batch(
+            gamelogSpecs.map((s) => {
+                const q = buildMinSql(s);
+                return env.DB_GAMELOG.prepare(q.sql).bind(q.bind);
+            })
+        ).catch(() => []),
+        env.DB_FEED.batch(
+            feedSpecs.map((s) => {
+                const q = buildMinSql(s);
+                return env.DB_FEED.prepare(q.sql).bind(q.bind);
+            })
+        ).catch(() => []),
+        legacyDb
+            ? legacyDb
+                  .batch(
+                      LEGACY_CLEANUP_TABLES.map((s) => {
+                          const q = buildMinSql(s);
+                          return legacyDb.prepare(q.sql).bind(q.bind);
+                      })
+                  )
+                  .catch(() => [])
+            : Promise.resolve([])
+    ]);
+
+    let minMs = Number.POSITIVE_INFINITY;
+    const inspectBatch = (specs: readonly CleanupTableSpec[], results: Array<{ results?: unknown[] }>) => {
+        specs.forEach((spec, i) => {
+            const first = (results[i]?.results?.[0] ?? null) as { min_ts?: unknown } | null;
+            const raw = first?.min_ts;
+            if (raw === null || raw === undefined || raw === '') return;
+            const ms = spec.cutoffKind === 'ms' ? Number(raw) : Date.parse(String(raw));
+            if (Number.isFinite(ms) && ms >= MIN_VALID_HISTORY_MS && ms < minMs) {
+                minMs = ms;
+            }
+        });
+    };
+
+    inspectBatch(coreSpecs, coreRes);
+    inspectBatch(gamelogSpecs, gamelogRes);
+    inspectBatch(feedSpecs, feedRes);
+    if (legacyDb) {
+        inspectBatch(LEGACY_CLEANUP_TABLES, legacyRes);
+    }
+
+    if (!Number.isFinite(minMs)) return null;
+    return { oldestIso: new Date(minMs).toISOString(), oldestMs: minMs };
+}
+
 function getCutoffParam(spec: CleanupTableSpec, cutoffIso: string, cutoffMs: number): string | number {
     return spec.cutoffKind === 'ms' ? cutoffMs : cutoffIso;
 }
@@ -433,13 +583,19 @@ async function gzipUtf8(text: string): Promise<Uint8Array> {
     return out;
 }
 
-function buildBackupKey(cutoffIso: string, now: Date = new Date()): { key: string; fileName: string } {
+function buildBackupKey(
+    cutoffIso: string,
+    now: Date = new Date(),
+    oldestIso = ''
+): { key: string; fileName: string } {
     const pad = (n: number) => String(n).padStart(2, '0');
     const stamp =
         `${now.getUTCFullYear()}${pad(now.getUTCMonth() + 1)}${pad(now.getUTCDate())}-` +
         `${pad(now.getUTCHours())}${pad(now.getUTCMinutes())}${pad(now.getUTCSeconds())}`;
     const cutoffTag = cutoffIso.slice(0, 10).replace(/-/g, '');
-    const fileName = `vrcx-cleanup-${stamp}-before-${cutoffTag}-${randomHex(4)}.json.gz`;
+    const startTag = oldestIso ? oldestIso.slice(0, 10).replace(/-/g, '') : '';
+    const rangeTag = startTag ? `${startTag}-to-${cutoffTag}` : `before-${cutoffTag}`;
+    const fileName = `vrcx-cleanup-${stamp}-${rangeTag}-${randomHex(4)}.json.gz`;
     return {
         key: `${CLEANUP_BACKUP_PREFIX}${fileName}`,
         fileName
@@ -543,7 +699,43 @@ export async function handleDbCleanupRoutes(
         }
         const includeLegacy = url.searchParams.get('includeLegacy') === '1';
         const legacyDb = includeLegacy ? getLegacyDb(env) : null;
-        const { cutoffIso, cutoffMs } = computeMonthsCutoff(months);
+        const now = new Date();
+        const oldest = await findOldestCleanableTimestamp(env, legacyDb);
+        const forwardWindow = oldest ? computeForwardMonthsCutoff(oldest.oldestIso, months, now) : null;
+        const oldestIso = forwardWindow?.oldestIso ?? '';
+        const cutoffIso = forwardWindow?.cutoffIso ?? '';
+        const cutoffMs = forwardWindow?.cutoffMs ?? 0;
+        const clampedToRecentGuard = forwardWindow?.clampedToRecentGuard ?? false;
+
+        const extCfg = await loadExternalStorageConfig(env);
+        const b2Creds = extCfg.enabled ? await resolveActiveB2Credentials(env, extCfg) : null;
+        const r2Usage = b2Creds && env.R2_MEDIA ? await measureR2Usage(env, { forceRefresh: false }) : null;
+        const overflowActive = Boolean(
+            b2Creds && (!env.R2_MEDIA || (r2Usage && r2Usage.usedBytes >= extCfg.r2OverflowThresholdBytes))
+        );
+
+        if (!forwardWindow || cutoffMs <= forwardWindow.oldestMs) {
+            return Response.json(
+                {
+                    ok: true,
+                    data: {
+                        months,
+                        oldestIso,
+                        cutoffIso,
+                        clampedToRecentGuard,
+                        includeLegacy: Boolean(legacyDb),
+                        legacyDbBound: Boolean(getLegacyDb(env)),
+                        r2Enabled: Boolean(env.R2_MEDIA),
+                        b2Enabled: Boolean(b2Creds),
+                        overflowActive,
+                        totalRows: 0,
+                        shards: { core: 0, gamelog: 0, feed: 0, legacy: 0 },
+                        tables: []
+                    }
+                },
+                { headers: { 'Cache-Control': 'no-store' } }
+            );
+        }
 
         const coreSpecs = CLEANUP_TABLES.filter((t) => t.shard === 'core');
         const gamelogSpecs = CLEANUP_TABLES.filter((t) => t.shard === 'gamelog');
@@ -638,19 +830,15 @@ export async function handleDbCleanupRoutes(
         }
 
         const totalRows = shards.core + shards.gamelog + shards.feed + shards.legacy;
-        const extCfg = await loadExternalStorageConfig(env);
-        const b2Creds = extCfg.enabled ? await resolveActiveB2Credentials(env, extCfg) : null;
-        const r2Usage = b2Creds && env.R2_MEDIA ? await measureR2Usage(env, { forceRefresh: false }) : null;
-        const overflowActive = Boolean(
-            b2Creds && (!env.R2_MEDIA || (r2Usage && r2Usage.usedBytes >= extCfg.r2OverflowThresholdBytes))
-        );
 
         return Response.json(
             {
                 ok: true,
                 data: {
                     months,
+                    oldestIso,
                     cutoffIso,
+                    clampedToRecentGuard,
                     includeLegacy: Boolean(legacyDb),
                     legacyDbBound: Boolean(getLegacyDb(env)),
                     r2Enabled: Boolean(env.R2_MEDIA),
@@ -943,10 +1131,60 @@ export async function handleDbCleanupRoutes(
             : DEFAULT_BACKUP_BATCH_LIMIT_PER_TABLE;
 
         const now = new Date();
-        const { cutoffIso, cutoffMs } = computeMonthsCutoff(months, now);
+        const oldest = await findOldestCleanableTimestamp(env, legacyDb);
+        const recentGuardMs = now.getTime() - CLEANUP_RECENT_GUARD_MS;
+        let oldestIso = oldest?.oldestIso ?? '';
+        let cutoffIso = '';
+        let cutoffMs = 0;
+
+        // Honor client-locked cutoffIso across multi-round backup_and_delete loops (strictly capped at recentGuardMs)
+        // so round 2+ never creeps into newer months as round 1 removes earlier rows.
+        const requestedCutoffRaw = typeof rawBody.cutoffIso === 'string' ? rawBody.cutoffIso.trim() : '';
+        if (requestedCutoffRaw) {
+            const parsedReqMs = Date.parse(requestedCutoffRaw);
+            if (!Number.isFinite(parsedReqMs) || parsedReqMs <= 0) {
+                return Response.json(
+                    { ok: false, error: { code: 'INVALID_CUTOFF', message: 'Invalid cutoffIso timestamp' } },
+                    { status: 400 }
+                );
+            }
+            cutoffMs = Math.min(parsedReqMs, recentGuardMs);
+            cutoffIso = new Date(cutoffMs).toISOString();
+        } else if (oldest) {
+            const forwardWindow = computeForwardMonthsCutoff(oldest.oldestIso, months, now);
+            if (forwardWindow) {
+                oldestIso = forwardWindow.oldestIso;
+                cutoffIso = forwardWindow.cutoffIso;
+                cutoffMs = forwardWindow.cutoffMs;
+            }
+        }
+
         const counterDeltas = new Map<string, number>();
         const legacyDeltas = new Map<'gamelog' | 'feed' | 'notifications' | 'friend_log', number>();
         const perShardDeleted = { core: 0, gamelog: 0, feed: 0, legacy: 0 };
+
+        if (!oldest || !cutoffIso || cutoffMs <= oldest.oldestMs) {
+            return Response.json(
+                {
+                    ok: true,
+                    data: {
+                        mode,
+                        months,
+                        oldestIso,
+                        cutoffIso,
+                        includeLegacy: Boolean(legacyDb),
+                        deletedRows: 0,
+                        backedUpRows: 0,
+                        backupKey: '',
+                        backupFileName: '',
+                        backupBytes: 0,
+                        hasMore: false,
+                        perShardDeleted
+                    }
+                },
+                { headers: { 'Cache-Control': 'no-store' } }
+            );
+        }
 
         if (mode === 'delete') {
             const coreSpecs = CLEANUP_TABLES.filter((t) => t.shard === 'core');
@@ -1061,6 +1299,7 @@ export async function handleDbCleanupRoutes(
                     data: {
                         mode,
                         months,
+                        oldestIso,
                         cutoffIso,
                         includeLegacy: Boolean(legacyDb),
                         deletedRows,
@@ -1309,6 +1548,7 @@ export async function handleDbCleanupRoutes(
                 format: 'vrcx-worker-db-cleanup-backup-v1',
                 backedUpAt: now.toISOString(),
                 months,
+                oldestIso,
                 cutoffIso,
                 includeLegacy: Boolean(legacyDb),
                 totalRows: backedUpRows,
@@ -1316,7 +1556,7 @@ export async function handleDbCleanupRoutes(
                 legacy: legacyArchive
             };
             const gzipBytes = await gzipUtf8(JSON.stringify(archivePayload));
-            const built = buildBackupKey(cutoffIso, now);
+            const built = buildBackupKey(cutoffIso, now, oldestIso);
             const storeRes = await storeObjectWithOverflow(env, built.key, gzipBytes, 'application/gzip', {
                 target: backupTarget,
                 metadata: {
@@ -1438,6 +1678,7 @@ export async function handleDbCleanupRoutes(
                 data: {
                     mode,
                     months,
+                    oldestIso,
                     cutoffIso,
                     includeLegacy: Boolean(legacyDb),
                     deletedRows,

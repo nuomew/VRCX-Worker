@@ -142,9 +142,16 @@
                         <div class="flex flex-wrap items-center justify-between gap-2">
                             <span class="text-muted-foreground">
                                 {{
-                                    t('cloud_hub.quota.cleanup_cutoff_label', {
-                                        date: cleanupPreview.cutoffIso.slice(0, 10)
-                                    })
+                                    cleanupPreview.oldestIso && cleanupPreview.cutoffIso && cleanupPreview.totalRows > 0
+                                        ? t('cloud_hub.quota.cleanup_cutoff_label', {
+                                              start: cleanupPreview.oldestIso.slice(0, 10),
+                                              end: cleanupPreview.cutoffIso.slice(0, 10)
+                                          })
+                                        : cleanupPreview.oldestIso
+                                          ? t('cloud_hub.quota.cleanup_oldest_only', {
+                                                start: cleanupPreview.oldestIso.slice(0, 10)
+                                            })
+                                          : t('cloud_hub.quota.cleanup_no_records')
                                 }}
                             </span>
                             <span class="font-mono font-medium text-foreground">
@@ -156,6 +163,11 @@
                                         : t('cloud_hub.quota.cleanup_nothing_to_clean')
                                 }}
                             </span>
+                        </div>
+                        <div
+                            v-if="cleanupPreview.clampedToRecentGuard && cleanupPreview.totalRows > 0"
+                            class="text-[11px] text-amber-600 dark:text-amber-400">
+                            {{ t('cloud_hub.quota.cleanup_recent_guard_hint') }}
                         </div>
                         <div
                             v-if="cleanupPreview.totalRows > 0"
@@ -220,14 +232,20 @@
                                     ? pendingCleanupTarget === 'b2' || cleanupPreview?.overflowActive
                                         ? t('cloud_hub.quota.cleanup_confirm_backup_b2_desc', {
                                               months: resolvedCleanupMonths,
+                                              start: cleanupPreview?.oldestIso?.slice(0, 10) || '',
+                                              end: cleanupPreview?.cutoffIso?.slice(0, 10) || '',
                                               rows: (cleanupPreview?.totalRows ?? 0).toLocaleString()
                                           })
                                         : t('cloud_hub.quota.cleanup_confirm_backup_desc', {
                                               months: resolvedCleanupMonths,
+                                              start: cleanupPreview?.oldestIso?.slice(0, 10) || '',
+                                              end: cleanupPreview?.cutoffIso?.slice(0, 10) || '',
                                               rows: (cleanupPreview?.totalRows ?? 0).toLocaleString()
                                           })
                                     : t('cloud_hub.quota.cleanup_confirm_direct_desc', {
                                           months: resolvedCleanupMonths,
+                                          start: cleanupPreview?.oldestIso?.slice(0, 10) || '',
+                                          end: cleanupPreview?.cutoffIso?.slice(0, 10) || '',
                                           rows: (cleanupPreview?.totalRows ?? 0).toLocaleString()
                                       })
                             }}
@@ -828,6 +846,9 @@
         try {
             const months = resolvedCleanupMonths.value;
             const includeLegacy = cleanupIncludeLegacy.value;
+            // Lock the confirmed forward cutoff across multi-round backup_and_delete batches
+            // so advancing the oldest timestamp after round 1 never creeps into newer months.
+            let lockedCutoffIso = cleanupPreview.value?.cutoffIso || '';
             let totalDeleted = 0;
             let totalBackedUp = 0;
             let backupCount = 0;
@@ -838,8 +859,17 @@
             for (let round = 0; round < 20; round++) {
                 const res = await cloudFetch('/api/admin/cleanup', {
                     method: 'POST',
-                    json: { months, mode, includeLegacy, backupTarget }
+                    json: {
+                        months,
+                        mode,
+                        includeLegacy,
+                        backupTarget,
+                        ...(lockedCutoffIso ? { cutoffIso: lockedCutoffIso } : {})
+                    }
                 });
+                if (!lockedCutoffIso && res?.cutoffIso) {
+                    lockedCutoffIso = res.cutoffIso;
+                }
                 totalDeleted += Number(res?.deletedRows || 0);
                 totalBackedUp += Number(res?.backedUpRows || 0);
                 if (res?.backupFileName) {
