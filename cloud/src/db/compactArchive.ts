@@ -93,6 +93,73 @@ export interface ChatArchiveRow {
 const utf8Encoder = new TextEncoder();
 
 /**
+ * Safely truncates a UTF-16 string to at most `maxCodeUnits`, stripping NUL bytes and any
+ * lone UTF-16 surrogates so MySQL 5.7 strict `utf8mb4` mode never rejects with ER_TRUNCATED_WRONG_VALUE_FOR_FIELD.
+ */
+export function sanitizeMysqlSafeText(raw: unknown, maxCodeUnits: number): string {
+    if (raw === null || raw === undefined) return '';
+    const str = typeof raw === 'string' ? raw : String(raw);
+    if (!str) return '';
+    let cut = str.length > maxCodeUnits ? maxCodeUnits : str.length;
+    if (cut > 0 && cut < str.length) {
+        const lastCode = str.charCodeAt(cut - 1);
+        if (lastCode >= 0xd800 && lastCode <= 0xdbff) {
+            cut--;
+        }
+    }
+    let out = '';
+    for (let i = 0; i < cut; i++) {
+        const c = str.charCodeAt(i);
+        if (c === 0) continue;
+        if (c >= 0xd800 && c <= 0xdbff) {
+            if (i + 1 < cut) {
+                const next = str.charCodeAt(i + 1);
+                if (next >= 0xdc00 && next <= 0xdfff) {
+                    out += str[i]! + str[i + 1]!;
+                    i++;
+                }
+            }
+            continue;
+        }
+        if (c >= 0xdc00 && c <= 0xdfff) {
+            continue;
+        }
+        out += str[i]!;
+    }
+    return out;
+}
+
+/**
+ * Normalizes an ASCII-indexed column value (such as `min_created_at`, `max_created_at`, `last_seen`,
+ * `last_visit`, or `world_id`) to printable ASCII strictly within `maxLen` bytes for MySQL 5.7 `CHARACTER SET ascii`.
+ */
+export function sanitizeMysqlSafeAscii(raw: unknown, maxLen: number, fallback = ''): string {
+    const str = raw === null || raw === undefined ? '' : typeof raw === 'string' ? raw : String(raw);
+    let out = '';
+    for (let i = 0; i < str.length && out.length < maxLen; i++) {
+        const c = str.charCodeAt(i);
+        if (c >= 0x20 && c <= 0x7e) {
+            out += str[i]!;
+        }
+    }
+    const trimmed = out.trim();
+    if (trimmed) return trimmed;
+    if (!fallback) return '';
+    return fallback.length > maxLen ? fallback.slice(0, maxLen) : fallback;
+}
+
+function isChunkUniqueKeyConflictError(err: unknown): boolean {
+    const code = String((err as { code?: unknown } | null)?.code ?? '');
+    const errno = Number((err as { errno?: unknown } | null)?.errno ?? 0);
+    const msg = err instanceof Error ? err.message : String(err ?? '');
+    return (
+        code === 'ER_DUP_ENTRY' ||
+        errno === 1062 ||
+        /duplicate entry|unique constraint failed/i.test(msg)
+    );
+}
+
+/**
  * Compresses a compact archive chunk JSON payload with synchronous native zlib gzip + base64 (`gz:` prefix)
  * when >= 512 bytes and strictly smaller than raw JSON. Falls back safely to raw JSON if small or incompressible.
  */
@@ -925,15 +992,16 @@ export async function appendTuplesToCompactTailChunk(options: {
     };
 
     const computeBounds = (rows: unknown[][]): { minTs: string; maxTs: string } => {
+        const safeFallback = sanitizeMysqlSafeAscii(fallbackIso, 40, new Date().toISOString().slice(0, 40));
         let minTs = '';
         let maxTs = '';
         for (const r of rows) {
-            const ts = String(r[0] ?? '');
+            const ts = sanitizeMysqlSafeAscii(r[0], 40);
             if (!ts) continue;
             if (!minTs || ts < minTs) minTs = ts;
             if (!maxTs || ts > maxTs) maxTs = ts;
         }
-        return { minTs: minTs || fallbackIso, maxTs: maxTs || fallbackIso };
+        return { minTs: minTs || safeFallback, maxTs: maxTs || safeFallback };
     };
 
     let totalCommittedUpdates = 0;
@@ -1044,15 +1112,24 @@ export async function appendTuplesToCompactTailChunk(options: {
             const newKey = await computeCompactChunkKey(kindValue, rawPayloadJson);
             const storedPayload = encodeCompactChunkPayload(rawPayloadJson);
             const { minTs, maxTs } = computeBounds(pc.rows);
-            const upd = await db
-                .prepare(
-                    `UPDATE ${archiveTable}
-                     SET chunk_key = ?, min_created_at = ?, max_created_at = ?, row_count = ?, payload_json = ?
-                     WHERE id = ? AND row_count = ? AND chunk_key = ?`
-                )
-                .bind(newKey, minTs, maxTs, pc.rows.length, storedPayload, pc.meta.id, pc.meta.row_count, pc.meta.chunk_key)
-                .run();
-            if ((upd.meta?.changes ?? 0) === 1) {
+            let upd: D1Result | null = null;
+            try {
+                upd = await db
+                    .prepare(
+                        `UPDATE ${archiveTable}
+                         SET chunk_key = ?, min_created_at = ?, max_created_at = ?, row_count = ?, payload_json = ?
+                         WHERE id = ? AND row_count = ? AND chunk_key = ?`
+                    )
+                    .bind(newKey, minTs, maxTs, pc.rows.length, storedPayload, pc.meta.id, pc.meta.row_count, pc.meta.chunk_key)
+                    .run();
+            } catch (err) {
+                if (isChunkUniqueKeyConflictError(err)) {
+                    casConflict = true;
+                    break;
+                }
+                throw err;
+            }
+            if (upd && (upd.meta?.changes ?? 0) === 1) {
                 totalChunksTouched++;
                 totalCommittedUpdates += pc.dirtyUpdates;
                 if (typeof upd.meta?.size_after === 'number' && upd.meta.size_after > sizeAfter) {
@@ -1091,24 +1168,32 @@ export async function appendTuplesToCompactTailChunk(options: {
                 const newKey = await computeCompactChunkKey(kindValue, rawPayloadJson);
                 const storedPayload = encodeCompactChunkPayload(rawPayloadJson);
                 const { minTs, maxTs } = computeBounds(tail.rows);
-                const upd = await db
-                    .prepare(
-                        `UPDATE ${archiveTable}
-                         SET chunk_key = ?, min_created_at = ?, max_created_at = ?, row_count = ?, payload_json = ?
-                         WHERE id = ? AND row_count = ? AND chunk_key = ?`
-                    )
-                    .bind(
-                        newKey,
-                        minTs,
-                        maxTs,
-                        tail.rows.length,
-                        storedPayload,
-                        tail.meta.id,
-                        originalTailLen,
-                        tail.meta.chunk_key
-                    )
-                    .run();
-                if ((upd.meta?.changes ?? 0) === 1) {
+                let upd: D1Result | null = null;
+                try {
+                    upd = await db
+                        .prepare(
+                            `UPDATE ${archiveTable}
+                             SET chunk_key = ?, min_created_at = ?, max_created_at = ?, row_count = ?, payload_json = ?
+                             WHERE id = ? AND row_count = ? AND chunk_key = ?`
+                        )
+                        .bind(
+                            newKey,
+                            minTs,
+                            maxTs,
+                            tail.rows.length,
+                            storedPayload,
+                            tail.meta.id,
+                            originalTailLen,
+                            tail.meta.chunk_key
+                        )
+                        .run();
+                } catch (err) {
+                    if (!isChunkUniqueKeyConflictError(err)) {
+                        throw err;
+                    }
+                    upd = null;
+                }
+                if (upd && (upd.meta?.changes ?? 0) === 1) {
                     totalChunksTouched++;
                     totalCommittedUpdates += tail.dirtyUpdates;
                     lastChunkId = Number(tail.meta.id);
@@ -1167,6 +1252,8 @@ export async function appendTuplesToCompactTailChunk(options: {
             for (const slice of slices) {
                 const chunkKey = await computeCompactChunkKey(kindValue, slice.payloadJson);
                 const storedPayload = encodeCompactChunkPayload(slice.payloadJson);
+                const safeMinTs = sanitizeMysqlSafeAscii(slice.minCreatedAt, 40, fallbackIso.slice(0, 40));
+                const safeMaxTs = sanitizeMysqlSafeAscii(slice.maxCreatedAt, 40, fallbackIso.slice(0, 40));
                 if (kindColumn) {
                     stmts.push(
                         db
@@ -1175,7 +1262,7 @@ export async function appendTuplesToCompactTailChunk(options: {
                                  (chunk_key, ${kindColumn}, min_created_at, max_created_at, row_count, payload_json)
                                  VALUES (?, ?, ?, ?, ?, ?)`
                             )
-                            .bind(chunkKey, kindValue, slice.minCreatedAt, slice.maxCreatedAt, slice.rows.length, storedPayload)
+                            .bind(chunkKey, kindValue, safeMinTs, safeMaxTs, slice.rows.length, storedPayload)
                     );
                 } else {
                     stmts.push(
@@ -1185,7 +1272,7 @@ export async function appendTuplesToCompactTailChunk(options: {
                                  (chunk_key, min_created_at, max_created_at, row_count, payload_json)
                                  VALUES (?, ?, ?, ?, ?)`
                             )
-                            .bind(chunkKey, slice.minCreatedAt, slice.maxCreatedAt, slice.rows.length, storedPayload)
+                            .bind(chunkKey, safeMinTs, safeMaxTs, slice.rows.length, storedPayload)
                     );
                 }
                 sliceMeta.push({ rows: slice.rows, startOffset: cursor });
@@ -1369,7 +1456,7 @@ export async function mutateArchiveChunks(options: {
                 let minTs = '';
                 let maxTs = '';
                 for (const r of nextTuples) {
-                    const ts = String(r[0] ?? '');
+                    const ts = sanitizeMysqlSafeAscii(r[0], 40);
                     if (!ts) continue;
                     if (!minTs || ts < minTs) minTs = ts;
                     if (!maxTs || ts > maxTs) maxTs = ts;
@@ -1437,11 +1524,11 @@ export async function applyWorldRollupForPackedLocations(
 ): Promise<void> {
     const agg = new Map<string, { worldName: string; visitCount: number; totalTime: number; lastVisit: string }>();
     for (const r of rows) {
-        const wid = String(r.world_id ?? '').trim().slice(0, 191);
+        const wid = sanitizeMysqlSafeAscii(r.world_id, 191);
         if (!wid) continue;
-        const ts = String(r.created_at ?? '');
-        const wname = String(r.world_name ?? '').trim();
-        const t = Math.max(0, Number(r.time ?? 0) || 0);
+        const ts = sanitizeMysqlSafeAscii(r.created_at, 40);
+        const wname = sanitizeMysqlSafeText(String(r.world_name ?? '').trim(), 512);
+        const t = Math.max(0, Math.trunc(Number(r.time ?? 0) || 0));
         const cur = agg.get(wid);
         if (!cur) {
             agg.set(wid, { worldName: wname, visitCount: 1, totalTime: t, lastVisit: ts });
@@ -1456,9 +1543,9 @@ export async function applyWorldRollupForPackedLocations(
             }
         }
     }
-    // Pack up to 18 rows per multi-value INSERT (18 * 5 = 90 <= D1's 100-param limit),
-    // slashing MySQL 5.7 round-trips and SQL statements by ~94% while remaining 100% D1-compatible.
-    const entries = Array.from(agg.entries());
+    // Sort deterministically by world_id so concurrent migration batches acquire InnoDB row locks in identical order (no deadlocks).
+    // Pack up to 18 rows per multi-value INSERT (18 * 5 = 90 <= D1's 100-param limit).
+    const entries = Array.from(agg.entries()).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
     const multiStmts: D1PreparedStatement[] = [];
     for (let i = 0; i < entries.length; i += 18) {
         const slice = entries.slice(i, i + 18);
@@ -1534,14 +1621,14 @@ export async function applyUserRollupForPackedJoinLeave(
         }
     >();
     for (const r of rows) {
-        const uid = String(r.user_id ?? '').trim();
-        const dname = String(r.display_name ?? '').trim();
+        const uid = sanitizeMysqlSafeText(String(r.user_id ?? '').trim(), 191);
+        const dname = sanitizeMysqlSafeText(String(r.display_name ?? '').trim(), 256);
         const rawKey = uid || (dname ? `name:${dname.toLowerCase()}` : '');
-        const key = rawKey.slice(0, 191);
+        const key = sanitizeMysqlSafeText(rawKey, 191);
         if (!key) continue;
-        const ts = String(r.created_at ?? '').trim();
+        const ts = sanitizeMysqlSafeAscii(r.created_at, 40);
         const loc = String(r.location ?? '').trim();
-        const t = Math.max(0, Number(r.time ?? 0) || 0);
+        const t = Math.max(0, Math.trunc(Number(r.time ?? 0) || 0));
         let cur = agg.get(key);
         if (!cur) {
             cur = {
@@ -1615,16 +1702,30 @@ export async function applyUserRollupForPackedJoinLeave(
             deltaLast,
             deltaSecond
         ]);
-        const mergedName =
+        const mergedName = sanitizeMysqlSafeText(
             delta.displayName && (!prev?.display_name || deltaLast >= (prev?.last_seen ?? ''))
                 ? delta.displayName
-                : prev?.display_name || delta.displayName;
-        const mergedJoinCount = Number(prev?.join_count ?? 0) + delta.locations.size;
-        const mergedTimeSpent = Number(prev?.time_spent ?? 0) + delta.timeSpent;
-        mergedRows.push([key, mergedName, mergedJoinCount, mergedTimeSpent, mergedLast, mergedSecond]);
+                : prev?.display_name || delta.displayName,
+            256
+        );
+        const mergedJoinCount = Math.max(0, Math.trunc(Number(prev?.join_count ?? 0) + delta.locations.size));
+        const mergedTimeSpent = Math.max(0, Math.trunc(Number(prev?.time_spent ?? 0) + delta.timeSpent));
+        mergedRows.push([
+            key,
+            mergedName,
+            mergedJoinCount,
+            mergedTimeSpent,
+            sanitizeMysqlSafeAscii(mergedLast, 40),
+            sanitizeMysqlSafeAscii(mergedSecond, 40)
+        ]);
     }
 
-    // Pack up to 15 rows per multi-value INSERT OR REPLACE (15 * 6 = 90 <= D1's 100-param limit),
+    // Sort deterministically by primary key `user_id` and use `ON CONFLICT(user_id) DO UPDATE`
+    // (rewritten to MySQL 5.7 `ON DUPLICATE KEY UPDATE`) instead of `REPLACE INTO` to eliminate
+    // InnoDB gap-lock deadlocks across concurrent desktop migration workers.
+    mergedRows.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+
+    // Pack up to 15 rows per multi-value UPSERT (15 * 6 = 90 <= D1's 100-param limit),
     // slashing MySQL 5.7 round-trips by ~93% while keeping D1 and MySQL 5.7 100% compatible.
     const stmts: D1PreparedStatement[] = [];
     for (let i = 0; i < mergedRows.length; i += 15) {
@@ -1635,9 +1736,15 @@ export async function applyUserRollupForPackedJoinLeave(
         stmts.push(
             db
                 .prepare(
-                    `INSERT OR REPLACE INTO gamelog_user_rollup
+                    `INSERT INTO gamelog_user_rollup
                      (user_id, display_name, join_count, time_spent, last_seen, second_last_seen)
-                     VALUES ${valuePlaceholders}`
+                     VALUES ${valuePlaceholders}
+                     ON CONFLICT(user_id) DO UPDATE SET
+                        display_name = excluded.display_name,
+                        join_count = excluded.join_count,
+                        time_spent = excluded.time_spent,
+                        last_seen = excluded.last_seen,
+                        second_last_seen = excluded.second_last_seen`
                 )
                 .bind(...binds)
         );

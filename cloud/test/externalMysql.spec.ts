@@ -2174,4 +2174,274 @@ describe('External MySQL 5.7+ Database Integration (Hybrid New-Writes Mode & Ful
             clearMysqlSchemaReadyCache();
         }
     });
+
+    it('hardens desktop migration batches on strict MySQL 5.7 against dirty ASCII/UTF-8 fields, InnoDB deadlocks, disconnects, and surfaces sanitized diagnostics', async () => {
+        await ensureSchemaReady(env);
+        const legacyDb = env.DB_LEGACY!;
+        const fakeMysql = new FakeMysql57Server();
+        setMysqlConnectionFactoryForTests(async () => fakeMysql.createConnection());
+        const headers = { 'Content-Type': 'application/json', Origin: 'http://example.com' };
+        const hasLoneSurrogate = (s: string): boolean => {
+            for (let i = 0; i < s.length; i++) {
+                const c = s.charCodeAt(i);
+                if (c >= 0xd800 && c <= 0xdbff) {
+                    const next = i + 1 < s.length ? s.charCodeAt(i + 1) : 0;
+                    if (next < 0xdc00 || next > 0xdfff) return true;
+                    i++;
+                } else if (c >= 0xdc00 && c <= 0xdfff) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        const isPrintableAscii = (s: string): boolean => /^[\x20-\x7e]*$/.test(s);
+
+        // Issue a device sync key for /api/agent/migration/batch authentication
+        const keyRes = await exports.default.fetch('http://example.com/api/agent/sync-key', {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({ deviceName: 'Desktop-MySQL57-Test' })
+        });
+        expect(keyRes.status).toBe(200);
+        const keyJson = (await keyRes.json()) as { data: { deviceId: string; syncKey: string } };
+        const agentHeaders = {
+            'Content-Type': 'application/json',
+            'X-Sync-Key': keyJson.data.syncKey
+        };
+
+        try {
+            // Enable external MySQL Compatibility Mode & initialize 12 tables
+            expect(
+                (
+                    await exports.default.fetch('http://example.com/api/storage/mysql/config', {
+                        method: 'PUT',
+                        headers,
+                        body: JSON.stringify({
+                            enabled: true,
+                            mode: 'new_writes_only',
+                            connectionType: 'direct',
+                            host: 'db.example.com',
+                            port: 3306,
+                            database: 'vrcx_db',
+                            username: 'vrcx',
+                            password: 'secret',
+                            sslMode: 'disabled',
+                            tablePrefix: 'vrcx_'
+                        })
+                    })
+                ).status
+            ).toBe(200);
+            expect(
+                (
+                    await exports.default.fetch('http://example.com/api/storage/mysql/test', {
+                        method: 'POST',
+                        headers,
+                        body: JSON.stringify({ useSaved: true })
+                    })
+                ).status
+            ).toBe(200);
+
+            // Seed an active desktop migration job in DB_LEGACY
+            const jobId = 'mig_strict57_test';
+            await legacyDb
+                .prepare(
+                    `INSERT INTO legacy_migration_state (state_key, payload_json, updated_at)
+                     VALUES ('job', ?, ?)
+                     ON CONFLICT(state_key) DO UPDATE SET payload_json = excluded.payload_json, updated_at = excluded.updated_at`
+                )
+                .bind(
+                    JSON.stringify({
+                        jobId,
+                        deviceId: keyJson.data.deviceId,
+                        accountPrefix: 'usrtest',
+                        categories: ['gamelog'],
+                        concurrency: 2,
+                        status: 'running',
+                        startedAt: '2026-11-28T00:00:00.000Z',
+                        updatedAt: '2026-11-28T00:00:00.000Z',
+                        finishedAt: '',
+                        currentCategory: 'gamelog',
+                        completedCategories: [],
+                        totalEstimatedRows: 10,
+                        processedRows: 0,
+                        insertedRows: 0,
+                        skippedRows: 0,
+                        estimatedBytes: 1024,
+                        errorMessage: ''
+                    }),
+                    '2026-11-28T00:00:00.000Z'
+                )
+                .run();
+
+            // Simulate strict MySQL 5.7 column validation + transient InnoDB deadlock (1213) + transient disconnect
+            let injectedDeadlock = false;
+            let injectedDisconnect = false;
+            let sawReplaceIntoRollup = false;
+            fakeMysql.onBeforeExecute = (sql, params) => {
+                if (/REPLACE\s+INTO\s+`vrcx_legacy_gamelog_user_rollup`/i.test(sql)) {
+                    sawReplaceIntoRollup = true;
+                }
+                for (const p of params) {
+                    if (typeof p === 'string' && hasLoneSurrogate(p)) {
+                        throw Object.assign(new Error('Incorrect string value: lone surrogate'), {
+                            code: 'ER_TRUNCATED_WRONG_VALUE_FOR_FIELD',
+                            errno: 1366
+                        });
+                    }
+                }
+                if (/INTO\s+`vrcx_legacy_gamelog_chunks`/i.test(sql)) {
+                    // params: [chunk_key, gamelog_kind, min_created_at, max_created_at, row_count, payload_json]
+                    const minTs = String(params[2] ?? '');
+                    const maxTs = String(params[3] ?? '');
+                    if (!isPrintableAscii(minTs) || minTs.length > 40 || !isPrintableAscii(maxTs) || maxTs.length > 40) {
+                        throw Object.assign(new Error("Data too long for column 'min_created_at'"), {
+                            code: 'ER_DATA_TOO_LONG',
+                            errno: 1406
+                        });
+                    }
+                }
+                if (/INTO\s+`vrcx_legacy_gamelog_world_rollup`/i.test(sql)) {
+                    if (!injectedDeadlock) {
+                        injectedDeadlock = true;
+                        throw Object.assign(new Error('Deadlock found when trying to get lock; try restarting transaction'), {
+                            code: 'ER_LOCK_DEADLOCK',
+                            errno: 1213
+                        });
+                    }
+                    for (let i = 0; i < params.length; i += 5) {
+                        const wid = String(params[i] ?? '');
+                        const wname = String(params[i + 1] ?? '');
+                        const lastVisit = String(params[i + 4] ?? '');
+                        if (!isPrintableAscii(wid) || wid.length > 191) {
+                            throw Object.assign(new Error("Incorrect string value for column 'world_id'"), {
+                                code: 'ER_TRUNCATED_WRONG_VALUE_FOR_FIELD',
+                                errno: 1366
+                            });
+                        }
+                        if (wname.length > 512) {
+                            throw Object.assign(new Error("Data too long for column 'world_name'"), {
+                                code: 'ER_DATA_TOO_LONG',
+                                errno: 1406
+                            });
+                        }
+                        if (!isPrintableAscii(lastVisit) || lastVisit.length > 40) {
+                            throw Object.assign(new Error("Data too long for column 'last_visit'"), {
+                                code: 'ER_DATA_TOO_LONG',
+                                errno: 1406
+                            });
+                        }
+                    }
+                }
+                if (/INTO\s+`vrcx_legacy_gamelog_user_rollup`/i.test(sql)) {
+                    if (!injectedDisconnect) {
+                        injectedDisconnect = true;
+                        throw Object.assign(new Error('Connection lost: The server closed the connection.'), {
+                            code: 'PROTOCOL_CONNECTION_LOST'
+                        });
+                    }
+                    for (let i = 0; i < params.length; i += 6) {
+                        const uid = String(params[i] ?? '');
+                        const dname = String(params[i + 1] ?? '');
+                        const lastSeen = String(params[i + 4] ?? '');
+                        const secondSeen = String(params[i + 5] ?? '');
+                        if (uid.length > 191 || dname.length > 256) {
+                            throw Object.assign(new Error('Data too long for user rollup'), {
+                                code: 'ER_DATA_TOO_LONG',
+                                errno: 1406
+                            });
+                        }
+                        if (!isPrintableAscii(lastSeen) || lastSeen.length > 40 || !isPrintableAscii(secondSeen) || secondSeen.length > 40) {
+                            throw Object.assign(new Error("Data too long for column 'last_seen'"), {
+                                code: 'ER_DATA_TOO_LONG',
+                                errno: 1406
+                            });
+                        }
+                    }
+                }
+            };
+
+            // 1. Upload dirty desktop records (non-ASCII >40-char timestamp, non-ASCII world_id, lone surrogate + >256/512 emoji strings)
+            const dirtyRes = await exports.default.fetch('http://example.com/api/agent/migration/batch', {
+                method: 'POST',
+                headers: agentHeaders,
+                body: JSON.stringify({
+                    jobId,
+                    category: 'gamelog',
+                    items: [
+                        {
+                            type: 'Location',
+                            created_at: '2025年03月01日T12:00:00.000000000000000000000000Z',
+                            location: 'wrld_dirty_测试_123:100',
+                            worldId: 'wrld_dirty_测试_123',
+                            worldName: `${'A'.repeat(511)}🌸\uD83D_extra_world_name`,
+                            time: 12345.67,
+                            groupName: ''
+                        },
+                        {
+                            type: 'OnPlayerJoined',
+                            created_at: '2025-03-01T12:05:00.000Z_extra_long_timestamp_padding_0123456789',
+                            displayName: `${'B'.repeat(255)}✨\uD83D_extra_display_name`,
+                            location: 'wrld_dirty_123:100',
+                            userId: '',
+                            time: 6789
+                        }
+                    ],
+                    categoryDone: false,
+                    allDone: false
+                })
+            });
+            expect(dirtyRes.status).toBe(200);
+            const dirtyJson = (await dirtyRes.json()) as { ok: boolean; data: { inserted: number } };
+            expect(dirtyJson.ok).toBe(true);
+            expect(dirtyJson.data.inserted).toBe(2);
+            expect(injectedDeadlock).toBe(true);
+            expect(injectedDisconnect).toBe(true);
+            expect(sawReplaceIntoRollup).toBe(false);
+
+            // 2. Persistent MySQL failure surfaces sanitized, actionable error code instead of opaque "Unexpected server error"
+            fakeMysql.onBeforeExecute = () => {
+                throw Object.assign(new Error('Got a packet bigger than max_allowed_packet from 203.0.113.42:3306'), {
+                    code: 'ER_NET_PACKET_TOO_LARGE',
+                    errno: 1153
+                });
+            };
+            const errRes = await exports.default.fetch('http://example.com/api/agent/migration/batch', {
+                method: 'POST',
+                headers: agentHeaders,
+                body: JSON.stringify({
+                    jobId,
+                    category: 'gamelog',
+                    items: [
+                        {
+                            type: 'Event',
+                            created_at: '2025-03-02T00:00:00.000Z',
+                            data: 'Trigger packet error'
+                        }
+                    ],
+                    categoryDone: false,
+                    allDone: false
+                })
+            });
+            expect(errRes.status).toBe(500);
+            const errJson = (await errRes.json()) as { ok: boolean; error: { code: string; message: string } };
+            expect(errJson.ok).toBe(false);
+            expect(errJson.error.code).toBe('MIGRATION_BATCH_FAILED');
+            expect(errJson.error.message).toContain('[gamelog/ingest]');
+            expect(errJson.error.message).toContain('ER_NET_PACKET_TOO_LARGE (1153)');
+            expect(errJson.error.message).not.toContain('203.0.113.42');
+            expect(errJson.error.message).toContain('<host>');
+        } finally {
+            fakeMysql.onBeforeExecute = null;
+            setMysqlConnectionFactoryForTests(null);
+            await legacyDb.prepare("DELETE FROM legacy_migration_state WHERE state_key = 'job'").run().catch(() => {});
+            await env.DB_CORE.prepare('DELETE FROM cloud_devices WHERE device_id = ?')
+                .bind(keyJson.data.deviceId)
+                .run()
+                .catch(() => {});
+            await saveExternalDbConfig(env, defaultExternalDbConfig());
+            await saveExternalDbMigrationState(env, defaultExternalDbMigrationState());
+            invalidateExternalDbConfigCache();
+            clearMysqlSchemaReadyCache();
+        }
+    });
 });

@@ -730,11 +730,16 @@ function buildIncrementLegacyCategoryStatStmt(
             `INSERT INTO legacy_migration_state (state_key, payload_json, updated_at)
              VALUES (?, ?, ?)
              ON CONFLICT(state_key) DO UPDATE SET
-                payload_json = json_set(
-                    legacy_migration_state.payload_json,
-                    ?,
-                    COALESCE(CAST(json_extract(legacy_migration_state.payload_json, ?) AS INTEGER), 0) + ?
-                ),
+                payload_json = CASE
+                    WHEN json_valid(legacy_migration_state.payload_json)
+                     AND json_type(legacy_migration_state.payload_json) = 'object'
+                        THEN json_set(
+                            legacy_migration_state.payload_json,
+                            ?,
+                            COALESCE(CAST(json_extract(legacy_migration_state.payload_json, ?) AS INTEGER), 0) + ?
+                        )
+                    ELSE excluded.payload_json
+                END,
                 updated_at = excluded.updated_at`
         )
         .bind(STATE_KEY_IMPORTED_STATS, JSON.stringify(seed), nowIso, jsonPath, jsonPath, delta);
@@ -825,15 +830,20 @@ function buildSaveLegacyTableCursorStmt(
             `INSERT INTO legacy_migration_state (state_key, payload_json, updated_at)
              VALUES (?, ?, ?)
              ON CONFLICT(state_key) DO UPDATE SET
-                payload_json = json_set(
-                    CASE
-                        WHEN json_type(legacy_migration_state.payload_json, ?) IS NULL
-                            THEN json_set(legacy_migration_state.payload_json, ?, json('{}'))
-                        ELSE legacy_migration_state.payload_json
-                    END,
-                    ?,
-                    json(?)
-                ),
+                payload_json = CASE
+                    WHEN json_valid(legacy_migration_state.payload_json)
+                     AND json_type(legacy_migration_state.payload_json) = 'object'
+                        THEN json_set(
+                            CASE
+                                WHEN json_type(legacy_migration_state.payload_json, ?) IS NULL
+                                    THEN json_set(legacy_migration_state.payload_json, ?, json('{}'))
+                                ELSE legacy_migration_state.payload_json
+                            END,
+                            ?,
+                            json(?)
+                        )
+                    ELSE excluded.payload_json
+                END,
                 updated_at = excluded.updated_at`
         )
         .bind(STATE_KEY_CURSORS, seedJson, nowIso, scopePath, scopePath, tablePath, JSON.stringify(cursor));
@@ -902,7 +912,53 @@ function isPlainObject(val: unknown): val is Record<string, unknown> {
 
 function asStr(val: unknown, maxLen = 16_384): string {
     if (typeof val !== 'string') return '';
-    return val.length > maxLen ? val.slice(0, maxLen) : val;
+    let cut = val.length > maxLen ? maxLen : val.length;
+    if (cut > 0 && cut < val.length) {
+        const lastCode = val.charCodeAt(cut - 1);
+        if (lastCode >= 0xd800 && lastCode <= 0xdbff) {
+            cut--;
+        }
+    }
+    let out = '';
+    for (let i = 0; i < cut; i++) {
+        const c = val.charCodeAt(i);
+        if (c === 0) continue;
+        if (c >= 0xd800 && c <= 0xdbff) {
+            if (i + 1 < cut) {
+                const next = val.charCodeAt(i + 1);
+                if (next >= 0xdc00 && next <= 0xdfff) {
+                    out += val[i]! + val[i + 1]!;
+                    i++;
+                }
+            }
+            continue;
+        }
+        if (c >= 0xdc00 && c <= 0xdfff) {
+            continue;
+        }
+        out += val[i]!;
+    }
+    return out;
+}
+
+/**
+ * Formats an unexpected migration batch DB/network failure into a sanitized, actionable message
+ * (preserving MySQL/D1 error codes without leaking credentials, host IPs, or row payloads).
+ */
+function formatSafeMigrationBatchError(err: unknown, category: string, stage: 'ingest' | 'state'): string {
+    const code = typeof (err as { code?: unknown } | null)?.code === 'string' ? (err as { code: string }).code : '';
+    const errno = Number((err as { errno?: unknown } | null)?.errno ?? 0);
+    const rawMsg = err instanceof Error ? err.message : String(err ?? 'Unknown error');
+    const cleanMsg = rawMsg
+        // Redact quoted host/user/value literals or IPv4 addresses to avoid leaking credentials/PII
+        .replace(/\b\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?\b/g, '<host>')
+        .replace(/password\s*[:=]\s*\S+/gi, 'password=<redacted>')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, 220);
+    const tag = `${category || 'unknown'}/${stage}`;
+    const errCode = code ? (errno > 0 ? `${code} (${errno})` : code) : errno > 0 ? `ERRNO ${errno}` : '';
+    return errCode ? `[${tag}] ${errCode}: ${cleanMsg || 'Database error'}` : `[${tag}] ${cleanMsg || 'Database error'}`;
 }
 
 function asFiniteInt(val: unknown, fallback = 0): number {
@@ -1400,8 +1456,8 @@ async function ingestLegacyCategoryBatch(
 
     let inserted = 0;
     let legacyDbBytes = 0;
-    for (let i = 0; i < stmts.length; i += 100) {
-        const res = await legacyDb.batch(stmts.slice(i, i + 100));
+    for (let i = 0; i < stmts.length; i += 50) {
+        const res = await legacyDb.batch(stmts.slice(i, i + 50));
         for (const r of res) {
             inserted += r.meta?.changes ?? 0;
             if (typeof r.meta?.size_after === 'number' && r.meta.size_after > legacyDbBytes) {
@@ -1830,18 +1886,28 @@ export async function handleLegacyMigrationAgentRoutes(
                         .bind(nowIso, nowIso, pausedMsg, nowIso, STATE_KEY_JOB, jobId)
                         .run()
                         .catch(() => {});
-                    return Response.json({
-                        ok: true,
-                        data: {
-                            inserted: 0,
-                            skipped: rawItems.length,
-                            legacyDbBytes: currentSize,
-                            shouldStop: true,
-                            reason: 'D1_DAILY_WRITE_QUOTA'
+                        return Response.json({
+                            ok: true,
+                            data: {
+                                inserted: 0,
+                                skipped: rawItems.length,
+                                legacyDbBytes: currentSize,
+                                shouldStop: true,
+                                reason: 'D1_DAILY_WRITE_QUOTA'
+                            }
+                        });
+                    }
+                console.error(`[VRCX Cloud] Legacy migration batch ingest error (${category}):`, err);
+                return Response.json(
+                    {
+                        ok: false,
+                        error: {
+                            code: 'MIGRATION_BATCH_FAILED',
+                            message: formatSafeMigrationBatchError(err, category, 'ingest')
                         }
-                    });
-                }
-                throw err;
+                    },
+                    { status: 500 }
+                );
             }
         } else {
             const probe = await legacyDb.prepare('SELECT 1 AS ok').all();
@@ -1919,7 +1985,21 @@ export async function handleLegacyMigrationAgentRoutes(
                     jobId
                 )
         );
-        await legacyDb.batch(postStateStmts);
+        try {
+            await legacyDb.batch(postStateStmts);
+        } catch (err) {
+            console.error(`[VRCX Cloud] Legacy migration batch state update error (${categoryRaw}):`, err);
+            return Response.json(
+                {
+                    ok: false,
+                    error: {
+                        code: 'MIGRATION_STATE_UPDATE_FAILED',
+                        message: formatSafeMigrationBatchError(err, categoryRaw, 'state')
+                    }
+                },
+                { status: 500 }
+            );
+        }
 
         if (categoryDone || allDone || quotaReached) {
             const latestJob = await readLegacyState<LegacyMigrationJob>(legacyDb, STATE_KEY_JOB);

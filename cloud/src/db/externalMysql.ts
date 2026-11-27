@@ -1042,6 +1042,8 @@ async function openRealMysqlConnection(params: ResolvedMysqlConnectionParams): P
 
     const { createConnection } = await import('mysql2/promise');
     const conn: Connection = await createConnection(baseOpts);
+    // Attach a no-op error listener so server-side disconnects/resets between queries never throw Unhandled 'error' event
+    conn.on('error', () => {});
     return {
         async execute(sql: string, values: unknown[] = []): Promise<MysqlExecResult> {
             // Use text protocol `query()` rather than server-side prepared statements (`execute()`)
@@ -1083,7 +1085,7 @@ export async function openMysqlConnection(params: ResolvedMysqlConnectionParams)
     return openRealMysqlConnection(params);
 }
 
-// Per-isolate schema-ready cache keyed by host/port/db/prefix so we don't run 8 CREATE TABLEs on every request.
+// Per-isolate schema-ready cache keyed by host/port/db/prefix so we don't run 12 CREATE TABLEs on every request.
 const schemaReadyKeys = new Set<string>();
 
 export function clearMysqlSchemaReadyCache(): void {
@@ -1099,6 +1101,35 @@ export async function ensureMysqlSchemaOnConnection(
     if (!force && schemaReadyKeys.has(cacheKey)) {
         return;
     }
+    if (!force) {
+        // Fast 1-RTT existence probe avoids 12 serial `CREATE TABLE IF NOT EXISTS` statements
+        // and prevents MySQL 5.7 Metadata Lock (MDL) contention across concurrent desktop migration workers.
+        const expectedNames = [
+            ...MANAGED_ARCHIVE_TABLES.map((s) => qualifyMysqlTableName(params.tablePrefix, s.table)),
+            qualifyMysqlTableName(params.tablePrefix, 'vrc_api_cache'),
+            ...MANAGED_ROLLUP_TABLES.map((s) => qualifyMysqlTableName(params.tablePrefix, s.physicalTable))
+        ];
+        try {
+            const ph = expectedNames.map(() => '?').join(', ');
+            const checkRes = await conn.execute(
+                `SELECT TABLE_NAME AS table_name
+                 FROM information_schema.TABLES
+                 WHERE TABLE_SCHEMA = ? AND TABLE_NAME IN (${ph})`,
+                [params.database, ...expectedNames]
+            );
+            const found = new Set(
+                checkRes.rows
+                    .map((r) => String(r.table_name ?? '').toLowerCase())
+                    .filter(Boolean)
+            );
+            if (expectedNames.every((name) => found.has(name.toLowerCase()))) {
+                schemaReadyKeys.add(cacheKey);
+                return;
+            }
+        } catch {
+            // Fall through to idempotent CREATE TABLE IF NOT EXISTS if information_schema is restricted
+        }
+    }
     const ddl = buildMysql57SchemaStatements(params.tablePrefix);
     for (const stmt of ddl) {
         await conn.execute(stmt, []);
@@ -1106,10 +1137,35 @@ export async function ensureMysqlSchemaOnConnection(
     schemaReadyKeys.add(cacheKey);
 }
 
+function isTransientMysqlLockError(err: unknown): boolean {
+    const code = String((err as { code?: unknown } | null)?.code ?? '');
+    const errno = Number((err as { errno?: unknown } | null)?.errno ?? 0);
+    const msg = err instanceof Error ? err.message : String(err ?? '');
+    return (
+        code === 'ER_LOCK_DEADLOCK' ||
+        code === 'ER_LOCK_WAIT_TIMEOUT' ||
+        errno === 1213 ||
+        errno === 1205 ||
+        /deadlock found|lock wait timeout/i.test(msg)
+    );
+}
+
+function isTransientMysqlDisconnectError(err: unknown): boolean {
+    const code = String((err as { code?: unknown } | null)?.code ?? '');
+    const msg = err instanceof Error ? err.message : String(err ?? '');
+    return (
+        code === 'PROTOCOL_CONNECTION_LOST' ||
+        code === 'ECONNRESET' ||
+        code === 'EPIPE' ||
+        /connection lost|connection closed|closed state|broken pipe|econnreset/i.test(msg)
+    );
+}
+
 /**
  * Request-scoped lazy MySQL connection session.
  * Opens at most one TCP connection per Worker request (and zero connections if the request only touches D1),
- * serializes concurrent queries safely on the single connection, and guarantees cleanup via `close()`.
+ * serializes concurrent queries safely on the single connection, retries transient InnoDB lock/disconnect errors,
+ * and guarantees cleanup via `close()`.
  */
 export class ExternalMysqlSession {
     readonly params: ResolvedMysqlConnectionParams;
@@ -1125,6 +1181,15 @@ export class ExternalMysqlSession {
         this.params = params;
         this.mode = mode;
         this.d1Drained = d1Drained;
+    }
+
+    private async resetBrokenConnection(): Promise<void> {
+        const broken = this.conn;
+        this.conn = null;
+        this.connectPromise = null;
+        if (broken) {
+            await broken.close().catch(() => {});
+        }
     }
 
     private async getConnection(): Promise<MysqlConnectionLike> {
@@ -1154,8 +1219,26 @@ export class ExternalMysqlSession {
 
     async query(sql: string, params: unknown[] = []): Promise<MysqlExecResult> {
         const run = async (): Promise<MysqlExecResult> => {
-            const conn = await this.getConnection();
-            return conn.execute(sql, params);
+            const maxAttempts = 3;
+            for (let attempt = 0; attempt < maxAttempts; attempt++) {
+                const conn = await this.getConnection();
+                try {
+                    return await conn.execute(sql, params);
+                } catch (err) {
+                    const isLast = attempt >= maxAttempts - 1 || this.closed;
+                    if (!isLast && isTransientMysqlLockError(err)) {
+                        const backoffMs = 40 * (attempt + 1) + Math.floor(Math.random() * 40);
+                        await new Promise((resolve) => setTimeout(resolve, backoffMs));
+                        continue;
+                    }
+                    if (!isLast && isTransientMysqlDisconnectError(err)) {
+                        await this.resetBrokenConnection();
+                        continue;
+                    }
+                    throw err;
+                }
+            }
+            throw new Error('External MySQL query retry loop exhausted');
         };
         const next = this.queue.then(run, run);
         this.queue = next.then(
