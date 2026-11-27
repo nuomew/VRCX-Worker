@@ -165,7 +165,11 @@
                             </div>
                             <template v-if="!mysqlUsage.connected">
                                 <p class="text-[11px] text-destructive break-all">
-                                    {{ mysqlUsage.error || t('cloud_hub.storage.mysql_connect_failed') }}
+                                    {{
+                                        mysqlUsage.error
+                                            ? formatMysqlErrorMessage(mysqlUsage.error)
+                                            : t('cloud_hub.storage.mysql_connect_failed')
+                                    }}
                                 </p>
                             </template>
                             <template v-else>
@@ -261,9 +265,11 @@
                                         type="password"
                                         autocomplete="new-password"
                                         :placeholder="
-                                            mysqlHasSavedPassword
+                                            mysqlCanReuseSavedPassword
                                                 ? t('cloud_hub.storage.mysql_password_saved_placeholder')
-                                                : t('cloud_hub.storage.mysql_password_placeholder')
+                                                : mysqlHasSavedPassword
+                                                  ? t('cloud_hub.storage.mysql_password_reenter_placeholder')
+                                                  : t('cloud_hub.storage.mysql_password_placeholder')
                                         "
                                         :disabled="savingMysqlConfig || migratingMysql"
                                         class="w-full rounded-md border border-input bg-background px-2.5 py-1.5 font-mono text-xs text-foreground" />
@@ -1132,6 +1138,9 @@
 
     const mysqlSavedEnabled = ref(false);
     const mysqlSavedMode = ref('new_writes_only');
+    const mysqlSavedHost = ref('');
+    const mysqlSavedPort = ref(3306);
+    const mysqlSavedUsername = ref('');
     const mysqlHyperdriveBound = ref(false);
     const mysqlHasSavedPassword = ref(false);
     const mysqlFormDirty = ref(false);
@@ -1175,12 +1184,107 @@
         return Math.max(2, Math.min(99, Math.round(((init - remaining) / init) * 100)));
     });
 
+    const mysqlCanReuseSavedPassword = computed(() => {
+        if (!mysqlHasSavedPassword.value || mysqlFormConnType.value !== 'direct') {
+            return false;
+        }
+        return (
+            mysqlFormHost.value.trim().toLowerCase() === mysqlSavedHost.value.trim().toLowerCase() &&
+            (Number(mysqlFormPort.value) || 3306) === (Number(mysqlSavedPort.value) || 3306) &&
+            mysqlFormUsername.value.trim() === mysqlSavedUsername.value.trim()
+        );
+    });
+
+    function formatMysqlErrorMessage(err) {
+        const code = typeof err === 'object' && err && typeof err.code === 'string' ? err.code : '';
+        const raw =
+            typeof err === 'string'
+                ? err
+                : err instanceof Error
+                  ? err.message || String(err)
+                  : typeof err?.message === 'string'
+                    ? err.message
+                    : String(err || '');
+
+        if (code === 'PASSWORD_REQUIRED_FOR_NEW_TARGET') {
+            return t('cloud_hub.storage.mysql_err_password_required_new_target');
+        }
+        if (code === 'SAVED_PASSWORD_UNREADABLE') {
+            return t('cloud_hub.storage.mysql_err_saved_password_unreadable');
+        }
+        if (code === 'UNSUPPORTED_SSL_MODE' || /does not support skipping TLS/i.test(raw)) {
+            return t('cloud_hub.storage.mysql_err_skip_verify_unsupported');
+        }
+        if (code === 'HYPERDRIVE_UNBOUND') {
+            return t('cloud_hub.storage.mysql_err_hyperdrive_unbound');
+        }
+        if (code === 'INVALID_HOST') {
+            return t('cloud_hub.storage.mysql_err_invalid_host');
+        }
+        if (code === 'INVALID_PORT') {
+            return t('cloud_hub.storage.mysql_err_invalid_port');
+        }
+        if (code === 'INVALID_DATABASE') {
+            return t('cloud_hub.storage.mysql_err_invalid_database');
+        }
+        if (code === 'INVALID_USERNAME') {
+            return t('cloud_hub.storage.mysql_err_invalid_username');
+        }
+        if (code === 'INVALID_TABLE_PREFIX') {
+            return t('cloud_hub.storage.mysql_err_invalid_prefix');
+        }
+        if (code === 'INVALID_PASSWORD') {
+            return t('cloud_hub.storage.mysql_err_invalid_password');
+        }
+        if (code === 'INCOMPLETE_CONFIG') {
+            return t('cloud_hub.storage.mysql_err_incomplete');
+        }
+
+        const accessDenied = raw.match(/Access denied for user '([^']*)'@'([^']*)'\s*\(using password:\s*(YES|NO)\)/i);
+        if (accessDenied) {
+            const [, user, ip, usingPw] = accessDenied;
+            return usingPw.toUpperCase() === 'NO'
+                ? t('cloud_hub.storage.mysql_err_access_denied_no_pw', { user, ip })
+                : t('cloud_hub.storage.mysql_err_access_denied_with_pw', { user, ip });
+        }
+        const hostNotAllowed = raw.match(/Host '([^']*)' is not allowed to connect/i);
+        if (hostNotAllowed) {
+            return t('cloud_hub.storage.mysql_err_host_not_allowed', { ip: hostNotAllowed[1] });
+        }
+        const unknownDb = raw.match(/Unknown database '([^']*)'/i);
+        if (unknownDb) {
+            return t('cloud_hub.storage.mysql_err_unknown_database', { db: unknownDb[1] });
+        }
+        if (/Server does not support secure connection|HANDSHAKE_NO_SSL_SUPPORT/i.test(raw)) {
+            return t('cloud_hub.storage.mysql_err_server_no_ssl');
+        }
+        if (/TLS handshake failed|HANDSHAKE_SSL_ERROR|certificate/i.test(raw)) {
+            return t('cloud_hub.storage.mysql_err_tls_failed');
+        }
+        if (/ETIMEDOUT|timed?\s*out/i.test(raw)) {
+            return t('cloud_hub.storage.mysql_err_timeout');
+        }
+        if (/ECONNREFUSED|connection refused/i.test(raw)) {
+            return t('cloud_hub.storage.mysql_err_refused');
+        }
+        if (/ENOTFOUND|getaddrinfo|could not resolve|dns/i.test(raw)) {
+            return t('cloud_hub.storage.mysql_err_dns');
+        }
+        if (/Connection lost|ECONNRESET|PROTOCOL_CONNECTION_LOST/i.test(raw)) {
+            return t('cloud_hub.storage.mysql_err_connection_lost');
+        }
+        return raw || t('cloud_hub.storage.mysql_connect_failed');
+    }
+
     function applyMysqlStatusPayload(data, { forceFormSync = false } = {}) {
         if (!data) return;
         const cfg = data.config;
         if (cfg) {
             mysqlSavedEnabled.value = Boolean(cfg.enabled);
             mysqlSavedMode.value = cfg.mode === 'full_migrate' ? 'full_migrate' : 'new_writes_only';
+            mysqlSavedHost.value = cfg.host || '';
+            mysqlSavedPort.value = Number(cfg.port || 3306) || 3306;
+            mysqlSavedUsername.value = cfg.username || '';
             mysqlHyperdriveBound.value = Boolean(cfg.hyperdriveBound);
             mysqlHasSavedPassword.value = Boolean(cfg.hasPassword);
             if (forceFormSync || !mysqlFormDirty.value) {
@@ -1215,7 +1319,7 @@
             const data = await cloudFetch(`/api/storage/mysql/status${forceRefresh ? '?refresh=1' : ''}`);
             applyMysqlStatusPayload(data);
         } catch (err) {
-            mysqlError.value = err?.message || String(err);
+            mysqlError.value = formatMysqlErrorMessage(err);
         } finally {
             loadingMysqlStatus.value = false;
         }
@@ -1255,7 +1359,7 @@
                 await Promise.all([loadMysqlStatus(wantEnable), loadQuota(), loadCleanupPreview()]);
             } catch (err) {
                 mysqlFormEnabled.value = !wantEnable;
-                mysqlError.value = err?.message || String(err);
+                mysqlError.value = formatMysqlErrorMessage(err);
                 toast.error(mysqlError.value);
             } finally {
                 savingMysqlConfig.value = false;
@@ -1293,7 +1397,7 @@
             toast.success(mysqlNotice.value);
             await Promise.all([loadMysqlStatus(mysqlFormEnabled.value), loadQuota(), loadCleanupPreview()]);
         } catch (err) {
-            mysqlError.value = err?.message || String(err);
+            mysqlError.value = formatMysqlErrorMessage(err);
             toast.error(mysqlError.value);
         } finally {
             savingMysqlConfig.value = false;
@@ -1329,7 +1433,7 @@
             });
             toast.success(mysqlNotice.value);
         } catch (err) {
-            mysqlError.value = err?.message || String(err);
+            mysqlError.value = formatMysqlErrorMessage(err);
             toast.error(mysqlError.value);
         } finally {
             testingMysql.value = false;
@@ -1426,7 +1530,7 @@
             }
             await Promise.all([loadMysqlStatus(true), loadQuota(), loadCleanupPreview()]);
         } catch (err) {
-            mysqlError.value = err?.message || String(err);
+            mysqlError.value = formatMysqlErrorMessage(err);
             toast.error(mysqlError.value);
         } finally {
             migratingMysql.value = false;

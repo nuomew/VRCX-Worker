@@ -1021,6 +1021,26 @@ export async function handleExternalMysqlRoutes(request: Request, env: Env, url:
             parsed.next.port === existing.port &&
             parsed.next.username === existing.username;
 
+        if (
+            parsed.next.enabled &&
+            parsed.next.connectionType === 'direct' &&
+            !parsed.rawPasswordInput &&
+            !parsed.clearPassword &&
+            existing.passwordEnc &&
+            !sameAuthTarget
+        ) {
+            return Response.json(
+                {
+                    ok: false,
+                    error: {
+                        code: 'PASSWORD_REQUIRED_FOR_NEW_TARGET',
+                        message: 'Re-enter the MySQL password when changing host, port, or username'
+                    }
+                },
+                { status: 400 }
+            );
+        }
+
         let passwordEnc = !parsed.clearPassword && sameAuthTarget ? existing.passwordEnc : '';
         if (parsed.rawPasswordInput) {
             passwordEnc = await encryptMysqlPassword(rawEnv, parsed.rawPasswordInput);
@@ -1131,6 +1151,18 @@ export async function handleExternalMysqlRoutes(request: Request, env: Env, url:
             if (!baseResolved) {
                 return Response.json(
                     { ok: false, error: { code: 'INCOMPLETE_CONFIG', message: 'Incomplete MySQL connection fields' } },
+                    { status: 400 }
+                );
+            }
+            if (!parsed.rawPasswordInput && tempCfg.passwordEnc && !baseResolved.password) {
+                return Response.json(
+                    {
+                        ok: false,
+                        error: {
+                            code: 'SAVED_PASSWORD_UNREADABLE',
+                            message: 'Saved MySQL password could not be decrypted; please re-enter your password'
+                        }
+                    },
                     { status: 400 }
                 );
             }

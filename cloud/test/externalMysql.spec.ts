@@ -1782,7 +1782,43 @@ describe('External MySQL 5.7+ Database Integration (Hybrid New-Writes Mode & Ful
                 true
             );
 
-            // 4. Saving a different host in /config without a new password clears the saved password instead of copying it
+            // 4. Enabling with a DIFFERENT host without re-entering password MUST be rejected instead of silently wiping password
+            const changeHostEnabledRes = await exports.default.fetch('http://example.com/api/storage/mysql/config', {
+                method: 'PUT',
+                headers,
+                body: JSON.stringify({
+                    enabled: true,
+                    host: 'db-b.example.com'
+                })
+            });
+            expect(changeHostEnabledRes.status).toBe(400);
+            const changeHostEnabledJson = (await changeHostEnabledRes.json()) as { error?: { code?: string } };
+            expect(changeHostEnabledJson.error?.code).toBe('PASSWORD_REQUIRED_FOR_NEW_TARGET');
+
+            // 5. Corrupt/unreadable saved passwordEnc MUST return 400 SAVED_PASSWORD_UNREADABLE on /test instead of sending empty password
+            const corruptedCfg = {
+                ...(await import('../src/db/externalMysql').then((m) => m.loadExternalDbConfig(env, true))),
+                passwordEnc: 'v1:invalid-iv:invalid-cipher'
+            };
+            await saveExternalDbConfig(env, corruptedCfg);
+            const corruptTestRes = await exports.default.fetch('http://example.com/api/storage/mysql/test', {
+                method: 'POST',
+                headers,
+                body: JSON.stringify({
+                    connectionType: 'direct',
+                    host: 'db-a.example.com',
+                    port: 3306,
+                    database: 'vrcx_a',
+                    username: 'user_a',
+                    sslMode: 'disabled',
+                    tablePrefix: 'vrcx_'
+                })
+            });
+            expect(corruptTestRes.status).toBe(400);
+            const corruptJson = (await corruptTestRes.json()) as { error?: { code?: string } };
+            expect(corruptJson.error?.code).toBe('SAVED_PASSWORD_UNREADABLE');
+
+            // 6. Disabling with a different host in /config still clears the saved password safely
             const changeHostRes = await exports.default.fetch('http://example.com/api/storage/mysql/config', {
                 method: 'PUT',
                 headers,
