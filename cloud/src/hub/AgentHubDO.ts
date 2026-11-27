@@ -1,4 +1,11 @@
 import { DurableObject } from 'cloudflare:workers';
+import {
+    appendTuplesToCompactTailChunk,
+    chatTupleDedupKey,
+    COMPACT_CHUNK_MAX_BYTES,
+    COMPACT_CHUNK_MAX_ROWS,
+    mutateArchiveChunks
+} from '../db/compactArchive';
 import { getChatDb } from '../db/schemaBootstrap';
 import type { Env } from '../env';
 
@@ -758,31 +765,37 @@ export class AgentHubDO extends DurableObject<Env> {
                     (async () => {
                         try {
                             const chatDb = getChatDb(this.env);
-                            await chatDb
-                                .prepare(
-                                    `INSERT OR IGNORE INTO cloud_chat_messages
-                                     (id, device_id, direction, source_text, translated_text, sent_text, source_lang, target_lang, display_mode, osc_address, osc_port, immediate, play_sfx, status, cmd_id, error_message, created_at)
-                                     VALUES (?, ?, ?, ?, '', ?, 'auto', '', 'source_only', '/chatbox/input', ?, ?, ?, 'synced', '', '', ?)`
-                                )
-                                .bind(
-                                    msgId,
-                                    attachment.deviceId,
-                                    direction,
-                                    text,
-                                    text,
-                                    oscPort,
-                                    immediate ? 1 : 0,
-                                    playSfx ? 1 : 0,
-                                    rawCreated
-                                )
-                                .run();
-                            await chatDb
-                                .prepare(
-                                    `DELETE FROM cloud_chat_messages
-                                     WHERE id NOT IN (SELECT id FROM cloud_chat_messages ORDER BY created_at DESC LIMIT ?)`
-                                )
-                                .bind(CHAT_OSC_MAX_STORED)
-                                .run();
+                            await appendTuplesToCompactTailChunk({
+                                db: chatDb,
+                                archiveTable: 'chat_archive_chunks',
+                                kindColumn: null,
+                                kindValue: 'chat',
+                                tuples: [
+                                    [
+                                        rawCreated,
+                                        msgId,
+                                        attachment.deviceId,
+                                        direction,
+                                        text,
+                                        '',
+                                        text,
+                                        'auto',
+                                        '',
+                                        'source_only',
+                                        '/chatbox/input',
+                                        oscPort,
+                                        immediate ? 1 : 0,
+                                        playSfx ? 1 : 0,
+                                        'synced',
+                                        '',
+                                        ''
+                                    ]
+                                ],
+                                dedupKeyFn: chatTupleDedupKey,
+                                fallbackIso: rawCreated,
+                                maxRows: COMPACT_CHUNK_MAX_ROWS,
+                                maxJsonBytes: COMPACT_CHUNK_MAX_BYTES
+                            });
                         } catch {
                             // Non-fatal in minimal test fixtures
                         }
@@ -816,16 +829,40 @@ export class AgentHubDO extends DurableObject<Env> {
                 if (chatMsgId || cmdId) {
                     const chatDb = getChatDb(this.env);
                     this.ctx.waitUntil(
-                        (chatMsgId
-                            ? chatDb
-                                  .prepare(`UPDATE cloud_chat_messages SET status = ?, error_message = ? WHERE id = ?`)
-                                  .bind(chatStatus, errMsg, chatMsgId)
-                            : chatDb
-                                  .prepare(`UPDATE cloud_chat_messages SET status = ?, error_message = ? WHERE cmd_id = ?`)
-                                  .bind(chatStatus, errMsg, cmdId)
-                        )
-                            .run()
-                            .catch(() => {})
+                        (async () => {
+                            try {
+                                const hotRes = await (chatMsgId
+                                    ? chatDb
+                                          .prepare(`UPDATE cloud_chat_messages SET status = ?, error_message = ? WHERE id = ?`)
+                                          .bind(chatStatus, errMsg, chatMsgId)
+                                    : chatDb
+                                          .prepare(`UPDATE cloud_chat_messages SET status = ?, error_message = ? WHERE cmd_id = ?`)
+                                          .bind(chatStatus, errMsg, cmdId)
+                                ).run();
+                                if ((hotRes.meta?.changes ?? 0) === 0) {
+                                    await mutateArchiveChunks({
+                                        db: chatDb,
+                                        archiveTable: 'chat_archive_chunks',
+                                        kindColumn: null,
+                                        kindValue: 'chat',
+                                        maxChunksToScan: 3,
+                                        stopAfterFirstChunkChange: true,
+                                        mutateTuple: (t) => {
+                                            const matched = chatMsgId
+                                                ? String(t[1] ?? '') === chatMsgId
+                                                : String(t[15] ?? '') === cmdId;
+                                            if (!matched) return 'keep';
+                                            const next = [...t];
+                                            next[14] = chatStatus;
+                                            next[16] = errMsg;
+                                            return next;
+                                        }
+                                    });
+                                }
+                            } catch {
+                                // Non-fatal
+                            }
+                        })()
                     );
                 }
             }
@@ -892,15 +929,38 @@ export class AgentHubDO extends DurableObject<Env> {
                                 .bind(status, JSON.stringify(cmdPayload), now, cmdId, attachment.deviceId)
                                 .run()
                                 .catch(() => {}),
-                            getChatDb(this.env)
-                                .prepare(
-                                    `UPDATE cloud_chat_messages
-                                     SET status = ?, error_message = ?
-                                     WHERE cmd_id = ?`
-                                )
-                                .bind(chatStatus, errMsg, cmdId)
-                                .run()
-                                .catch(() => {})
+                            (async () => {
+                                try {
+                                    const chatDb = getChatDb(this.env);
+                                    const hotRes = await chatDb
+                                        .prepare(
+                                            `UPDATE cloud_chat_messages
+                                             SET status = ?, error_message = ?
+                                             WHERE cmd_id = ?`
+                                        )
+                                        .bind(chatStatus, errMsg, cmdId)
+                                        .run();
+                                    if ((hotRes.meta?.changes ?? 0) === 0) {
+                                        await mutateArchiveChunks({
+                                            db: chatDb,
+                                            archiveTable: 'chat_archive_chunks',
+                                            kindColumn: null,
+                                            kindValue: 'chat',
+                                            maxChunksToScan: 3,
+                                            stopAfterFirstChunkChange: true,
+                                            mutateTuple: (t) => {
+                                                if (String(t[15] ?? '') !== cmdId) return 'keep';
+                                                const next = [...t];
+                                                next[14] = chatStatus;
+                                                next[16] = errMsg;
+                                                return next;
+                                            }
+                                        });
+                                    }
+                                } catch {
+                                    // Non-fatal
+                                }
+                            })()
                         ])
                     );
                 }

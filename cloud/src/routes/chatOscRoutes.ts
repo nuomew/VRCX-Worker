@@ -1,6 +1,13 @@
 import { preAuthenticateAgent, verifyAgentBodyHmac } from '../auth/auth';
 import { randomHex } from '../crypto/vault';
-import { decodeChatChunkRows } from '../db/compactArchive';
+import {
+    appendTuplesToCompactTailChunk,
+    chatTupleDedupKey,
+    COMPACT_CHUNK_MAX_BYTES,
+    COMPACT_CHUNK_MAX_ROWS,
+    decodeChatChunkRows,
+    mutateArchiveChunks
+} from '../db/compactArchive';
 import { getChatDb } from '../db/schemaBootstrap';
 import type { Env } from '../env';
 import {
@@ -355,16 +362,36 @@ export async function syncChatMessageStatusByCmdId(
             )
             .bind(nextStatus, safeError, cmdId)
             .run();
+        let updated: ChatMessageRow | null = null;
         if ((res.meta?.changes ?? 0) > 0) {
-            const updated = await chatDb
+            updated = await chatDb
                 .prepare('SELECT * FROM cloud_chat_messages WHERE cmd_id = ? LIMIT 1')
                 .bind(cmdId)
                 .first<ChatMessageRow>();
-            if (updated) {
-                await broadcastChatEvent(env, 'chat.message', {
-                    message: formatChatMessageDto(updated)
-                });
+        } else {
+            const chunkUpd = await mutateArchiveChunks({
+                db: chatDb,
+                archiveTable: 'chat_archive_chunks',
+                kindColumn: null,
+                kindValue: 'chat',
+                maxChunksToScan: 6,
+                stopAfterFirstChunkChange: true,
+                mutateTuple: (t) => {
+                    if (String(t[15] ?? '') !== cmdId) return 'keep';
+                    const next = [...t];
+                    next[14] = nextStatus;
+                    next[16] = safeError;
+                    return next;
+                }
+            });
+            if (chunkUpd.modifiedPairs.length > 0) {
+                updated = decodeChatChunkRows(JSON.stringify([chunkUpd.modifiedPairs[0]!.after]))[0] ?? null;
             }
+        }
+        if (updated) {
+            await broadcastChatEvent(env, 'chat.message', {
+                message: formatChatMessageDto(updated)
+            });
         }
     } catch {
         // Ignore when chat table is absent in minimal test fixtures
@@ -782,36 +809,39 @@ export async function handleChatOscAgentRoutes(request: Request, env: Env, url: 
             created_at: rawCreated
         };
         insertedRows.push(row);
-        chatWrites.push(
-            chatDb
-                .prepare(
-                    `INSERT OR IGNORE INTO cloud_chat_messages
-                     (id, device_id, direction, source_text, translated_text, sent_text, source_lang, target_lang, display_mode, osc_address, osc_port, immediate, play_sfx, status, cmd_id, error_message, created_at)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', '', ?)`
-                )
-                .bind(
-                    row.id,
-                    row.device_id,
-                    row.direction,
-                    row.source_text,
-                    row.translated_text,
-                    row.sent_text,
-                    row.source_lang,
-                    row.target_lang,
-                    row.display_mode,
-                    row.osc_address,
-                    row.osc_port,
-                    row.immediate,
-                    row.play_sfx,
-                    row.status,
-                    row.created_at
-                )
-        );
     }
 
-    if (chatWrites.length > 0) {
-        await chatDb.batch(chatWrites);
-        await pruneChatMessages(env);
+    if (insertedRows.length > 0) {
+        const tuples = insertedRows.map((row) => [
+            row.created_at,
+            row.id,
+            row.device_id,
+            row.direction,
+            row.source_text,
+            row.translated_text,
+            row.sent_text,
+            row.source_lang,
+            row.target_lang,
+            row.display_mode,
+            row.osc_address,
+            row.osc_port,
+            row.immediate,
+            row.play_sfx,
+            row.status,
+            row.cmd_id,
+            row.error_message
+        ]);
+        await appendTuplesToCompactTailChunk({
+            db: chatDb,
+            archiveTable: 'chat_archive_chunks',
+            kindColumn: null,
+            kindValue: 'chat',
+            tuples,
+            dedupKeyFn: chatTupleDedupKey,
+            fallbackIso: nowIso,
+            maxRows: COMPACT_CHUNK_MAX_ROWS,
+            maxJsonBytes: COMPACT_CHUNK_MAX_BYTES
+        });
         for (const row of insertedRows) {
             await broadcastChatEvent(env, 'chat.message', {
                 message: formatChatMessageDto(row)
@@ -1098,31 +1128,38 @@ export async function handleChatOscWebRoutes(request: Request, env: Env, url: UR
         let errorMessage = '';
         let deliveryStatus: 'dispatched' | 'queued' | 'skipped' | 'failed' = 'skipped';
 
-        // Persist the row BEFORE dispatching over realtime WebSocket so sub-millisecond `chat.osc_result`
-        // callbacks from the desktop companion always find and update this row cleanly in DB_CHAT.
-        await chatDb
-            .prepare(
-                `INSERT INTO cloud_chat_messages
-                 (id, device_id, direction, source_text, translated_text, sent_text, source_lang, target_lang, display_mode, osc_address, osc_port, immediate, play_sfx, status, cmd_id, error_message, created_at)
-                 VALUES (?, ?, 'web_to_vrc', ?, ?, ?, ?, ?, ?, '/chatbox/input', ?, ?, ?, ?, ?, '', ?)`
-            )
-            .bind(
-                msgId,
-                resolvedDeviceId,
-                sourceText || sentText,
-                translatedText,
-                sentText,
-                sourceLang,
-                targetLang,
-                displayMode,
-                oscPort,
-                immediate ? 1 : 0,
-                playSfx ? 1 : 0,
-                status,
-                cmdId,
-                nowIso
-            )
-            .run();
+        // Persist directly into compact chat_archive_chunks tail row BEFORE dispatching over realtime WebSocket
+        // so sub-millisecond `chat.osc_result` callbacks always find and update this row cleanly.
+        const initialTuple: unknown[] = [
+            nowIso,
+            msgId,
+            resolvedDeviceId,
+            'web_to_vrc',
+            sourceText || sentText,
+            translatedText,
+            sentText,
+            sourceLang,
+            targetLang,
+            displayMode,
+            '/chatbox/input',
+            oscPort,
+            immediate ? 1 : 0,
+            playSfx ? 1 : 0,
+            status,
+            cmdId,
+            ''
+        ];
+        await appendTuplesToCompactTailChunk({
+            db: chatDb,
+            archiveTable: 'chat_archive_chunks',
+            kindColumn: null,
+            kindValue: 'chat',
+            tuples: [initialTuple],
+            dedupKeyFn: chatTupleDedupKey,
+            fallbackIso: nowIso,
+            maxRows: COMPACT_CHUNK_MAX_ROWS,
+            maxJsonBytes: COMPACT_CHUNK_MAX_BYTES
+        });
 
         if (sendToVrc) {
             const oscParams = {
@@ -1168,21 +1205,40 @@ export async function handleChatOscWebRoutes(request: Request, env: Env, url: UR
                 }
             }
 
-            await chatDb
-                .prepare(
-                    `UPDATE cloud_chat_messages
-                     SET device_id = ?, status = ?, cmd_id = ?, error_message = ?
-                     WHERE id = ? AND status = 'dispatching'`
-                )
-                .bind(resolvedDeviceId, status, cmdId, errorMessage, msgId)
-                .run();
+            await mutateArchiveChunks({
+                db: chatDb,
+                archiveTable: 'chat_archive_chunks',
+                kindColumn: null,
+                kindValue: 'chat',
+                maxChunksToScan: 2,
+                stopAfterFirstChunkChange: true,
+                mutateTuple: (t) => {
+                    if (String(t[1] ?? '') !== msgId || String(t[14] ?? '') !== 'dispatching') return 'keep';
+                    const next = [...t];
+                    next[2] = resolvedDeviceId;
+                    next[14] = status;
+                    next[15] = cmdId;
+                    next[16] = errorMessage;
+                    return next;
+                }
+            });
         }
 
-        await pruneChatMessages(env);
-        const latestRow = await chatDb
-            .prepare('SELECT * FROM cloud_chat_messages WHERE id = ? LIMIT 1')
-            .bind(msgId)
-            .first<ChatMessageRow>();
+        let latestRow: ChatMessageRow | null = null;
+        try {
+            const tailChunks = await chatDb
+                .prepare('SELECT payload_json FROM chat_archive_chunks ORDER BY id DESC LIMIT 2')
+                .all<{ payload_json: string }>();
+            for (const c of tailChunks.results ?? []) {
+                const found = decodeChatChunkRows(c.payload_json).find((r) => r.id === msgId);
+                if (found) {
+                    latestRow = found;
+                    break;
+                }
+            }
+        } catch {
+            // Non-fatal fallback
+        }
         const row: ChatMessageRow = latestRow ?? {
             id: msgId,
             device_id: resolvedDeviceId,
@@ -1307,21 +1363,43 @@ export async function handleChatOscWebRoutes(request: Request, env: Env, url: UR
             .bind(translatedText, targetLang, targetLang, msgId)
             .run();
 
-        if ((res.meta?.changes ?? 0) === 0) {
+        let updated: ChatMessageRow | null = null;
+        if ((res.meta?.changes ?? 0) > 0) {
+            updated = await chatDb
+                .prepare('SELECT * FROM cloud_chat_messages WHERE id = ? LIMIT 1')
+                .bind(msgId)
+                .first<ChatMessageRow>();
+        } else {
+            const chunkUpd = await mutateArchiveChunks({
+                db: chatDb,
+                archiveTable: 'chat_archive_chunks',
+                kindColumn: null,
+                kindValue: 'chat',
+                maxChunksToScan: 6,
+                stopAfterFirstChunkChange: true,
+                mutateTuple: (t) => {
+                    if (String(t[1] ?? '') !== msgId) return 'keep';
+                    const next = [...t];
+                    next[5] = translatedText;
+                    if (targetLang) next[8] = targetLang;
+                    return next;
+                }
+            });
+            if (chunkUpd.modifiedPairs.length > 0) {
+                const after = chunkUpd.modifiedPairs[0]!.after;
+                updated = decodeChatChunkRows(JSON.stringify([after]))[0] ?? null;
+            }
+        }
+
+        if (!updated) {
             return Response.json(
                 { ok: false, error: { code: 'NOT_FOUND', message: 'Chat message not found' } },
                 { status: 404 }
             );
         }
 
-        const updated = await chatDb
-            .prepare('SELECT * FROM cloud_chat_messages WHERE id = ? LIMIT 1')
-            .bind(msgId)
-            .first<ChatMessageRow>();
-        const dto = updated ? formatChatMessageDto(updated) : null;
-        if (dto) {
-            await broadcastChatEvent(env, 'chat.message', { message: dto });
-        }
+        const dto = formatChatMessageDto(updated);
+        await broadcastChatEvent(env, 'chat.message', { message: dto });
         return Response.json({ ok: true, data: { message: dto } });
     }
 
@@ -1336,6 +1414,15 @@ export async function handleChatOscWebRoutes(request: Request, env: Env, url: UR
                 );
             }
             await chatDb.prepare('DELETE FROM cloud_chat_messages WHERE id = ?').bind(id).run();
+            await mutateArchiveChunks({
+                db: chatDb,
+                archiveTable: 'chat_archive_chunks',
+                kindColumn: null,
+                kindValue: 'chat',
+                maxChunksToScan: 12,
+                stopAfterFirstChunkChange: true,
+                mutateTuple: (t) => (String(t[1] ?? '') === id ? 'delete' : 'keep')
+            });
             await broadcastChatEvent(env, 'chat.deleted', { id });
             return Response.json({ ok: true, data: { deletedId: id } });
         }

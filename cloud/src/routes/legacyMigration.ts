@@ -1,24 +1,28 @@
 import { preAuthenticateAgent, verifyAgentBodyHmac } from '../auth/auth';
 import { randomHex } from '../crypto/vault';
 import {
+    appendTuplesToCompactTailChunk,
+    applyUserRollupForPackedJoinLeave,
+    applyWorldRollupForPackedLocations,
     CHUNK_KIND_TO_CORE_TABLE,
     CHUNK_KIND_TO_FEED_TABLE,
     CHUNK_KIND_TO_GAMELOG_TABLE,
     COMPACT_CHUNK_MAX_BYTES,
     COMPACT_CHUNK_MAX_ROWS,
     COMPACT_EXPORT_CHUNK_OFFSET,
-    computeCompactChunkKey,
     CORE_TABLE_TO_CHUNK_KIND,
     type CoreChunkKind,
+    coreTupleDedupKey,
     decodeCoreChunkRows,
     decodeFeedChunkForExport,
     decodeFeedChunkRows,
     decodeGameLogChunkForExport,
     FEED_TABLE_TO_CHUNK_KIND,
     type FeedChunkKind,
+    feedTupleDedupKey,
     GAMELOG_TABLE_TO_CHUNK_KIND,
     type GameLogChunkKind,
-    splitTuplesIntoCompactChunks
+    gamelogTupleDedupKey
 } from '../db/compactArchive';
 import { getLegacyDb } from '../db/schemaBootstrap';
 import type { Env } from '../env';
@@ -1000,6 +1004,13 @@ async function ingestLegacyCategoryBatch(
     const stmts: D1PreparedStatement[] = [];
     const gamelogLocationRows: unknown[][] = [];
     const gamelogJoinLeaveRows: unknown[][] = [];
+    const gamelogPortalRows: unknown[][] = [];
+    const gamelogVideoRows: unknown[][] = [];
+    const gamelogEventRows: unknown[][] = [];
+    const gamelogExternalRows: unknown[][] = [];
+    const coreFriendLogRows: unknown[][] = [];
+    const coreNotifV1Rows: unknown[][] = [];
+    const coreNotifV2Rows: unknown[][] = [];
     const feedGpsRows: unknown[][] = [];
     const feedOnlineOfflineRows: unknown[][] = [];
     const feedStatusRows: unknown[][] = [];
@@ -1143,87 +1154,63 @@ async function ingestLegacyCategoryBatch(
                 const type = asStr(raw.type, 64).trim();
                 if (!userId || !type) continue;
                 const displayName = asStr(raw.displayName ?? raw.display_name, 256);
-                stmts.push(
-                    legacyDb
-                        .prepare(
-                            `INSERT OR IGNORE INTO friend_log_history
-                             (created_at, type, user_id, display_name, previous_display_name, trust_level, previous_trust_level, friend_number)
-                             VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-                        )
-                        .bind(
-                            asStr(raw.createdAt ?? raw.created_at, 64) || nowIso,
-                            type,
-                            userId,
-                            displayName,
-                            asStr(raw.previousDisplayName ?? raw.previous_display_name, 256),
-                            asStr(raw.trustLevel ?? raw.trust_level, 64),
-                            asStr(raw.previousTrustLevel ?? raw.previous_trust_level, 64),
-                            Math.max(0, asFiniteInt(raw.friendNumber ?? raw.friend_number, 0))
-                        )
-                );
+                coreFriendLogRows.push([
+                    asStr(raw.createdAt ?? raw.created_at, 64) || nowIso,
+                    type,
+                    userId,
+                    displayName,
+                    asStr(raw.previousDisplayName ?? raw.previous_display_name, 256),
+                    asStr(raw.trustLevel ?? raw.trust_level, 64),
+                    asStr(raw.previousTrustLevel ?? raw.previous_trust_level, 64),
+                    Math.max(0, asFiniteInt(raw.friendNumber ?? raw.friend_number, 0))
+                ]);
                 if (displayName) userEntities.set(userId, displayName);
             }
         } else if (category === 'notifications') {
             if (kind === 'notification_v2') {
                 const id = asStr(raw.id, 128).trim();
                 if (!id) continue;
-                stmts.push(
-                    legacyDb
-                        .prepare(
-                            `INSERT OR IGNORE INTO notifications_v2
-                             (id, created_at, updated_at, expires_at, type, link, link_text, message, title, image_url, seen, sender_user_id, sender_username, data, responses, details)
-                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-                        )
-                        .bind(
-                            id,
-                            asStr(raw.createdAt ?? raw.created_at, 64) || nowIso,
-                            asStr(raw.updatedAt ?? raw.updated_at, 64),
-                            asStr(raw.expiresAt ?? raw.expires_at, 64),
-                            asStr(raw.type, 128),
-                            asStr(raw.link, 512),
-                            asStr(raw.linkText ?? raw.link_text, 256),
-                            asStr(raw.message, 4096),
-                            asStr(raw.title, 512),
-                            asStr(raw.imageUrl ?? raw.image_url, 1024),
-                            raw.seen ? 1 : 0,
-                            asStr(raw.senderUserId ?? raw.sender_user_id, 128),
-                            asStr(raw.senderUsername ?? raw.sender_username, 256),
-                            typeof raw.data === 'string' ? raw.data.slice(0, 8192) : JSON.stringify(raw.data ?? {}),
-                            typeof raw.responses === 'string'
-                                ? raw.responses.slice(0, 8192)
-                                : JSON.stringify(raw.responses ?? []),
-                            typeof raw.details === 'string'
-                                ? raw.details.slice(0, 8192)
-                                : JSON.stringify(raw.details ?? {})
-                        )
-                );
+                coreNotifV2Rows.push([
+                    asStr(raw.createdAt ?? raw.created_at, 64) || nowIso,
+                    id,
+                    asStr(raw.updatedAt ?? raw.updated_at, 64),
+                    asStr(raw.expiresAt ?? raw.expires_at, 64),
+                    asStr(raw.type, 128),
+                    asStr(raw.link, 512),
+                    asStr(raw.linkText ?? raw.link_text, 256),
+                    asStr(raw.message, 4096),
+                    asStr(raw.title, 512),
+                    asStr(raw.imageUrl ?? raw.image_url, 1024),
+                    raw.seen ? 1 : 0,
+                    asStr(raw.senderUserId ?? raw.sender_user_id, 128),
+                    asStr(raw.senderUsername ?? raw.sender_username, 256),
+                    typeof raw.data === 'string' ? raw.data.slice(0, 8192) : JSON.stringify(raw.data ?? {}),
+                    typeof raw.responses === 'string'
+                        ? raw.responses.slice(0, 8192)
+                        : JSON.stringify(raw.responses ?? []),
+                    typeof raw.details === 'string'
+                        ? raw.details.slice(0, 8192)
+                        : JSON.stringify(raw.details ?? {})
+                ]);
             } else {
                 const id = asStr(raw.id, 128).trim();
                 if (!id) continue;
-                stmts.push(
-                    legacyDb
-                        .prepare(
-                            `INSERT OR IGNORE INTO notifications
-                             (id, created_at, type, sender_user_id, sender_username, receiver_user_id, message, world_id, world_name, image_url, invite_message, request_message, response_message, expired)
-                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-                        )
-                        .bind(
-                            id,
-                            asStr(raw.createdAt ?? raw.created_at, 64) || nowIso,
-                            asStr(raw.type, 128),
-                            asStr(raw.senderUserId ?? raw.sender_user_id, 128),
-                            asStr(raw.senderUsername ?? raw.sender_username, 256),
-                            asStr(raw.receiverUserId ?? raw.receiver_user_id, 128),
-                            asStr(raw.message, 4096),
-                            asStr(raw.worldId ?? raw.world_id, 128),
-                            asStr(raw.worldName ?? raw.world_name, 512),
-                            asStr(raw.imageUrl ?? raw.image_url, 1024),
-                            asStr(raw.inviteMessage ?? raw.invite_message, 1024),
-                            asStr(raw.requestMessage ?? raw.request_message, 1024),
-                            asStr(raw.responseMessage ?? raw.response_message, 1024),
-                            raw.expired ? 1 : 0
-                        )
-                );
+                coreNotifV1Rows.push([
+                    asStr(raw.createdAt ?? raw.created_at, 64) || nowIso,
+                    id,
+                    asStr(raw.type, 128),
+                    asStr(raw.senderUserId ?? raw.sender_user_id, 128),
+                    asStr(raw.senderUsername ?? raw.sender_username, 256),
+                    asStr(raw.receiverUserId ?? raw.receiver_user_id, 128),
+                    asStr(raw.message, 4096),
+                    asStr(raw.worldId ?? raw.world_id, 128),
+                    asStr(raw.worldName ?? raw.world_name, 512),
+                    asStr(raw.imageUrl ?? raw.image_url, 1024),
+                    asStr(raw.inviteMessage ?? raw.invite_message, 1024),
+                    asStr(raw.requestMessage ?? raw.request_message, 1024),
+                    asStr(raw.responseMessage ?? raw.response_message, 1024),
+                    raw.expired ? 1 : 0
+                ]);
             }
         } else if (category === 'moderation_profiles') {
             if (kind === 'user_profile') {
@@ -1297,56 +1284,34 @@ async function ingestLegacyCategoryBatch(
             } else if (type === 'PortalSpawn') {
                 const displayName = asStr(raw.displayName ?? raw.display_name, 256);
                 const userId = asStr(raw.userId ?? raw.user_id, 128);
-                stmts.push(
-                    legacyDb
-                        .prepare(
-                            'INSERT OR IGNORE INTO gamelog_portal_spawn (created_at, display_name, location, user_id, instance_id, world_name) VALUES (?, ?, ?, ?, ?, ?)'
-                        )
-                        .bind(
-                            createdAt,
-                            displayName,
-                            asStr(raw.location, 512),
-                            userId,
-                            asStr(raw.instanceId ?? raw.instance_id, 512),
-                            asStr(raw.worldName ?? raw.world_name, 512)
-                        )
-                );
+                gamelogPortalRows.push([
+                    createdAt,
+                    displayName,
+                    asStr(raw.location, 512),
+                    userId,
+                    asStr(raw.instanceId ?? raw.instance_id, 512),
+                    asStr(raw.worldName ?? raw.world_name, 512)
+                ]);
             } else if (type === 'VideoPlay') {
-                stmts.push(
-                    legacyDb
-                        .prepare(
-                            'INSERT OR IGNORE INTO gamelog_video_play (created_at, video_url, video_name, video_id, location, display_name, user_id) VALUES (?, ?, ?, ?, ?, ?, ?)'
-                        )
-                        .bind(
-                            createdAt,
-                            asStr(raw.videoUrl ?? raw.video_url, 2048),
-                            asStr(raw.videoName ?? raw.video_name, 512),
-                            asStr(raw.videoId ?? raw.video_id, 128),
-                            asStr(raw.location, 512),
-                            asStr(raw.displayName ?? raw.display_name, 256),
-                            asStr(raw.userId ?? raw.user_id, 128)
-                        )
-                );
+                gamelogVideoRows.push([
+                    createdAt,
+                    asStr(raw.videoUrl ?? raw.video_url, 2048),
+                    asStr(raw.videoName ?? raw.video_name, 512),
+                    asStr(raw.videoId ?? raw.video_id, 128),
+                    asStr(raw.location, 512),
+                    asStr(raw.displayName ?? raw.display_name, 256),
+                    asStr(raw.userId ?? raw.user_id, 128)
+                ]);
             } else if (type === 'Event') {
-                stmts.push(
-                    legacyDb
-                        .prepare('INSERT OR IGNORE INTO gamelog_event (created_at, data) VALUES (?, ?)')
-                        .bind(createdAt, asStr(raw.data, 4096))
-                );
+                gamelogEventRows.push([createdAt, asStr(raw.data, 4096)]);
             } else if (type === 'External') {
-                stmts.push(
-                    legacyDb
-                        .prepare(
-                            'INSERT OR IGNORE INTO gamelog_external (created_at, message, display_name, user_id, location) VALUES (?, ?, ?, ?, ?)'
-                        )
-                        .bind(
-                            createdAt,
-                            asStr(raw.message, 4096),
-                            asStr(raw.displayName ?? raw.display_name, 256),
-                            asStr(raw.userId ?? raw.user_id, 128),
-                            asStr(raw.location, 512)
-                        )
-                );
+                gamelogExternalRows.push([
+                    createdAt,
+                    asStr(raw.message, 4096),
+                    asStr(raw.displayName ?? raw.display_name, 256),
+                    asStr(raw.userId ?? raw.user_id, 128),
+                    asStr(raw.location, 512)
+                ]);
             }
         } else if (category === 'feed') {
             const type = asStr(raw.type ?? kind, 64).trim();
@@ -1427,61 +1392,6 @@ async function ingestLegacyCategoryBatch(
         }
     }
 
-    pushMultiRowInsert(
-        legacyDb,
-        stmts,
-        'INSERT OR IGNORE INTO gamelog_location (created_at, location, world_id, world_name, time, group_name)',
-        6,
-        gamelogLocationRows
-    );
-    pushMultiRowInsert(
-        legacyDb,
-        stmts,
-        'INSERT OR IGNORE INTO gamelog_join_leave (created_at, type, display_name, location, user_id, time)',
-        6,
-        gamelogJoinLeaveRows
-    );
-
-    // Plan A: Pack migrated Feed batches into compact chunk rows (up to 1000 rows / <=512 KiB per D1 row)
-    // to cut D1 rows_written by >99.5% so multi-year Feed archives fit effortlessly inside Free-tier daily quotas.
-    const feedChunkBatches: Array<{ kind: LegacyFeedChunkKind; rows: unknown[][] }> = [
-        { kind: 'gps', rows: feedGpsRows },
-        { kind: 'oo', rows: feedOnlineOfflineRows },
-        { kind: 'status', rows: feedStatusRows },
-        { kind: 'bio', rows: feedBioRows }
-    ];
-    const chunkStmts: D1PreparedStatement[] = [];
-    const chunkLogicalCounts: number[] = [];
-    for (const bucket of feedChunkBatches) {
-        if (bucket.rows.length === 0) continue;
-        const slices = splitTuplesIntoCompactChunks(
-            bucket.rows,
-            nowIso,
-            COMPACT_CHUNK_MAX_ROWS,
-            COMPACT_CHUNK_MAX_BYTES
-        );
-        for (const slice of slices) {
-            const chunkKey = await computeCompactChunkKey(bucket.kind, slice.payloadJson);
-            chunkStmts.push(
-                legacyDb
-                    .prepare(
-                        `INSERT OR IGNORE INTO legacy_feed_chunks
-                         (chunk_key, feed_kind, min_created_at, max_created_at, row_count, payload_json)
-                         VALUES (?, ?, ?, ?, ?, ?)`
-                    )
-                    .bind(
-                        chunkKey,
-                        bucket.kind,
-                        slice.minCreatedAt,
-                        slice.maxCreatedAt,
-                        slice.rows.length,
-                        slice.payloadJson
-                    )
-            );
-            chunkLogicalCounts.push(slice.rows.length);
-        }
-    }
-
     let inserted = 0;
     let legacyDbBytes = 0;
     for (let i = 0; i < stmts.length; i += 100) {
@@ -1493,17 +1403,107 @@ async function ingestLegacyCategoryBatch(
             }
         }
     }
-    if (chunkStmts.length > 0) {
-        const chunkRes = await legacyDb.batch(chunkStmts);
-        for (let i = 0; i < chunkRes.length; i++) {
-            const r = chunkRes[i]!;
-            if ((r.meta?.changes ?? 0) > 0) {
-                inserted += chunkLogicalCounts[i] ?? 0;
-            }
-            if (typeof r.meta?.size_after === 'number' && r.meta.size_after > legacyDbBytes) {
-                legacyDbBytes = r.meta.size_after;
+
+    // Write-directly-to-compact-chunks (<= 1,000 rows AND <= 512 KiB per D1 row) for ALL high-volume
+    // historical categories in DB_LEGACY: Feed (4 tables), GameLog (all 6 tables + rollups), Notifications, FriendLog.
+    const feedChunkBatches: Array<{ kind: LegacyFeedChunkKind; rows: unknown[][] }> = [
+        { kind: 'gps', rows: feedGpsRows },
+        { kind: 'oo', rows: feedOnlineOfflineRows },
+        { kind: 'status', rows: feedStatusRows },
+        { kind: 'bio', rows: feedBioRows }
+    ];
+    for (const bucket of feedChunkBatches) {
+        if (bucket.rows.length === 0) continue;
+        const res = await appendTuplesToCompactTailChunk({
+            db: legacyDb,
+            archiveTable: 'legacy_feed_chunks',
+            kindColumn: 'feed_kind',
+            kindValue: bucket.kind,
+            tuples: bucket.rows,
+            dedupKeyFn: (t) => feedTupleDedupKey(bucket.kind, t),
+            fallbackIso: nowIso,
+            maxRows: COMPACT_CHUNK_MAX_ROWS,
+            maxJsonBytes: COMPACT_CHUNK_MAX_BYTES,
+            negateRowIds: true
+        });
+        inserted += res.inserted;
+        if (res.sizeAfter > legacyDbBytes) legacyDbBytes = res.sizeAfter;
+    }
+
+    const gamelogChunkBatches: Array<{ kind: GameLogChunkKind; rows: unknown[][] }> = [
+        { kind: 'location', rows: gamelogLocationRows },
+        { kind: 'join_leave', rows: gamelogJoinLeaveRows },
+        { kind: 'portal', rows: gamelogPortalRows },
+        { kind: 'video', rows: gamelogVideoRows },
+        { kind: 'event', rows: gamelogEventRows },
+        { kind: 'external', rows: gamelogExternalRows }
+    ];
+    for (const bucket of gamelogChunkBatches) {
+        if (bucket.rows.length === 0) continue;
+        const res = await appendTuplesToCompactTailChunk({
+            db: legacyDb,
+            archiveTable: 'legacy_gamelog_chunks',
+            kindColumn: 'gamelog_kind',
+            kindValue: bucket.kind,
+            tuples: bucket.rows,
+            dedupKeyFn: (t) => gamelogTupleDedupKey(bucket.kind, t),
+            fallbackIso: nowIso,
+            maxRows: COMPACT_CHUNK_MAX_ROWS,
+            maxJsonBytes: COMPACT_CHUNK_MAX_BYTES,
+            negateRowIds: true
+        });
+        inserted += res.inserted;
+        if (res.sizeAfter > legacyDbBytes) legacyDbBytes = res.sizeAfter;
+        if (res.insertedTuples.length > 0) {
+            if (bucket.kind === 'location') {
+                await applyWorldRollupForPackedLocations(
+                    legacyDb,
+                    res.insertedTuples.map((t) => ({
+                        created_at: t[0],
+                        location: t[1],
+                        world_id: t[2],
+                        world_name: t[3],
+                        time: t[4],
+                        group_name: t[5]
+                    }))
+                );
+            } else if (bucket.kind === 'join_leave') {
+                await applyUserRollupForPackedJoinLeave(
+                    legacyDb,
+                    res.insertedTuples.map((t) => ({
+                        created_at: t[0],
+                        type: t[1],
+                        display_name: t[2],
+                        location: t[3],
+                        user_id: t[4],
+                        time: t[5]
+                    }))
+                );
             }
         }
+    }
+
+    const coreChunkBatches: Array<{ kind: CoreChunkKind; rows: unknown[][] }> = [
+        { kind: 'friend_log', rows: coreFriendLogRows },
+        { kind: 'notif_v1', rows: coreNotifV1Rows },
+        { kind: 'notif_v2', rows: coreNotifV2Rows }
+    ];
+    for (const bucket of coreChunkBatches) {
+        if (bucket.rows.length === 0) continue;
+        const res = await appendTuplesToCompactTailChunk({
+            db: legacyDb,
+            archiveTable: 'legacy_core_chunks',
+            kindColumn: 'core_kind',
+            kindValue: bucket.kind,
+            tuples: bucket.rows,
+            dedupKeyFn: (t) => coreTupleDedupKey(bucket.kind, t),
+            fallbackIso: nowIso,
+            maxRows: COMPACT_CHUNK_MAX_ROWS,
+            maxJsonBytes: COMPACT_CHUNK_MAX_BYTES,
+            negateRowIds: true
+        });
+        inserted += res.inserted;
+        if (res.sizeAfter > legacyDbBytes) legacyDbBytes = res.sizeAfter;
     }
 
     if (userEntities.size > 0) {

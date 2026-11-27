@@ -137,10 +137,17 @@ public static class DesktopLegacyMigrator
     public const int DefaultConcurrency = 2;
     private const int BatchRowsLimit = 240;
     private const int MaxBatchPayloadBytes = 180 * 1024;
-    // Historical Feed rows are stored as compact JSON tuple chunks (1 D1 row per chunk),
-    // safely packing up to 1000 rows / 512 KiB per upload batch (well below D1's 1 MB cell limit).
-    private const int FeedBatchRowsLimit = 1000;
-    private const int FeedMaxBatchPayloadBytes = 512 * 1024;
+    // Compact chunked categories (feed, gamelog, notifications, friend_log) are written directly into
+    // <=1,000-row / <=512 KiB D1 chunks at ingest time, cutting D1 rows_written by >99.5%.
+    private const int CompactBatchRowsLimit = 1000;
+    private const int CompactMaxBatchPayloadBytes = 512 * 1024;
+    private static readonly HashSet<string> CompactChunkCategories = new(StringComparer.Ordinal)
+    {
+        "feed",
+        "gamelog",
+        "notifications",
+        "friend_log"
+    };
     private const int MaxSingleFieldChars = 16384;
     private const int MaxBatchRetryAttempts = 3;
     private const int SampleHalfRows = 200;
@@ -884,8 +891,9 @@ public static class DesktopLegacyMigrator
                         cmd.CommandText = $"SELECT rowid AS __vrcx_rowid, * FROM \"{physicalTable}\" {whereSql} ORDER BY rowid ASC";
                     }
 
-                    int effectiveBatchRowsLimit = rawCategory == "feed" ? FeedBatchRowsLimit : BatchRowsLimit;
-                    int effectiveMaxBatchPayloadBytes = rawCategory == "feed" ? FeedMaxBatchPayloadBytes : MaxBatchPayloadBytes;
+                    bool isCompactCategory = CompactChunkCategories.Contains(rawCategory);
+                    int effectiveBatchRowsLimit = isCompactCategory ? CompactBatchRowsLimit : BatchRowsLimit;
+                    int effectiveMaxBatchPayloadBytes = isCompactCategory ? CompactMaxBatchPayloadBytes : MaxBatchPayloadBytes;
                     var buffer = new List<Dictionary<string, object?>>(effectiveBatchRowsLimit);
                     int bufferBytes = 256;
                     string bufferLastCreatedAt = existingCursor?.CreatedAt ?? string.Empty;

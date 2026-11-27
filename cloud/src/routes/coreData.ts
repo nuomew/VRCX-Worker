@@ -1,4 +1,12 @@
-import { decodeCoreChunkRows } from '../db/compactArchive';
+import {
+    appendTuplesToCompactTailChunk,
+    COMPACT_CHUNK_MAX_BYTES,
+    COMPACT_CHUNK_MAX_ROWS,
+    coreTupleDedupKey,
+    decodeCoreChunkRows,
+    mutateArchiveChunks,
+    parseActiveArchiveVirtualRowId
+} from '../db/compactArchive';
 import { getLegacyDb } from '../db/schemaBootstrap';
 import type { Env } from '../env';
 import { loadExternalStorageConfig } from '../storage/objectStorage';
@@ -1257,30 +1265,35 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
                 );
             }
             const nowIso = new Date().toISOString();
-            for (let i = 0; i < list.length; i += 50) {
-                const chunk = list.slice(i, i + 50);
-                await env.DB_CORE.batch(
-                    chunk.map((e) => {
-                        const fn = Number(e.friend_number ?? 0);
-                        return env.DB_CORE.prepare(
-                            `INSERT INTO friend_log_history
-                             (created_at, type, user_id, display_name, previous_display_name, trust_level, previous_trust_level, friend_number)
-                             VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-                        ).bind(
-                            typeof e.created_at === 'string' && e.created_at.trim() ? e.created_at.trim() : nowIso,
-                            String(e.type).trim(),
-                            String(e.user_id).trim(),
-                            typeof e.display_name === 'string' ? e.display_name : '',
-                            typeof e.previous_display_name === 'string' ? e.previous_display_name : '',
-                            typeof e.trust_level === 'string' ? e.trust_level : '',
-                            typeof e.previous_trust_level === 'string' ? e.previous_trust_level : '',
-                            Number.isFinite(fn) ? fn : 0
-                        );
-                    })
-                );
-            }
-            if (list.length > 0) {
-                await incrementCounter(env.DB_CORE, 'friend_log_history', list.length);
+            const tuples: unknown[][] = list.map((e) => {
+                const fn = Number(e.friend_number ?? 0);
+                return [
+                    typeof e.created_at === 'string' && e.created_at.trim() ? e.created_at.trim() : nowIso,
+                    String(e.type).trim(),
+                    String(e.user_id).trim(),
+                    typeof e.display_name === 'string' ? e.display_name : '',
+                    typeof e.previous_display_name === 'string' ? e.previous_display_name : '',
+                    typeof e.trust_level === 'string' ? e.trust_level : '',
+                    typeof e.previous_trust_level === 'string' ? e.previous_trust_level : '',
+                    Number.isFinite(fn) ? fn : 0
+                ];
+            });
+            if (tuples.length > 0) {
+                const res = await appendTuplesToCompactTailChunk({
+                    db: env.DB_CORE,
+                    archiveTable: 'core_archive_chunks',
+                    kindColumn: 'core_kind',
+                    kindValue: 'friend_log',
+                    tuples,
+                    dedupKeyFn: (t) => coreTupleDedupKey('friend_log', t),
+                    fallbackIso: nowIso,
+                    maxRows: COMPACT_CHUNK_MAX_ROWS,
+                    maxJsonBytes: COMPACT_CHUNK_MAX_BYTES,
+                    negateRowIds: false
+                });
+                if (res.inserted > 0) {
+                    await incrementCounter(env.DB_CORE, 'friend_log_history', res.inserted);
+                }
             }
             return Response.json({ ok: true, data: { count: list.length } });
         }
@@ -1288,11 +1301,27 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
             const rawRowId = Number(url.searchParams.get('rowId') ?? '0');
             const rowId = Number.isFinite(rawRowId) && rawRowId > 0 ? Math.floor(rawRowId) : 0;
             if (rowId > 0) {
-                const delRes = await env.DB_CORE.prepare('DELETE FROM friend_log_history WHERE id = ?')
-                    .bind(rowId)
-                    .run();
-                if ((delRes.meta?.changes ?? 0) > 0) {
-                    await incrementCounter(env.DB_CORE, 'friend_log_history', -(delRes.meta?.changes ?? 1));
+                const virtualLoc = parseActiveArchiveVirtualRowId(rowId);
+                let deleted = 0;
+                if (virtualLoc) {
+                    const chunkDel = await mutateArchiveChunks({
+                        db: env.DB_CORE,
+                        archiveTable: 'core_archive_chunks',
+                        kindColumn: 'core_kind',
+                        kindValue: 'friend_log',
+                        chunkIdHint: virtualLoc.chunkId,
+                        stopAfterFirstChunkChange: true,
+                        mutateTuple: (_t, _cid, idx) => (idx === virtualLoc.idxInChunk ? 'delete' : 'keep')
+                    });
+                    deleted = chunkDel.deletedCount;
+                } else {
+                    const delRes = await env.DB_CORE.prepare('DELETE FROM friend_log_history WHERE id = ?')
+                        .bind(rowId)
+                        .run();
+                    deleted = delRes.meta?.changes ?? 0;
+                }
+                if (deleted > 0) {
+                    await incrementCounter(env.DB_CORE, 'friend_log_history', -deleted);
                 }
             } else {
                 const createdAt = (url.searchParams.get('createdAt') ?? '').trim();
@@ -1304,8 +1333,22 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
                     )
                         .bind(createdAt, type, userId)
                         .run();
-                    if ((delRes.meta?.changes ?? 0) > 0) {
-                        await incrementCounter(env.DB_CORE, 'friend_log_history', -(delRes.meta?.changes ?? 1));
+                    const chunkDel = await mutateArchiveChunks({
+                        db: env.DB_CORE,
+                        archiveTable: 'core_archive_chunks',
+                        kindColumn: 'core_kind',
+                        kindValue: 'friend_log',
+                        maxChunksToScan: 12,
+                        mutateTuple: (t) =>
+                            String(t[0] ?? '') === createdAt &&
+                            String(t[1] ?? '') === type &&
+                            String(t[2] ?? '') === userId
+                                ? 'delete'
+                                : 'keep'
+                    });
+                    const deleted = (delRes.meta?.changes ?? 0) + chunkDel.deletedCount;
+                    if (deleted > 0) {
+                        await incrementCounter(env.DB_CORE, 'friend_log_history', -deleted);
                     }
                 }
             }
@@ -1402,87 +1445,103 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
             }
             const nowIso = new Date().toISOString();
             if (body.version === 2) {
-                for (let i = 0; i < list.length; i += 50) {
-                    const chunk = list.slice(i, i + 50);
-                    await env.DB_CORE.batch(
-                        chunk.map((e) =>
-                            env.DB_CORE.prepare(
-                                `INSERT INTO notifications_v2
-                                 (id, created_at, updated_at, expires_at, type, link, link_text, message, title, image_url, seen, sender_user_id, sender_username, data, responses, details)
-                                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                                 ON CONFLICT(id) DO UPDATE SET
-                                    updated_at = CASE WHEN excluded.updated_at != '' THEN excluded.updated_at ELSE notifications_v2.updated_at END,
-                                    expires_at = CASE
-                                        WHEN excluded.expires_at != '' AND (notifications_v2.expires_at = '' OR excluded.expires_at < notifications_v2.expires_at)
-                                            THEN excluded.expires_at
-                                        ELSE notifications_v2.expires_at
-                                    END,
-                                    seen = MAX(notifications_v2.seen, excluded.seen)`
-                            ).bind(
-                                typeof e.id === 'string' && e.id.trim() ? e.id.trim() : crypto.randomUUID(),
-                                String(e.createdAt ?? e.created_at ?? nowIso),
-                                String(e.updatedAt ?? e.updated_at ?? ''),
-                                String(e.expiresAt ?? e.expires_at ?? ''),
-                                String(e.type ?? ''),
-                                String(e.link ?? ''),
-                                String(e.linkText ?? e.link_text ?? ''),
-                                String(e.message ?? ''),
-                                String(e.title ?? ''),
-                                String(e.imageUrl ?? e.image_url ?? ''),
-                                e.seen ? 1 : 0,
-                                String(e.senderUserId ?? e.sender_user_id ?? ''),
-                                String(e.senderUsername ?? e.sender_username ?? ''),
-                                typeof e.data === 'string' ? e.data : JSON.stringify(e.data ?? {}),
-                                typeof e.responses === 'string' ? e.responses : JSON.stringify(e.responses ?? []),
-                                typeof e.details === 'string' ? e.details : JSON.stringify(e.details ?? {})
-                            )
-                        )
-                    );
-                }
-            } else {
-                let insertedCount = 0;
-                const expiredUpdates: string[] = [];
-                for (let i = 0; i < list.length; i += 50) {
-                    const chunk = list.slice(i, i + 50);
-                    const chunkIds: string[] = [];
-                    const results = await env.DB_CORE.batch(
-                        chunk.map((e) => {
-                            const id = typeof e.id === 'string' && e.id.trim() ? e.id.trim() : crypto.randomUUID();
-                            chunkIds.push(id);
-                            const details = isPlainObject(e.details) ? e.details : {};
-                            return env.DB_CORE.prepare(
-                                `INSERT OR IGNORE INTO notifications
-                                 (id, created_at, type, sender_user_id, sender_username, receiver_user_id, message, world_id, world_name, image_url, invite_message, request_message, response_message, expired)
-                                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-                            ).bind(
-                                id,
-                                String(e.created_at ?? nowIso),
-                                String(e.type ?? ''),
-                                String(e.senderUserId ?? ''),
-                                String(e.senderUsername ?? ''),
-                                String(e.receiverUserId ?? ''),
-                                String(e.message ?? ''),
-                                String(details.worldId ?? ''),
-                                String(details.worldName ?? ''),
-                                String(details.imageUrl ?? ''),
-                                String(details.inviteMessage ?? ''),
-                                String(details.requestMessage ?? ''),
-                                String(details.responseMessage ?? ''),
-                                e.$isExpired ? 1 : 0
-                            );
-                        })
-                    );
-                    for (let j = 0; j < results.length; j++) {
-                        const changes = results[j]?.meta?.changes ?? 0;
-                        insertedCount += changes;
-                        if (changes === 0 && chunk[j]?.$isExpired) {
-                            expiredUpdates.push(chunkIds[j]!);
+                const tuples: unknown[][] = list.map((e) => [
+                    String(e.createdAt ?? e.created_at ?? nowIso),
+                    typeof e.id === 'string' && e.id.trim() ? e.id.trim() : crypto.randomUUID(),
+                    String(e.updatedAt ?? e.updated_at ?? ''),
+                    String(e.expiresAt ?? e.expires_at ?? ''),
+                    String(e.type ?? ''),
+                    String(e.link ?? ''),
+                    String(e.linkText ?? e.link_text ?? ''),
+                    String(e.message ?? ''),
+                    String(e.title ?? ''),
+                    String(e.imageUrl ?? e.image_url ?? ''),
+                    e.seen ? 1 : 0,
+                    String(e.senderUserId ?? e.sender_user_id ?? ''),
+                    String(e.senderUsername ?? e.sender_username ?? ''),
+                    typeof e.data === 'string' ? e.data : JSON.stringify(e.data ?? {}),
+                    typeof e.responses === 'string' ? e.responses : JSON.stringify(e.responses ?? []),
+                    typeof e.details === 'string' ? e.details : JSON.stringify(e.details ?? {})
+                ]);
+                await appendTuplesToCompactTailChunk({
+                    db: env.DB_CORE,
+                    archiveTable: 'core_archive_chunks',
+                    kindColumn: 'core_kind',
+                    kindValue: 'notif_v2',
+                    tuples,
+                    dedupKeyFn: (t) => coreTupleDedupKey('notif_v2', t),
+                    mergeConflictTuple: (existing, incoming) => {
+                        const next = [...existing];
+                        let changed = false;
+                        const incUpdated = String(incoming[2] ?? '');
+                        if (incUpdated && incUpdated !== String(existing[2] ?? '')) {
+                            next[2] = incUpdated;
+                            changed = true;
                         }
-                    }
-                }
-                if (expiredUpdates.length > 0) {
-                    for (let i = 0; i < expiredUpdates.length; i += 50) {
-                        const slice = expiredUpdates.slice(i, i + 50);
+                        const curExp = String(existing[3] ?? '');
+                        const incExp = String(incoming[3] ?? '');
+                        if (incExp && (!curExp || incExp < curExp)) {
+                            next[3] = incExp;
+                            changed = true;
+                        }
+                        const mergedSeen = Math.max(Number(existing[10] ?? 0) ? 1 : 0, Number(incoming[10] ?? 0) ? 1 : 0);
+                        if (mergedSeen !== (Number(existing[10] ?? 0) ? 1 : 0)) {
+                            next[10] = mergedSeen;
+                            changed = true;
+                        }
+                        return changed ? next : null;
+                    },
+                    fallbackIso: nowIso,
+                    maxRows: COMPACT_CHUNK_MAX_ROWS,
+                    maxJsonBytes: COMPACT_CHUNK_MAX_BYTES,
+                    negateRowIds: false
+                });
+            } else {
+                const tuples: unknown[][] = list.map((e) => {
+                    const id = typeof e.id === 'string' && e.id.trim() ? e.id.trim() : crypto.randomUUID();
+                    const details = isPlainObject(e.details) ? e.details : {};
+                    return [
+                        String(e.created_at ?? nowIso),
+                        id,
+                        String(e.type ?? ''),
+                        String(e.senderUserId ?? ''),
+                        String(e.senderUsername ?? ''),
+                        String(e.receiverUserId ?? ''),
+                        String(e.message ?? ''),
+                        String(details.worldId ?? ''),
+                        String(details.worldName ?? ''),
+                        String(details.imageUrl ?? ''),
+                        String(details.inviteMessage ?? ''),
+                        String(details.requestMessage ?? ''),
+                        String(details.responseMessage ?? ''),
+                        e.$isExpired ? 1 : 0
+                    ];
+                });
+                const res = await appendTuplesToCompactTailChunk({
+                    db: env.DB_CORE,
+                    archiveTable: 'core_archive_chunks',
+                    kindColumn: 'core_kind',
+                    kindValue: 'notif_v1',
+                    tuples,
+                    dedupKeyFn: (t) => coreTupleDedupKey('notif_v1', t),
+                    mergeConflictTuple: (existing, incoming) => {
+                        if (Number(incoming[13] ?? 0) && !Number(existing[13] ?? 0)) {
+                            const next = [...existing];
+                            next[13] = 1;
+                            return next;
+                        }
+                        return null;
+                    },
+                    fallbackIso: nowIso,
+                    maxRows: COMPACT_CHUNK_MAX_ROWS,
+                    maxJsonBytes: COMPACT_CHUNK_MAX_BYTES,
+                    negateRowIds: false
+                });
+                // Also mark expired in legacy hot single-row table if that id existed there
+                const expiredIds = tuples.filter((t) => Number(t[13] ?? 0) === 1).map((t) => String(t[1] ?? ''));
+                if (expiredIds.length > 0 && res.inserted < list.length) {
+                    for (let i = 0; i < expiredIds.length; i += 50) {
+                        const slice = expiredIds.slice(i, i + 50);
                         await env.DB_CORE.batch(
                             slice.map((id) =>
                                 env.DB_CORE.prepare('UPDATE notifications SET expired = 1 WHERE id = ?').bind(id)
@@ -1490,8 +1549,8 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
                         );
                     }
                 }
-                if (insertedCount > 0) {
-                    await incrementCounter(env.DB_CORE, 'notifications', insertedCount);
+                if (res.inserted > 0) {
+                    await incrementCounter(env.DB_CORE, 'notifications', res.inserted);
                 }
             }
             return Response.json({ ok: true, data: { count: list.length } });
@@ -1527,18 +1586,72 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
             }
             if (body.version === 2) {
                 if (body.expired) {
-                    await env.DB_CORE.prepare('UPDATE notifications_v2 SET expires_at = ?, seen = 1 WHERE id = ?')
-                        .bind(new Date().toISOString(), id)
+                    const nowIso = new Date().toISOString();
+                    const hotRes = await env.DB_CORE.prepare(
+                        'UPDATE notifications_v2 SET expires_at = ?, seen = 1 WHERE id = ?'
+                    )
+                        .bind(nowIso, id)
                         .run();
+                    if ((hotRes.meta?.changes ?? 0) === 0) {
+                        await mutateArchiveChunks({
+                            db: env.DB_CORE,
+                            archiveTable: 'core_archive_chunks',
+                            kindColumn: 'core_kind',
+                            kindValue: 'notif_v2',
+                            maxChunksToScan: 8,
+                            stopAfterFirstChunkChange: true,
+                            mutateTuple: (t) => {
+                                if (String(t[1] ?? '') !== id) return 'keep';
+                                const next = [...t];
+                                next[3] = nowIso;
+                                next[10] = 1;
+                                return next;
+                            }
+                        });
+                    }
                 } else if (typeof body.seen === 'boolean') {
-                    await env.DB_CORE.prepare('UPDATE notifications_v2 SET seen = ? WHERE id = ?')
-                        .bind(body.seen ? 1 : 0, id)
+                    const seenVal = body.seen ? 1 : 0;
+                    const hotRes = await env.DB_CORE.prepare('UPDATE notifications_v2 SET seen = ? WHERE id = ?')
+                        .bind(seenVal, id)
                         .run();
+                    if ((hotRes.meta?.changes ?? 0) === 0) {
+                        await mutateArchiveChunks({
+                            db: env.DB_CORE,
+                            archiveTable: 'core_archive_chunks',
+                            kindColumn: 'core_kind',
+                            kindValue: 'notif_v2',
+                            maxChunksToScan: 8,
+                            stopAfterFirstChunkChange: true,
+                            mutateTuple: (t) => {
+                                if (String(t[1] ?? '') !== id) return 'keep';
+                                const next = [...t];
+                                next[10] = seenVal;
+                                return next;
+                            }
+                        });
+                    }
                 }
             } else if (typeof body.expired === 'boolean') {
-                await env.DB_CORE.prepare('UPDATE notifications SET expired = ? WHERE id = ?')
-                    .bind(body.expired ? 1 : 0, id)
+                const expVal = body.expired ? 1 : 0;
+                const hotRes = await env.DB_CORE.prepare('UPDATE notifications SET expired = ? WHERE id = ?')
+                    .bind(expVal, id)
                     .run();
+                if ((hotRes.meta?.changes ?? 0) === 0) {
+                    await mutateArchiveChunks({
+                        db: env.DB_CORE,
+                        archiveTable: 'core_archive_chunks',
+                        kindColumn: 'core_kind',
+                        kindValue: 'notif_v1',
+                        maxChunksToScan: 8,
+                        stopAfterFirstChunkChange: true,
+                        mutateTuple: (t) => {
+                            if (String(t[1] ?? '') !== id) return 'keep';
+                            const next = [...t];
+                            next[13] = expVal;
+                            return next;
+                        }
+                    });
+                }
             }
             return Response.json({ ok: true });
         }
@@ -1546,8 +1659,20 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
             const version = url.searchParams.get('v') === '2' ? 2 : 1;
             const id = url.searchParams.get('id') ?? '';
             const table = version === 2 ? 'notifications_v2' : 'notifications';
+            const coreKind = version === 2 ? 'notif_v2' : 'notif_v1';
             const delRes = await env.DB_CORE.prepare(`DELETE FROM ${table} WHERE id = ?`).bind(id).run();
-            const deleted = delRes.meta?.changes ?? 0;
+            const chunkDel = id
+                ? await mutateArchiveChunks({
+                      db: env.DB_CORE,
+                      archiveTable: 'core_archive_chunks',
+                      kindColumn: 'core_kind',
+                      kindValue: coreKind,
+                      maxChunksToScan: 12,
+                      stopAfterFirstChunkChange: true,
+                      mutateTuple: (t) => (String(t[1] ?? '') === id ? 'delete' : 'keep')
+                  })
+                : { deletedCount: 0 };
+            const deleted = (delRes.meta?.changes ?? 0) + chunkDel.deletedCount;
             if (version === 1 && deleted > 0) {
                 await incrementCounter(env.DB_CORE, 'notifications', -deleted).catch(() => {});
             }

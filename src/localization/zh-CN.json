@@ -4001,7 +4001,7 @@
             "b2_pricing_hint_suffix": "（前 10 GB 免费，超出后存储费用约为 6.95 美元 / TB / 月）。",
             "status_unsaved": "未保存",
             "compact_heading": "全部 6 库分块压缩瘦身",
-            "compact_desc": "支持对正在使用的全部 6 个数据库（Core / GameLog / Feed / Cache / Legacy / Chat）已有数据进行无损压缩：每 1,000 条打包为 1 行并自动维护统计汇总，同时对 API 缓存做 gzip 原地压缩。所有查询、统计、搜索与导出均 100% 透明兼容。",
+            "compact_desc": "全部 6 个数据库（Core / GameLog / Feed / Cache / Legacy / Chat）的新数据在写入时已直接尾块合并为 ≤1,000 条且 ≤512 KiB / 行（缓存写入即 gzip 压缩），无需定时重复搬运消耗写入行数；点击此按钮可立即压缩升级前的旧单行存量数据与未压缩缓存。",
             "compact_mode_all": "全部已有数据（立即全量压缩）",
             "compact_mode_7d": "保留近 7 天热数据",
             "compact_mode_30d": "保留近 30 天热数据",

@@ -1,3 +1,4 @@
+import { decodeGameLogChunkRows } from '../db/compactArchive';
 import type { Env } from '../env';
 
 export interface QueryPlanRow {
@@ -135,7 +136,13 @@ async function explainPlan(db: D1Database, sql: string, params: unknown[]): Prom
 export async function searchGameLogByEntity(
     env: Env,
     rawQuery: string,
-    options: { limit?: number; includeExplain?: boolean; excludeUserId?: string; includeOtherTypes?: boolean } = {}
+    options: {
+        limit?: number;
+        includeExplain?: boolean;
+        excludeUserId?: string;
+        includeOtherTypes?: boolean;
+        archiveTable?: 'gamelog_archive_chunks' | 'legacy_gamelog_chunks';
+    } = {}
 ): Promise<EntitySearchResult> {
     const query = rawQuery.replaceAll('\u0000', '').trim();
     const limit = clampLimit(options.limit ?? 50);
@@ -399,6 +406,206 @@ export async function searchGameLogByEntity(
                         );
                     })
                     .slice(0, limit);
+            }
+        }
+    }
+
+    // Transparently merge compact GameLog archive chunks (`gamelog_archive_chunks` / `legacy_gamelog_chunks`)
+    // whenever single-row tables have fewer than `limit` matches (skipped during EXPLAIN POC probes when hot rows suffice).
+    const archiveTable = options.archiveTable ?? 'gamelog_archive_chunks';
+    const wantChunkJl = effectiveUserIds.length > 0 && joinLeaveRows.length < limit;
+    const wantChunkLoc = matchedWorldIds.length > 0 && locationRows.length < limit;
+    const wantChunkOther =
+        includeOtherTypes &&
+        (videoPlayRows.length < limit ||
+            eventRows.length < limit ||
+            portalSpawnRows.length < limit ||
+            externalRows.length < limit);
+    if (!options.includeExplain && (wantChunkJl || wantChunkLoc || wantChunkOther)) {
+        const chunkKinds: string[] = [];
+        if (wantChunkJl) chunkKinds.push('join_leave');
+        if (wantChunkLoc) chunkKinds.push('location');
+        if (includeOtherTypes) {
+            if (videoPlayRows.length < limit) chunkKinds.push('video');
+            if (eventRows.length < limit) chunkKinds.push('event');
+            if (portalSpawnRows.length < limit) chunkKinds.push('portal');
+            if (externalRows.length < limit) chunkKinds.push('external');
+        }
+        if (chunkKinds.length > 0) {
+            try {
+                const kindPh = chunkKinds.map(() => '?').join(', ');
+                const chunkRes = await env.DB_GAMELOG.prepare(
+                    `SELECT id, gamelog_kind, payload_json
+                     FROM ${archiveTable}
+                     WHERE gamelog_kind IN (${kindPh})
+                     ORDER BY max_created_at DESC, id DESC
+                     LIMIT 24`
+                )
+                    .bind(...chunkKinds)
+                    .all<{ id: number; gamelog_kind: string; payload_json: string }>();
+                gamelogRowsRead += chunkRes.meta?.rows_read ?? 0;
+
+                const qLower = query.toLowerCase();
+                const effUserSet = new Set(effectiveUserIds);
+                const allUserSet = new Set(matchedUserIds);
+                const worldSet = new Set(matchedWorldIds);
+                const negate = archiveTable === 'legacy_gamelog_chunks';
+
+                const seenJl = new Set(joinLeaveRows.map((r) => `${r.created_at}|${r.type}|${r.display_name}`));
+                const seenLoc = new Set(locationRows.map((r) => `${r.created_at}|${r.location}`));
+                const seenVid = new Set(videoPlayRows.map((r) => `${r.created_at}|${r.video_url}`));
+                const seenEv = new Set(eventRows.map((r) => `${r.created_at}|${r.data}`));
+                const seenPortal = new Set(portalSpawnRows.map((r) => `${r.created_at}|${r.display_name}`));
+                const seenExt = new Set(externalRows.map((r) => `${r.created_at}|${r.message}`));
+
+                for (const c of chunkRes.results ?? []) {
+                    const unpacked = decodeGameLogChunkRows(c.id, c.gamelog_kind, c.payload_json, {
+                        negateRowIds: negate
+                    });
+                    for (const entry of unpacked) {
+                        const rid = Number(entry.rowId ?? 0);
+                        const createdAt = String(entry.created_at ?? '');
+                        if (c.gamelog_kind === 'join_leave' && wantChunkJl) {
+                            const uid = String(entry.userId ?? '');
+                            if (!effUserSet.has(uid) || (excludeUserId && uid === excludeUserId)) continue;
+                            const type = String(entry.type ?? '');
+                            const dname = String(entry.displayName ?? '');
+                            const k = `${createdAt}|${type}|${dname}`;
+                            if (seenJl.has(k)) continue;
+                            seenJl.add(k);
+                            joinLeaveRows.push({
+                                id: rid,
+                                created_at: createdAt,
+                                type,
+                                display_name: dname,
+                                location: String(entry.location ?? ''),
+                                user_id: uid,
+                                time: Number(entry.time ?? 0) || 0
+                            });
+                        } else if (c.gamelog_kind === 'location' && wantChunkLoc) {
+                            const wid = String(entry.worldId ?? '');
+                            if (!worldSet.has(wid)) continue;
+                            const loc = String(entry.location ?? '');
+                            const k = `${createdAt}|${loc}`;
+                            if (seenLoc.has(k)) continue;
+                            seenLoc.add(k);
+                            locationRows.push({
+                                id: rid,
+                                created_at: createdAt,
+                                location: loc,
+                                world_id: wid,
+                                world_name: String(entry.worldName ?? ''),
+                                time: Number(entry.time ?? 0) || 0,
+                                group_name: String(entry.groupName ?? '')
+                            });
+                        } else if (c.gamelog_kind === 'video' && includeOtherTypes) {
+                            const vurl = String(entry.videoUrl ?? '');
+                            const vname = String(entry.videoName ?? '');
+                            const dname = String(entry.displayName ?? '');
+                            const loc = String(entry.location ?? '');
+                            const uid = String(entry.userId ?? '');
+                            if (
+                                !(
+                                    allUserSet.has(uid) ||
+                                    vname.toLowerCase().includes(qLower) ||
+                                    vurl.toLowerCase().includes(qLower) ||
+                                    dname.toLowerCase().includes(qLower) ||
+                                    loc.toLowerCase().includes(qLower)
+                                )
+                            ) {
+                                continue;
+                            }
+                            const k = `${createdAt}|${vurl}`;
+                            if (seenVid.has(k)) continue;
+                            seenVid.add(k);
+                            videoPlayRows.push({
+                                id: rid,
+                                created_at: createdAt,
+                                video_url: vurl,
+                                video_name: vname,
+                                video_id: String(entry.videoId ?? ''),
+                                location: loc,
+                                display_name: dname,
+                                user_id: uid
+                            });
+                        } else if (c.gamelog_kind === 'event' && includeOtherTypes) {
+                            const data = String(entry.data ?? '');
+                            if (!data.toLowerCase().includes(qLower)) continue;
+                            const k = `${createdAt}|${data}`;
+                            if (seenEv.has(k)) continue;
+                            seenEv.add(k);
+                            eventRows.push({ id: rid, created_at: createdAt, data });
+                        } else if (c.gamelog_kind === 'portal' && includeOtherTypes) {
+                            const dname = String(entry.displayName ?? '');
+                            const loc = String(entry.location ?? '');
+                            const uid = String(entry.userId ?? '');
+                            const instId = String(entry.instanceId ?? '');
+                            const wname = String(entry.worldName ?? '');
+                            const wid = (instId || loc).split(':')[0] ?? '';
+                            if (
+                                !(
+                                    allUserSet.has(uid) ||
+                                    worldSet.has(wid) ||
+                                    dname.toLowerCase().includes(qLower) ||
+                                    wname.toLowerCase().includes(qLower) ||
+                                    instId.toLowerCase().includes(qLower) ||
+                                    loc.toLowerCase().includes(qLower)
+                                )
+                            ) {
+                                continue;
+                            }
+                            const k = `${createdAt}|${dname}`;
+                            if (seenPortal.has(k)) continue;
+                            seenPortal.add(k);
+                            portalSpawnRows.push({
+                                id: rid,
+                                created_at: createdAt,
+                                display_name: dname,
+                                location: loc,
+                                user_id: uid,
+                                instance_id: instId,
+                                world_name: wname
+                            });
+                        } else if (c.gamelog_kind === 'external' && includeOtherTypes) {
+                            const msg = String(entry.message ?? '');
+                            const dname = String(entry.displayName ?? '');
+                            const uid = String(entry.userId ?? '');
+                            if (
+                                !(
+                                    allUserSet.has(uid) ||
+                                    msg.toLowerCase().includes(qLower) ||
+                                    dname.toLowerCase().includes(qLower)
+                                )
+                            ) {
+                                continue;
+                            }
+                            const k = `${createdAt}|${msg}`;
+                            if (seenExt.has(k)) continue;
+                            seenExt.add(k);
+                            externalRows.push({
+                                id: rid,
+                                created_at: createdAt,
+                                message: msg,
+                                display_name: dname,
+                                user_id: uid,
+                                location: String(entry.location ?? '')
+                            });
+                        }
+                    }
+                }
+
+                const byDateDesc = <T extends { created_at: string }>(arr: T[]): T[] =>
+                    arr.sort((a, b) => String(b.created_at ?? '').localeCompare(String(a.created_at ?? ''))).slice(0, limit);
+                joinLeaveRows = byDateDesc(joinLeaveRows);
+                locationRows = byDateDesc(locationRows);
+                if (includeOtherTypes) {
+                    videoPlayRows = byDateDesc(videoPlayRows);
+                    eventRows = byDateDesc(eventRows);
+                    portalSpawnRows = byDateDesc(portalSpawnRows);
+                    externalRows = byDateDesc(externalRows);
+                }
+            } catch {
+                // Graceful fallback if archive table is not initialized
             }
         }
     }

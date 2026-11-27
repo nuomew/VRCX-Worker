@@ -8,6 +8,14 @@ import {
     type RssSnapshotPayload,
     type VrcCacheTier
 } from '../cache/vrcCache';
+import {
+    appendTuplesToCompactTailChunk,
+    COMPACT_CHUNK_MAX_BYTES,
+    COMPACT_CHUNK_MAX_ROWS,
+    coreTupleDedupKey,
+    decodeCoreChunkRows,
+    decodeFeedChunkRows
+} from '../db/compactArchive';
 import { getCacheDb } from '../db/schemaBootstrap';
 import type { Env } from '../env';
 import { parseCloudSyncIntervalSeconds, parseWebSyncIntervalSeconds } from '../routes/coreData';
@@ -385,6 +393,29 @@ async function hydrateMissingOnlineAtFromFeed(env: Env, snapshot: FriendSnapshot
                 const ts = row.created_at ? Date.parse(row.created_at) : NaN;
                 if (Number.isFinite(ts) && ts > 0) {
                     latestByUser.set(uid, { type: String(row.type ?? ''), ts });
+                }
+            }
+        }
+        // Also inspect latest compact feed_archive_chunks ('oo') when hot single-row table missed users
+        if (latestByUser.size < boundedIds.length) {
+            const missingSet = new Set(boundedIds.filter((id) => !latestByUser.has(id)));
+            const ooChunks = await env.DB_FEED.prepare(
+                "SELECT id, payload_json FROM feed_archive_chunks WHERE feed_kind = 'oo' ORDER BY max_created_at DESC, id DESC LIMIT 4"
+            ).all<{ id: number; payload_json: string }>();
+            for (const c of ooChunks.results ?? []) {
+                const unpacked = decodeFeedChunkRows(c.id, 'oo', c.payload_json, { negateRowIds: false });
+                for (let i = unpacked.length - 1; i >= 0; i--) {
+                    const entry = unpacked[i]!;
+                    const uid = String(entry.userId ?? '');
+                    if (!uid || !missingSet.has(uid)) continue;
+                    const tp = String(entry.type ?? '');
+                    if (tp !== 'Online' && tp !== 'Offline') continue;
+                    const ts = Date.parse(String(entry.created_at ?? ''));
+                    if (!Number.isFinite(ts) || ts <= 0) continue;
+                    const prev = latestByUser.get(uid);
+                    if (!prev || ts > prev.ts) {
+                        latestByUser.set(uid, { type: tp, ts });
+                    }
                 }
             }
         }
@@ -963,14 +994,15 @@ async function fetchNotificationsForSync(
     webSyncIntervalSeconds: number
 ): Promise<{
     v1Ids: string[];
-    v1Stmts: D1PreparedStatement[];
+    v1Tuples: unknown[][];
     v2Items: Array<Record<string, unknown>>;
     cacheWrites: PendingVrcCacheWrite[];
     cookieChanged: boolean;
 }> {
+    void env;
     let cookieChanged = false;
     const v1Ids: string[] = [];
-    const v1Stmts: D1PreparedStatement[] = [];
+    const v1Tuples: unknown[][] = [];
     let v2Items: Array<Record<string, unknown>> = [];
     const cacheWrites: PendingVrcCacheWrite[] = [];
     const notifTtlMs = Math.max(60, webSyncIntervalSeconds) * 1000;
@@ -1007,27 +1039,22 @@ async function fetchNotificationsForSync(
                 } else if (raw.details && typeof raw.details === 'object') {
                     details = raw.details as Record<string, unknown>;
                 }
-                v1Stmts.push(
-                    env.DB_CORE.prepare(
-                        `INSERT OR IGNORE INTO notifications
-                         (id, created_at, type, sender_user_id, sender_username, receiver_user_id, message, world_id, world_name, image_url, invite_message, request_message, response_message, expired)
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`
-                    ).bind(
-                        id,
-                        String(raw.created_at ?? nowIso),
-                        type,
-                        String(raw.senderUserId ?? ''),
-                        String(raw.senderUsername ?? ''),
-                        String(raw.receiverUserId ?? ''),
-                        String(raw.message ?? ''),
-                        String(details.worldId ?? ''),
-                        String(details.worldName ?? ''),
-                        String(details.imageUrl ?? ''),
-                        String(details.inviteMessage ?? ''),
-                        String(details.requestMessage ?? ''),
-                        String(details.responseMessage ?? '')
-                    )
-                );
+                v1Tuples.push([
+                    String(raw.created_at ?? nowIso),
+                    id,
+                    type,
+                    String(raw.senderUserId ?? ''),
+                    String(raw.senderUsername ?? ''),
+                    String(raw.receiverUserId ?? ''),
+                    String(raw.message ?? ''),
+                    String(details.worldId ?? ''),
+                    String(details.worldName ?? ''),
+                    String(details.imageUrl ?? ''),
+                    String(details.inviteMessage ?? ''),
+                    String(details.requestMessage ?? ''),
+                    String(details.responseMessage ?? ''),
+                    0
+                ]);
             }
         }
     } catch {
@@ -1057,7 +1084,7 @@ async function fetchNotificationsForSync(
         // Non-fatal
     }
 
-    return { v1Ids, v1Stmts, v2Items, cacheWrites, cookieChanged };
+    return { v1Ids, v1Tuples, v2Items, cacheWrites, cookieChanged };
 }
 
 function computeTrustLevelFromTags(tags: unknown): string {
@@ -1093,13 +1120,14 @@ async function prepareFriendLogChanges(
     savedOwnerUserId: string
 ): Promise<{
     inserted: number;
+    historyTuples: unknown[][];
     dbStmts: D1PreparedStatement[];
     cookieChanged: boolean;
     nextFriendMembershipCheckAt?: string;
 }> {
     if (rows.length === 0) {
         // Baseline has not been initialized by the Web client yet; avoid emitting false Friend events.
-        return { inserted: 0, dbStmts: [], cookieChanged: false };
+        return { inserted: 0, historyTuples: [], dbStmts: [], cookieChanged: false };
     }
 
     const currentMap = new Map<
@@ -1236,6 +1264,7 @@ async function prepareFriendLogChanges(
                     // reset baseline and record new owner without emitting bogus cross-account Friend/Unfriend history.
                     return {
                         inserted: 0,
+                        historyTuples: [],
                         cookieChanged,
                         nextFriendMembershipCheckAt: nowIso,
                         dbStmts: [
@@ -1344,24 +1373,16 @@ async function prepareFriendLogChanges(
             ).bind(STATE_KEY_FRIEND_LOG_OWNER, JSON.stringify({ userId: resolvedOwnerUserId }), nowIso)
         );
     }
-    for (const h of historyWrites) {
-        dbStmts.push(
-            env.DB_CORE.prepare(
-                `INSERT INTO friend_log_history
-                 (created_at, type, user_id, display_name, previous_display_name, trust_level, previous_trust_level, friend_number)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-            ).bind(
-                nowIso,
-                h.type,
-                h.userId,
-                h.displayName,
-                h.previousDisplayName,
-                h.trustLevel,
-                h.previousTrustLevel,
-                h.friendNumber
-            )
-        );
-    }
+    const historyTuples: unknown[][] = historyWrites.map((h) => [
+        nowIso,
+        h.type,
+        h.userId,
+        h.displayName,
+        h.previousDisplayName,
+        h.trustLevel,
+        h.previousTrustLevel,
+        h.friendNumber
+    ]);
     for (const u of currentUpserts.values()) {
         dbStmts.push(
             env.DB_CORE.prepare(
@@ -1375,6 +1396,7 @@ async function prepareFriendLogChanges(
 
     return {
         inserted: historyWrites.length,
+        historyTuples,
         dbStmts,
         cookieChanged,
         ...(nextFriendMembershipCheckAt ? { nextFriendMembershipCheckAt } : {})
@@ -1686,6 +1708,12 @@ export async function runBackgroundFeedSync(
                 env.DB_CORE.prepare(`SELECT id FROM notifications_v2 WHERE id IN (${ph})`).bind(...chunkIds)
             );
         }
+        const chunkReadIdx = combinedReadStmts.length;
+        combinedReadStmts.push(
+            env.DB_CORE.prepare(
+                "SELECT id, core_kind, payload_json FROM core_archive_chunks WHERE core_kind IN ('notif_v1', 'notif_v2') ORDER BY max_created_at DESC, id DESC LIMIT 4"
+            )
+        );
         const combinedReadResults = await env.DB_CORE.batch(combinedReadStmts);
         const friendLogCurrentRows = (combinedReadResults[0]?.results ?? []) as FriendLogCurrentRow[];
         const ownerRow = (combinedReadResults[1]?.results?.[0] ?? null) as { payload_json?: string } | null;
@@ -1699,9 +1727,22 @@ export async function runBackgroundFeedSync(
             }
         }
         const existingV2Ids = new Set<string>();
-        for (let i = v2ReadStartIdx; i < combinedReadResults.length; i++) {
+        for (let i = v2ReadStartIdx; i < chunkReadIdx; i++) {
             for (const row of (combinedReadResults[i]?.results ?? []) as Array<{ id: string }>) {
                 existingV2Ids.add(row.id);
+            }
+        }
+        for (const c of (combinedReadResults[chunkReadIdx]?.results ?? []) as Array<{
+            id: number;
+            core_kind: string;
+            payload_json: string;
+        }>) {
+            const unpacked = decodeCoreChunkRows(c.id, c.core_kind, c.payload_json, { negateRowIds: false });
+            for (const entry of unpacked) {
+                const eid = String(entry.id ?? '');
+                if (!eid) continue;
+                if (c.core_kind === 'notif_v1') existingV1Ids.add(eid);
+                else if (c.core_kind === 'notif_v2') existingV2Ids.add(eid);
             }
         }
 
@@ -1783,7 +1824,7 @@ export async function runBackgroundFeedSync(
                 : {})
         };
 
-        const coreFinalStmts: D1PreparedStatement[] = [...notifFetch.v1Stmts];
+        const coreFinalStmts: D1PreparedStatement[] = [];
         for (const [worldId, worldName] of worldRes.worldsToUpsert.entries()) {
             coreFinalStmts.push(
                 env.DB_CORE.prepare(
@@ -1796,6 +1837,7 @@ export async function runBackgroundFeedSync(
             );
         }
         coreFinalStmts.push(...bioRes.profileWrites);
+        const v2Tuples: unknown[][] = [];
         for (const e of notifFetch.v2Items) {
             const notifType = String(e.type ?? '');
             let msg = String(e.message ?? '');
@@ -1827,46 +1869,86 @@ export async function runBackgroundFeedSync(
                     imageUrl = `${VRC_API_BASE}/file/${emojiId}/${emojiVersion}`;
                 }
             }
-            coreFinalStmts.push(
-                env.DB_CORE.prepare(
-                    `INSERT INTO notifications_v2
-                     (id, created_at, updated_at, expires_at, type, link, link_text, message, title, image_url, seen, sender_user_id, sender_username, data, responses, details)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                     ON CONFLICT(id) DO UPDATE SET
-                        updated_at = CASE WHEN excluded.updated_at != '' THEN excluded.updated_at ELSE notifications_v2.updated_at END,
-                        expires_at = CASE
-                            WHEN excluded.expires_at != '' AND (notifications_v2.expires_at = '' OR excluded.expires_at < notifications_v2.expires_at)
-                                THEN excluded.expires_at
-                            ELSE notifications_v2.expires_at
-                        END,
-                        seen = MAX(notifications_v2.seen, excluded.seen),
-                        link = excluded.link,
-                        link_text = excluded.link_text,
-                        message = excluded.message,
-                        title = excluded.title,
-                        image_url = excluded.image_url,
-                        data = excluded.data,
-                        responses = excluded.responses,
-                        details = excluded.details`
-                ).bind(
-                    String(e.id),
-                    String(e.createdAt ?? e.created_at ?? nowIso),
-                    String(e.updatedAt ?? e.updated_at ?? ''),
-                    String(e.expiresAt ?? e.expires_at ?? ''),
-                    notifType,
-                    String(e.link ?? ''),
-                    String(e.linkText ?? e.link_text ?? ''),
-                    msg,
-                    title,
-                    imageUrl,
-                    e.seen ? 1 : 0,
-                    String(e.senderUserId ?? e.sender_user_id ?? ''),
-                    String(e.senderUsername ?? e.sender_username ?? ''),
-                    typeof e.data === 'string' ? e.data : JSON.stringify(e.data ?? {}),
-                    typeof e.responses === 'string' ? e.responses : JSON.stringify(e.responses ?? []),
-                    typeof e.details === 'string' ? e.details : JSON.stringify(e.details ?? {})
-                )
-            );
+            v2Tuples.push([
+                String(e.createdAt ?? e.created_at ?? nowIso),
+                String(e.id),
+                String(e.updatedAt ?? e.updated_at ?? ''),
+                String(e.expiresAt ?? e.expires_at ?? ''),
+                notifType,
+                String(e.link ?? ''),
+                String(e.linkText ?? e.link_text ?? ''),
+                msg,
+                title,
+                imageUrl,
+                e.seen ? 1 : 0,
+                String(e.senderUserId ?? e.sender_user_id ?? ''),
+                String(e.senderUsername ?? e.sender_username ?? ''),
+                typeof e.data === 'string' ? e.data : JSON.stringify(e.data ?? {}),
+                typeof e.responses === 'string' ? e.responses : JSON.stringify(e.responses ?? []),
+                typeof e.details === 'string' ? e.details : JSON.stringify(e.details ?? {})
+            ]);
+        }
+        // Directly append v1/v2 notifications & friend_log_history into compact <=1,000-row chunks at write time
+        const freshV1Tuples = notifFetch.v1Tuples.filter((t) => !existingV1Ids.has(String(t[1] ?? '')));
+        if (freshV1Tuples.length > 0) {
+            await appendTuplesToCompactTailChunk({
+                db: env.DB_CORE,
+                archiveTable: 'core_archive_chunks',
+                kindColumn: 'core_kind',
+                kindValue: 'notif_v1',
+                tuples: freshV1Tuples,
+                dedupKeyFn: (t) => coreTupleDedupKey('notif_v1', t),
+                fallbackIso: nowIso,
+                maxRows: COMPACT_CHUNK_MAX_ROWS,
+                maxJsonBytes: COMPACT_CHUNK_MAX_BYTES,
+                negateRowIds: false
+            });
+        }
+        if (v2Tuples.length > 0) {
+            await appendTuplesToCompactTailChunk({
+                db: env.DB_CORE,
+                archiveTable: 'core_archive_chunks',
+                kindColumn: 'core_kind',
+                kindValue: 'notif_v2',
+                tuples: v2Tuples,
+                dedupKeyFn: (t) => coreTupleDedupKey('notif_v2', t),
+                mergeConflictTuple: (existing, incoming) => {
+                    const next = [...existing];
+                    const incUpdated = String(incoming[2] ?? '');
+                    if (incUpdated) next[2] = incUpdated;
+                    const curExp = String(existing[3] ?? '');
+                    const incExp = String(incoming[3] ?? '');
+                    if (incExp && (!curExp || incExp < curExp)) next[3] = incExp;
+                    next[5] = incoming[5];
+                    next[6] = incoming[6];
+                    next[7] = incoming[7];
+                    next[8] = incoming[8];
+                    next[9] = incoming[9];
+                    next[10] = Math.max(Number(existing[10] ?? 0) ? 1 : 0, Number(incoming[10] ?? 0) ? 1 : 0);
+                    next[13] = incoming[13];
+                    next[14] = incoming[14];
+                    next[15] = incoming[15];
+                    return JSON.stringify(next) !== JSON.stringify(existing) ? next : null;
+                },
+                fallbackIso: nowIso,
+                maxRows: COMPACT_CHUNK_MAX_ROWS,
+                maxJsonBytes: COMPACT_CHUNK_MAX_BYTES,
+                negateRowIds: false
+            });
+        }
+        if (friendLogPrep.historyTuples.length > 0) {
+            await appendTuplesToCompactTailChunk({
+                db: env.DB_CORE,
+                archiveTable: 'core_archive_chunks',
+                kindColumn: 'core_kind',
+                kindValue: 'friend_log',
+                tuples: friendLogPrep.historyTuples,
+                dedupKeyFn: (t) => coreTupleDedupKey('friend_log', t),
+                fallbackIso: nowIso,
+                maxRows: COMPACT_CHUNK_MAX_ROWS,
+                maxJsonBytes: COMPACT_CHUNK_MAX_BYTES,
+                negateRowIds: false
+            });
         }
         coreFinalStmts.push(...friendLogPrep.dbStmts);
         if (v1Added > 0) {
@@ -2112,17 +2194,27 @@ export async function getRssAggregatedFeed(
         };
     }
 
-    const [feedResults, notifResults] = await Promise.all([
+    const [feedResults, feedChunkRes, notifResults, notifChunkRes] = await Promise.all([
         env.DB_FEED.batch([
             env.DB_FEED.prepare('SELECT * FROM feed_gps ORDER BY id DESC LIMIT 30'),
             env.DB_FEED.prepare('SELECT * FROM feed_online_offline ORDER BY id DESC LIMIT 30'),
             env.DB_FEED.prepare('SELECT * FROM feed_status ORDER BY id DESC LIMIT 30'),
             env.DB_FEED.prepare('SELECT * FROM feed_bio ORDER BY id DESC LIMIT 30')
         ]),
+        env.DB_FEED.prepare(
+            'SELECT id, feed_kind, payload_json FROM feed_archive_chunks ORDER BY max_created_at DESC, id DESC LIMIT 8'
+        )
+            .all<{ id: number; feed_kind: string; payload_json: string }>()
+            .catch(() => ({ results: [] as Array<{ id: number; feed_kind: string; payload_json: string }> })),
         env.DB_CORE.batch([
             env.DB_CORE.prepare('SELECT * FROM notifications ORDER BY created_at DESC LIMIT 50'),
             env.DB_CORE.prepare('SELECT * FROM notifications_v2 ORDER BY created_at DESC LIMIT 50')
-        ])
+        ]),
+        env.DB_CORE.prepare(
+            "SELECT id, core_kind, payload_json FROM core_archive_chunks WHERE core_kind IN ('notif_v1', 'notif_v2') ORDER BY max_created_at DESC, id DESC LIMIT 6"
+        )
+            .all<{ id: number; core_kind: string; payload_json: string }>()
+            .catch(() => ({ results: [] as Array<{ id: number; core_kind: string; payload_json: string }> }))
     ]);
 
     const recentFeeds: Array<Record<string, unknown>> = [];
@@ -2183,13 +2275,48 @@ export async function getRssAggregatedFeed(
             )
         });
     }
-    recentFeeds.sort((a, b) => String(b.created_at ?? '').localeCompare(String(a.created_at ?? '')));
+    for (const c of feedChunkRes.results ?? []) {
+        recentFeeds.push(...decodeFeedChunkRows(c.id, c.feed_kind, c.payload_json, { negateRowIds: false }));
+    }
+    const seenFeedKeys = new Set<string>();
+    const dedupedFeeds = recentFeeds.filter((f) => {
+        const k = `${String(f.type ?? '')}|${String(f.created_at ?? '')}|${String(f.userId ?? '')}|${String(f.location ?? f.status ?? f.bio ?? '')}`;
+        if (seenFeedKeys.has(k)) return false;
+        seenFeedKeys.add(k);
+        return true;
+    });
+    dedupedFeeds.sort((a, b) => String(b.created_at ?? '').localeCompare(String(a.created_at ?? '')));
     const filteredFeeds = since
-        ? recentFeeds.filter((f) => String(f.created_at ?? '') > since).slice(0, 60)
-        : recentFeeds.slice(0, 60);
+        ? dedupedFeeds.filter((f) => String(f.created_at ?? '') > since).slice(0, 60)
+        : dedupedFeeds.slice(0, 60);
 
-    const rawV1 = (notifResults[0] as D1Result<Record<string, unknown>> | undefined)?.results ?? [];
-    const rawV2 = (notifResults[1] as D1Result<Record<string, unknown>> | undefined)?.results ?? [];
+    const rawV1Hot = (notifResults[0] as D1Result<Record<string, unknown>> | undefined)?.results ?? [];
+    const rawV2Hot = (notifResults[1] as D1Result<Record<string, unknown>> | undefined)?.results ?? [];
+    const rawV1Map = new Map<string, Record<string, unknown>>();
+    const rawV2Map = new Map<string, Record<string, unknown>>();
+    for (const r of rawV1Hot) {
+        const id = String(r.id ?? '');
+        if (id) rawV1Map.set(id, r);
+    }
+    for (const r of rawV2Hot) {
+        const id = String(r.id ?? '');
+        if (id) rawV2Map.set(id, r);
+    }
+    for (const c of notifChunkRes.results ?? []) {
+        const unpacked = decodeCoreChunkRows(c.id, c.core_kind, c.payload_json, { negateRowIds: false });
+        for (const r of unpacked) {
+            const id = String(r.id ?? '');
+            if (!id) continue;
+            if (c.core_kind === 'notif_v1' && !rawV1Map.has(id)) rawV1Map.set(id, r);
+            else if (c.core_kind === 'notif_v2' && !rawV2Map.has(id)) rawV2Map.set(id, r);
+        }
+    }
+    const rawV1 = Array.from(rawV1Map.values())
+        .sort((a, b) => String(b.created_at ?? '').localeCompare(String(a.created_at ?? '')))
+        .slice(0, 50);
+    const rawV2 = Array.from(rawV2Map.values())
+        .sort((a, b) => String(b.created_at ?? '').localeCompare(String(a.created_at ?? '')))
+        .slice(0, 50);
 
     const notificationsV1 = rawV1.map((r) => ({
         id: String(r.id ?? ''),

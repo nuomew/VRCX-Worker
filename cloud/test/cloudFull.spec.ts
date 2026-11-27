@@ -2,6 +2,7 @@ import { env as rawEnv, exports as rawExports } from 'cloudflare:workers';
 import { beforeAll, describe, expect, it, vi } from 'vitest';
 import { getMasterKey, isSameOriginRequest, MAX_2FA_TRUST_SECONDS } from '../src/auth/auth';
 import { generateTotpCode, hmacSha256Hex, sha256Hex, sign2faTrustCookie, verifyPasscode } from '../src/crypto/vault';
+import { ACTIVE_ARCHIVE_ROWID_BASE, maybeRunDailyAutoCompaction } from '../src/db/compactArchive';
 import type { Env } from '../src/env';
 import worker from '../src/index';
 import { incrementCounter } from '../src/routes/coreData';
@@ -3269,10 +3270,11 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ version: 2, id: 'not_v2_w3_exp', expired: true })
         });
-        const n2Row = await env.DB_CORE.prepare("SELECT seen, expires_at FROM notifications_v2 WHERE id = 'not_v2_w3_exp'").first<{
-            seen: number;
-            expires_at: string;
-        }>();
+        const n2ListRes = await exports.default.fetch('http://example.com/api/notifications?v=2&limit=50');
+        const n2ListJson = (await n2ListRes.json()) as {
+            data: Array<{ id: string; seen: number; expires_at: string }>;
+        };
+        const n2Row = n2ListJson.data.find((r) => r.id === 'not_v2_w3_exp');
         expect(n2Row?.seen).toBe(1);
         expect(n2Row?.expires_at).toBeTruthy();
 
@@ -4189,23 +4191,36 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
             `http://example.com/api/gamelog?kind=OnPlayerJoined&createdAt=${encodeURIComponent(sameSec)}`,
             { method: 'DELETE' }
         );
-        const stillBoth = await env.DB_GAMELOG.prepare(
-            'SELECT display_name FROM gamelog_join_leave WHERE created_at = ? ORDER BY display_name'
-        )
-            .bind(sameSec)
-            .all<{ display_name: string }>();
-        expect((stillBoth.results ?? []).map((r) => r.display_name)).toEqual(['SameSecAlice', 'SameSecBob']);
+        const stillBothRes = await exports.default.fetch('http://example.com/api/gamelog/query', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ types: ['OnPlayerJoined'], limit: 50 })
+        });
+        const stillBothJson = (await stillBothRes.json()) as {
+            data: Array<{ created_at: string; displayName: string }>;
+        };
+        expect(
+            stillBothJson.data
+                .filter((r) => r.created_at === sameSec)
+                .map((r) => r.displayName)
+                .sort()
+        ).toEqual(['SameSecAlice', 'SameSecBob']);
         // Providing displayName deletes ONLY Alice
         await exports.default.fetch(
             `http://example.com/api/gamelog?kind=OnPlayerJoined&createdAt=${encodeURIComponent(sameSec)}&displayName=SameSecAlice`,
             { method: 'DELETE' }
         );
-        const onlyBob = await env.DB_GAMELOG.prepare(
-            'SELECT display_name FROM gamelog_join_leave WHERE created_at = ?'
-        )
-            .bind(sameSec)
-            .all<{ display_name: string }>();
-        expect((onlyBob.results ?? []).map((r) => r.display_name)).toEqual(['SameSecBob']);
+        const onlyBobRes = await exports.default.fetch('http://example.com/api/gamelog/query', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ types: ['OnPlayerJoined'], limit: 50 })
+        });
+        const onlyBobJson = (await onlyBobRes.json()) as {
+            data: Array<{ created_at: string; displayName: string }>;
+        };
+        expect(onlyBobJson.data.filter((r) => r.created_at === sameSec).map((r) => r.displayName)).toEqual([
+            'SameSecBob'
+        ]);
 
         // Third-party allowlisted POST to /api/1/logout must NOT delete VRChat cloud_cookie_vault
         await exports.default.fetch('http://example.com/api/vrc/cookies', {
@@ -4706,14 +4721,16 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
             { method: 'DELETE' }
         );
         expect(delInstRes.status).toBe(200);
-        const locStillThere = await env.DB_GAMELOG.prepare('SELECT COUNT(*) AS c FROM gamelog_location WHERE location = ?')
-            .bind(w8Loc1)
-            .first<{ c: number }>();
-        const jlStillThere = await env.DB_GAMELOG.prepare('SELECT COUNT(*) AS c FROM gamelog_join_leave WHERE location = ?')
-            .bind(w8Loc1)
-            .first<{ c: number }>();
-        expect(locStillThere?.c).toBe(0);
-        expect(jlStillThere?.c).toBeGreaterThanOrEqual(1);
+        const byLocAfterDelRes = await exports.default.fetch(
+            `http://example.com/api/gamelog/by-location?location=${encodeURIComponent(w8Loc1)}`
+        );
+        const byLocAfterDelJson = (await byLocAfterDelRes.json()) as {
+            data: Array<{ type: string; location: string }>;
+        };
+        expect(byLocAfterDelJson.data.filter((r) => r.type === 'Location')).toHaveLength(0);
+        expect(
+            byLocAfterDelJson.data.filter((r) => r.type === 'OnPlayerJoined' || r.type === 'OnPlayerLeft').length
+        ).toBeGreaterThanOrEqual(1);
 
         // /api/feed/search matches grp_... AND group_name across feed_gps & feed_online_offline even when a friend's displayName contains the group name
         await exports.default.fetch('http://example.com/api/feed', {
@@ -5096,10 +5113,14 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
             })
         });
         expect(emptyIdNotyRes.status).toBe(200);
-        const emptyIdCount = await env.DB_CORE.prepare(
-            "SELECT COUNT(*) AS c FROM notifications WHERE sender_user_id IN ('usr_w9_n1', 'usr_w9_n2') AND id != ''"
-        ).first<{ c: number }>();
-        expect(emptyIdCount?.c).toBe(2);
+        const emptyIdNotyListRes = await exports.default.fetch('http://example.com/api/notifications?v=1&limit=100');
+        const emptyIdNotyListJson = (await emptyIdNotyListRes.json()) as {
+            data: Array<{ id: string; sender_user_id: string }>;
+        };
+        const emptyIdMatched = emptyIdNotyListJson.data.filter(
+            (r) => (r.sender_user_id === 'usr_w9_n1' || r.sender_user_id === 'usr_w9_n2') && r.id !== ''
+        );
+        expect(emptyIdMatched).toHaveLength(2);
 
         // 9. serializeBoundedRssSnapshot marks onlineFriendsTruncated when Tier-3 slicing triggers
         const hugeFriends = Array.from({ length: 6500 }, (_, i) => ({
@@ -5295,10 +5316,15 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
         } finally {
             fetchSpy.mockRestore();
         }
-        const boopRows = await env.DB_CORE.prepare(
-            "SELECT id, title, message, image_url FROM notifications_v2 WHERE id IN ('not_w10_boop_custom', 'not_w10_boop_default') ORDER BY id ASC"
-        ).all<{ id: string; title: string; message: string; image_url: string }>();
-        const byId = new Map((boopRows.results ?? []).map((r) => [r.id, r]));
+        const boopListRes = await exports.default.fetch('http://example.com/api/notifications?v=2&limit=100');
+        const boopListJson = (await boopListRes.json()) as {
+            data: Array<{ id: string; title: string; message: string; image_url: string }>;
+        };
+        const byId = new Map(
+            boopListJson.data
+                .filter((r) => r.id === 'not_w10_boop_custom' || r.id === 'not_w10_boop_default')
+                .map((r) => [r.id, { id: r.id, title: r.title, message: r.message, image_url: r.image_url }])
+        );
         expect(byId.get('not_w10_boop_custom')).toEqual({
             id: 'not_w10_boop_custom',
             title: '',
@@ -7804,6 +7830,7 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
         } finally {
             await env.DB_CHAT?.batch([
                 env.DB_CHAT.prepare('DELETE FROM cloud_chat_messages'),
+                env.DB_CHAT.prepare('DELETE FROM chat_archive_chunks'),
                 env.DB_CHAT.prepare('DELETE FROM cloud_chat_config')
             ]).catch(() => {});
             await env.DB_CORE.batch([
@@ -8082,18 +8109,29 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
             const gameChatFrame = await webReceivedGameChat;
             expect(gameChatFrame).toContain('"direction":"desktop_sync"');
 
-            // Verify both messages persisted cleanly inside dedicated DB_CHAT
-            const chatDbRows = await env.DB_CHAT!.prepare(
-                'SELECT id, status, source_text FROM cloud_chat_messages WHERE id IN (?, ?)'
-            )
-                .bind(sendJson.data.message.id, 'osc_rt_in_1')
-                .all<{ id: string; status: string; source_text: string }>();
-            expect(chatDbRows.results ?? []).toHaveLength(2);
-            expect((chatDbRows.results ?? []).find((r) => r.id === sendJson.data.message.id)?.status).toBe('sent');
-            expect((chatDbRows.results ?? []).find((r) => r.id === 'osc_rt_in_1')?.source_text).toBe('游戏里刚打的字');
+            // Verify both messages persisted cleanly inside dedicated DB_CHAT (directly into compact chat_archive_chunks)
+            const chatPersistRes = await exports.default.fetch(
+                'http://example.com/api/chat/messages?limit=20&heartbeat=0'
+            );
+            const chatPersistJson = (await chatPersistRes.json()) as {
+                data: { messages: Array<{ id: string; status: string; sourceText: string }> };
+            };
+            const persistedPair = chatPersistJson.data.messages.filter(
+                (m) => m.id === sendJson.data.message.id || m.id === 'osc_rt_in_1'
+            );
+            expect(persistedPair).toHaveLength(2);
+            expect(persistedPair.find((r) => r.id === sendJson.data.message.id)?.status).toBe('sent');
+            expect(persistedPair.find((r) => r.id === 'osc_rt_in_1')?.sourceText).toBe('游戏里刚打的字');
+            const hotChatCnt = await env.DB_CHAT!.prepare('SELECT COUNT(*) AS cnt FROM cloud_chat_messages').first<{
+                cnt: number;
+            }>();
+            expect(hotChatCnt?.cnt).toBe(0);
 
             // Verify keyset pagination: default limit=20 newest-first + before/beforeId loads remaining items without gaps
-            await env.DB_CHAT!.prepare('DELETE FROM cloud_chat_messages').run();
+            await env.DB_CHAT!.batch([
+                env.DB_CHAT!.prepare('DELETE FROM cloud_chat_messages'),
+                env.DB_CHAT!.prepare('DELETE FROM chat_archive_chunks')
+            ]);
             const seedStmts = Array.from({ length: 25 }, (_, i) => {
                 const idx = i + 1;
                 const ts = new Date(Date.UTC(2026, 10, 26, 12, idx, 0)).toISOString();
@@ -8137,6 +8175,7 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
             webWs.close(1000, 'done');
             await env.DB_CHAT?.batch([
                 env.DB_CHAT.prepare('DELETE FROM cloud_chat_messages'),
+                env.DB_CHAT.prepare('DELETE FROM chat_archive_chunks'),
                 env.DB_CHAT.prepare('DELETE FROM cloud_chat_config')
             ]).catch(() => {});
         }
@@ -8869,19 +8908,18 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
             expect(expSummaryJson.data.tables.find((t) => t.name === 'feed_gps')!.activeCount).toBeGreaterThanOrEqual(3);
             expect(expSummaryJson.data.tables.find((t) => t.name === 'gamelog_event')!.activeCount).toBeGreaterThanOrEqual(2);
 
-            const expEventRes = await exports.default.fetch(
-                'http://example.com/api/migration/export?table=gamelog_event&source=active&afterRowId=0&limit=500'
-            );
-            const expEventJson = (await expEventRes.json()) as {
-                data: { rows: Array<{ data?: string }>; nextAfterRowId: number; hasMore: boolean };
-            };
-            const exportedEvents = [...expEventJson.data.rows];
-            if (expEventJson.data.hasMore) {
-                const expEventRes2 = await exports.default.fetch(
-                    `http://example.com/api/migration/export?table=gamelog_event&source=active&afterRowId=${expEventJson.data.nextAfterRowId}&limit=500`
+            const exportedEvents: Array<{ data?: string }> = [];
+            let expAfterRowId = 0;
+            for (let page = 0; page < 10; page++) {
+                const expEventRes = await exports.default.fetch(
+                    `http://example.com/api/migration/export?table=gamelog_event&source=active&afterRowId=${expAfterRowId}&limit=500`
                 );
-                const expEventJson2 = (await expEventRes2.json()) as { data: { rows: Array<{ data?: string }> } };
-                exportedEvents.push(...expEventJson2.data.rows);
+                const expEventJson = (await expEventRes.json()) as {
+                    data: { rows: Array<{ data?: string }>; nextAfterRowId: number; hasMore: boolean };
+                };
+                exportedEvents.push(...expEventJson.data.rows);
+                if (!expEventJson.data.hasMore) break;
+                expAfterRowId = expEventJson.data.nextAfterRowId;
             }
             expect(exportedEvents.some((r) => r.data === 'CompactOldEvent')).toBe(true);
             expect(exportedEvents.some((r) => r.data === 'CompactHotEvent')).toBe(true);
@@ -9219,6 +9257,384 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
                 chatDb.prepare("DELETE FROM cloud_chat_messages WHERE id LIKE 'chat_all6_%'"),
                 chatDb.prepare('DELETE FROM chat_archive_chunks')
             ]).catch(() => {});
+        }
+    });
+
+    it('writes directly into <=1000-row compact chunks across ALL 6 D1 databases with tail-chunk merging, zero single-row writes, in-place PATCH/DELETE, and zero daily Cron re-packing', async () => {
+        const legacyDb = env.DB_LEGACY!;
+        const cacheDb = env.DB_CACHE ?? env.DB_CORE;
+        const chatDb = env.DB_CHAT ?? env.DB_CORE;
+        const syncKey = 'direct-chunk-6db-test-key';
+        const guardedEnv: Env = { ...env, AGENT_SYNC_KEY: syncKey };
+        const deviceId = 'win-direct-chunk-6db';
+        const bigCacheKey = 'https://api.vrchat.cloud/api/1/worlds/wrld_direct_gzip_1';
+        const bigCacheJson = JSON.stringify({
+            id: 'wrld_direct_gzip_1',
+            name: 'Direct Gzip Cache World',
+            description: 'Directly gzipped on initial write without waiting for compaction. '.repeat(80)
+        });
+        const t1 = '2026-11-26T10:00:00.000Z';
+        const t2 = '2026-11-26T10:05:00.000Z';
+        const t3 = '2026-11-26T10:10:00.000Z';
+
+        try {
+            // Clear single-row & chunk tables for a clean 6-DB direct-write measurement
+            await env.DB_FEED.batch([
+                env.DB_FEED.prepare('DELETE FROM feed_gps'),
+                env.DB_FEED.prepare('DELETE FROM feed_online_offline'),
+                env.DB_FEED.prepare('DELETE FROM feed_status'),
+                env.DB_FEED.prepare('DELETE FROM feed_bio'),
+                env.DB_FEED.prepare('DELETE FROM feed_archive_chunks')
+            ]);
+            await env.DB_GAMELOG.batch([
+                env.DB_GAMELOG.prepare('DELETE FROM gamelog_location'),
+                env.DB_GAMELOG.prepare('DELETE FROM gamelog_join_leave'),
+                env.DB_GAMELOG.prepare('DELETE FROM gamelog_portal_spawn'),
+                env.DB_GAMELOG.prepare('DELETE FROM gamelog_video_play'),
+                env.DB_GAMELOG.prepare('DELETE FROM gamelog_event'),
+                env.DB_GAMELOG.prepare('DELETE FROM gamelog_external'),
+                env.DB_GAMELOG.prepare('DELETE FROM gamelog_archive_chunks'),
+                env.DB_GAMELOG.prepare("DELETE FROM gamelog_world_rollup WHERE world_id = 'wrld_direct_1'"),
+                env.DB_GAMELOG.prepare("DELETE FROM gamelog_user_rollup WHERE user_id = 'usr_direct_u1'")
+            ]);
+            await env.DB_CORE.batch([
+                env.DB_CORE.prepare('DELETE FROM friend_log_history'),
+                env.DB_CORE.prepare('DELETE FROM notifications'),
+                env.DB_CORE.prepare('DELETE FROM notifications_v2'),
+                env.DB_CORE.prepare('DELETE FROM core_archive_chunks'),
+                env.DB_CORE.prepare("DELETE FROM cloud_bg_sync_state WHERE state_key = 'db_auto_compact_meta'")
+            ]);
+            await chatDb.batch([
+                chatDb.prepare('DELETE FROM cloud_chat_messages'),
+                chatDb.prepare('DELETE FROM chat_archive_chunks')
+            ]);
+            await legacyDb.batch([
+                legacyDb.prepare('DELETE FROM feed_gps'),
+                legacyDb.prepare('DELETE FROM gamelog_location'),
+                legacyDb.prepare('DELETE FROM gamelog_join_leave'),
+                legacyDb.prepare('DELETE FROM friend_log_history'),
+                legacyDb.prepare('DELETE FROM notifications'),
+                legacyDb.prepare('DELETE FROM notifications_v2'),
+                legacyDb.prepare('DELETE FROM legacy_feed_chunks'),
+                legacyDb.prepare('DELETE FROM legacy_gamelog_chunks'),
+                legacyDb.prepare('DELETE FROM legacy_core_chunks'),
+                legacyDb.prepare("DELETE FROM gamelog_world_rollup WHERE world_id = 'wrld_direct_leg'"),
+                legacyDb.prepare("DELETE FROM gamelog_user_rollup WHERE user_id = 'usr_direct_leg'")
+            ]);
+
+            // 1. DB_FEED: 2 sequential POST /api/feed batches + 1 duplicate replay -> merged into 1 tail chunk row
+            for (const batch of [
+                [
+                    { type: 'GPS', created_at: t1, userId: 'usr_direct_f1', displayName: 'DirectAlice', location: 'wrld_direct_1:100', worldName: 'Direct World' },
+                    { type: 'Online', created_at: t1, userId: 'usr_direct_f1', displayName: 'DirectAlice', location: 'wrld_direct_1:100', worldName: 'Direct World' }
+                ],
+                [
+                    { type: 'GPS', created_at: t2, userId: 'usr_direct_f2', displayName: 'DirectBob', location: 'wrld_direct_1:100', worldName: 'Direct World' },
+                    // Duplicate of t1 GPS must be deduplicated cleanly
+                    { type: 'GPS', created_at: t1, userId: 'usr_direct_f1', displayName: 'DirectAlice', location: 'wrld_direct_1:100', worldName: 'Direct World' }
+                ]
+            ]) {
+                const res = await exports.default.fetch('http://example.com/api/feed', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+                    body: JSON.stringify({ items: batch })
+                });
+                expect(res.status).toBe(200);
+            }
+            expect((await env.DB_FEED.prepare('SELECT COUNT(*) AS cnt FROM feed_gps').first<{ cnt: number }>())?.cnt).toBe(0);
+            expect((await env.DB_FEED.prepare('SELECT COUNT(*) AS cnt FROM feed_online_offline').first<{ cnt: number }>())?.cnt).toBe(0);
+            const feedGpsChunks = await env.DB_FEED.prepare(
+                "SELECT COUNT(*) AS chunks, COALESCE(SUM(row_count), 0) AS rows FROM feed_archive_chunks WHERE feed_kind = 'gps'"
+            ).first<{ chunks: number; rows: number }>();
+            expect(feedGpsChunks).toEqual({ chunks: 1, rows: 2 });
+
+            // 2. DB_GAMELOG: 2 sequential POST /api/gamelog batches -> merged into 1 tail chunk per kind, virtual rowIds, idempotent rollups, in-place PATCH & DELETE
+            const glRes1 = await exports.default.fetch('http://example.com/api/gamelog', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+                body: JSON.stringify({
+                    items: [
+                        { type: 'Location', created_at: t1, location: 'wrld_direct_1:100', worldId: 'wrld_direct_1', worldName: 'Direct World', time: 10000 },
+                        { type: 'OnPlayerJoined', created_at: t1, location: 'wrld_direct_1:100', userId: 'usr_direct_u1', displayName: 'DirectGuest', time: 5000 },
+                        { type: 'VideoPlay', created_at: t1, location: 'wrld_direct_1:100', videoUrl: 'https://youtu.be/direct1', videoName: 'Initial Title', videoId: 'direct1' }
+                    ]
+                })
+            });
+            expect(glRes1.status).toBe(200);
+            const glJson1 = (await glRes1.json()) as { data: { inserted: number; rowIds: Array<number | null> } };
+            expect(glJson1.data.inserted).toBe(3);
+            const videoVirtualRowId = Number(glJson1.data.rowIds[2] ?? 0);
+            expect(videoVirtualRowId).toBeGreaterThan(ACTIVE_ARCHIVE_ROWID_BASE);
+
+            const glRes2 = await exports.default.fetch('http://example.com/api/gamelog', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+                body: JSON.stringify({
+                    items: [
+                        // Duplicate of t1 Location must not inflate chunk or world rollup
+                        { type: 'Location', created_at: t1, location: 'wrld_direct_1:100', worldId: 'wrld_direct_1', worldName: 'Direct World', time: 10000 },
+                        { type: 'Location', created_at: t2, location: 'wrld_direct_1:200', worldId: 'wrld_direct_1', worldName: 'Direct World', time: 20000 },
+                        { type: 'OnPlayerJoined', created_at: t2, location: 'wrld_direct_1:200', userId: 'usr_direct_u1', displayName: 'DirectGuest', time: 7000 }
+                    ]
+                })
+            });
+            expect(glRes2.status).toBe(200);
+            expect((await env.DB_GAMELOG.prepare('SELECT COUNT(*) AS cnt FROM gamelog_location').first<{ cnt: number }>())?.cnt).toBe(0);
+            expect((await env.DB_GAMELOG.prepare('SELECT COUNT(*) AS cnt FROM gamelog_join_leave').first<{ cnt: number }>())?.cnt).toBe(0);
+            expect((await env.DB_GAMELOG.prepare('SELECT COUNT(*) AS cnt FROM gamelog_video_play').first<{ cnt: number }>())?.cnt).toBe(0);
+            const glLocChunkStats = await env.DB_GAMELOG.prepare(
+                "SELECT COUNT(*) AS chunks, COALESCE(SUM(row_count), 0) AS rows FROM gamelog_archive_chunks WHERE gamelog_kind = 'location'"
+            ).first<{ chunks: number; rows: number }>();
+            expect(glLocChunkStats).toEqual({ chunks: 1, rows: 2 });
+
+            // In-place PATCH on compacted tail chunk (location time syncs rollup + video name by virtual rowId)
+            const patchTimeRes = await exports.default.fetch('http://example.com/api/gamelog', {
+                method: 'PATCH',
+                headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+                body: JSON.stringify({ op: 'update_location_time', created_at: t2, location: 'wrld_direct_1:200', time: 50000 })
+            });
+            expect(patchTimeRes.status).toBe(200);
+            const patchVidRes = await exports.default.fetch('http://example.com/api/gamelog', {
+                method: 'PATCH',
+                headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+                body: JSON.stringify({ op: 'update_video_name', rowId: videoVirtualRowId, videoName: 'Renamed Inside Chunk' })
+            });
+            expect(patchVidRes.status).toBe(200);
+
+            const directWStats = (await (
+                await exports.default.fetch('http://example.com/api/gamelog/stats?kind=world&worldId=wrld_direct_1')
+            ).json()) as { data: { visitCount: number; timeSpent: number; lastVisit: string; secondLastVisit: string } };
+            expect(directWStats.data.visitCount).toBe(2);
+            expect(directWStats.data.timeSpent).toBe(60000);
+            expect(directWStats.data.lastVisit).toBe(t2);
+            expect(directWStats.data.secondLastVisit).toBe(t1);
+
+            const vidQuery = (await (
+                await exports.default.fetch('http://example.com/api/gamelog/query', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+                    body: JSON.stringify({ types: ['VideoPlay'], limit: 10 })
+                })
+            ).json()) as { data: Array<{ videoName?: string }> };
+            expect(vidQuery.data.some((v) => v.videoName === 'Renamed Inside Chunk')).toBe(true);
+
+            // 3. DB_CORE: friend_log_history & notifications v1/v2 write directly into core_archive_chunks with upsert & PATCH
+            await exports.default.fetch('http://example.com/api/friend-log/history', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+                body: JSON.stringify({
+                    entries: [{ created_at: t1, type: 'Friend', user_id: 'usr_direct_c1', display_name: 'CoreFriend1' }]
+                })
+            });
+            await exports.default.fetch('http://example.com/api/friend-log/history', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+                body: JSON.stringify({
+                    entries: [{ created_at: t2, type: 'DisplayName', user_id: 'usr_direct_c1', display_name: 'CoreFriend1New', previous_display_name: 'CoreFriend1' }]
+                })
+            });
+            await exports.default.fetch('http://example.com/api/notifications', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+                body: JSON.stringify({
+                    version: 2,
+                    entries: [{ id: 'not_direct_v2', created_at: t1, type: 'boop', message: 'Hi', seen: false }]
+                })
+            });
+            await exports.default.fetch('http://example.com/api/notifications', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+                body: JSON.stringify({
+                    version: 2,
+                    entries: [{ id: 'not_direct_v2', created_at: t1, updatedAt: t2, type: 'boop', message: 'Hi Updated', seen: true }]
+                })
+            });
+            expect((await env.DB_CORE.prepare('SELECT COUNT(*) AS cnt FROM friend_log_history').first<{ cnt: number }>())?.cnt).toBe(0);
+            expect((await env.DB_CORE.prepare('SELECT COUNT(*) AS cnt FROM notifications_v2').first<{ cnt: number }>())?.cnt).toBe(0);
+            const flChunkStats = await env.DB_CORE.prepare(
+                "SELECT COUNT(*) AS chunks, COALESCE(SUM(row_count), 0) AS rows FROM core_archive_chunks WHERE core_kind = 'friend_log'"
+            ).first<{ chunks: number; rows: number }>();
+            expect(flChunkStats).toEqual({ chunks: 1, rows: 2 });
+            const n2CheckJson = (await (
+                await exports.default.fetch('http://example.com/api/notifications?v=2&limit=10')
+            ).json()) as { data: Array<{ id: string; message: string; updated_at: string; seen: number }> };
+            expect(n2CheckJson.data.find((n) => n.id === 'not_direct_v2')).toMatchObject({
+                message: 'Hi',
+                updated_at: t2,
+                seen: 1
+            });
+
+            // 4. DB_CHAT: /api/agent/chat/sync writes directly into 1 tail chunk in chat_archive_chunks + PATCH in place
+            for (const msg of [
+                { id: 'chat_direct_01', sourceText: 'First direct msg', sentText: 'First direct msg', createdAt: t1 },
+                { id: 'chat_direct_02', sourceText: 'Second direct msg', sentText: 'Second direct msg', createdAt: t2 }
+            ]) {
+                const syncRes = await worker.fetch(
+                    new Request('http://example.com/api/agent/chat/sync', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            Authorization: `Bearer ${syncKey}`,
+                            'X-Device-Id': deviceId
+                        },
+                        body: JSON.stringify({ messages: [msg] })
+                    }),
+                    guardedEnv
+                );
+                expect(syncRes.status).toBe(200);
+            }
+            expect((await chatDb.prepare('SELECT COUNT(*) AS cnt FROM cloud_chat_messages').first<{ cnt: number }>())?.cnt).toBe(0);
+            const chatChunkStats = await chatDb.prepare(
+                'SELECT COUNT(*) AS chunks, COALESCE(SUM(row_count), 0) AS rows FROM chat_archive_chunks'
+            ).first<{ chunks: number; rows: number }>();
+            expect(chatChunkStats).toEqual({ chunks: 1, rows: 2 });
+            const chatPatchRes = await exports.default.fetch('http://example.com/api/chat/messages/chat_direct_02', {
+                method: 'PATCH',
+                headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+                body: JSON.stringify({ translatedText: 'Translated inside chunk', targetLang: 'en' })
+            });
+            expect(chatPatchRes.status).toBe(200);
+
+            // 5. DB_LEGACY: agent migration batches for gamelog + notifications + friend_log write directly into compact chunks (0 single-row writes)
+            await legacyDb
+                .prepare(
+                    `INSERT INTO legacy_migration_state (state_key, payload_json, updated_at)
+                     VALUES ('job', ?, ?)
+                     ON CONFLICT(state_key) DO UPDATE SET payload_json = excluded.payload_json, updated_at = excluded.updated_at`
+                )
+                .bind(
+                    JSON.stringify({
+                        jobId: 'job_direct_6db',
+                        deviceId,
+                        accountPrefix: 'usr_direct_leg',
+                        categories: ['gamelog', 'notifications', 'friend_log'],
+                        status: 'running',
+                        startedAt: t1,
+                        updatedAt: t1,
+                        finishedAt: '',
+                        currentCategory: 'gamelog',
+                        completedCategories: [],
+                        totalEstimatedRows: 5,
+                        processedRows: 0,
+                        insertedRows: 0,
+                        skippedRows: 0,
+                        legacyDbBytes: 0,
+                        lastError: ''
+                    }),
+                    t1
+                )
+                .run();
+            const legBatches: Array<{ category: string; items: unknown[] }> = [
+                {
+                    category: 'gamelog',
+                    items: [
+                        { type: 'Location', created_at: t1, location: 'wrld_direct_leg:1', worldId: 'wrld_direct_leg', worldName: 'Legacy Direct World', time: 15000 },
+                        { type: 'OnPlayerJoined', created_at: t1, location: 'wrld_direct_leg:1', userId: 'usr_direct_leg', displayName: 'LegacyGuest', time: 4000 }
+                    ]
+                },
+                {
+                    category: 'gamelog',
+                    items: [
+                        { type: 'Location', created_at: t3, location: 'wrld_direct_leg:2', worldId: 'wrld_direct_leg', worldName: 'Legacy Direct World', time: 25000 }
+                    ]
+                },
+                {
+                    category: 'notifications',
+                    items: [
+                        { kind: 'notification', id: 'not_leg_direct_1', created_at: t1, type: 'invite', senderUserId: 'usr_direct_leg', message: 'Legacy direct invite' }
+                    ]
+                },
+                {
+                    category: 'friend_log',
+                    items: [
+                        { kind: 'friend_log_history', created_at: t1, type: 'Friend', userId: 'usr_direct_leg', displayName: 'LegacyGuest' }
+                    ]
+                }
+            ];
+            for (const b of legBatches) {
+                const res = await worker.fetch(
+                    new Request('http://example.com/api/agent/migration/batch', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            Authorization: `Bearer ${syncKey}`,
+                            'X-Device-Id': deviceId
+                        },
+                        body: JSON.stringify({
+                            jobId: 'job_direct_6db',
+                            category: b.category,
+                            items: b.items,
+                            categoryDone: false,
+                            allDone: false
+                        })
+                    }),
+                    guardedEnv
+                );
+                expect(res.status).toBe(200);
+                const bJson = (await res.json()) as { data: { inserted: number; shouldStop?: boolean } };
+                expect(bJson.data.shouldStop).not.toBe(true);
+                expect(bJson.data.inserted).toBe(b.items.length);
+            }
+            expect((await legacyDb.prepare('SELECT COUNT(*) AS cnt FROM gamelog_location').first<{ cnt: number }>())?.cnt).toBe(0);
+            expect((await legacyDb.prepare('SELECT COUNT(*) AS cnt FROM notifications').first<{ cnt: number }>())?.cnt).toBe(0);
+            expect((await legacyDb.prepare('SELECT COUNT(*) AS cnt FROM friend_log_history').first<{ cnt: number }>())?.cnt).toBe(0);
+            const legGlChunks = await legacyDb.prepare(
+                "SELECT COUNT(*) AS chunks, COALESCE(SUM(row_count), 0) AS rows FROM legacy_gamelog_chunks WHERE gamelog_kind = 'location'"
+            ).first<{ chunks: number; rows: number }>();
+            expect(legGlChunks).toEqual({ chunks: 1, rows: 2 });
+            const legCoreChunks = await legacyDb.prepare(
+                'SELECT COUNT(*) AS chunks, COALESCE(SUM(row_count), 0) AS rows FROM legacy_core_chunks'
+            ).first<{ chunks: number; rows: number }>();
+            expect(legCoreChunks).toEqual({ chunks: 2, rows: 2 });
+
+            // 6. DB_CACHE: writing >=2 KiB JSON compresses directly with 'gz:' at write time
+            await putCachedVrcResponses(env, [
+                { url: bigCacheKey, tier: 'world', status: 200, bodyText: bigCacheJson, ttlMs: 3600_000 }
+            ]);
+            const cacheRow = await cacheDb
+                .prepare('SELECT body_text FROM vrc_api_cache WHERE cache_key = ?')
+                .bind(bigCacheKey)
+                .first<{ body_text: string }>();
+            expect(cacheRow?.body_text.startsWith('gz:')).toBe(true);
+
+            // 7. Daily auto compaction detects 0 single-row backlog and performs 0 re-packing writes
+            const dailyRan = await maybeRunDailyAutoCompaction(env, Date.now());
+            expect(dailyRan).toBe(true);
+            const compactMetaRow = await env.DB_CORE.prepare(
+                "SELECT payload_json FROM cloud_bg_sync_state WHERE state_key = 'db_auto_compact_meta'"
+            ).first<{ payload_json: string }>();
+            const compactMeta = JSON.parse(compactMetaRow?.payload_json ?? '{}') as {
+                totalPackedRows?: number;
+                totalChunksCreated?: number;
+                cacheCompressedRows?: number;
+            };
+            expect(compactMeta.totalPackedRows).toBe(0);
+            expect(compactMeta.totalChunksCreated).toBe(0);
+            expect(compactMeta.cacheCompressedRows).toBe(0);
+        } finally {
+            await env.DB_FEED.prepare('DELETE FROM feed_archive_chunks').run().catch(() => {});
+            await env.DB_GAMELOG.batch([
+                env.DB_GAMELOG.prepare('DELETE FROM gamelog_archive_chunks'),
+                env.DB_GAMELOG.prepare("DELETE FROM gamelog_world_rollup WHERE world_id = 'wrld_direct_1'"),
+                env.DB_GAMELOG.prepare("DELETE FROM gamelog_user_rollup WHERE user_id = 'usr_direct_u1'")
+            ]).catch(() => {});
+            await env.DB_CORE.batch([
+                env.DB_CORE.prepare('DELETE FROM core_archive_chunks'),
+                env.DB_CORE.prepare("DELETE FROM cloud_bg_sync_state WHERE state_key = 'db_auto_compact_meta'")
+            ]).catch(() => {});
+            await chatDb.batch([
+                chatDb.prepare('DELETE FROM cloud_chat_messages'),
+                chatDb.prepare('DELETE FROM chat_archive_chunks')
+            ]).catch(() => {});
+            await legacyDb.batch([
+                legacyDb.prepare('DELETE FROM legacy_feed_chunks'),
+                legacyDb.prepare('DELETE FROM legacy_gamelog_chunks'),
+                legacyDb.prepare('DELETE FROM legacy_core_chunks'),
+                legacyDb.prepare("DELETE FROM legacy_migration_state WHERE state_key = 'job'"),
+                legacyDb.prepare("DELETE FROM gamelog_world_rollup WHERE world_id = 'wrld_direct_leg'"),
+                legacyDb.prepare("DELETE FROM gamelog_user_rollup WHERE user_id = 'usr_direct_leg'")
+            ]).catch(() => {});
+            await cacheDb.prepare('DELETE FROM vrc_api_cache WHERE cache_key = ?').bind(bigCacheKey).run().catch(() => {});
         }
     });
 });

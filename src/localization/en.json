@@ -4003,7 +4003,7 @@
             "b2_pricing_hint_suffix": " (first 10 GB free; storage pricing is $6.95 / TB / month).",
             "status_unsaved": "Unsaved",
             "compact_heading": "All-6-Database Compaction",
-            "compact_desc": "Compacts existing data across all 6 D1 databases (Core, GameLog, Feed, Cache, Legacy, Chat) into 1,000-row chunks with rollup stats and gzip-compressed API caches. Queries, stats, search, and exports stay 100% intact.",
+            "compact_desc": "All new writes across all 6 D1 databases already pack directly into <=1,000-row / <=512 KiB chunks (and gzip DB_CACHE) at write time with zero cron re-packing waste. Click to immediately compact pre-upgrade single-row data and uncompressed caches.",
             "compact_mode_all": "All existing data (Compact now)",
             "compact_mode_7d": "Keep last 7 days hot",
             "compact_mode_30d": "Keep last 30 days hot",
