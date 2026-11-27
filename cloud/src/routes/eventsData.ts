@@ -248,7 +248,8 @@ export async function ingestGameLogItems(
                         location: t[3],
                         user_id: t[4],
                         time: t[5]
-                    }))
+                    })),
+                    res.recentExistingTuples
                 );
             }
         }
@@ -600,13 +601,19 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
         db: D1Database,
         userId: string,
         displayName: string,
-        timeDelta: number
+        timeDelta: number,
+        joinDelta = 0
     ): Promise<void> => {
         const key = userId.trim() || (displayName.trim() ? `name:${displayName.trim().toLowerCase()}` : '');
-        if (!key || timeDelta === 0) return;
+        if (!key || (timeDelta === 0 && joinDelta === 0)) return;
         await db
-            .prepare('UPDATE gamelog_user_rollup SET time_spent = MAX(0, time_spent + ?) WHERE user_id = ?')
-            .bind(timeDelta, key)
+            .prepare(
+                `UPDATE gamelog_user_rollup
+                 SET time_spent = MAX(0, time_spent + ?),
+                     join_count = MAX(0, join_count + ?)
+                 WHERE user_id = ?`
+            )
+            .bind(timeDelta, joinDelta, key)
             .run()
             .catch(() => {});
     };
@@ -937,6 +944,20 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
         return Response.json({ ok: true, data: out });
     }
 
+    const gamelogDedupKey = (r: Record<string, unknown>): string => {
+        const type = String(r.type ?? '');
+        const created = String(r.created_at ?? '');
+        if (type === 'Location') return `Location|${created}|${String(r.location ?? '')}`;
+        if (type === 'OnPlayerJoined' || type === 'OnPlayerLeft') {
+            return `${type}|${created}|${String(r.displayName ?? '')}`;
+        }
+        if (type === 'PortalSpawn') return `PortalSpawn|${created}|${String(r.displayName ?? '')}`;
+        if (type === 'VideoPlay') return `VideoPlay|${created}|${String(r.videoUrl ?? '')}`;
+        if (type === 'Event') return `Event|${created}|${String(r.data ?? '')}`;
+        if (type === 'External') return `External|${created}|${String(r.message ?? '')}`;
+        return `${type}|${created}|${String(r.rowId ?? '')}`;
+    };
+
     const runFilteredGameLogQueryOnDb = async (
         db: D1Database,
         limit: number,
@@ -1052,9 +1073,9 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
                 }
             }
         }
-        // Merge compact archive chunks transparently across ALL 6 GameLog tables
-        // (`gamelog_archive_chunks` on active DB_GAMELOG, `legacy_gamelog_chunks` on DB_LEGACY)
-        if (negateRowIds || normalized.length < limit) {
+        // Always merge compact archive chunks transparently across ALL 6 GameLog tables
+        // (new writes go directly into compact chunks, so pre-upgrade hot rows must never shadow newer data)
+        {
             const chunkKinds: string[] = [];
             if (wantLocation) chunkKinds.push('location');
             if (wantJl) chunkKinds.push('join_leave');
@@ -1077,6 +1098,7 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
                         .bind(...chunkKinds, hasVip ? 16 : 8)
                         .all<{ id: number; gamelog_kind: string; payload_json: string }>();
                     const vipSet = hasVip ? new Set(cleanVips) : null;
+                    const seenLocal = new Set<string>(normalized.map(gamelogDedupKey));
                     for (const c of chunkRes.results ?? []) {
                         const unpacked = decodeGameLogChunkRows(c.id, c.gamelog_kind, c.payload_json, {
                             negateRowIds
@@ -1085,6 +1107,9 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
                             const entryType = String(entry.type ?? '');
                             if (hasTypeFilter && !typeSet.has(entryType)) continue;
                             if (vipSet && !vipSet.has(String(entry.userId ?? ''))) continue;
+                            const dk = gamelogDedupKey(entry);
+                            if (seenLocal.has(dk)) continue;
+                            seenLocal.add(dk);
                             normalized.push(entry);
                         }
                     }
@@ -1095,20 +1120,6 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
             }
         }
         return normalized.slice(0, limit);
-    };
-
-    const gamelogDedupKey = (r: Record<string, unknown>): string => {
-        const type = String(r.type ?? '');
-        const created = String(r.created_at ?? '');
-        if (type === 'Location') return `Location|${created}|${String(r.location ?? '')}`;
-        if (type === 'OnPlayerJoined' || type === 'OnPlayerLeft') {
-            return `${type}|${created}|${String(r.displayName ?? '')}`;
-        }
-        if (type === 'PortalSpawn') return `PortalSpawn|${created}|${String(r.displayName ?? '')}`;
-        if (type === 'VideoPlay') return `VideoPlay|${created}|${String(r.videoUrl ?? '')}`;
-        if (type === 'Event') return `Event|${created}|${String(r.data ?? '')}`;
-        if (type === 'External') return `External|${created}|${String(r.message ?? '')}`;
-        return `${type}|${created}|${String(r.rowId ?? '')}`;
     };
 
     const runFilteredGameLogQuery = async (
@@ -1221,7 +1232,7 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
                 );
             }
             const op = asStr(rawBody.op);
-            const createdAt = asStr(rawBody.created_at).trim();
+            const createdAt = asStr(rawBody.created_at ?? rawBody.createdAt).trim();
             const location = asStr(rawBody.location);
             const timeVal = asFiniteNumber(rawBody.time);
             const videoUrl = asStr(rawBody.videoUrl);
@@ -1377,9 +1388,26 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
                         }
                     });
                     deleted += chunkDel.deletedCount;
+                    const deletedUserLocKeys = new Map<string, { uid: string; dname: string; timeDelta: number }>();
                     for (const dt of chunkDel.deletedTuples) {
+                        const uid = String(dt[4] ?? '').trim();
+                        const dname = String(dt[2] ?? '').trim();
+                        const uKey = uid || (dname ? `name:${dname.toLowerCase()}` : '');
+                        if (!uKey) continue;
                         const spent = Math.max(0, Number(dt[5] ?? 0) || 0);
-                        await adjustUserRollupDelta(env.DB_GAMELOG, String(dt[4] ?? ''), String(dt[2] ?? ''), -spent);
+                        const prev = deletedUserLocKeys.get(uKey);
+                        if (prev) prev.timeDelta -= spent;
+                        else deletedUserLocKeys.set(uKey, { uid, dname, timeDelta: -spent });
+                    }
+                    const fullInstanceDelete = eventIds.length === 0;
+                    for (const info of deletedUserLocKeys.values()) {
+                        await adjustUserRollupDelta(
+                            env.DB_GAMELOG,
+                            info.uid,
+                            info.dname,
+                            info.timeDelta,
+                            fullInstanceDelete ? -1 : 0
+                        );
                     }
                     if (deleted > 0) {
                         await incrementCounter(env.DB_CORE, 'gamelog_join_leave', -deleted).catch(() => {});
@@ -2175,8 +2203,9 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
                     });
                 }
             }
-            // Supplement recent instances from compact location chunks if hot rows are sparse
-            if (byLocation.size < limit) {
+            // Always merge compact location chunks (new writes go directly into gamelog_archive_chunks)
+            // so pre-upgrade hot rows never mask newer world visits.
+            {
                 const mergeLocationChunks = async (
                     targetDb: D1Database,
                     archiveTable: 'gamelog_archive_chunks' | 'legacy_gamelog_chunks'
@@ -2219,7 +2248,7 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
                     }
                 };
                 await mergeLocationChunks(env.DB_GAMELOG, 'gamelog_archive_chunks');
-                if (byLocation.size < limit && hasLegacyGamelog && legacyDb) {
+                if (hasLegacyGamelog && legacyDb) {
                     await mergeLocationChunks(legacyDb, 'legacy_gamelog_chunks');
                 }
             }
@@ -3602,6 +3631,17 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
         previousBioLinks: safeJsonParse<string[]>(r.previous_bio_links, [])
     });
 
+    const feedDedupKey = (r: Record<string, unknown>): string => {
+        const type = String(r.type ?? '');
+        const created = String(r.created_at ?? '');
+        const uid = String(r.userId ?? '');
+        if (type === 'GPS') return `GPS|${created}|${uid}|${String(r.location ?? '')}`;
+        if (type === 'Online' || type === 'Offline') return `${type}|${created}|${uid}`;
+        if (type === 'Status') return `Status|${created}|${uid}|${String(r.status ?? '')}|${String(r.statusDescription ?? '')}`;
+        if (type === 'Bio') return `Bio|${created}|${uid}|${String(r.bio ?? '')}`;
+        return `${type}|${created}|${uid}|${String(r.rowId ?? '')}`;
+    };
+
     const runFilteredFeedQueryOnDb = async (
         db: D1Database,
         limit: number,
@@ -3711,11 +3751,9 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
             }
         }
 
-        // Read compact archived chunks transparently:
-        // - DB_LEGACY: `legacy_feed_chunks` (always queried)
-        // - Active DB_FEED: `feed_archive_chunks` (queried when hot single-row rows < limit or date/VIP filtered)
-        const shouldReadFeedChunks = negateRowIds || items.length < limit || hasDateBound || hasVip;
-        if (shouldReadFeedChunks) {
+        // Always read compact archived chunks transparently across both DB_FEED and DB_LEGACY
+        // because new writes go directly into compact chunks (pre-upgrade hot rows must never shadow newer data).
+        {
             const chunkKinds: string[] = [];
             if (wantGps) chunkKinds.push('gps');
             if (wantOnline || wantOffline) chunkKinds.push('oo');
@@ -3747,6 +3785,7 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
                         .bind(...chunkBinds, chunkLimit)
                         .all<{ id: number; feed_kind: string; payload_json: string }>();
                     const vipSet = hasVip ? new Set(vipIds) : null;
+                    const seenLocal = new Set<string>(items.map(feedDedupKey));
                     for (const c of chunkRes.results ?? []) {
                         const unpacked = decodeFeedChunkRows(c.id, c.feed_kind, c.payload_json, {
                             negateRowIds
@@ -3758,6 +3797,9 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
                             const createdAt = String(entry.created_at ?? '');
                             if (cleanDateFrom && createdAt < cleanDateFrom) continue;
                             if (cleanDateTo && createdAt > cleanDateTo) continue;
+                            const dk = feedDedupKey(entry);
+                            if (seenLocal.has(dk)) continue;
+                            seenLocal.add(dk);
                             items.push(entry);
                         }
                     }
@@ -3769,17 +3811,6 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
 
         items.sort((a, b) => String(b.created_at ?? '').localeCompare(String(a.created_at ?? '')));
         return items.slice(0, limit);
-    };
-
-    const feedDedupKey = (r: Record<string, unknown>): string => {
-        const type = String(r.type ?? '');
-        const created = String(r.created_at ?? '');
-        const uid = String(r.userId ?? '');
-        if (type === 'GPS') return `GPS|${created}|${uid}|${String(r.location ?? '')}`;
-        if (type === 'Online' || type === 'Offline') return `${type}|${created}|${uid}`;
-        if (type === 'Status') return `Status|${created}|${uid}|${String(r.status ?? '')}|${String(r.statusDescription ?? '')}`;
-        if (type === 'Bio') return `Bio|${created}|${uid}|${String(r.bio ?? '')}`;
-        return `${type}|${created}|${uid}|${String(r.rowId ?? '')}`;
     };
 
     const runFilteredFeedQuery = async (
@@ -4128,9 +4159,9 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
             }
         }
 
-        // Also search compact feed archive chunks (`feed_archive_chunks` & `legacy_feed_chunks`)
-        // so searches keep working transparently even after 0-day full compaction.
-        if (merged.length < limit) {
+        // Always search compact feed archive chunks (`feed_archive_chunks` & `legacy_feed_chunks`)
+        // because new writes go directly into compact chunks (pre-upgrade hot rows must never shadow newer matches).
+        {
             const chunkKinds: string[] = [];
             if (wantGps) chunkKinds.push('gps');
             if (wantOnline || wantOffline) chunkKinds.push('oo');

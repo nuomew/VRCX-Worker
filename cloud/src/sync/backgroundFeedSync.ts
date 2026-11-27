@@ -1711,7 +1711,10 @@ export async function runBackgroundFeedSync(
         const chunkReadIdx = combinedReadStmts.length;
         combinedReadStmts.push(
             env.DB_CORE.prepare(
-                "SELECT id, core_kind, payload_json FROM core_archive_chunks WHERE core_kind IN ('notif_v1', 'notif_v2') ORDER BY max_created_at DESC, id DESC LIMIT 4"
+                "SELECT id, core_kind, payload_json FROM core_archive_chunks WHERE core_kind = 'notif_v1' ORDER BY max_created_at DESC, id DESC LIMIT 3"
+            ),
+            env.DB_CORE.prepare(
+                "SELECT id, core_kind, payload_json FROM core_archive_chunks WHERE core_kind = 'notif_v2' ORDER BY max_created_at DESC, id DESC LIMIT 3"
             )
         );
         const combinedReadResults = await env.DB_CORE.batch(combinedReadStmts);
@@ -1732,17 +1735,19 @@ export async function runBackgroundFeedSync(
                 existingV2Ids.add(row.id);
             }
         }
-        for (const c of (combinedReadResults[chunkReadIdx]?.results ?? []) as Array<{
-            id: number;
-            core_kind: string;
-            payload_json: string;
-        }>) {
-            const unpacked = decodeCoreChunkRows(c.id, c.core_kind, c.payload_json, { negateRowIds: false });
-            for (const entry of unpacked) {
-                const eid = String(entry.id ?? '');
-                if (!eid) continue;
-                if (c.core_kind === 'notif_v1') existingV1Ids.add(eid);
-                else if (c.core_kind === 'notif_v2') existingV2Ids.add(eid);
+        for (const chunkResIdx of [chunkReadIdx, chunkReadIdx + 1]) {
+            for (const c of (combinedReadResults[chunkResIdx]?.results ?? []) as Array<{
+                id: number;
+                core_kind: string;
+                payload_json: string;
+            }>) {
+                const unpacked = decodeCoreChunkRows(c.id, c.core_kind, c.payload_json, { negateRowIds: false });
+                for (const entry of unpacked) {
+                    const eid = String(entry.id ?? '');
+                    if (!eid) continue;
+                    if (c.core_kind === 'notif_v1') existingV1Ids.add(eid);
+                    else if (c.core_kind === 'notif_v2') existingV2Ids.add(eid);
+                }
             }
         }
 
@@ -1889,9 +1894,11 @@ export async function runBackgroundFeedSync(
             ]);
         }
         // Directly append v1/v2 notifications & friend_log_history into compact <=1,000-row chunks at write time
+        // and use authoritative actually-inserted counts for counters & metadata.
         const freshV1Tuples = notifFetch.v1Tuples.filter((t) => !existingV1Ids.has(String(t[1] ?? '')));
+        let actualV1Inserted = 0;
         if (freshV1Tuples.length > 0) {
-            await appendTuplesToCompactTailChunk({
+            const v1ChunkRes = await appendTuplesToCompactTailChunk({
                 db: env.DB_CORE,
                 archiveTable: 'core_archive_chunks',
                 kindColumn: 'core_kind',
@@ -1903,9 +1910,11 @@ export async function runBackgroundFeedSync(
                 maxJsonBytes: COMPACT_CHUNK_MAX_BYTES,
                 negateRowIds: false
             });
+            actualV1Inserted = v1ChunkRes.inserted;
         }
+        let actualV2Inserted = 0;
         if (v2Tuples.length > 0) {
-            await appendTuplesToCompactTailChunk({
+            const v2ChunkRes = await appendTuplesToCompactTailChunk({
                 db: env.DB_CORE,
                 archiveTable: 'core_archive_chunks',
                 kindColumn: 'core_kind',
@@ -1935,9 +1944,11 @@ export async function runBackgroundFeedSync(
                 maxJsonBytes: COMPACT_CHUNK_MAX_BYTES,
                 negateRowIds: false
             });
+            actualV2Inserted = v2ChunkRes.inserted;
         }
+        let actualFriendLogInserted = 0;
         if (friendLogPrep.historyTuples.length > 0) {
-            await appendTuplesToCompactTailChunk({
+            const flChunkRes = await appendTuplesToCompactTailChunk({
                 db: env.DB_CORE,
                 archiveTable: 'core_archive_chunks',
                 kindColumn: 'core_kind',
@@ -1949,14 +1960,18 @@ export async function runBackgroundFeedSync(
                 maxJsonBytes: COMPACT_CHUNK_MAX_BYTES,
                 negateRowIds: false
             });
+            actualFriendLogInserted = flChunkRes.inserted;
         }
+        const effectiveNotifInserted = actualV1Inserted + actualV2Inserted;
+        nextMeta.lastNotificationsInserted = effectiveNotifInserted;
+        nextMeta.lastFriendLogInserted = actualFriendLogInserted;
         coreFinalStmts.push(...friendLogPrep.dbStmts);
-        if (v1Added > 0) {
-            coreFinalStmts.push(buildIncrementCounterStatement(env.DB_CORE, 'notifications', v1Added, nowIso));
+        if (actualV1Inserted > 0) {
+            coreFinalStmts.push(buildIncrementCounterStatement(env.DB_CORE, 'notifications', actualV1Inserted, nowIso));
         }
-        if (friendLogPrep.inserted > 0) {
+        if (actualFriendLogInserted > 0) {
             coreFinalStmts.push(
-                buildIncrementCounterStatement(env.DB_CORE, 'friend_log_history', friendLogPrep.inserted, nowIso)
+                buildIncrementCounterStatement(env.DB_CORE, 'friend_log_history', actualFriendLogInserted, nowIso)
             );
         }
         if (cookieDirty && finalGuard.currentUpdatedAt === initialCookieUpdatedAt) {
@@ -2028,9 +2043,9 @@ export async function runBackgroundFeedSync(
                 syncedAt: nowIso,
                 onlineCount: inGameCount,
                 feedInserted,
-                notificationsInserted,
+                notificationsInserted: effectiveNotifInserted,
                 bioChecked: bioRes.bioChecked,
-                friendLogInserted: friendLogPrep.inserted,
+                friendLogInserted: actualFriendLogInserted,
                 onlineFriendsTruncated: onlineListTruncated,
                 onlineFriends: attachPresenceTimesToOnlineFriends(rawOnlineFriendRecords, nextSnapshot)
             };
@@ -2053,9 +2068,9 @@ export async function runBackgroundFeedSync(
             status: feedWriteError ? 'error' : nextMeta.lastStatus,
             onlineCount: inGameCount,
             feedInserted,
-            notificationsInserted,
+            notificationsInserted: effectiveNotifInserted,
             bioChecked: bioRes.bioChecked,
-            friendLogInserted: friendLogPrep.inserted,
+            friendLogInserted: actualFriendLogInserted,
             ...(feedWriteError ? { error: feedWriteError.slice(0, 240) } : {}),
             ...(committedRssSnapshot ? { rssSnapshot: committedRssSnapshot } : {}),
             webSyncIntervalSeconds,

@@ -137,16 +137,25 @@ public static class DesktopLegacyMigrator
     public const int DefaultConcurrency = 2;
     private const int BatchRowsLimit = 240;
     private const int MaxBatchPayloadBytes = 180 * 1024;
-    // Compact chunked categories (feed, gamelog, notifications, friend_log) are written directly into
-    // <=1,000-row / <=512 KiB D1 chunks at ingest time, cutting D1 rows_written by >99.5%.
+    // Logical tables whose cloud ingest writes directly into <=1,000-row / <=512 KiB D1 chunks,
+    // cutting D1 rows_written by >99.5% (single-row tables like friend_log_current keep 240-row batches).
     private const int CompactBatchRowsLimit = 1000;
     private const int CompactMaxBatchPayloadBytes = 512 * 1024;
-    private static readonly HashSet<string> CompactChunkCategories = new(StringComparer.Ordinal)
+    private static readonly HashSet<string> CompactChunkLogicalTables = new(StringComparer.Ordinal)
     {
-        "feed",
-        "gamelog",
+        "feed_gps",
+        "feed_online_offline",
+        "feed_status",
+        "feed_bio",
+        "gamelog_location",
+        "gamelog_join_leave",
+        "gamelog_portal_spawn",
+        "gamelog_video_play",
+        "gamelog_event",
+        "gamelog_external",
+        "friend_log_history",
         "notifications",
-        "friend_log"
+        "notifications_v2"
     };
     private const int MaxSingleFieldChars = 16384;
     private const int MaxBatchRetryAttempts = 3;
@@ -891,9 +900,9 @@ public static class DesktopLegacyMigrator
                         cmd.CommandText = $"SELECT rowid AS __vrcx_rowid, * FROM \"{physicalTable}\" {whereSql} ORDER BY rowid ASC";
                     }
 
-                    bool isCompactCategory = CompactChunkCategories.Contains(rawCategory);
-                    int effectiveBatchRowsLimit = isCompactCategory ? CompactBatchRowsLimit : BatchRowsLimit;
-                    int effectiveMaxBatchPayloadBytes = isCompactCategory ? CompactMaxBatchPayloadBytes : MaxBatchPayloadBytes;
+                    bool isCompactTable = CompactChunkLogicalTables.Contains(logicalTable);
+                    int effectiveBatchRowsLimit = isCompactTable ? CompactBatchRowsLimit : BatchRowsLimit;
+                    int effectiveMaxBatchPayloadBytes = isCompactTable ? CompactMaxBatchPayloadBytes : MaxBatchPayloadBytes;
                     var buffer = new List<Dictionary<string, object?>>(effectiveBatchRowsLimit);
                     int bufferBytes = 256;
                     string bufferLastCreatedAt = existingCursor?.CreatedAt ?? string.Empty;

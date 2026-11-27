@@ -2,7 +2,13 @@ import { env as rawEnv, exports as rawExports } from 'cloudflare:workers';
 import { beforeAll, describe, expect, it, vi } from 'vitest';
 import { getMasterKey, isSameOriginRequest, MAX_2FA_TRUST_SECONDS } from '../src/auth/auth';
 import { generateTotpCode, hmacSha256Hex, sha256Hex, sign2faTrustCookie, verifyPasscode } from '../src/crypto/vault';
-import { ACTIVE_ARCHIVE_ROWID_BASE, maybeRunDailyAutoCompaction } from '../src/db/compactArchive';
+import {
+    ACTIVE_ARCHIVE_ROWID_BASE,
+    appendTuplesToCompactTailChunk,
+    feedTupleDedupKey,
+    maybeRunDailyAutoCompaction,
+    mutateArchiveChunks
+} from '../src/db/compactArchive';
 import type { Env } from '../src/env';
 import worker from '../src/index';
 import { incrementCounter } from '../src/routes/coreData';
@@ -9635,6 +9641,358 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
                 legacyDb.prepare("DELETE FROM gamelog_user_rollup WHERE user_id = 'usr_direct_leg'")
             ]).catch(() => {});
             await cacheDb.prepare('DELETE FROM vrc_api_cache WHERE cache_key = ?').bind(bigCacheKey).run().catch(() => {});
+        }
+    });
+
+    it('prevents hot-table shadowing, cross-batch join_count inflation, boundary-chunk cleanup misses, and concurrent CAS lost updates', async () => {
+        const chatDb = env.DB_CHAT ?? env.DB_CORE;
+        const createdBackupKeys: string[] = [];
+        const oldIso = new Date(Date.now() - 370 * 86400_000).toISOString();
+        const recentIso = new Date(Date.now() - 60_000).toISOString();
+        const newestIso = new Date().toISOString();
+        const syncKey = 'audit-fixes-regression-key';
+        const guardedEnv: Env = { ...env, AGENT_SYNC_KEY: syncKey };
+
+        try {
+            await env.DB_FEED.batch([
+                env.DB_FEED.prepare('DELETE FROM feed_gps'),
+                env.DB_FEED.prepare('DELETE FROM feed_archive_chunks')
+            ]);
+            await env.DB_GAMELOG.batch([
+                env.DB_GAMELOG.prepare('DELETE FROM gamelog_location'),
+                env.DB_GAMELOG.prepare('DELETE FROM gamelog_join_leave'),
+                env.DB_GAMELOG.prepare('DELETE FROM gamelog_archive_chunks'),
+                env.DB_GAMELOG.prepare("DELETE FROM gamelog_world_rollup WHERE world_id IN ('wrld_shadow_1', 'wrld_bnd_1')"),
+                env.DB_GAMELOG.prepare("DELETE FROM gamelog_user_rollup WHERE user_id = 'usr_cb_join'")
+            ]);
+            await env.DB_CORE.batch([
+                env.DB_CORE.prepare('DELETE FROM notifications'),
+                env.DB_CORE.prepare('DELETE FROM notifications_v2'),
+                env.DB_CORE.prepare('DELETE FROM friend_log_history'),
+                env.DB_CORE.prepare('DELETE FROM core_archive_chunks')
+            ]);
+            await chatDb.batch([
+                chatDb.prepare('DELETE FROM cloud_chat_messages'),
+                chatDb.prepare('DELETE FROM chat_archive_chunks')
+            ]);
+
+            // 1. Hot-table shadowing regression: fill pre-upgrade single-row tables with >=5 OLD rows,
+            //    then write 1 NEWER row via public APIs (into compact chunks), and query with limit=5.
+            //    Every endpoint MUST surface the newest chunked row at the top!
+            const oldNotifV2Stmts = Array.from({ length: 5 }, (_, i) =>
+                env.DB_CORE.prepare(
+                    `INSERT INTO notifications_v2 (id, created_at, type, message, seen)
+                     VALUES (?, ?, 'boop', ?, 0)`
+                ).bind(`not_shadow_old_${i}`, `2026-01-0${i + 1}T00:00:00.000Z`, `Old V2 #${i}`)
+            );
+            const oldFlStmts = Array.from({ length: 5 }, (_, i) =>
+                env.DB_CORE.prepare(
+                    `INSERT INTO friend_log_history (created_at, type, user_id, display_name)
+                     VALUES (?, 'Friend', ?, ?)`
+                ).bind(`2026-01-0${i + 1}T00:00:00.000Z`, `usr_shadow_old_${i}`, `OldPal_${i}`)
+            );
+            await env.DB_CORE.batch([...oldNotifV2Stmts, ...oldFlStmts]);
+
+            await env.DB_FEED.batch(
+                Array.from({ length: 5 }, (_, i) =>
+                    env.DB_FEED.prepare(
+                        `INSERT INTO feed_gps (created_at, user_id, display_name, location, world_name, previous_location, time, group_name)
+                         VALUES (?, 'usr_shadow_f', 'ShadowFriend', ?, 'Shadow Old World', '', 100, '')`
+                    ).bind(`2026-01-0${i + 1}T00:00:00.000Z`, `wrld_shadow_1:${i}`)
+                )
+            );
+            await env.DB_GAMELOG.batch(
+                Array.from({ length: 5 }, (_, i) =>
+                    env.DB_GAMELOG.prepare(
+                        `INSERT INTO gamelog_location (created_at, location, world_id, world_name, time, group_name)
+                         VALUES (?, ?, 'wrld_shadow_1', 'Shadow Old World', 1000, '')`
+                    ).bind(`2026-01-0${i + 1}T00:00:00.000Z`, `wrld_shadow_1:${i}`)
+                )
+            );
+            await chatDb.batch(
+                Array.from({ length: 5 }, (_, i) =>
+                    chatDb
+                        .prepare(
+                            `INSERT INTO cloud_chat_messages
+                             (id, device_id, direction, source_text, translated_text, sent_text, source_lang, target_lang, display_mode, osc_address, osc_port, immediate, play_sfx, status, cmd_id, error_message, created_at)
+                             VALUES (?, 'dev_shadow', 'web_to_vrc', ?, '', ?, 'auto', '', 'source_only', '/chatbox/input', 9000, 1, 1, 'sent', '', '', ?)`
+                        )
+                        .bind(`chat_shadow_old_${i}`, `Old chat ${i}`, `Old chat ${i}`, `2026-01-0${i + 1}T00:00:00.000Z`)
+                )
+            );
+
+            // Write 1 NEWER record into each shard via public APIs (goes straight into *_archive_chunks)
+            await exports.default.fetch('http://example.com/api/notifications', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+                body: JSON.stringify({
+                    version: 2,
+                    entries: [{ id: 'not_shadow_new_chunk', created_at: newestIso, type: 'boop', message: 'Newest Chunk V2', seen: false }]
+                })
+            });
+            await exports.default.fetch('http://example.com/api/friend-log/history', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+                body: JSON.stringify({
+                    entries: [{ created_at: newestIso, type: 'Friend', user_id: 'usr_shadow_new', display_name: 'NewestChunkPal' }]
+                })
+            });
+            await exports.default.fetch('http://example.com/api/feed', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+                body: JSON.stringify({
+                    items: [{ type: 'GPS', created_at: newestIso, userId: 'usr_shadow_f', displayName: 'ShadowFriend', location: 'wrld_shadow_1:999', worldName: 'Shadow Newest World' }]
+                })
+            });
+            await exports.default.fetch('http://example.com/api/gamelog', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+                body: JSON.stringify({
+                    items: [{ type: 'Location', created_at: newestIso, location: 'wrld_shadow_1:999', worldId: 'wrld_shadow_1', worldName: 'Shadow Newest World', time: 5000 }]
+                })
+            });
+            await worker.fetch(
+                new Request('http://example.com/api/agent/chat/sync', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        Authorization: `Bearer ${syncKey}`,
+                        'X-Device-Id': 'dev_shadow'
+                    },
+                    body: JSON.stringify({
+                        messages: [{ id: 'chat_shadow_new_chunk', sourceText: 'Newest Chunk Chat', sentText: 'Newest Chunk Chat', createdAt: newestIso }]
+                    })
+                }),
+                guardedEnv
+            );
+
+            // Assert limit=5 returns the newest chunked record FIRST on every single endpoint
+            const n2Top = (await (await exports.default.fetch('http://example.com/api/notifications?v=2&limit=5')).json()) as {
+                data: Array<{ id: string }>;
+            };
+            expect(n2Top.data[0]?.id).toBe('not_shadow_new_chunk');
+
+            const flTop = (await (await exports.default.fetch('http://example.com/api/friend-log/history?limit=5')).json()) as {
+                data: Array<{ user_id: string }>;
+            };
+            expect(flTop.data[0]?.user_id).toBe('usr_shadow_new');
+
+            const feedTop = (await (
+                await exports.default.fetch('http://example.com/api/feed/query', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+                    body: JSON.stringify({ types: ['GPS'], limit: 5 })
+                })
+            ).json()) as { data: Array<{ location?: string }> };
+            expect(feedTop.data[0]?.location).toBe('wrld_shadow_1:999');
+
+            const glTop = (await (
+                await exports.default.fetch('http://example.com/api/gamelog/query', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+                    body: JSON.stringify({ types: ['Location'], limit: 5 })
+                })
+            ).json()) as { data: Array<{ location?: string }> };
+            expect(glTop.data[0]?.location).toBe('wrld_shadow_1:999');
+
+            const chatTop = (await (await exports.default.fetch('http://example.com/api/chat/messages?limit=5&heartbeat=0')).json()) as {
+                data: { messages: Array<{ id: string }> };
+            };
+            expect(chatTop.data.messages[0]?.id).toBe('chat_shadow_new_chunk');
+
+            const feedSearchTop = (await (
+                await exports.default.fetch('http://example.com/api/feed/search?q=usr_shadow_f&limit=5')
+            ).json()) as { data: Array<{ location?: string }> };
+            expect(feedSearchTop.data[0]?.location).toBe('wrld_shadow_1:999');
+
+            const glSearchTop = (await (
+                await exports.default.fetch('http://example.com/api/gamelog/search?q=wrld_shadow_1&limit=5')
+            ).json()) as { data: { locationRows: Array<{ location: string }> } };
+            expect(glSearchTop.data.locationRows[0]?.location).toBe('wrld_shadow_1:999');
+
+            const wStatsTop = (await (
+                await exports.default.fetch('http://example.com/api/gamelog/stats?kind=world&worldId=wrld_shadow_1&limit=5')
+            ).json()) as { data: { lastVisit: string; instances: Array<{ location: string }> } };
+            expect(wStatsTop.data.lastVisit).toBe(newestIso);
+            expect(wStatsTop.data.instances[0]?.location).toBe('wrld_shadow_1:999');
+
+            // 2. Cross-batch same-instance Join + Leave must NOT double-count join_count
+            await exports.default.fetch('http://example.com/api/gamelog', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+                body: JSON.stringify({
+                    items: [{ type: 'OnPlayerJoined', created_at: '2026-11-26T14:00:00.000Z', location: 'wrld_cb:100', userId: 'usr_cb_join', displayName: 'CrossBatchPal', time: 0 }]
+                })
+            });
+            await exports.default.fetch('http://example.com/api/gamelog', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+                body: JSON.stringify({
+                    items: [{ type: 'OnPlayerLeft', created_at: '2026-11-26T14:15:00.000Z', location: 'wrld_cb:100', userId: 'usr_cb_join', displayName: 'CrossBatchPal', time: 12000 }]
+                })
+            });
+            const cbUserStats = (await (
+                await exports.default.fetch('http://example.com/api/gamelog/stats?kind=user&userId=usr_cb_join')
+            ).json()) as { data: { joinCount: number; timeSpent: number; secondLastSeen: string } };
+            expect(cbUserStats.data.joinCount).toBe(1);
+            expect(cbUserStats.data.timeSpent).toBe(12000);
+            expect(cbUserStats.data.secondLastSeen).toBe('');
+
+            // 3. Boundary-chunk cleanup regression: 1 tail chunk holds BOTH 12-month-old rows AND today's rows.
+            //    Cleanup preview MUST count the expired rows inside the spanning tail chunk, backup MUST unpack
+            //    readable rows into R2, and CAS trimming MUST delete ONLY the old rows while preserving today's rows!
+            await env.DB_FEED.batch([
+                env.DB_FEED.prepare('DELETE FROM feed_gps'),
+                env.DB_FEED.prepare('DELETE FROM feed_archive_chunks')
+            ]);
+            await env.DB_GAMELOG.batch([
+                env.DB_GAMELOG.prepare('DELETE FROM gamelog_location'),
+                env.DB_GAMELOG.prepare('DELETE FROM gamelog_archive_chunks')
+            ]);
+            await env.DB_CORE.batch([
+                env.DB_CORE.prepare('DELETE FROM notifications'),
+                env.DB_CORE.prepare('DELETE FROM notifications_v2'),
+                env.DB_CORE.prepare('DELETE FROM friend_log_history'),
+                env.DB_CORE.prepare('DELETE FROM core_archive_chunks')
+            ]);
+            await exports.default.fetch('http://example.com/api/feed', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+                body: JSON.stringify({
+                    items: [
+                        { type: 'GPS', created_at: oldIso, userId: 'usr_bnd', displayName: 'BndOld', location: 'wrld_bnd_1:old', worldName: 'Old Boundary World' },
+                        { type: 'GPS', created_at: recentIso, userId: 'usr_bnd', displayName: 'BndNew', location: 'wrld_bnd_1:new', worldName: 'New Boundary World' }
+                    ]
+                })
+            });
+            await exports.default.fetch('http://example.com/api/gamelog', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+                body: JSON.stringify({
+                    items: [
+                        { type: 'Location', created_at: oldIso, location: 'wrld_bnd_1:old', worldId: 'wrld_bnd_1', worldName: 'Old Boundary World', time: 5000 },
+                        { type: 'Location', created_at: recentIso, location: 'wrld_bnd_1:new', worldId: 'wrld_bnd_1', worldName: 'New Boundary World', time: 6000 }
+                    ]
+                })
+            });
+            await exports.default.fetch('http://example.com/api/notifications', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+                body: JSON.stringify({
+                    version: 1,
+                    entries: [
+                        { id: 'not_bnd_old', created_at: oldIso, type: 'invite', senderUserId: 'usr_bnd', message: 'Old bnd notif' },
+                        { id: 'not_bnd_new', created_at: recentIso, type: 'invite', senderUserId: 'usr_bnd', message: 'New bnd notif' }
+                    ]
+                })
+            });
+
+            const bndPreview = (await (
+                await exports.default.fetch('http://example.com/api/admin/cleanup/preview?months=6')
+            ).json()) as { data: { shards: { core: number; gamelog: number; feed: number } } };
+            expect(bndPreview.data.shards.feed).toBeGreaterThanOrEqual(1);
+            expect(bndPreview.data.shards.gamelog).toBeGreaterThanOrEqual(1);
+            expect(bndPreview.data.shards.core).toBeGreaterThanOrEqual(1);
+
+            const bndCleanup = (await (
+                await exports.default.fetch('http://example.com/api/admin/cleanup', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+                    body: JSON.stringify({ months: 6, mode: 'backup_and_delete', includeLegacy: false })
+                })
+            ).json()) as { data: { deletedRows: number; backedUpRows: number; backupKey: string } };
+            expect(bndCleanup.data.deletedRows).toBeGreaterThanOrEqual(3);
+            expect(bndCleanup.data.backedUpRows).toBeGreaterThanOrEqual(3);
+            expect(bndCleanup.data.backupKey).toBeTruthy();
+            createdBackupKeys.push(bndCleanup.data.backupKey);
+
+            // Verify R2 backup contains decoded logical rows for the old boundary entries
+            const bndDl = await exports.default.fetch(
+                `http://example.com/api/admin/cleanup/backups/download?key=${encodeURIComponent(bndCleanup.data.backupKey)}`
+            );
+            const bndArchive = JSON.parse(
+                await new Response(bndDl.body!.pipeThrough(new DecompressionStream('gzip'))).text()
+            ) as { active: Record<string, Array<Record<string, unknown>>> };
+            expect(bndArchive.active.feed_gps?.some((r) => r.location === 'wrld_bnd_1:old')).toBe(true);
+            expect(bndArchive.active.gamelog_location?.some((r) => r.location === 'wrld_bnd_1:old')).toBe(true);
+            expect(bndArchive.active.notifications?.some((r) => r.id === 'not_bnd_old')).toBe(true);
+
+            // Verify ONLY old rows were removed from the spanning tail chunks while recent rows survived
+            const feedAfterBnd = (await (
+                await exports.default.fetch('http://example.com/api/feed/query', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+                    body: JSON.stringify({ types: ['GPS'], limit: 10 })
+                })
+            ).json()) as { data: Array<{ location?: string }> };
+            expect(feedAfterBnd.data.some((r) => r.location === 'wrld_bnd_1:old')).toBe(false);
+            expect(feedAfterBnd.data.some((r) => r.location === 'wrld_bnd_1:new')).toBe(true);
+
+            const notAfterBnd = (await (await exports.default.fetch('http://example.com/api/notifications?v=1&limit=10')).json()) as {
+                data: Array<{ id: string }>;
+            };
+            expect(notAfterBnd.data.some((r) => r.id === 'not_bnd_old')).toBe(false);
+            expect(notAfterBnd.data.some((r) => r.id === 'not_bnd_new')).toBe(true);
+
+            // 4. Concurrent CAS test: parallel append + in-place mutate on the same tail chunk loses ZERO data
+            const [appendConcurrent, mutateConcurrent] = await Promise.all([
+                appendTuplesToCompactTailChunk({
+                    db: env.DB_FEED,
+                    archiveTable: 'feed_archive_chunks',
+                    kindColumn: 'feed_kind',
+                    kindValue: 'gps',
+                    tuples: [[newestIso, 'usr_cas_new', 'CasPal', 'wrld_cas:2', 'Cas New World', '', 100, '']],
+                    dedupKeyFn: (t) => feedTupleDedupKey('gps', t)
+                }),
+                mutateArchiveChunks({
+                    db: env.DB_FEED,
+                    archiveTable: 'feed_archive_chunks',
+                    kindColumn: 'feed_kind',
+                    kindValue: 'gps',
+                    mutateTuple: (t) => {
+                        if (String(t[3] ?? '') !== 'wrld_bnd_1:new') return 'keep';
+                        const next = [...t];
+                        next[4] = 'Mutated Under CAS';
+                        return next;
+                    }
+                })
+            ]);
+            expect(appendConcurrent.inserted).toBe(1);
+            expect(mutateConcurrent.modifiedCount).toBe(1);
+            const feedAfterCas = (await (
+                await exports.default.fetch('http://example.com/api/feed/query', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+                    body: JSON.stringify({ types: ['GPS'], limit: 10 })
+                })
+            ).json()) as { data: Array<{ location?: string; worldName?: string }> };
+            expect(feedAfterCas.data.some((r) => r.location === 'wrld_cas:2')).toBe(true);
+            expect(feedAfterCas.data.some((r) => r.location === 'wrld_bnd_1:new' && r.worldName === 'Mutated Under CAS')).toBe(true);
+        } finally {
+            for (const key of createdBackupKeys) {
+                await env.R2_MEDIA?.delete(key).catch(() => {});
+            }
+            await env.DB_FEED.batch([
+                env.DB_FEED.prepare('DELETE FROM feed_gps'),
+                env.DB_FEED.prepare('DELETE FROM feed_archive_chunks')
+            ]).catch(() => {});
+            await env.DB_GAMELOG.batch([
+                env.DB_GAMELOG.prepare('DELETE FROM gamelog_location'),
+                env.DB_GAMELOG.prepare('DELETE FROM gamelog_join_leave'),
+                env.DB_GAMELOG.prepare('DELETE FROM gamelog_archive_chunks'),
+                env.DB_GAMELOG.prepare("DELETE FROM gamelog_world_rollup WHERE world_id IN ('wrld_shadow_1', 'wrld_bnd_1')"),
+                env.DB_GAMELOG.prepare("DELETE FROM gamelog_user_rollup WHERE user_id = 'usr_cb_join'")
+            ]).catch(() => {});
+            await env.DB_CORE.batch([
+                env.DB_CORE.prepare('DELETE FROM notifications'),
+                env.DB_CORE.prepare('DELETE FROM notifications_v2'),
+                env.DB_CORE.prepare('DELETE FROM friend_log_history'),
+                env.DB_CORE.prepare('DELETE FROM core_archive_chunks')
+            ]).catch(() => {});
+            await chatDb.batch([
+                chatDb.prepare('DELETE FROM cloud_chat_messages'),
+                chatDb.prepare('DELETE FROM chat_archive_chunks')
+            ]).catch(() => {});
         }
     });
 });

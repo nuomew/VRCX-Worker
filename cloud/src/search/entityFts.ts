@@ -410,26 +410,18 @@ export async function searchGameLogByEntity(
         }
     }
 
-    // Transparently merge compact GameLog archive chunks (`gamelog_archive_chunks` / `legacy_gamelog_chunks`)
-    // whenever single-row tables have fewer than `limit` matches (skipped during EXPLAIN POC probes when hot rows suffice).
+    // Always merge compact GameLog archive chunks (`gamelog_archive_chunks` / `legacy_gamelog_chunks`)
+    // because new writes go directly into compact chunks (skipped only for EXPLAIN POC probes).
     const archiveTable = options.archiveTable ?? 'gamelog_archive_chunks';
-    const wantChunkJl = effectiveUserIds.length > 0 && joinLeaveRows.length < limit;
-    const wantChunkLoc = matchedWorldIds.length > 0 && locationRows.length < limit;
-    const wantChunkOther =
-        includeOtherTypes &&
-        (videoPlayRows.length < limit ||
-            eventRows.length < limit ||
-            portalSpawnRows.length < limit ||
-            externalRows.length < limit);
+    const wantChunkJl = effectiveUserIds.length > 0;
+    const wantChunkLoc = matchedWorldIds.length > 0;
+    const wantChunkOther = includeOtherTypes;
     if (!options.includeExplain && (wantChunkJl || wantChunkLoc || wantChunkOther)) {
         const chunkKinds: string[] = [];
         if (wantChunkJl) chunkKinds.push('join_leave');
         if (wantChunkLoc) chunkKinds.push('location');
         if (includeOtherTypes) {
-            if (videoPlayRows.length < limit) chunkKinds.push('video');
-            if (eventRows.length < limit) chunkKinds.push('event');
-            if (portalSpawnRows.length < limit) chunkKinds.push('portal');
-            if (externalRows.length < limit) chunkKinds.push('external');
+            chunkKinds.push('video', 'event', 'portal', 'external');
         }
         if (chunkKinds.length > 0) {
             try {

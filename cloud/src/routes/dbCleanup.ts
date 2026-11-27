@@ -1,8 +1,19 @@
 import { randomHex } from '../crypto/vault';
 import {
+    CHUNK_KIND_TO_CORE_TABLE,
+    CHUNK_KIND_TO_FEED_TABLE,
+    CHUNK_KIND_TO_GAMELOG_TABLE,
+    type CompactArchiveTableName,
+    type CoreChunkKind,
+    decodeCoreChunkRows,
+    decodeFeedChunkForExport,
+    decodeGameLogChunkForExport,
     DEFAULT_COMPACT_RETENTION_DAYS,
+    type FeedChunkKind,
+    type GameLogChunkKind,
     MAX_COMPACT_RETENTION_DAYS,
     MIN_COMPACT_RETENTION_DAYS,
+    mutateArchiveChunks,
     runAllDatabasesCompaction
 } from '../db/compactArchive';
 import { getLegacyDb } from '../db/schemaBootstrap';
@@ -37,6 +48,8 @@ interface CleanupTableSpec {
     readonly counterKey?: string;
     readonly legacyCategory?: 'gamelog' | 'feed' | 'notifications' | 'friend_log';
     readonly backup?: boolean;
+    readonly isChunkTable?: boolean;
+    readonly chunkKindCol?: 'feed_kind' | 'gamelog_kind' | 'core_kind';
 }
 
 /**
@@ -99,7 +112,9 @@ const CLEANUP_TABLES: readonly CleanupTableSpec[] = [
         shard: 'gamelog',
         table: 'gamelog_archive_chunks',
         whereSql: 'max_created_at < ?',
-        cutoffKind: 'iso'
+        cutoffKind: 'iso',
+        isChunkTable: true,
+        chunkKindCol: 'gamelog_kind'
     },
     // DB_FEED (4 feed tables + compact archive chunks + completed activity_sessions_v2)
     {
@@ -138,7 +153,9 @@ const CLEANUP_TABLES: readonly CleanupTableSpec[] = [
         shard: 'feed',
         table: 'feed_archive_chunks',
         whereSql: 'max_created_at < ?',
-        cutoffKind: 'iso'
+        cutoffKind: 'iso',
+        isChunkTable: true,
+        chunkKindCol: 'feed_kind'
     },
     {
         shard: 'feed',
@@ -174,7 +191,9 @@ const CLEANUP_TABLES: readonly CleanupTableSpec[] = [
         shard: 'core',
         table: 'core_archive_chunks',
         whereSql: 'max_created_at < ?',
-        cutoffKind: 'iso'
+        cutoffKind: 'iso',
+        isChunkTable: true,
+        chunkKindCol: 'core_kind'
     },
     {
         shard: 'core',
@@ -192,23 +211,151 @@ const LEGACY_CLEANUP_TABLES: readonly CleanupTableSpec[] = [
         table: 'legacy_feed_chunks',
         whereSql: 'max_created_at < ?',
         cutoffKind: 'iso',
-        legacyCategory: 'feed'
+        legacyCategory: 'feed',
+        isChunkTable: true,
+        chunkKindCol: 'feed_kind'
     },
     {
         shard: 'gamelog',
         table: 'legacy_gamelog_chunks',
         whereSql: 'max_created_at < ?',
         cutoffKind: 'iso',
-        legacyCategory: 'gamelog'
+        legacyCategory: 'gamelog',
+        isChunkTable: true,
+        chunkKindCol: 'gamelog_kind'
     },
     {
         shard: 'core',
         table: 'legacy_core_chunks',
         whereSql: 'max_created_at < ?',
         cutoffKind: 'iso',
-        legacyCategory: 'notifications'
+        legacyCategory: 'notifications',
+        isChunkTable: true,
+        chunkKindCol: 'core_kind'
     }
 ];
+
+function resolveChunkLogicalMeta(
+    spec: CleanupTableSpec,
+    kindVal: string
+): {
+    logicalTable: string;
+    counterKey?: string;
+    legacyCategory: 'gamelog' | 'feed' | 'notifications' | 'friend_log';
+} {
+    if (spec.chunkKindCol === 'feed_kind') {
+        const tbl = CHUNK_KIND_TO_FEED_TABLE[kindVal as FeedChunkKind] ?? spec.table;
+        return { logicalTable: tbl, counterKey: tbl, legacyCategory: 'feed' };
+    }
+    if (spec.chunkKindCol === 'gamelog_kind') {
+        const tbl = CHUNK_KIND_TO_GAMELOG_TABLE[kindVal as GameLogChunkKind] ?? spec.table;
+        return { logicalTable: tbl, counterKey: tbl, legacyCategory: 'gamelog' };
+    }
+    const tbl = CHUNK_KIND_TO_CORE_TABLE[kindVal as CoreChunkKind] ?? spec.table;
+    return {
+        logicalTable: tbl,
+        counterKey: tbl === 'notifications_v2' ? undefined : tbl,
+        legacyCategory: kindVal === 'friend_log' ? 'friend_log' : 'notifications'
+    };
+}
+
+function decodeChunkTuplesForBackup(
+    spec: CleanupTableSpec,
+    chunkId: number,
+    kindVal: string,
+    tuples: unknown[][]
+): Array<Record<string, unknown>> {
+    const json = JSON.stringify(tuples);
+    if (spec.chunkKindCol === 'feed_kind') {
+        return decodeFeedChunkForExport(kindVal as FeedChunkKind, json);
+    }
+    if (spec.chunkKindCol === 'gamelog_kind') {
+        return decodeGameLogChunkForExport(kindVal as GameLogChunkKind, json);
+    }
+    return decodeCoreChunkRows(chunkId, kindVal as CoreChunkKind, json, { forExport: true });
+}
+
+async function countBoundaryExpiredRowsInChunkTable(
+    db: D1Database,
+    spec: CleanupTableSpec,
+    cutoffIso: string
+): Promise<number> {
+    if (!spec.isChunkTable) return 0;
+    try {
+        const res = await db
+            .prepare(
+                `SELECT payload_json FROM ${spec.table}
+                 WHERE min_created_at < ? AND max_created_at >= ?
+                 LIMIT 24`
+            )
+            .bind(cutoffIso, cutoffIso)
+            .all<{ payload_json: string }>();
+        let total = 0;
+        for (const r of res.results ?? []) {
+            try {
+                const parsed = JSON.parse(r.payload_json) as unknown;
+                if (!Array.isArray(parsed)) continue;
+                for (const t of parsed) {
+                    if (Array.isArray(t) && String(t[0] ?? '') < cutoffIso) total++;
+                }
+            } catch {
+                // Skip malformed chunk
+            }
+        }
+        return total;
+    } catch {
+        return 0;
+    }
+}
+
+async function trimBoundaryChunksForSpec(
+    db: D1Database,
+    shardName: 'core' | 'gamelog' | 'feed' | 'legacy',
+    spec: CleanupTableSpec,
+    cutoffIso: string,
+    counterDeltas: Map<string, number>,
+    legacyDeltas: Map<'gamelog' | 'feed' | 'notifications' | 'friend_log', number>,
+    onlyChunkIds?: Set<number>
+): Promise<number> {
+    if (!spec.isChunkTable || !spec.chunkKindCol) return 0;
+    let deletedTotal = 0;
+    try {
+        const res = await db
+            .prepare(
+                `SELECT id, ${spec.chunkKindCol} AS kind_val
+                 FROM ${spec.table}
+                 WHERE min_created_at < ? AND max_created_at >= ?
+                 LIMIT 24`
+            )
+            .bind(cutoffIso, cutoffIso)
+            .all<{ id: number; kind_val: string }>();
+        for (const row of res.results ?? []) {
+            if (onlyChunkIds && !onlyChunkIds.has(row.id)) continue;
+            const kindVal = String(row.kind_val ?? '');
+            const mut = await mutateArchiveChunks({
+                db,
+                archiveTable: spec.table as CompactArchiveTableName,
+                kindColumn: spec.chunkKindCol,
+                kindValue: kindVal,
+                chunkIdHint: row.id,
+                stopAfterFirstChunkChange: true,
+                mutateTuple: (t) => (String(t[0] ?? '') < cutoffIso ? 'delete' : 'keep')
+            });
+            if (mut.deletedCount > 0) {
+                deletedTotal += mut.deletedCount;
+                const meta = resolveChunkLogicalMeta(spec, kindVal);
+                if (shardName === 'legacy') {
+                    legacyDeltas.set(meta.legacyCategory, (legacyDeltas.get(meta.legacyCategory) ?? 0) + mut.deletedCount);
+                } else if (meta.counterKey) {
+                    counterDeltas.set(meta.counterKey, (counterDeltas.get(meta.counterKey) ?? 0) - mut.deletedCount);
+                }
+            }
+        }
+    } catch {
+        // Non-fatal
+    }
+    return deletedTotal;
+}
 
 function isPlainObject(val: unknown): val is Record<string, unknown> {
     return Boolean(val) && typeof val === 'object' && !Array.isArray(val);
@@ -402,26 +549,25 @@ export async function handleDbCleanupRoutes(
         const gamelogSpecs = CLEANUP_TABLES.filter((t) => t.shard === 'gamelog');
         const feedSpecs = CLEANUP_TABLES.filter((t) => t.shard === 'feed');
 
-        const [coreRes, gamelogRes, feedRes, legacyRes] = await Promise.all([
+        const buildPreviewCountSql = (s: CleanupTableSpec) =>
+            s.isChunkTable
+                ? `SELECT COALESCE(SUM(row_count), 0) AS cnt FROM ${s.table} WHERE ${s.whereSql}`
+                : `SELECT COUNT(*) AS cnt FROM ${s.table} WHERE ${s.whereSql}`;
+
+        const [coreRes, gamelogRes, feedRes, legacyRes, boundaryCounts] = await Promise.all([
             env.DB_CORE.batch(
                 coreSpecs.map((s) =>
-                    env.DB_CORE.prepare(`SELECT COUNT(*) AS cnt FROM ${s.table} WHERE ${s.whereSql}`).bind(
-                        getCutoffParam(s, cutoffIso, cutoffMs)
-                    )
+                    env.DB_CORE.prepare(buildPreviewCountSql(s)).bind(getCutoffParam(s, cutoffIso, cutoffMs))
                 )
             ),
             env.DB_GAMELOG.batch(
                 gamelogSpecs.map((s) =>
-                    env.DB_GAMELOG.prepare(`SELECT COUNT(*) AS cnt FROM ${s.table} WHERE ${s.whereSql}`).bind(
-                        getCutoffParam(s, cutoffIso, cutoffMs)
-                    )
+                    env.DB_GAMELOG.prepare(buildPreviewCountSql(s)).bind(getCutoffParam(s, cutoffIso, cutoffMs))
                 )
             ),
             env.DB_FEED.batch(
                 feedSpecs.map((s) =>
-                    env.DB_FEED.prepare(`SELECT COUNT(*) AS cnt FROM ${s.table} WHERE ${s.whereSql}`).bind(
-                        getCutoffParam(s, cutoffIso, cutoffMs)
-                    )
+                    env.DB_FEED.prepare(buildPreviewCountSql(s)).bind(getCutoffParam(s, cutoffIso, cutoffMs))
                 )
             ),
             legacyDb
@@ -429,14 +575,41 @@ export async function handleDbCleanupRoutes(
                       .batch(
                           LEGACY_CLEANUP_TABLES.map((s) =>
                               legacyDb
-                                  .prepare(`SELECT COUNT(*) AS cnt FROM ${s.table} WHERE ${s.whereSql}`)
+                                  .prepare(buildPreviewCountSql(s))
                                   .bind(getCutoffParam(s, cutoffIso, cutoffMs))
                           )
                       )
                       .catch(() => LEGACY_CLEANUP_TABLES.map(() => ({ results: [{ cnt: 0 }] })))
-                : Promise.resolve([])
+                : Promise.resolve([]),
+            Promise.all([
+                ...coreSpecs
+                    .filter((s) => s.isChunkTable)
+                    .map(async (s) => ({
+                        key: `core:${s.table}`,
+                        cnt: await countBoundaryExpiredRowsInChunkTable(env.DB_CORE, s, cutoffIso)
+                    })),
+                ...gamelogSpecs
+                    .filter((s) => s.isChunkTable)
+                    .map(async (s) => ({
+                        key: `gamelog:${s.table}`,
+                        cnt: await countBoundaryExpiredRowsInChunkTable(env.DB_GAMELOG, s, cutoffIso)
+                    })),
+                ...feedSpecs
+                    .filter((s) => s.isChunkTable)
+                    .map(async (s) => ({
+                        key: `feed:${s.table}`,
+                        cnt: await countBoundaryExpiredRowsInChunkTable(env.DB_FEED, s, cutoffIso)
+                    })),
+                ...(legacyDb
+                    ? LEGACY_CLEANUP_TABLES.filter((s) => s.isChunkTable).map(async (s) => ({
+                          key: `legacy:${s.table}`,
+                          cnt: await countBoundaryExpiredRowsInChunkTable(legacyDb, s, cutoffIso)
+                      }))
+                    : [])
+            ])
         ]);
 
+        const boundaryCountMap = new Map<string, number>(boundaryCounts.map((b) => [b.key, b.cnt]));
         const tables: Array<{ shard: 'core' | 'gamelog' | 'feed' | 'legacy'; table: string; count: number }> = [];
         const shards = { core: 0, gamelog: 0, feed: 0, legacy: 0 };
 
@@ -447,7 +620,9 @@ export async function handleDbCleanupRoutes(
         ) => {
             specs.forEach((spec, i) => {
                 const first = (results[i]?.results?.[0] ?? null) as { cnt?: number } | null;
-                const count = Math.max(0, Number(first?.cnt ?? 0));
+                const count =
+                    Math.max(0, Number(first?.cnt ?? 0)) +
+                    Math.max(0, boundaryCountMap.get(`${shardName}:${spec.table}`) ?? 0);
                 shards[shardName] += count;
                 if (count > 0) {
                     tables.push({ shard: shardName, table: spec.table, count });
@@ -778,68 +953,99 @@ export async function handleDbCleanupRoutes(
             const gamelogSpecs = CLEANUP_TABLES.filter((t) => t.shard === 'gamelog');
             const feedSpecs = CLEANUP_TABLES.filter((t) => t.shard === 'feed');
 
-            const [coreRes, gamelogRes, feedRes, legacyRes] = await Promise.all([
-                env.DB_CORE.batch(
-                    coreSpecs.map((s) =>
-                        env.DB_CORE.prepare(`DELETE FROM ${s.table} WHERE ${s.whereSql}`).bind(
-                            getCutoffParam(s, cutoffIso, cutoffMs)
-                        )
-                    )
-                ),
-                env.DB_GAMELOG.batch(
-                    gamelogSpecs.map((s) =>
-                        env.DB_GAMELOG.prepare(`DELETE FROM ${s.table} WHERE ${s.whereSql}`).bind(
-                            getCutoffParam(s, cutoffIso, cutoffMs)
-                        )
-                    )
-                ),
-                env.DB_FEED.batch(
-                    feedSpecs.map((s) =>
-                        env.DB_FEED.prepare(`DELETE FROM ${s.table} WHERE ${s.whereSql}`).bind(
-                            getCutoffParam(s, cutoffIso, cutoffMs)
-                        )
-                    )
-                ),
-                legacyDb
-                    ? legacyDb
-                          .batch(
-                              LEGACY_CLEANUP_TABLES.map((s) =>
-                                  legacyDb
-                                      .prepare(`DELETE FROM ${s.table} WHERE ${s.whereSql}`)
-                                      .bind(getCutoffParam(s, cutoffIso, cutoffMs))
-                              )
-                          )
-                          .catch(() => LEGACY_CLEANUP_TABLES.map(() => ({ meta: { changes: 0 } })))
-                    : Promise.resolve([])
-            ]);
-
-            const tallyActive = (
-                shardName: 'core' | 'gamelog' | 'feed',
-                specs: readonly CleanupTableSpec[],
-                results: Array<{ meta?: { changes?: number } }>
+            const deleteShardSpecs = async (
+                shardName: 'core' | 'gamelog' | 'feed' | 'legacy',
+                db: D1Database | null,
+                specs: readonly CleanupTableSpec[]
             ) => {
-                specs.forEach((spec, i) => {
-                    const changes = Math.max(0, Number(results[i]?.meta?.changes ?? 0));
-                    perShardDeleted[shardName] += changes;
-                    if (changes > 0 && spec.counterKey) {
-                        counterDeltas.set(spec.counterKey, (counterDeltas.get(spec.counterKey) ?? 0) - changes);
+                if (!db) return;
+                const singleSpecs = specs.filter((s) => !s.isChunkTable);
+                const chunkSpecs = specs.filter((s) => s.isChunkTable);
+
+                if (singleSpecs.length > 0) {
+                    const res = await db
+                        .batch(
+                            singleSpecs.map((s) =>
+                                db
+                                    .prepare(`DELETE FROM ${s.table} WHERE ${s.whereSql}`)
+                                    .bind(getCutoffParam(s, cutoffIso, cutoffMs))
+                            )
+                        )
+                        .catch(() => singleSpecs.map(() => ({ meta: { changes: 0 } })));
+                    singleSpecs.forEach((spec, i) => {
+                        const changes = Math.max(0, Number(res[i]?.meta?.changes ?? 0));
+                        perShardDeleted[shardName] += changes;
+                        if (changes > 0) {
+                            if (shardName === 'legacy' && spec.legacyCategory) {
+                                legacyDeltas.set(
+                                    spec.legacyCategory,
+                                    (legacyDeltas.get(spec.legacyCategory) ?? 0) + changes
+                                );
+                            } else if (shardName !== 'legacy' && spec.counterKey) {
+                                counterDeltas.set(spec.counterKey, (counterDeltas.get(spec.counterKey) ?? 0) - changes);
+                            }
+                        }
+                    });
+                }
+
+                for (const spec of chunkSpecs) {
+                    if (!spec.chunkKindCol) continue;
+                    // 1. Delete whole chunks strictly older than cutoffIso and tally exact row_count
+                    const wholeRes = await db
+                        .prepare(
+                            `SELECT ${spec.chunkKindCol} AS kind_val, COALESCE(SUM(row_count), 0) AS total_rows
+                             FROM ${spec.table}
+                             WHERE ${spec.whereSql}
+                             GROUP BY ${spec.chunkKindCol}`
+                        )
+                        .bind(cutoffIso)
+                        .all<{ kind_val: string; total_rows: number }>()
+                        .catch(() => ({ results: [] as Array<{ kind_val: string; total_rows: number }> }));
+                    const wholeGroups = (wholeRes.results ?? []).filter((g) => Number(g.total_rows ?? 0) > 0);
+                    if (wholeGroups.length > 0) {
+                        const delRes = await db
+                            .prepare(`DELETE FROM ${spec.table} WHERE ${spec.whereSql}`)
+                            .bind(cutoffIso)
+                            .run()
+                            .catch(() => ({ meta: { changes: 0 } }));
+                        if ((delRes.meta?.changes ?? 0) > 0) {
+                            for (const g of wholeGroups) {
+                                const rowsCnt = Math.max(0, Number(g.total_rows ?? 0));
+                                perShardDeleted[shardName] += rowsCnt;
+                                const meta = resolveChunkLogicalMeta(spec, String(g.kind_val ?? ''));
+                                if (shardName === 'legacy') {
+                                    legacyDeltas.set(
+                                        meta.legacyCategory,
+                                        (legacyDeltas.get(meta.legacyCategory) ?? 0) + rowsCnt
+                                    );
+                                } else if (meta.counterKey) {
+                                    counterDeltas.set(
+                                        meta.counterKey,
+                                        (counterDeltas.get(meta.counterKey) ?? 0) - rowsCnt
+                                    );
+                                }
+                            }
+                        }
                     }
-                });
+                    // 2. CAS-trim expired tuples from any boundary chunk spanning cutoffIso
+                    const trimmed = await trimBoundaryChunksForSpec(
+                        db,
+                        shardName,
+                        spec,
+                        cutoffIso,
+                        counterDeltas,
+                        legacyDeltas
+                    );
+                    perShardDeleted[shardName] += trimmed;
+                }
             };
 
-            tallyActive('core', coreSpecs, coreRes);
-            tallyActive('gamelog', gamelogSpecs, gamelogRes);
-            tallyActive('feed', feedSpecs, feedRes);
-
-            if (legacyDb) {
-                LEGACY_CLEANUP_TABLES.forEach((spec, i) => {
-                    const changes = Math.max(0, Number(legacyRes[i]?.meta?.changes ?? 0));
-                    perShardDeleted.legacy += changes;
-                    if (changes > 0 && spec.legacyCategory) {
-                        legacyDeltas.set(spec.legacyCategory, (legacyDeltas.get(spec.legacyCategory) ?? 0) + changes);
-                    }
-                });
-            }
+            await Promise.all([
+                deleteShardSpecs('core', env.DB_CORE, coreSpecs),
+                deleteShardSpecs('gamelog', env.DB_GAMELOG, gamelogSpecs),
+                deleteShardSpecs('feed', env.DB_FEED, feedSpecs),
+                deleteShardSpecs('legacy', legacyDb, LEGACY_CLEANUP_TABLES)
+            ]);
 
             await Promise.all([
                 incrementCountersBatch(env.DB_CORE, counterDeltas).catch(() => {}),
@@ -871,33 +1077,34 @@ export async function handleDbCleanupRoutes(
         }
 
         // mode === 'backup_and_delete':
-        // 1. Read bounded rowid-ordered slices across all shards first
-        // 2. Write gzip JSON archive to R2_MEDIA and await confirmation
-        // 3. Delete ONLY the exact rowid <= maxRid slices already safely archived to R2
+        // 1. Read bounded rowid-ordered slices across all shards first (unpacking compact chunks into logical tables)
+        // 2. Write gzip JSON archive to R2_MEDIA / B2 and await confirmation
+        // 3. Delete ONLY the exact rowid <= maxRid slices and boundary-trimmed chunk tuples already safely archived
         const coreSpecs = CLEANUP_TABLES.filter((t) => t.shard === 'core');
         const gamelogSpecs = CLEANUP_TABLES.filter((t) => t.shard === 'gamelog');
         const feedSpecs = CLEANUP_TABLES.filter((t) => t.shard === 'feed');
+        const chunkSliceLimit = Math.max(4, Math.min(16, Math.ceil(batchLimit / 200)));
 
         const [coreRowsRes, gamelogRowsRes, feedRowsRes, legacyRowsRes] = await Promise.all([
             env.DB_CORE.batch(
                 coreSpecs.map((s) =>
                     env.DB_CORE.prepare(
                         `SELECT rowid AS _rid, * FROM ${s.table} WHERE ${s.whereSql} ORDER BY rowid ASC LIMIT ?`
-                    ).bind(getCutoffParam(s, cutoffIso, cutoffMs), batchLimit + 1)
+                    ).bind(getCutoffParam(s, cutoffIso, cutoffMs), (s.isChunkTable ? chunkSliceLimit : batchLimit) + 1)
                 )
             ),
             env.DB_GAMELOG.batch(
                 gamelogSpecs.map((s) =>
                     env.DB_GAMELOG.prepare(
                         `SELECT rowid AS _rid, * FROM ${s.table} WHERE ${s.whereSql} ORDER BY rowid ASC LIMIT ?`
-                    ).bind(getCutoffParam(s, cutoffIso, cutoffMs), batchLimit + 1)
+                    ).bind(getCutoffParam(s, cutoffIso, cutoffMs), (s.isChunkTable ? chunkSliceLimit : batchLimit) + 1)
                 )
             ),
             env.DB_FEED.batch(
                 feedSpecs.map((s) =>
                     env.DB_FEED.prepare(
                         `SELECT rowid AS _rid, * FROM ${s.table} WHERE ${s.whereSql} ORDER BY rowid ASC LIMIT ?`
-                    ).bind(getCutoffParam(s, cutoffIso, cutoffMs), batchLimit + 1)
+                    ).bind(getCutoffParam(s, cutoffIso, cutoffMs), (s.isChunkTable ? chunkSliceLimit : batchLimit) + 1)
                 )
             ),
             legacyDb
@@ -908,7 +1115,10 @@ export async function handleDbCleanupRoutes(
                                   .prepare(
                                       `SELECT rowid AS _rid, * FROM ${s.table} WHERE ${s.whereSql} ORDER BY rowid ASC LIMIT ?`
                                   )
-                                  .bind(getCutoffParam(s, cutoffIso, cutoffMs), batchLimit + 1)
+                                  .bind(
+                                      getCutoffParam(s, cutoffIso, cutoffMs),
+                                      (s.isChunkTable ? chunkSliceLimit : batchLimit) + 1
+                                  )
                           )
                       )
                       .catch(() => LEGACY_CLEANUP_TABLES.map(() => ({ results: [] })))
@@ -917,10 +1127,29 @@ export async function handleDbCleanupRoutes(
 
         const activeArchive: Record<string, Array<Record<string, unknown>>> = {};
         const legacyArchive: Record<string, Array<Record<string, unknown>>> = {};
+        const appendArchiveRows = (
+            shardName: 'core' | 'gamelog' | 'feed' | 'legacy',
+            logicalTable: string,
+            rowsToAdd: Array<Record<string, unknown>>
+        ) => {
+            if (rowsToAdd.length === 0) return;
+            const target = shardName === 'legacy' ? legacyArchive : activeArchive;
+            const existing = target[logicalTable];
+            if (existing) existing.push(...rowsToAdd);
+            else target[logicalTable] = [...rowsToAdd];
+        };
+
         const deleteTargets: Array<{
             shard: 'core' | 'gamelog' | 'feed' | 'legacy';
             spec: CleanupTableSpec;
             maxRid: number;
+            chunkKindCounts?: Map<string, number>;
+        }> = [];
+        const boundaryTrimTargets: Array<{
+            shard: 'core' | 'gamelog' | 'feed' | 'legacy';
+            db: D1Database;
+            spec: CleanupTableSpec;
+            chunkIds: Set<number>;
         }> = [];
         let backedUpRows = 0;
         let hasMore = false;
@@ -933,11 +1162,41 @@ export async function handleDbCleanupRoutes(
             specs.forEach((spec, i) => {
                 const rawRows = (results[i]?.results ?? []) as Array<Record<string, unknown>>;
                 if (rawRows.length === 0) return;
-                if (rawRows.length > batchLimit) {
+                const effLimit = spec.isChunkTable ? chunkSliceLimit : batchLimit;
+                if (rawRows.length > effLimit) {
                     hasMore = true;
                 }
-                const slice = rawRows.length > batchLimit ? rawRows.slice(0, batchLimit) : rawRows;
+                const slice = rawRows.length > effLimit ? rawRows.slice(0, effLimit) : rawRows;
                 let maxRid = 0;
+
+                if (spec.isChunkTable && spec.chunkKindCol) {
+                    const chunkKindCounts = new Map<string, number>();
+                    for (const row of slice) {
+                        const rid = Number(row._rid ?? 0);
+                        if (Number.isFinite(rid) && rid > maxRid) maxRid = rid;
+                        const kindVal = String(row[spec.chunkKindCol] ?? '');
+                        let tuples: unknown[][] = [];
+                        try {
+                            const parsed = JSON.parse(String(row.payload_json ?? '[]')) as unknown;
+                            if (Array.isArray(parsed)) tuples = parsed.filter(Array.isArray) as unknown[][];
+                        } catch {
+                            tuples = [];
+                        }
+                        const rowCnt = Math.max(tuples.length, Number(row.row_count ?? 0) || 0);
+                        chunkKindCounts.set(kindVal, (chunkKindCounts.get(kindVal) ?? 0) + rowCnt);
+                        if (spec.backup !== false && tuples.length > 0) {
+                            const meta = resolveChunkLogicalMeta(spec, kindVal);
+                            const decoded = decodeChunkTuplesForBackup(spec, Number(row.id ?? rid), kindVal, tuples);
+                            appendArchiveRows(shardName, meta.logicalTable, decoded);
+                            backedUpRows += decoded.length;
+                        }
+                    }
+                    if (maxRid > 0) {
+                        deleteTargets.push({ shard: shardName, spec, maxRid, chunkKindCounts });
+                    }
+                    return;
+                }
+
                 const cleanRows: Array<Record<string, unknown>> = [];
                 for (const row of slice) {
                     const rid = Number(row._rid ?? 0);
@@ -954,11 +1213,7 @@ export async function handleDbCleanupRoutes(
                 }
                 if (cleanRows.length > 0) {
                     backedUpRows += cleanRows.length;
-                    if (shardName === 'legacy') {
-                        legacyArchive[spec.table] = cleanRows;
-                    } else {
-                        activeArchive[spec.table] = cleanRows;
-                    }
+                    appendArchiveRows(shardName, spec.table, cleanRows);
                 }
             });
         };
@@ -970,7 +1225,57 @@ export async function handleDbCleanupRoutes(
             collectSlice('legacy', LEGACY_CLEANUP_TABLES, legacyRowsRes);
         }
 
-        if (deleteTargets.length === 0) {
+        // Also extract expired tuples from boundary chunks spanning cutoffIso BEFORE uploading backup
+        const collectBoundaryForBackup = async (
+            shardName: 'core' | 'gamelog' | 'feed' | 'legacy',
+            db: D1Database | null,
+            specs: readonly CleanupTableSpec[]
+        ) => {
+            if (!db) return;
+            for (const spec of specs) {
+                if (!spec.isChunkTable || !spec.chunkKindCol) continue;
+                const res = await db
+                    .prepare(
+                        `SELECT id, ${spec.chunkKindCol} AS kind_val, payload_json
+                         FROM ${spec.table}
+                         WHERE min_created_at < ? AND max_created_at >= ?
+                         LIMIT 24`
+                    )
+                    .bind(cutoffIso, cutoffIso)
+                    .all<{ id: number; kind_val: string; payload_json: string }>()
+                    .catch(() => ({ results: [] as Array<{ id: number; kind_val: string; payload_json: string }> }));
+                const matchedChunkIds = new Set<number>();
+                for (const row of res.results ?? []) {
+                    let tuples: unknown[][] = [];
+                    try {
+                        const parsed = JSON.parse(row.payload_json) as unknown;
+                        if (Array.isArray(parsed)) tuples = parsed.filter(Array.isArray) as unknown[][];
+                    } catch {
+                        continue;
+                    }
+                    const expiredTuples = tuples.filter((t) => String(t[0] ?? '') < cutoffIso);
+                    if (expiredTuples.length === 0) continue;
+                    matchedChunkIds.add(row.id);
+                    const kindVal = String(row.kind_val ?? '');
+                    const meta = resolveChunkLogicalMeta(spec, kindVal);
+                    const decoded = decodeChunkTuplesForBackup(spec, row.id, kindVal, expiredTuples);
+                    appendArchiveRows(shardName, meta.logicalTable, decoded);
+                    backedUpRows += decoded.length;
+                }
+                if (matchedChunkIds.size > 0) {
+                    boundaryTrimTargets.push({ shard: shardName, db, spec, chunkIds: matchedChunkIds });
+                }
+            }
+        };
+
+        await Promise.all([
+            collectBoundaryForBackup('core', env.DB_CORE, coreSpecs),
+            collectBoundaryForBackup('gamelog', env.DB_GAMELOG, gamelogSpecs),
+            collectBoundaryForBackup('feed', env.DB_FEED, feedSpecs),
+            collectBoundaryForBackup('legacy', legacyDb, LEGACY_CLEANUP_TABLES)
+        ]);
+
+        if (deleteTargets.length === 0 && boundaryTrimTargets.length === 0) {
             return Response.json(
                 {
                     ok: true,
@@ -1040,7 +1345,7 @@ export async function handleDbCleanupRoutes(
             overflowed = storeRes.overflowed;
         }
 
-        // Now delete ONLY the exact rowid <= maxRid slices backed up above
+        // Now delete ONLY the exact rowid <= maxRid slices and boundary chunks safely backed up above
         const targetsByShard: Record<'core' | 'gamelog' | 'feed' | 'legacy', typeof deleteTargets> = {
             core: [],
             gamelog: [],
@@ -1066,8 +1371,23 @@ export async function handleDbCleanupRoutes(
             );
             list.forEach((item, i) => {
                 const changes = Math.max(0, Number(res[i]?.meta?.changes ?? 0));
-                perShardDeleted[shardName] += changes;
-                if (changes > 0) {
+                if (changes <= 0) return;
+                if (item.spec.isChunkTable && item.chunkKindCounts) {
+                    for (const [kindVal, rowCnt] of item.chunkKindCounts.entries()) {
+                        if (rowCnt <= 0) continue;
+                        perShardDeleted[shardName] += rowCnt;
+                        const meta = resolveChunkLogicalMeta(item.spec, kindVal);
+                        if (shardName === 'legacy') {
+                            legacyDeltas.set(
+                                meta.legacyCategory,
+                                (legacyDeltas.get(meta.legacyCategory) ?? 0) + rowCnt
+                            );
+                        } else if (meta.counterKey) {
+                            counterDeltas.set(meta.counterKey, (counterDeltas.get(meta.counterKey) ?? 0) - rowCnt);
+                        }
+                    }
+                } else {
+                    perShardDeleted[shardName] += changes;
                     if (shardName === 'legacy' && item.spec.legacyCategory) {
                         legacyDeltas.set(
                             item.spec.legacyCategory,
@@ -1089,6 +1409,20 @@ export async function handleDbCleanupRoutes(
             runShardDeletes('feed', getShardDb(env, 'feed')),
             runShardDeletes('legacy', legacyDb)
         ]);
+
+        // Now CAS-trim the exact boundary chunks whose expired tuples were backed up above
+        for (const bt of boundaryTrimTargets) {
+            const trimmed = await trimBoundaryChunksForSpec(
+                bt.db,
+                bt.shard,
+                bt.spec,
+                cutoffIso,
+                counterDeltas,
+                legacyDeltas,
+                bt.chunkIds
+            );
+            perShardDeleted[bt.shard] += trimmed;
+        }
 
         await Promise.all([
             incrementCountersBatch(env.DB_CORE, counterDeltas).catch(() => {}),

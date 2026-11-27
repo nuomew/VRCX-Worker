@@ -1220,19 +1220,16 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
                 }
             };
             const [activeArchiveRows, legacyArchiveRows] = await Promise.all([
-                primaryRows.length < limit ? readFriendLogChunks(env.DB_CORE, 'core_archive_chunks', false) : Promise.resolve([]),
-                hasLegacyFriendLog && legacyDb && legacyRows.length < limit
+                readFriendLogChunks(env.DB_CORE, 'core_archive_chunks', false),
+                hasLegacyFriendLog && legacyDb
                     ? readFriendLogChunks(legacyDb, 'legacy_core_chunks', true)
                     : Promise.resolve([])
             ]);
-            primaryRows.push(...activeArchiveRows);
-            legacyRows.push(...legacyArchiveRows);
-            const merged = mergePrimaryAndLegacy(
-                primaryRows,
-                legacyRows,
-                (r) =>
-                    `${String(r.created_at ?? '')}|${String(r.type ?? '')}|${String(r.user_id ?? '')}|${String(r.display_name ?? '')}`
-            )
+            const friendLogKey = (r: Record<string, unknown>) =>
+                `${String(r.created_at ?? '')}|${String(r.type ?? '')}|${String(r.user_id ?? '')}|${String(r.display_name ?? '')}`;
+            const primaryMerged = mergePrimaryAndLegacy(primaryRows, activeArchiveRows, friendLogKey);
+            const legacyMerged = mergePrimaryAndLegacy(legacyRows, legacyArchiveRows, friendLogKey);
+            const merged = mergePrimaryAndLegacy(primaryMerged, legacyMerged, friendLogKey)
                 .sort((a, b) => String(b.created_at ?? '').localeCompare(String(a.created_at ?? '')))
                 .slice(0, limit);
             return Response.json({ ok: true, data: merged });
@@ -1405,8 +1402,8 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
                 }
             };
             const [activeArchiveRows, legacyArchiveRows] = await Promise.all([
-                primaryRows.length < limit ? readNotifChunks(env.DB_CORE, 'core_archive_chunks', false) : Promise.resolve([]),
-                hasLegacyNotif && legacyDb && legacyRows.length < limit
+                readNotifChunks(env.DB_CORE, 'core_archive_chunks', false),
+                hasLegacyNotif && legacyDb
                     ? readNotifChunks(legacyDb, 'legacy_core_chunks', true)
                     : Promise.resolve([])
             ]);

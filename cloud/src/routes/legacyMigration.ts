@@ -1477,7 +1477,8 @@ async function ingestLegacyCategoryBatch(
                         location: t[3],
                         user_id: t[4],
                         time: t[5]
-                    }))
+                    })),
+                    res.recentExistingTuples
                 );
             }
         }

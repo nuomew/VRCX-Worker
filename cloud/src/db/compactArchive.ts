@@ -815,6 +815,8 @@ export interface AppendTailChunkResult {
     lastChunkId: number;
     lastVirtualRowId: number;
     insertedTuples: unknown[][];
+    /** Existing tuples already present in the scanned recent chunks BEFORE this write (for cross-batch rollup dedup). */
+    recentExistingTuples: unknown[][];
     insertedRowIdsByInputIndex: Map<number, number>;
     sizeAfter: number;
 }
@@ -861,6 +863,7 @@ export async function appendTuplesToCompactTailChunk(options: {
         lastChunkId: 0,
         lastVirtualRowId: 0,
         insertedTuples: [],
+        recentExistingTuples: [],
         insertedRowIdsByInputIndex: new Map<number, number>(),
         sizeAfter: 0
     };
@@ -905,7 +908,11 @@ export async function appendTuplesToCompactTailChunk(options: {
         return { minTs: minTs || fallbackIso, maxTs: maxTs || fallbackIso };
     };
 
-    for (let attempt = 0; attempt < 2; attempt++) {
+    let totalCommittedUpdates = 0;
+    let totalChunksTouched = 0;
+    const maxAttempts = 4;
+
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
         // 2. Read the newest 2 chunks (1-2 indexed rows) for tail merge & boundary deduplication
         const recentRes = kindColumn
             ? await db
@@ -946,9 +953,11 @@ export async function appendTuplesToCompactTailChunk(options: {
             meta: (typeof recentChunks)[number];
             rows: unknown[][];
             dirty: boolean;
+            dirtyUpdates: number;
             keyToIdx: Map<string, number>;
         }> = [];
         const globalRecentKeyLoc = new Map<string, { chunkPos: number; rowPos: number }>();
+        const recentExistingTuples: unknown[][] = [];
 
         for (let cIdx = 0; cIdx < recentChunks.length; cIdx++) {
             const c = recentChunks[cIdx]!;
@@ -961,7 +970,9 @@ export async function appendTuplesToCompactTailChunk(options: {
             }
             const keyToIdx = new Map<string, number>();
             for (let rIdx = 0; rIdx < rows.length; rIdx++) {
-                const k = dedupKeyFn(rows[rIdx]!);
+                const row = rows[rIdx]!;
+                recentExistingTuples.push(row);
+                const k = dedupKeyFn(row);
                 if (k) {
                     keyToIdx.set(k, rIdx);
                     if (!globalRecentKeyLoc.has(k)) {
@@ -969,11 +980,10 @@ export async function appendTuplesToCompactTailChunk(options: {
                     }
                 }
             }
-            parsedChunks.push({ meta: c, rows, dirty: false, keyToIdx });
+            parsedChunks.push({ meta: c, rows, dirty: false, dirtyUpdates: 0, keyToIdx });
         }
 
         const fresh: Array<{ tuple: unknown[]; inputIndex: number }> = [];
-        let updatedCount = 0;
         let duplicateCount = batchSkipped;
 
         for (const item of batchDeduped) {
@@ -985,7 +995,7 @@ export async function appendTuplesToCompactTailChunk(options: {
                     if (merged) {
                         targetChunk.rows[loc.rowPos] = merged;
                         targetChunk.dirty = true;
-                        updatedCount++;
+                        targetChunk.dirtyUpdates++;
                         continue;
                     }
                 }
@@ -995,7 +1005,6 @@ export async function appendTuplesToCompactTailChunk(options: {
             fresh.push({ tuple: item.tuple, inputIndex: item.inputIndex });
         }
 
-        let chunksTouched = 0;
         let lastChunkId = 0;
         let lastVirtualRowId = 0;
         let sizeAfter = 0;
@@ -1019,7 +1028,8 @@ export async function appendTuplesToCompactTailChunk(options: {
                 .bind(newKey, minTs, maxTs, pc.rows.length, payloadJson, pc.meta.id, pc.meta.row_count, pc.meta.chunk_key)
                 .run();
             if ((upd.meta?.changes ?? 0) === 1) {
-                chunksTouched++;
+                totalChunksTouched++;
+                totalCommittedUpdates += pc.dirtyUpdates;
                 if (typeof upd.meta?.size_after === 'number' && upd.meta.size_after > sizeAfter) {
                     sizeAfter = upd.meta.size_after;
                 }
@@ -1028,7 +1038,7 @@ export async function appendTuplesToCompactTailChunk(options: {
                 break;
             }
         }
-        if (casConflict && attempt === 0) continue;
+        if (casConflict && attempt < maxAttempts - 1) continue;
 
         // 4. Append into the newest tail chunk if it has room (<= 1,000 rows AND <= 512 KiB)
         let remainingStart = 0;
@@ -1073,7 +1083,8 @@ export async function appendTuplesToCompactTailChunk(options: {
                     )
                     .run();
                 if ((upd.meta?.changes ?? 0) === 1) {
-                    chunksTouched++;
+                    totalChunksTouched++;
+                    totalCommittedUpdates += tail.dirtyUpdates;
                     lastChunkId = Number(tail.meta.id);
                     if (typeof upd.meta?.size_after === 'number' && upd.meta.size_after > sizeAfter) {
                         sizeAfter = upd.meta.size_after;
@@ -1085,9 +1096,32 @@ export async function appendTuplesToCompactTailChunk(options: {
                         lastVirtualRowId = vrid;
                     }
                 } else {
-                    if (attempt === 0) continue;
-                    // On second concurrent conflict, fall back to inserting a fresh chunk for all items
+                    if (attempt < maxAttempts - 1) continue;
+                    // On exhausted concurrent CAS retries, fall back to inserting a fresh chunk for new items
+                    // AND preserve any pending conflict-merged tuples via CAS-safe targeted mutation so updates are never lost.
                     remainingStart = 0;
+                    if (tail.dirty && mergeConflictTuple) {
+                        const batchByKey = new Map<string, unknown[]>();
+                        for (const item of batchDeduped) {
+                            if (item.key) batchByKey.set(item.key, item.tuple);
+                        }
+                        const repairRes = await mutateArchiveChunks({
+                            db,
+                            archiveTable,
+                            kindColumn,
+                            kindValue,
+                            chunkIdHint: tail.meta.id,
+                            stopAfterFirstChunkChange: true,
+                            mutateTuple: (existingTuple) => {
+                                const k = dedupKeyFn(existingTuple);
+                                const inc = k ? batchByKey.get(k) : undefined;
+                                if (!inc) return 'keep';
+                                return mergeConflictTuple(existingTuple, inc) ?? 'keep';
+                            }
+                        });
+                        totalCommittedUpdates += repairRes.modifiedCount;
+                        if (repairRes.modifiedCount > 0) totalChunksTouched++;
+                    }
                 }
             }
         }
@@ -1138,7 +1172,7 @@ export async function appendTuplesToCompactTailChunk(options: {
                 }
                 const meta = sliceMeta[sIdx]!;
                 if ((r.meta?.changes ?? 0) > 0) {
-                    chunksTouched++;
+                    totalChunksTouched++;
                     const cid = Number(r.meta?.last_row_id ?? 0);
                     if (cid > 0) lastChunkId = cid;
                     for (let rIdx = 0; rIdx < meta.rows.length; rIdx++) {
@@ -1159,12 +1193,13 @@ export async function appendTuplesToCompactTailChunk(options: {
 
         return {
             inserted: insertedTuples.length,
-            updated: updatedCount,
+            updated: totalCommittedUpdates,
             skipped: duplicateCount,
-            chunksTouched,
+            chunksTouched: totalChunksTouched,
             lastChunkId,
             lastVirtualRowId,
             insertedTuples,
+            recentExistingTuples,
             insertedRowIdsByInputIndex,
             sizeAfter
         };
@@ -1176,6 +1211,8 @@ export async function appendTuplesToCompactTailChunk(options: {
 /**
  * In-place modifier/deleter for compact archive chunks (`PATCH` / `DELETE` compatibility).
  * Scans either a single hinted chunk (derived from virtual rowId) or the newest N chunks.
+ * Uses optimistic CAS (`WHERE id = ? AND row_count = ? AND chunk_key = ?`) with retries so
+ * concurrent tail-chunk appends can never be overwritten (Lost Update protection).
  */
 export async function mutateArchiveChunks(options: {
     db: D1Database;
@@ -1202,48 +1239,62 @@ export async function mutateArchiveChunks(options: {
         stopAfterFirstChunkChange = false,
         mutateTuple
     } = options;
-    let rowsRes: D1Result<{ id: number; min_created_at: string; max_created_at: string; payload_json: string }>;
-    if (chunkIdHint && chunkIdHint > 0) {
-        rowsRes = kindColumn
+    type ChunkSnapshot = {
+        id: number;
+        chunk_key: string;
+        row_count: number;
+        min_created_at: string;
+        max_created_at: string;
+        payload_json: string;
+    };
+    const fetchChunkById = async (cid: number): Promise<ChunkSnapshot | null> => {
+        return kindColumn
             ? await db
                   .prepare(
-                      `SELECT id, min_created_at, max_created_at, payload_json
+                      `SELECT id, chunk_key, row_count, min_created_at, max_created_at, payload_json
                        FROM ${archiveTable}
                        WHERE id = ? AND ${kindColumn} = ?
                        LIMIT 1`
                   )
-                  .bind(chunkIdHint, kindValue)
-                  .all()
+                  .bind(cid, kindValue)
+                  .first<ChunkSnapshot>()
             : await db
                   .prepare(
-                      `SELECT id, min_created_at, max_created_at, payload_json
+                      `SELECT id, chunk_key, row_count, min_created_at, max_created_at, payload_json
                        FROM ${archiveTable}
                        WHERE id = ?
                        LIMIT 1`
                   )
-                  .bind(chunkIdHint)
-                  .all();
+                  .bind(cid)
+                  .first<ChunkSnapshot>();
+    };
+
+    let initialChunks: ChunkSnapshot[] = [];
+    if (chunkIdHint && chunkIdHint > 0) {
+        const single = await fetchChunkById(chunkIdHint);
+        if (single) initialChunks = [single];
     } else {
-        rowsRes = kindColumn
+        const rowsRes = kindColumn
             ? await db
                   .prepare(
-                      `SELECT id, min_created_at, max_created_at, payload_json
+                      `SELECT id, chunk_key, row_count, min_created_at, max_created_at, payload_json
                        FROM ${archiveTable}
                        WHERE ${kindColumn} = ?
                        ORDER BY max_created_at DESC, id DESC
                        LIMIT ?`
                   )
                   .bind(kindValue, maxChunksToScan)
-                  .all()
+                  .all<ChunkSnapshot>()
             : await db
                   .prepare(
-                      `SELECT id, min_created_at, max_created_at, payload_json
+                      `SELECT id, chunk_key, row_count, min_created_at, max_created_at, payload_json
                        FROM ${archiveTable}
                        ORDER BY max_created_at DESC, id DESC
                        LIMIT ?`
                   )
                   .bind(maxChunksToScan)
-                  .all();
+                  .all<ChunkSnapshot>();
+        initialChunks = rowsRes.results ?? [];
     }
 
     let modifiedCount = 0;
@@ -1252,56 +1303,87 @@ export async function mutateArchiveChunks(options: {
     const modifiedPairs: Array<{ before: unknown[]; after: unknown[] }> = [];
     const nowIso = new Date().toISOString();
 
-    for (const chunk of rowsRes.results ?? []) {
-        let tuples: unknown[][] = [];
-        try {
-            const parsed = JSON.parse(chunk.payload_json) as unknown;
-            if (Array.isArray(parsed)) tuples = parsed.filter(Array.isArray) as unknown[][];
-        } catch {
-            continue;
-        }
-        let changed = false;
-        const nextTuples: unknown[][] = [];
-        for (let i = 0; i < tuples.length; i++) {
-            const orig = tuples[i]!;
-            const res = mutateTuple(orig, chunk.id, i);
-            if (res === 'keep') {
-                nextTuples.push(orig);
-            } else if (res === 'delete') {
-                changed = true;
-                deletedCount++;
-                deletedTuples.push(orig);
+    for (const initialChunk of initialChunks) {
+        let currentChunk: ChunkSnapshot | null = initialChunk;
+        let chunkCommitted = false;
+        for (let attempt = 0; attempt < 4 && currentChunk; attempt++) {
+            let tuples: unknown[][] = [];
+            try {
+                const parsed = JSON.parse(currentChunk.payload_json) as unknown;
+                if (Array.isArray(parsed)) tuples = parsed.filter(Array.isArray) as unknown[][];
+            } catch {
+                break;
+            }
+            let changed = false;
+            const nextTuples: unknown[][] = [];
+            const chunkDeleted: unknown[][] = [];
+            const chunkModified: Array<{ before: unknown[]; after: unknown[] }> = [];
+            for (let i = 0; i < tuples.length; i++) {
+                const orig = tuples[i]!;
+                const res = mutateTuple(orig, currentChunk.id, i);
+                if (res === 'keep') {
+                    nextTuples.push(orig);
+                } else if (res === 'delete') {
+                    changed = true;
+                    chunkDeleted.push(orig);
+                } else {
+                    changed = true;
+                    chunkModified.push({ before: orig, after: res });
+                    nextTuples.push(res);
+                }
+            }
+            if (!changed) break;
+
+            let casOk = false;
+            if (nextTuples.length === 0) {
+                const delRes = await db
+                    .prepare(`DELETE FROM ${archiveTable} WHERE id = ? AND row_count = ? AND chunk_key = ?`)
+                    .bind(currentChunk.id, currentChunk.row_count, currentChunk.chunk_key)
+                    .run();
+                casOk = (delRes.meta?.changes ?? 0) === 1;
             } else {
-                changed = true;
-                modifiedCount++;
-                modifiedPairs.push({ before: orig, after: res });
-                nextTuples.push(res);
+                let minTs = '';
+                let maxTs = '';
+                for (const r of nextTuples) {
+                    const ts = String(r[0] ?? '');
+                    if (!ts) continue;
+                    if (!minTs || ts < minTs) minTs = ts;
+                    if (!maxTs || ts > maxTs) maxTs = ts;
+                }
+                const payloadJson = JSON.stringify(nextTuples);
+                const newKey = await computeCompactChunkKey(kindValue, payloadJson);
+                const updRes = await db
+                    .prepare(
+                        `UPDATE ${archiveTable}
+                         SET chunk_key = ?, min_created_at = ?, max_created_at = ?, row_count = ?, payload_json = ?
+                         WHERE id = ? AND row_count = ? AND chunk_key = ?`
+                    )
+                    .bind(
+                        newKey,
+                        minTs || nowIso,
+                        maxTs || nowIso,
+                        nextTuples.length,
+                        payloadJson,
+                        currentChunk.id,
+                        currentChunk.row_count,
+                        currentChunk.chunk_key
+                    )
+                    .run();
+                casOk = (updRes.meta?.changes ?? 0) === 1;
             }
-        }
-        if (!changed) continue;
-        if (nextTuples.length === 0) {
-            await db.prepare(`DELETE FROM ${archiveTable} WHERE id = ?`).bind(chunk.id).run();
-        } else {
-            let minTs = '';
-            let maxTs = '';
-            for (const r of nextTuples) {
-                const ts = String(r[0] ?? '');
-                if (!ts) continue;
-                if (!minTs || ts < minTs) minTs = ts;
-                if (!maxTs || ts > maxTs) maxTs = ts;
+
+            if (casOk) {
+                deletedCount += chunkDeleted.length;
+                modifiedCount += chunkModified.length;
+                deletedTuples.push(...chunkDeleted);
+                modifiedPairs.push(...chunkModified);
+                chunkCommitted = true;
+                break;
             }
-            const payloadJson = JSON.stringify(nextTuples);
-            const newKey = await computeCompactChunkKey(kindValue, payloadJson);
-            await db
-                .prepare(
-                    `UPDATE ${archiveTable}
-                     SET chunk_key = ?, min_created_at = ?, max_created_at = ?, row_count = ?, payload_json = ?
-                     WHERE id = ?`
-                )
-                .bind(newKey, minTs || nowIso, maxTs || nowIso, nextTuples.length, payloadJson, chunk.id)
-                .run();
+            // Reload the latest chunk snapshot and re-apply mutation on top of concurrent appends
+            currentChunk = await fetchChunkById(currentChunk.id);
         }
-        if (stopAfterFirstChunkChange) break;
+        if (chunkCommitted && stopAfterFirstChunkChange) break;
     }
 
     return { modifiedCount, deletedCount, deletedTuples, modifiedPairs };
@@ -1386,8 +1468,27 @@ export async function applyWorldRollupForPackedLocations(
  */
 export async function applyUserRollupForPackedJoinLeave(
     db: D1Database,
-    rows: Array<Record<string, unknown>>
+    rows: Array<Record<string, unknown>>,
+    existingRecentTuples?: unknown[][]
 ): Promise<void> {
+    // Build already-counted (userKey -> Set<location>) from scanned recent chunks so cross-batch
+    // Join + Leave for the exact same instance never double-increments join_count.
+    const alreadySeenLocsByUser = new Map<string, Set<string>>();
+    if (existingRecentTuples && existingRecentTuples.length > 0) {
+        for (const t of existingRecentTuples) {
+            const uid = String(t[4] ?? '').trim();
+            const dname = String(t[2] ?? '').trim();
+            const key = uid || (dname ? `name:${dname.toLowerCase()}` : '');
+            const loc = String(t[3] ?? '').trim();
+            if (!key || !loc) continue;
+            let set = alreadySeenLocsByUser.get(key);
+            if (!set) {
+                set = new Set<string>();
+                alreadySeenLocsByUser.set(key, set);
+            }
+            set.add(loc);
+        }
+    }
     const agg = new Map<
         string,
         {
@@ -1417,7 +1518,9 @@ export async function applyUserRollupForPackedJoinLeave(
             };
             agg.set(key, cur);
         }
-        if (loc) cur.locations.add(loc);
+        if (loc && !alreadySeenLocsByUser.get(key)?.has(loc)) {
+            cur.locations.add(loc);
+        }
         cur.timeSpent += t;
         if (ts) {
             const locBucket = loc || `__noloc_${ts}`;
