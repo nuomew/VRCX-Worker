@@ -3,6 +3,7 @@
     "name": "vrcx-cloud",
     "main": "cloud/src/index.ts",
     "compatibility_date": "2026-11-01",
+    "compatibility_flags": ["nodejs_compat"],
     // Automatically build the VRCX Web SPA during `npx wrangler deploy` so zero Dashboard build-command config is required.
     "build": {
         "command": "npm run build:web"
@@ -73,7 +74,7 @@
     "keep_vars": true,
     "unsafe": {
         "metadata": {
-            "keep_bindings": ["secret_text", "secret_key", "plain_text", "json", "r2_bucket"]
+            "keep_bindings": ["secret_text", "secret_key", "plain_text", "json", "r2_bucket", "hyperdrive"]
         }
     },
     // 1-minute cron tick gated inside scheduled() by user-configured syncIntervalSeconds (0 external fetch when idle/web active).

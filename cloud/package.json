@@ -20,5 +20,8 @@
     "allowScripts": {
         "esbuild": true,
         "workerd": true
+    },
+    "dependencies": {
+        "mysql2": "^3.24.6"
     }
 }

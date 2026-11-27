@@ -10,6 +10,8 @@ export interface Env {
     DB_CHAT?: D1Database;
     AGENT_HUB: DurableObjectNamespace;
     R2_MEDIA?: R2Bucket;
+    /** Optional Cloudflare Hyperdrive binding for pooled edge connections to an external MySQL 5.7+ database. */
+    HYPERDRIVE?: Hyperdrive;
     /** Optional bearer token for API/POC access. */
     POC_ADMIN_TOKEN?: string;
     /** Optional shared sync secret for Windows VRCX.Agent periodic HTTP uploads. */

@@ -6,6 +6,7 @@ import {
     COMPACT_CHUNK_MAX_ROWS,
     mutateArchiveChunks
 } from '../db/compactArchive';
+import { runWithExternalMysqlEnv } from '../db/externalMysqlProxy';
 import { getChatDb } from '../db/schemaBootstrap';
 import type { Env } from '../env';
 
@@ -764,37 +765,39 @@ export class AgentHubDO extends DurableObject<Env> {
                 this.ctx.waitUntil(
                     (async () => {
                         try {
-                            const chatDb = getChatDb(this.env);
-                            await appendTuplesToCompactTailChunk({
-                                db: chatDb,
-                                archiveTable: 'chat_archive_chunks',
-                                kindColumn: null,
-                                kindValue: 'chat',
-                                tuples: [
-                                    [
-                                        rawCreated,
-                                        msgId,
-                                        attachment.deviceId,
-                                        direction,
-                                        text,
-                                        '',
-                                        text,
-                                        'auto',
-                                        '',
-                                        'source_only',
-                                        '/chatbox/input',
-                                        oscPort,
-                                        immediate ? 1 : 0,
-                                        playSfx ? 1 : 0,
-                                        'synced',
-                                        '',
-                                        ''
-                                    ]
-                                ],
-                                dedupKeyFn: chatTupleDedupKey,
-                                fallbackIso: rawCreated,
-                                maxRows: COMPACT_CHUNK_MAX_ROWS,
-                                maxJsonBytes: COMPACT_CHUNK_MAX_BYTES
+                            await runWithExternalMysqlEnv(this.env, async (activeEnv) => {
+                                const chatDb = getChatDb(activeEnv);
+                                await appendTuplesToCompactTailChunk({
+                                    db: chatDb,
+                                    archiveTable: 'chat_archive_chunks',
+                                    kindColumn: null,
+                                    kindValue: 'chat',
+                                    tuples: [
+                                        [
+                                            rawCreated,
+                                            msgId,
+                                            attachment.deviceId,
+                                            direction,
+                                            text,
+                                            '',
+                                            text,
+                                            'auto',
+                                            '',
+                                            'source_only',
+                                            '/chatbox/input',
+                                            oscPort,
+                                            immediate ? 1 : 0,
+                                            playSfx ? 1 : 0,
+                                            'synced',
+                                            '',
+                                            ''
+                                        ]
+                                    ],
+                                    dedupKeyFn: chatTupleDedupKey,
+                                    fallbackIso: rawCreated,
+                                    maxRows: COMPACT_CHUNK_MAX_ROWS,
+                                    maxJsonBytes: COMPACT_CHUNK_MAX_BYTES
+                                });
                             });
                         } catch {
                             // Non-fatal in minimal test fixtures
@@ -827,38 +830,40 @@ export class AgentHubDO extends DurableObject<Env> {
                 });
 
                 if (chatMsgId || cmdId) {
-                    const chatDb = getChatDb(this.env);
                     this.ctx.waitUntil(
                         (async () => {
                             try {
-                                const hotRes = await (chatMsgId
-                                    ? chatDb
-                                          .prepare(`UPDATE cloud_chat_messages SET status = ?, error_message = ? WHERE id = ?`)
-                                          .bind(chatStatus, errMsg, chatMsgId)
-                                    : chatDb
-                                          .prepare(`UPDATE cloud_chat_messages SET status = ?, error_message = ? WHERE cmd_id = ?`)
-                                          .bind(chatStatus, errMsg, cmdId)
-                                ).run();
-                                if ((hotRes.meta?.changes ?? 0) === 0) {
-                                    await mutateArchiveChunks({
-                                        db: chatDb,
-                                        archiveTable: 'chat_archive_chunks',
-                                        kindColumn: null,
-                                        kindValue: 'chat',
-                                        maxChunksToScan: 3,
-                                        stopAfterFirstChunkChange: true,
-                                        mutateTuple: (t) => {
-                                            const matched = chatMsgId
-                                                ? String(t[1] ?? '') === chatMsgId
-                                                : String(t[15] ?? '') === cmdId;
-                                            if (!matched) return 'keep';
-                                            const next = [...t];
-                                            next[14] = chatStatus;
-                                            next[16] = errMsg;
-                                            return next;
-                                        }
-                                    });
-                                }
+                                await runWithExternalMysqlEnv(this.env, async (activeEnv) => {
+                                    const chatDb = getChatDb(activeEnv);
+                                    const hotRes = await (chatMsgId
+                                        ? chatDb
+                                              .prepare(`UPDATE cloud_chat_messages SET status = ?, error_message = ? WHERE id = ?`)
+                                              .bind(chatStatus, errMsg, chatMsgId)
+                                        : chatDb
+                                              .prepare(`UPDATE cloud_chat_messages SET status = ?, error_message = ? WHERE cmd_id = ?`)
+                                              .bind(chatStatus, errMsg, cmdId)
+                                    ).run();
+                                    if ((hotRes.meta?.changes ?? 0) === 0) {
+                                        await mutateArchiveChunks({
+                                            db: chatDb,
+                                            archiveTable: 'chat_archive_chunks',
+                                            kindColumn: null,
+                                            kindValue: 'chat',
+                                            maxChunksToScan: 3,
+                                            stopAfterFirstChunkChange: true,
+                                            mutateTuple: (t) => {
+                                                const matched = chatMsgId
+                                                    ? String(t[1] ?? '') === chatMsgId
+                                                    : String(t[15] ?? '') === cmdId;
+                                                if (!matched) return 'keep';
+                                                const next = [...t];
+                                                next[14] = chatStatus;
+                                                next[16] = errMsg;
+                                                return next;
+                                            }
+                                        });
+                                    }
+                                });
                             } catch {
                                 // Non-fatal
                             }
@@ -931,32 +936,34 @@ export class AgentHubDO extends DurableObject<Env> {
                                 .catch(() => {}),
                             (async () => {
                                 try {
-                                    const chatDb = getChatDb(this.env);
-                                    const hotRes = await chatDb
-                                        .prepare(
-                                            `UPDATE cloud_chat_messages
-                                             SET status = ?, error_message = ?
-                                             WHERE cmd_id = ?`
-                                        )
-                                        .bind(chatStatus, errMsg, cmdId)
-                                        .run();
-                                    if ((hotRes.meta?.changes ?? 0) === 0) {
-                                        await mutateArchiveChunks({
-                                            db: chatDb,
-                                            archiveTable: 'chat_archive_chunks',
-                                            kindColumn: null,
-                                            kindValue: 'chat',
-                                            maxChunksToScan: 3,
-                                            stopAfterFirstChunkChange: true,
-                                            mutateTuple: (t) => {
-                                                if (String(t[15] ?? '') !== cmdId) return 'keep';
-                                                const next = [...t];
-                                                next[14] = chatStatus;
-                                                next[16] = errMsg;
-                                                return next;
-                                            }
-                                        });
-                                    }
+                                    await runWithExternalMysqlEnv(this.env, async (activeEnv) => {
+                                        const chatDb = getChatDb(activeEnv);
+                                        const hotRes = await chatDb
+                                            .prepare(
+                                                `UPDATE cloud_chat_messages
+                                                 SET status = ?, error_message = ?
+                                                 WHERE cmd_id = ?`
+                                            )
+                                            .bind(chatStatus, errMsg, cmdId)
+                                            .run();
+                                        if ((hotRes.meta?.changes ?? 0) === 0) {
+                                            await mutateArchiveChunks({
+                                                db: chatDb,
+                                                archiveTable: 'chat_archive_chunks',
+                                                kindColumn: null,
+                                                kindValue: 'chat',
+                                                maxChunksToScan: 3,
+                                                stopAfterFirstChunkChange: true,
+                                                mutateTuple: (t) => {
+                                                    if (String(t[15] ?? '') !== cmdId) return 'keep';
+                                                    const next = [...t];
+                                                    next[14] = chatStatus;
+                                                    next[16] = errMsg;
+                                                    return next;
+                                                }
+                                            });
+                                        }
+                                    });
                                 } catch {
                                     // Non-fatal
                                 }

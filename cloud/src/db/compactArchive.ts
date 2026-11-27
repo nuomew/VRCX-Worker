@@ -913,11 +913,12 @@ export async function appendTuplesToCompactTailChunk(options: {
     const maxAttempts = 4;
 
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
-        // 2. Read the newest 2 chunks (1-2 indexed rows) for tail merge & boundary deduplication
+        // 2. Read the newest 2 chunks (1-2 indexed rows) from the active write target for tail merge & boundary dedup
         const recentRes = kindColumn
             ? await db
                   .prepare(
-                      `SELECT id, chunk_key, min_created_at, max_created_at, row_count, payload_json
+                      `/* vrcx:write-target */
+                       SELECT id, chunk_key, min_created_at, max_created_at, row_count, payload_json
                        FROM ${archiveTable}
                        WHERE ${kindColumn} = ?
                        ORDER BY id DESC
@@ -934,7 +935,8 @@ export async function appendTuplesToCompactTailChunk(options: {
                   }>()
             : await db
                   .prepare(
-                      `SELECT id, chunk_key, min_created_at, max_created_at, row_count, payload_json
+                      `/* vrcx:write-target */
+                       SELECT id, chunk_key, min_created_at, max_created_at, row_count, payload_json
                        FROM ${archiveTable}
                        ORDER BY id DESC
                        LIMIT 2`

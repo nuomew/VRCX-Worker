@@ -4,6 +4,7 @@
     "name": "vrcx-cloud-local-test",
     "main": "src/index.ts",
     "compatibility_date": "2026-11-01",
+    "compatibility_flags": ["nodejs_compat"],
     // Static frontend assets served directly from Cloudflare edge at zero Worker request cost.
     // Phase 0 serves the diagnostics page; Phase 1 will point to the built VRCX Web SPA.
     "assets": {

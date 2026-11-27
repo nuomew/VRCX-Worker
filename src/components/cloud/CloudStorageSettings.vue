@@ -24,6 +24,407 @@
                     </div>
                 </div>
 
+                <!-- External Database (MySQL 5.7+ Hybrid Overflow / Full Migration) -->
+                <div class="rounded-lg border border-border bg-card/60 p-4 space-y-3">
+                    <div class="flex flex-wrap items-center justify-between gap-2">
+                        <div class="flex flex-wrap items-center gap-2">
+                            <span class="font-medium text-sm text-foreground">
+                                {{ t('cloud_hub.storage.mysql_title') }}
+                            </span>
+                            <span
+                                class="inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-[11px] font-medium"
+                                :class="
+                                    mysqlSavedEnabled
+                                        ? 'border-status-online/40 bg-status-online/10 text-foreground'
+                                        : mysqlFormEnabled
+                                          ? 'border-amber-500/40 bg-amber-500/10 text-amber-600 dark:text-amber-400'
+                                          : 'border-border bg-muted/40 text-muted-foreground'
+                                ">
+                                <span
+                                    class="inline-block size-1.5 rounded-full"
+                                    :class="
+                                        mysqlSavedEnabled
+                                            ? 'bg-status-online'
+                                            : mysqlFormEnabled
+                                              ? 'bg-amber-500'
+                                              : 'bg-muted-foreground/60'
+                                    " />
+                                {{
+                                    mysqlSavedEnabled
+                                        ? mysqlSavedMode === 'full_migrate'
+                                            ? t('cloud_hub.storage.mysql_status_full')
+                                            : t('cloud_hub.storage.mysql_status_hybrid')
+                                        : mysqlFormEnabled
+                                          ? t('cloud_hub.storage.status_unsaved')
+                                          : t('cloud_hub.storage.status_disabled')
+                                }}
+                            </span>
+                        </div>
+                        <div class="flex items-center gap-2">
+                            <Button
+                                v-if="mysqlSavedEnabled"
+                                size="sm"
+                                variant="outline"
+                                :disabled="loadingMysqlStatus || migratingMysql"
+                                @click="loadMysqlStatus(true)">
+                                {{
+                                    loadingMysqlStatus
+                                        ? t('cloud_hub.storage.refreshing')
+                                        : t('cloud_hub.storage.refresh_usage_btn')
+                                }}
+                            </Button>
+                            <Switch
+                                :model-value="mysqlFormEnabled"
+                                :disabled="savingMysqlConfig || migratingMysql"
+                                :aria-label="t('cloud_hub.storage.mysql_enable_label')"
+                                @update:model-value="onToggleExternalMysql" />
+                        </div>
+                    </div>
+
+                    <p class="text-[11px] text-muted-foreground leading-relaxed">
+                        {{ t('cloud_hub.storage.mysql_intro') }}
+                    </p>
+
+                    <div
+                        v-if="!mysqlFormEnabled && mysqlSavedEnabled"
+                        class="rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-[11px] text-amber-700 dark:text-amber-300">
+                        {{ t('cloud_hub.storage.mysql_disable_warning') }}
+                    </div>
+
+                    <template v-if="mysqlFormEnabled">
+                        <!-- Two Operating Modes: 1) Hybrid (keep D1 + new data to MySQL 5.7)  2) Full Migration -->
+                        <div class="grid grid-cols-1 gap-2.5 sm:grid-cols-2">
+                            <button
+                                type="button"
+                                :disabled="savingMysqlConfig || migratingMysql"
+                                class="rounded-md border p-3 text-left transition-colors"
+                                :class="
+                                    mysqlFormMode === 'new_writes_only'
+                                        ? 'border-primary bg-primary/10'
+                                        : 'border-border/80 bg-background/60 hover:bg-accent/40'
+                                "
+                                @click="selectMysqlMode('new_writes_only')">
+                                <div class="flex items-center justify-between gap-2">
+                                    <span class="font-medium text-xs text-foreground">
+                                        {{ t('cloud_hub.storage.mysql_mode_hybrid_title') }}
+                                    </span>
+                                    <span
+                                        class="inline-block size-3 rounded-full border"
+                                        :class="
+                                            mysqlFormMode === 'new_writes_only'
+                                                ? 'border-primary bg-primary'
+                                                : 'border-muted-foreground/50'
+                                        " />
+                                </div>
+                                <p class="mt-1 text-[11px] text-muted-foreground leading-relaxed">
+                                    {{ t('cloud_hub.storage.mysql_mode_hybrid_desc') }}
+                                </p>
+                            </button>
+
+                            <button
+                                type="button"
+                                :disabled="savingMysqlConfig || migratingMysql"
+                                class="rounded-md border p-3 text-left transition-colors"
+                                :class="
+                                    mysqlFormMode === 'full_migrate'
+                                        ? 'border-primary bg-primary/10'
+                                        : 'border-border/80 bg-background/60 hover:bg-accent/40'
+                                "
+                                @click="selectMysqlMode('full_migrate')">
+                                <div class="flex items-center justify-between gap-2">
+                                    <span class="font-medium text-xs text-foreground">
+                                        {{ t('cloud_hub.storage.mysql_mode_full_title') }}
+                                    </span>
+                                    <span
+                                        class="inline-block size-3 rounded-full border"
+                                        :class="
+                                            mysqlFormMode === 'full_migrate'
+                                                ? 'border-primary bg-primary'
+                                                : 'border-muted-foreground/50'
+                                        " />
+                                </div>
+                                <p class="mt-1 text-[11px] text-muted-foreground leading-relaxed">
+                                    {{ t('cloud_hub.storage.mysql_mode_full_desc') }}
+                                </p>
+                            </button>
+                        </div>
+
+                        <!-- Live MySQL Usage Card -->
+                        <div
+                            v-if="mysqlUsage"
+                            class="rounded-md border border-border/70 bg-muted/30 p-3 space-y-1.5">
+                            <div class="flex flex-wrap items-center justify-between gap-2">
+                                <span class="font-medium text-foreground">
+                                    {{ t('cloud_hub.storage.mysql_usage_heading') }}
+                                </span>
+                                <span
+                                    v-if="mysqlUsage.connected"
+                                    class="font-mono text-[11px] text-muted-foreground">
+                                    MySQL {{ mysqlUsage.mysqlVersion }}
+                                </span>
+                            </div>
+                            <template v-if="!mysqlUsage.connected">
+                                <p class="text-[11px] text-destructive break-all">
+                                    {{ mysqlUsage.error || t('cloud_hub.storage.mysql_connect_failed') }}
+                                </p>
+                            </template>
+                            <template v-else>
+                                <div class="flex flex-wrap gap-x-4 gap-y-1 font-mono text-[11px] text-foreground">
+                                    <span>{{ t('cloud_hub.storage.mysql_usage_size', { size: formatBytes(mysqlUsage.usedBytes) }) }}</span>
+                                    <span>{{ t('cloud_hub.storage.mysql_usage_chunks', { chunks: Number(mysqlUsage.totalChunks || 0).toLocaleString() }) }}</span>
+                                    <span>{{ t('cloud_hub.storage.mysql_usage_rows', { rows: Number(mysqlUsage.totalLogicalRows || 0).toLocaleString() }) }}</span>
+                                    <span>{{ t('cloud_hub.storage.mysql_usage_cache', { count: Number(mysqlUsage.cacheRows || 0).toLocaleString() }) }}</span>
+                                </div>
+                            </template>
+                        </div>
+
+                        <!-- Connection Type & MySQL 5.7+ Credentials Form -->
+                        <div class="grid grid-cols-1 gap-3 sm:grid-cols-2" @input="mysqlFormDirty = true">
+                            <div v-if="mysqlHyperdriveBound" class="space-y-1 sm:col-span-2">
+                                <label class="block text-[11px] font-medium text-muted-foreground">
+                                    {{ t('cloud_hub.storage.mysql_conn_type_label') }}
+                                </label>
+                                <select
+                                    v-model="mysqlFormConnType"
+                                    :disabled="savingMysqlConfig || migratingMysql"
+                                    class="w-full sm:w-80 rounded-md border border-input bg-background px-2.5 py-1.5 text-xs text-foreground dark:[color-scheme:dark]"
+                                    @change="mysqlFormDirty = true">
+                                    <option class="bg-card text-foreground" value="direct">
+                                        {{ t('cloud_hub.storage.mysql_conn_direct') }}
+                                    </option>
+                                    <option class="bg-card text-foreground" value="hyperdrive">
+                                        {{ t('cloud_hub.storage.mysql_conn_hyperdrive') }}
+                                    </option>
+                                </select>
+                            </div>
+
+                            <template v-if="mysqlFormConnType === 'direct'">
+                                <div class="space-y-1">
+                                    <label class="block text-[11px] font-medium text-muted-foreground">
+                                        {{ t('cloud_hub.storage.mysql_host_label') }}
+                                    </label>
+                                    <input
+                                        v-model="mysqlFormHost"
+                                        type="text"
+                                        placeholder="db.example.com"
+                                        autocomplete="off"
+                                        :disabled="savingMysqlConfig || migratingMysql"
+                                        class="w-full rounded-md border border-input bg-background px-2.5 py-1.5 font-mono text-xs text-foreground" />
+                                </div>
+
+                                <div class="space-y-1">
+                                    <label class="block text-[11px] font-medium text-muted-foreground">
+                                        {{ t('cloud_hub.storage.mysql_port_label') }}
+                                    </label>
+                                    <input
+                                        v-model.number="mysqlFormPort"
+                                        type="number"
+                                        min="1"
+                                        max="65535"
+                                        placeholder="3306"
+                                        :disabled="savingMysqlConfig || migratingMysql"
+                                        class="w-full rounded-md border border-input bg-background px-2.5 py-1.5 font-mono text-xs text-foreground" />
+                                </div>
+
+                                <div class="space-y-1">
+                                    <label class="block text-[11px] font-medium text-muted-foreground">
+                                        {{ t('cloud_hub.storage.mysql_database_label') }}
+                                    </label>
+                                    <input
+                                        v-model="mysqlFormDatabase"
+                                        type="text"
+                                        placeholder="vrcx_cloud"
+                                        autocomplete="off"
+                                        :disabled="savingMysqlConfig || migratingMysql"
+                                        class="w-full rounded-md border border-input bg-background px-2.5 py-1.5 font-mono text-xs text-foreground" />
+                                </div>
+
+                                <div class="space-y-1">
+                                    <label class="block text-[11px] font-medium text-muted-foreground">
+                                        {{ t('cloud_hub.storage.mysql_username_label') }}
+                                    </label>
+                                    <input
+                                        v-model="mysqlFormUsername"
+                                        type="text"
+                                        placeholder="vrcx"
+                                        autocomplete="off"
+                                        :disabled="savingMysqlConfig || migratingMysql"
+                                        class="w-full rounded-md border border-input bg-background px-2.5 py-1.5 font-mono text-xs text-foreground" />
+                                </div>
+
+                                <div class="space-y-1">
+                                    <label class="block text-[11px] font-medium text-muted-foreground">
+                                        {{ t('cloud_hub.storage.mysql_password_label') }}
+                                    </label>
+                                    <input
+                                        v-model="mysqlFormPassword"
+                                        type="password"
+                                        autocomplete="new-password"
+                                        :placeholder="
+                                            mysqlHasSavedPassword
+                                                ? t('cloud_hub.storage.mysql_password_saved_placeholder')
+                                                : t('cloud_hub.storage.mysql_password_placeholder')
+                                        "
+                                        :disabled="savingMysqlConfig || migratingMysql"
+                                        class="w-full rounded-md border border-input bg-background px-2.5 py-1.5 font-mono text-xs text-foreground" />
+                                </div>
+
+                                <div class="space-y-1">
+                                    <label class="block text-[11px] font-medium text-muted-foreground">
+                                        {{ t('cloud_hub.storage.mysql_ssl_label') }}
+                                    </label>
+                                    <select
+                                        v-model="mysqlFormSslMode"
+                                        :disabled="savingMysqlConfig || migratingMysql"
+                                        class="w-full rounded-md border border-input bg-background px-2.5 py-1.5 text-xs text-foreground dark:[color-scheme:dark]"
+                                        @change="mysqlFormDirty = true">
+                                        <option class="bg-card text-foreground" value="disabled">
+                                            {{ t('cloud_hub.storage.mysql_ssl_disabled') }}
+                                        </option>
+                                        <option class="bg-card text-foreground" value="skip_verify">
+                                            {{ t('cloud_hub.storage.mysql_ssl_skip_verify') }}
+                                        </option>
+                                        <option class="bg-card text-foreground" value="verify">
+                                            {{ t('cloud_hub.storage.mysql_ssl_verify') }}
+                                        </option>
+                                    </select>
+                                </div>
+                            </template>
+
+                            <div class="space-y-1 sm:col-span-2">
+                                <label class="block text-[11px] font-medium text-muted-foreground">
+                                    {{ t('cloud_hub.storage.mysql_prefix_label') }}
+                                </label>
+                                <input
+                                    v-model="mysqlFormTablePrefix"
+                                    type="text"
+                                    placeholder="vrcx_"
+                                    :disabled="savingMysqlConfig || migratingMysql"
+                                    class="w-64 rounded-md border border-input bg-background px-2.5 py-1.5 font-mono text-xs text-foreground" />
+                            </div>
+                        </div>
+
+                        <div class="flex flex-wrap items-center gap-2 pt-1">
+                            <Button
+                                size="sm"
+                                :disabled="savingMysqlConfig || migratingMysql"
+                                @click="saveMysqlConfig">
+                                {{
+                                    savingMysqlConfig
+                                        ? t('cloud_hub.storage.saving')
+                                        : t('cloud_hub.storage.save_btn')
+                                }}
+                            </Button>
+                            <Button
+                                size="sm"
+                                variant="outline"
+                                :disabled="testingMysql || savingMysqlConfig || migratingMysql"
+                                @click="testMysqlConnection">
+                                {{
+                                    testingMysql
+                                        ? t('cloud_hub.storage.testing')
+                                        : t('cloud_hub.storage.mysql_test_btn')
+                                }}
+                            </Button>
+                        </div>
+
+                        <!-- Mode 2: Full D1 -> MySQL Resumable Migration Panel -->
+                        <div
+                            v-if="mysqlFormMode === 'full_migrate'"
+                            class="rounded-md border border-border/80 bg-muted/25 p-3 space-y-2.5">
+                            <div class="flex flex-wrap items-center justify-between gap-2">
+                                <span class="font-medium text-xs text-foreground">
+                                    {{ t('cloud_hub.storage.mysql_migrate_heading') }}
+                                </span>
+                                <span
+                                    v-if="mysqlMigrationState?.d1Drained && mysqlD1PendingTotal === 0"
+                                    class="rounded-full border border-status-online/40 bg-status-online/10 px-2 py-0.5 text-[11px] font-medium text-foreground">
+                                    {{ t('cloud_hub.storage.mysql_migrate_done_badge') }}
+                                </span>
+                            </div>
+
+                            <div class="flex flex-wrap gap-x-4 gap-y-1 font-mono text-[11px] text-muted-foreground">
+                                <span>
+                                    {{
+                                        t('cloud_hub.storage.mysql_pending_chunks', {
+                                            chunks: Number(mysqlD1Pending?.totalChunks || 0).toLocaleString(),
+                                            rows: Number(mysqlD1Pending?.totalChunkRows || 0).toLocaleString()
+                                        })
+                                    }}
+                                </span>
+                                <span v-if="(mysqlD1Pending?.totalLegacySingleRows || 0) > 0">
+                                    {{
+                                        t('cloud_hub.storage.mysql_pending_legacy', {
+                                            rows: Number(mysqlD1Pending?.totalLegacySingleRows || 0).toLocaleString()
+                                        })
+                                    }}
+                                </span>
+                                <span v-if="(mysqlD1Pending?.totalCacheRows || 0) > 0">
+                                    {{
+                                        t('cloud_hub.storage.mysql_pending_cache', {
+                                            count: Number(mysqlD1Pending?.totalCacheRows || 0).toLocaleString()
+                                        })
+                                    }}
+                                </span>
+                                <span v-if="(mysqlMigrationState?.totalRowsMoved || 0) > 0">
+                                    {{
+                                        t('cloud_hub.storage.mysql_moved_summary', {
+                                            chunks: Number(mysqlMigrationState?.totalChunksMoved || 0).toLocaleString(),
+                                            rows: Number(mysqlMigrationState?.totalRowsMoved || 0).toLocaleString()
+                                        })
+                                    }}
+                                </span>
+                            </div>
+
+                            <div v-if="migratingMysql || mysqlMigrationProgressPercent > 0" class="space-y-1">
+                                <div class="h-1.5 w-full overflow-hidden rounded-full bg-muted">
+                                    <div
+                                        class="h-full rounded-full bg-primary transition-all duration-200"
+                                        :style="{ width: `${Math.min(100, mysqlMigrationProgressPercent)}%` }" />
+                                </div>
+                            </div>
+
+                            <div class="flex flex-wrap items-center gap-2">
+                                <Button
+                                    size="sm"
+                                    :disabled="
+                                        migratingMysql ||
+                                        savingMysqlConfig ||
+                                        !mysqlSavedEnabled ||
+                                        mysqlSavedMode !== 'full_migrate' ||
+                                        mysqlFormDirty ||
+                                        mysqlD1PendingTotal === 0
+                                    "
+                                    @click="startMysqlMigration">
+                                    {{
+                                        migratingMysql
+                                            ? t('cloud_hub.storage.mysql_migrating_btn')
+                                            : (mysqlMigrationState?.totalChunksMoved || 0) > 0 &&
+                                                mysqlD1PendingTotal > 0
+                                              ? t('cloud_hub.storage.mysql_resume_migrate_btn')
+                                              : t('cloud_hub.storage.mysql_start_migrate_btn')
+                                    }}
+                                </Button>
+                                <Button
+                                    v-if="migratingMysql"
+                                    size="sm"
+                                    variant="outline"
+                                    @click="pauseMysqlMigration">
+                                    {{ t('cloud_hub.storage.mysql_pause_migrate_btn') }}
+                                </Button>
+                                <span
+                                    v-if="!mysqlSavedEnabled || mysqlSavedMode !== 'full_migrate' || mysqlFormDirty"
+                                    class="text-[11px] text-amber-600 dark:text-amber-400">
+                                    {{ t('cloud_hub.storage.mysql_save_before_migrate_hint') }}
+                                </span>
+                            </div>
+                        </div>
+                    </template>
+
+                    <p v-if="mysqlNotice" class="text-[11px] text-primary">{{ mysqlNotice }}</p>
+                    <p v-if="mysqlError" class="text-[11px] text-destructive break-all">{{ mysqlError }}</p>
+                </div>
+
                 <!-- Database Row Compaction (All 6 D1 Shards: 1000-row Chunks + Cache Gzip + Control Pruning) -->
                 <div class="rounded-lg border border-border bg-card/60 p-4 space-y-2.5">
                     <div class="flex flex-wrap items-center justify-between gap-2">
@@ -716,6 +1117,278 @@
         return Math.min(Math.max(Math.floor(raw), 1), 120);
     });
 
+    // --- External Database (MySQL 5.7+) State ---
+    const loadingMysqlStatus = ref(false);
+    const savingMysqlConfig = ref(false);
+    const testingMysql = ref(false);
+    const migratingMysql = ref(false);
+    const pauseMysqlRequested = ref(false);
+
+    const mysqlSavedEnabled = ref(false);
+    const mysqlSavedMode = ref('new_writes_only');
+    const mysqlHyperdriveBound = ref(false);
+    const mysqlHasSavedPassword = ref(false);
+    const mysqlFormDirty = ref(false);
+
+    const mysqlFormEnabled = ref(false);
+    const mysqlFormMode = ref('new_writes_only');
+    const mysqlFormConnType = ref('direct');
+    const mysqlFormHost = ref('');
+    const mysqlFormPort = ref(3306);
+    const mysqlFormDatabase = ref('');
+    const mysqlFormUsername = ref('');
+    const mysqlFormPassword = ref('');
+    const mysqlFormSslMode = ref('disabled');
+    const mysqlFormTablePrefix = ref('vrcx_');
+
+    const mysqlUsage = ref(null);
+    const mysqlD1Pending = ref(null);
+    const mysqlMigrationState = ref(null);
+    const mysqlMigrationInitialTotal = ref(0);
+    const mysqlNotice = ref('');
+    const mysqlError = ref('');
+
+    const mysqlD1PendingTotal = computed(() => {
+        const p = mysqlD1Pending.value;
+        if (!p) return 0;
+        return (
+            Number(p.totalChunks || 0) +
+            Number(p.totalLegacySingleRows || 0) +
+            Number(p.totalCacheRows || 0)
+        );
+    });
+
+    const mysqlMigrationProgressPercent = computed(() => {
+        const init = mysqlMigrationInitialTotal.value;
+        if (init <= 0) {
+            return mysqlMigrationState.value?.d1Drained && mysqlD1PendingTotal.value === 0 ? 100 : 0;
+        }
+        const remaining = mysqlD1PendingTotal.value;
+        if (remaining <= 0) return 100;
+        return Math.max(2, Math.min(99, Math.round(((init - remaining) / init) * 100)));
+    });
+
+    function applyMysqlStatusPayload(data, { forceFormSync = false } = {}) {
+        if (!data) return;
+        const cfg = data.config;
+        if (cfg) {
+            mysqlSavedEnabled.value = Boolean(cfg.enabled);
+            mysqlSavedMode.value = cfg.mode === 'full_migrate' ? 'full_migrate' : 'new_writes_only';
+            mysqlHyperdriveBound.value = Boolean(cfg.hyperdriveBound);
+            mysqlHasSavedPassword.value = Boolean(cfg.hasPassword);
+            if (forceFormSync || !mysqlFormDirty.value) {
+                mysqlFormEnabled.value = Boolean(cfg.enabled);
+                mysqlFormMode.value = cfg.mode === 'full_migrate' ? 'full_migrate' : 'new_writes_only';
+                mysqlFormConnType.value = cfg.connectionType === 'hyperdrive' ? 'hyperdrive' : 'direct';
+                mysqlFormHost.value = cfg.host || '';
+                mysqlFormPort.value = Number(cfg.port || 3306) || 3306;
+                mysqlFormDatabase.value = cfg.database || '';
+                mysqlFormUsername.value = cfg.username || '';
+                mysqlFormSslMode.value = cfg.sslMode || 'disabled';
+                mysqlFormTablePrefix.value = cfg.tablePrefix ?? 'vrcx_';
+                mysqlFormDirty.value = false;
+            }
+        }
+        if (data.d1Pending !== undefined) {
+            mysqlD1Pending.value = data.d1Pending;
+        }
+        if (data.migration !== undefined) {
+            mysqlMigrationState.value = data.migration;
+        }
+        if (data.mysqlUsage !== undefined) {
+            mysqlUsage.value = data.mysqlUsage;
+        }
+    }
+
+    async function loadMysqlStatus(forceRefresh = false) {
+        if (!cloudState.authenticated) return;
+        loadingMysqlStatus.value = true;
+        mysqlError.value = '';
+        try {
+            const data = await cloudFetch(`/api/storage/mysql/status${forceRefresh ? '?refresh=1' : ''}`);
+            applyMysqlStatusPayload(data);
+        } catch (err) {
+            mysqlError.value = err?.message || String(err);
+        } finally {
+            loadingMysqlStatus.value = false;
+        }
+    }
+
+    function selectMysqlMode(mode) {
+        mysqlFormMode.value = mode === 'full_migrate' ? 'full_migrate' : 'new_writes_only';
+        mysqlFormDirty.value = true;
+        mysqlError.value = '';
+        mysqlNotice.value = '';
+    }
+
+    async function onToggleExternalMysql(nextEnabled) {
+        const wantEnable = Boolean(nextEnabled);
+        const hadUnsaved = mysqlFormDirty.value;
+        mysqlFormEnabled.value = wantEnable;
+        mysqlError.value = '';
+        mysqlNotice.value = '';
+
+        const hasCompleteDirect = Boolean(
+            mysqlFormHost.value.trim() && mysqlFormDatabase.value.trim() && mysqlFormUsername.value.trim()
+        );
+        const hasCompleteSaved =
+            mysqlFormConnType.value === 'hyperdrive' ? mysqlHyperdriveBound.value : hasCompleteDirect;
+
+        if ((!wantEnable && mysqlSavedEnabled.value) || (wantEnable && !mysqlSavedEnabled.value && hasCompleteSaved && !hadUnsaved)) {
+            if (savingMysqlConfig.value) return;
+            savingMysqlConfig.value = true;
+            try {
+                const data = await cloudFetch('/api/storage/mysql/config', {
+                    method: 'PUT',
+                    json: { enabled: wantEnable }
+                });
+                applyMysqlStatusPayload(data, { forceFormSync: true });
+                mysqlNotice.value = t('cloud_hub.storage.mysql_saved_toast');
+                toast.success(mysqlNotice.value);
+                await Promise.all([loadMysqlStatus(wantEnable), loadQuota(), loadCleanupPreview()]);
+            } catch (err) {
+                mysqlFormEnabled.value = !wantEnable;
+                mysqlError.value = err?.message || String(err);
+                toast.error(mysqlError.value);
+            } finally {
+                savingMysqlConfig.value = false;
+            }
+            return;
+        }
+
+        mysqlFormDirty.value = true;
+    }
+
+    async function saveMysqlConfig() {
+        if (savingMysqlConfig.value) return;
+        savingMysqlConfig.value = true;
+        mysqlError.value = '';
+        mysqlNotice.value = '';
+        try {
+            const data = await cloudFetch('/api/storage/mysql/config', {
+                method: 'PUT',
+                json: {
+                    enabled: mysqlFormEnabled.value,
+                    mode: mysqlFormMode.value,
+                    connectionType: mysqlFormConnType.value,
+                    host: mysqlFormHost.value.trim(),
+                    port: Number(mysqlFormPort.value) || 3306,
+                    database: mysqlFormDatabase.value.trim(),
+                    username: mysqlFormUsername.value.trim(),
+                    sslMode: mysqlFormSslMode.value,
+                    tablePrefix: mysqlFormTablePrefix.value.trim(),
+                    ...(mysqlFormPassword.value ? { password: mysqlFormPassword.value } : {})
+                }
+            });
+            mysqlFormPassword.value = '';
+            applyMysqlStatusPayload(data, { forceFormSync: true });
+            mysqlNotice.value = t('cloud_hub.storage.mysql_saved_toast');
+            toast.success(mysqlNotice.value);
+            await Promise.all([loadMysqlStatus(mysqlFormEnabled.value), loadQuota(), loadCleanupPreview()]);
+        } catch (err) {
+            mysqlError.value = err?.message || String(err);
+            toast.error(mysqlError.value);
+        } finally {
+            savingMysqlConfig.value = false;
+        }
+    }
+
+    async function testMysqlConnection() {
+        if (testingMysql.value) return;
+        testingMysql.value = true;
+        mysqlError.value = '';
+        mysqlNotice.value = '';
+        try {
+            const data = await cloudFetch('/api/storage/mysql/test', {
+                method: 'POST',
+                json: {
+                    connectionType: mysqlFormConnType.value,
+                    host: mysqlFormHost.value.trim(),
+                    port: Number(mysqlFormPort.value) || 3306,
+                    database: mysqlFormDatabase.value.trim(),
+                    username: mysqlFormUsername.value.trim(),
+                    sslMode: mysqlFormSslMode.value,
+                    tablePrefix: mysqlFormTablePrefix.value.trim(),
+                    ...(mysqlFormPassword.value ? { password: mysqlFormPassword.value } : {})
+                }
+            });
+            if (data?.mysqlUsage) {
+                mysqlUsage.value = data.mysqlUsage;
+            }
+            mysqlNotice.value = t('cloud_hub.storage.mysql_test_ok', {
+                version: data?.mysqlVersion || '5.7+',
+                ms: data?.latencyMs ?? 0,
+                tables: data?.tablesReady ?? 8
+            });
+            toast.success(mysqlNotice.value);
+        } catch (err) {
+            mysqlError.value = err?.message || String(err);
+            toast.error(mysqlError.value);
+        } finally {
+            testingMysql.value = false;
+        }
+    }
+
+    function pauseMysqlMigration() {
+        pauseMysqlRequested.value = true;
+    }
+
+    async function startMysqlMigration() {
+        if (migratingMysql.value || savingMysqlConfig.value) return;
+        migratingMysql.value = true;
+        pauseMysqlRequested.value = false;
+        mysqlError.value = '';
+        mysqlNotice.value = '';
+        mysqlMigrationInitialTotal.value = Math.max(mysqlMigrationInitialTotal.value, mysqlD1PendingTotal.value);
+
+        let batchMovedChunks = 0;
+        let batchMovedRows = 0;
+        let finished = false;
+        try {
+            for (let round = 0; round < 200; round++) {
+                if (pauseMysqlRequested.value) {
+                    mysqlNotice.value = t('cloud_hub.storage.mysql_migrate_paused_toast', {
+                        chunks: batchMovedChunks.toLocaleString(),
+                        rows: batchMovedRows.toLocaleString()
+                    });
+                    break;
+                }
+                const res = await cloudFetch('/api/storage/mysql/migrate', {
+                    method: 'POST',
+                    json: { maxChunks: 8, maxCacheRows: 80 }
+                });
+                batchMovedChunks += Number(res?.movedChunks || 0);
+                batchMovedRows += Number(res?.movedRows || 0) + Number(res?.compactedSingleRows || 0);
+                if (res?.remaining) mysqlD1Pending.value = res.remaining;
+                if (res?.migration) mysqlMigrationState.value = res.migration;
+                if (res?.done) {
+                    finished = true;
+                    break;
+                }
+            }
+            if (finished) {
+                mysqlNotice.value = t('cloud_hub.storage.mysql_migrate_done_toast', {
+                    chunks: Number(mysqlMigrationState.value?.totalChunksMoved || batchMovedChunks).toLocaleString(),
+                    rows: Number(mysqlMigrationState.value?.totalRowsMoved || batchMovedRows).toLocaleString()
+                });
+                toast.success(mysqlNotice.value);
+            } else if (!pauseMysqlRequested.value) {
+                mysqlNotice.value = t('cloud_hub.storage.mysql_migrate_more_toast', {
+                    chunks: batchMovedChunks.toLocaleString(),
+                    rows: batchMovedRows.toLocaleString()
+                });
+                toast.success(mysqlNotice.value);
+            }
+            await Promise.all([loadMysqlStatus(true), loadQuota(), loadCleanupPreview()]);
+        } catch (err) {
+            mysqlError.value = err?.message || String(err);
+            toast.error(mysqlError.value);
+        } finally {
+            migratingMysql.value = false;
+            pauseMysqlRequested.value = false;
+        }
+    }
+
     // --- Object Storage (R2 & Backblaze B2) State ---
     const loadingStatus = ref(false);
     const savingConfig = ref(false);
@@ -1129,6 +1802,6 @@
     }
 
     onMounted(() => {
-        Promise.all([loadQuota(), loadCleanupPreview(), loadCleanupBackups(), loadStatus(true)]);
+        Promise.all([loadQuota(), loadMysqlStatus(true), loadCleanupPreview(), loadCleanupBackups(), loadStatus(true)]);
     });
 </script>

@@ -1,5 +1,6 @@
 import { authenticateAgent, authenticateWeb, handleAuthRoutes, isSameOriginRequest } from './auth/auth';
 import { maybeRunDailyAutoCompaction } from './db/compactArchive';
+import { runWithExternalMysqlEnv } from './db/externalMysqlProxy';
 import { ensureSchemaReady } from './db/schemaBootstrap';
 import type { Env } from './env';
 import { AgentHubDO } from './hub/AgentHubDO';
@@ -8,6 +9,7 @@ import { handleChatOscAgentRoutes, handleChatOscWebRoutes } from './routes/chatO
 import { handleCoreDataRoutes } from './routes/coreData';
 import { handleDbCleanupRoutes } from './routes/dbCleanup';
 import { handleEventsDataRoutes } from './routes/eventsData';
+import { handleExternalMysqlRoutes } from './routes/externalMysqlRoutes';
 import { handleLegacyMigrationAgentRoutes, handleLegacyMigrationWebRoutes } from './routes/legacyMigration';
 import { handleStorageRoutes } from './routes/storageRoutes';
 import { handleVrcProxyRoutes } from './routes/vrcProxy';
@@ -127,17 +129,17 @@ export default {
             await ensureSchemaReady(env);
 
             // 3. Windows Agent routes (pairing redemption & Device Bearer+HMAC authenticated endpoints)
-            const agentPublicResp = await handleAgentPublicRoutes(request, env, url);
-            if (agentPublicResp) {
-                return agentPublicResp;
-            }
-            const chatAgentResp = await handleChatOscAgentRoutes(request, env, url);
-            if (chatAgentResp) {
-                return chatAgentResp;
-            }
-            const legacyAgentResp = await handleLegacyMigrationAgentRoutes(request, env, url);
-            if (legacyAgentResp) {
-                return legacyAgentResp;
+            if (url.pathname.startsWith('/api/agent/')) {
+                const agentResp = await runWithExternalMysqlEnv(env, async (activeEnv) => {
+                    const agentPublicResp = await handleAgentPublicRoutes(request, activeEnv, url);
+                    if (agentPublicResp) return agentPublicResp;
+                    const chatAgentResp = await handleChatOscAgentRoutes(request, activeEnv, url);
+                    if (chatAgentResp) return chatAgentResp;
+                    return handleLegacyMigrationAgentRoutes(request, activeEnv, url);
+                });
+                if (agentResp) {
+                    return agentResp;
+                }
             }
 
             // 4. Windows Agent WebSocket upgrades (Device Bearer auth)
@@ -183,73 +185,81 @@ export default {
                 return probeVrchatApi();
             }
 
-            if (url.pathname === '/poc/search' && request.method === 'GET') {
-                const q = url.searchParams.get('q') ?? '';
-                const limit = Number(url.searchParams.get('limit') ?? '50');
-                const includeExplain = url.searchParams.get('explain') === '1';
-                const data = await searchGameLogByEntity(env, q, { limit, includeExplain });
-                return Response.json({ ok: true, data });
+            // External MySQL admin routes always execute against native D1 so admins can fix/disable even if MySQL is down.
+            const externalMysqlResp = await handleExternalMysqlRoutes(request, env, url);
+            if (externalMysqlResp) {
+                return externalMysqlResp;
             }
 
-            if (url.pathname === '/api/bg-sync/status' && request.method === 'GET') {
-                const data = await getBackgroundFeedSyncStatus(env);
-                return Response.json({ ok: true, data }, { headers: { 'Cache-Control': 'no-store' } });
-            }
+            return await runWithExternalMysqlEnv(env, async (activeEnv) => {
+                if (url.pathname === '/poc/search' && request.method === 'GET') {
+                    const q = url.searchParams.get('q') ?? '';
+                    const limit = Number(url.searchParams.get('limit') ?? '50');
+                    const includeExplain = url.searchParams.get('explain') === '1';
+                    const data = await searchGameLogByEntity(activeEnv, q, { limit, includeExplain });
+                    return Response.json({ ok: true, data });
+                }
 
-            if (url.pathname === '/api/bg-sync/run' && request.method === 'POST') {
-                const data = await runBackgroundFeedSync(env, { force: true, trigger: 'manual' });
-                return Response.json({ ok: true, data }, { headers: { 'Cache-Control': 'no-store' } });
-            }
+                if (url.pathname === '/api/bg-sync/status' && request.method === 'GET') {
+                    const data = await getBackgroundFeedSyncStatus(activeEnv);
+                    return Response.json({ ok: true, data }, { headers: { 'Cache-Control': 'no-store' } });
+                }
 
-            if (url.pathname === '/api/bg-sync/config' && request.method === 'PUT') {
-                const rawBody = await request.json().catch(() => ({}));
-                const body = (
-                    rawBody && typeof rawBody === 'object' && !Array.isArray(rawBody) ? rawBody : {}
-                ) as { enabled?: unknown };
-                const enabled = await setBackgroundFeedSyncEnabled(env, body.enabled !== false);
-                return Response.json({ ok: true, data: { enabled } });
-            }
+                if (url.pathname === '/api/bg-sync/run' && request.method === 'POST') {
+                    const data = await runBackgroundFeedSync(activeEnv, { force: true, trigger: 'manual' });
+                    return Response.json({ ok: true, data }, { headers: { 'Cache-Control': 'no-store' } });
+                }
 
-            if (url.pathname === '/api/rss/feed' && request.method === 'GET') {
-                const since = url.searchParams.get('since') ?? '';
-                const data = await getRssAggregatedFeed(env, { since });
-                return Response.json({ ok: true, data }, { headers: { 'Cache-Control': 'no-store' } });
-            }
+                if (url.pathname === '/api/bg-sync/config' && request.method === 'PUT') {
+                    const rawBody = await request.json().catch(() => ({}));
+                    const body = (
+                        rawBody && typeof rawBody === 'object' && !Array.isArray(rawBody) ? rawBody : {}
+                    ) as { enabled?: unknown };
+                    const enabled = await setBackgroundFeedSyncEnabled(activeEnv, body.enabled !== false);
+                    return Response.json({ ok: true, data: { enabled } });
+                }
 
-            if (url.pathname === '/api/rss/sync' && request.method === 'POST') {
-                const since = url.searchParams.get('since') ?? '';
-                const data = await getRssAggregatedFeed(env, { since, forceSync: true });
-                return Response.json({ ok: true, data }, { headers: { 'Cache-Control': 'no-store' } });
-            }
+                if (url.pathname === '/api/rss/feed' && request.method === 'GET') {
+                    const since = url.searchParams.get('since') ?? '';
+                    const data = await getRssAggregatedFeed(activeEnv, { since });
+                    return Response.json({ ok: true, data }, { headers: { 'Cache-Control': 'no-store' } });
+                }
 
-            const vrcResp = await handleVrcProxyRoutes(request, env, url);
-            if (vrcResp) return vrcResp;
+                if (url.pathname === '/api/rss/sync' && request.method === 'POST') {
+                    const since = url.searchParams.get('since') ?? '';
+                    const data = await getRssAggregatedFeed(activeEnv, { since, forceSync: true });
+                    return Response.json({ ok: true, data }, { headers: { 'Cache-Control': 'no-store' } });
+                }
 
-            const coreResp = await handleCoreDataRoutes(request, env, url);
-            if (coreResp) return coreResp;
+                const vrcResp = await handleVrcProxyRoutes(request, activeEnv, url);
+                if (vrcResp) return vrcResp;
 
-            const eventsResp = await handleEventsDataRoutes(request, env, url);
-            if (eventsResp) return eventsResp;
+                const coreResp = await handleCoreDataRoutes(request, activeEnv, url);
+                if (coreResp) return coreResp;
 
-            const agentWebResp = await handleAgentWebRoutes(request, env, url);
-            if (agentWebResp) return agentWebResp;
+                const eventsResp = await handleEventsDataRoutes(request, activeEnv, url);
+                if (eventsResp) return eventsResp;
 
-            const chatWebResp = await handleChatOscWebRoutes(request, env, url);
-            if (chatWebResp) return chatWebResp;
+                const agentWebResp = await handleAgentWebRoutes(request, activeEnv, url);
+                if (agentWebResp) return agentWebResp;
 
-            const legacyWebResp = await handleLegacyMigrationWebRoutes(request, env, url);
-            if (legacyWebResp) return legacyWebResp;
+                const chatWebResp = await handleChatOscWebRoutes(request, activeEnv, url);
+                if (chatWebResp) return chatWebResp;
 
-            const cleanupResp = await handleDbCleanupRoutes(request, env, url);
-            if (cleanupResp) return cleanupResp;
+                const legacyWebResp = await handleLegacyMigrationWebRoutes(request, activeEnv, url);
+                if (legacyWebResp) return legacyWebResp;
 
-            const storageResp = await handleStorageRoutes(request, env, url);
-            if (storageResp) return storageResp;
+                const cleanupResp = await handleDbCleanupRoutes(request, activeEnv, url);
+                if (cleanupResp) return cleanupResp;
 
-            return Response.json(
-                { ok: false, error: { code: 'NOT_FOUND', message: 'Route not found' } },
-                { status: 404 }
-            );
+                const storageResp = await handleStorageRoutes(request, activeEnv, url);
+                if (storageResp) return storageResp;
+
+                return Response.json(
+                    { ok: false, error: { code: 'NOT_FOUND', message: 'Route not found' } },
+                    { status: 404 }
+                );
+            });
         } catch (err) {
             console.error('[VRCX Cloud] Unhandled Worker error:', err);
             return Response.json(
@@ -268,8 +278,10 @@ export default {
     async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
         const task = (async () => {
             await ensureSchemaReady(env);
-            await runBackgroundFeedSync(env, { trigger: 'cron' });
-            await maybeRunDailyAutoCompaction(env);
+            await runWithExternalMysqlEnv(env, async (activeEnv) => {
+                await runBackgroundFeedSync(activeEnv, { trigger: 'cron' });
+                await maybeRunDailyAutoCompaction(activeEnv);
+            });
         })();
         ctx.waitUntil(task);
         await task;
