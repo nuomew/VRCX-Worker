@@ -278,9 +278,13 @@ export function $throw(code, error, endpoint) {
         }
     }
     if (typeof error !== 'undefined') {
-        message.push(
-            `${t('api.error.message.error_message')}: ${typeof error === 'string' ? error : JSON.stringify(error)}`
-        );
+        const errorText =
+            typeof error === 'string'
+                ? error
+                : error instanceof Error
+                  ? error.message || String(error)
+                  : JSON.stringify(error);
+        message.push(`${t('api.error.message.error_message')}: ${errorText}`);
     }
     if (typeof endpoint !== 'undefined') {
         message.push(

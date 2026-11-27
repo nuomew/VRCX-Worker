@@ -4,7 +4,7 @@ vi.mock('../../plugins/router.js', () => ({
     initRouter: vi.fn()
 }));
 
-import { buildRequestInit, parseResponse, processBulk, shouldIgnoreError } from '../request.js';
+import { $throw, buildRequestInit, parseResponse, processBulk, shouldIgnoreError } from '../request.js';
 
 describe('buildRequestInit', () => {
     test('builds GET request with default method', () => {
@@ -290,5 +290,19 @@ describe('processBulk', () => {
 
         expect(fn).toHaveBeenCalledTimes(2);
         expect(done).toHaveBeenCalledWith(true);
+    });
+});
+
+describe('$throw', () => {
+    test('formats Error instances using error.message instead of empty "{}"', () => {
+        expect(() => $throw(0, new Error('Unexpected server error'), 'config')).toThrow(
+            /Unexpected server error/
+        );
+        try {
+            $throw(0, new Error('Unexpected server error'), 'config');
+        } catch (err) {
+            expect(err.message).not.toContain('{}');
+            expect(err.message).toContain('"config"');
+        }
     });
 });

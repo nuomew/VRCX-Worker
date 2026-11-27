@@ -923,6 +923,15 @@ function parseCandidateConfigInput(
         return { ok: false, code: 'INVALID_PASSWORD', message: 'Invalid MySQL password format' };
     }
 
+    if (enabled && connectionType === 'direct' && sslMode === 'skip_verify') {
+        return {
+            ok: false,
+            code: 'UNSUPPORTED_SSL_MODE',
+            message:
+                'Cloudflare Workers does not support skipping TLS certificate verification (self-signed certificates). Switch TLS/SSL mode to "Disabled", use "TLS Enabled (strict CA verification)" with a trusted CA certificate, or connect via Cloudflare Hyperdrive.'
+        };
+    }
+
     return {
         ok: true,
         next: {
@@ -1132,15 +1141,11 @@ export async function handleExternalMysqlRoutes(request: Request, env: Env, url:
         }
 
         try {
-            const testResult = await testExternalMysqlConnection(resolved);
-            const usage = await measureExternalMysqlUsage(resolved);
+            const testResult = await testExternalMysqlConnection(resolved, { includeUsage: true });
             return Response.json(
                 {
                     ok: true,
-                    data: {
-                        ...testResult,
-                        mysqlUsage: usage
-                    }
+                    data: testResult
                 },
                 { headers: { 'Cache-Control': 'no-store' } }
             );

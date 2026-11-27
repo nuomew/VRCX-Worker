@@ -4056,7 +4056,7 @@
             "mysql_password_saved_placeholder": "已加密保存（留空表示不修改）",
             "mysql_ssl_label": "TLS / SSL 加密模式",
             "mysql_ssl_disabled": "关闭（常见自建 MySQL 5.7 默认）",
-            "mysql_ssl_skip_verify": "开启 TLS（允许自签证书）",
+            "mysql_ssl_skip_verify": "跳过证书校验（Cloudflare Workers 平台不支持，请改选关闭或严格 CA 校验）",
             "mysql_ssl_verify": "开启 TLS（严格校验 CA 证书）",
             "mysql_prefix_label": "表前缀（可选，默认 vrcx_）",
             "mysql_test_btn": "测试连接并建表",

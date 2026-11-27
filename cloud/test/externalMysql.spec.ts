@@ -1871,4 +1871,135 @@ describe('External MySQL 5.7+ Database Integration (Hybrid New-Writes Mode & Ful
             ).run();
         }
     });
+
+    it('rejects unsupported skip_verify SSL on Workers, reuses 1 connection in /test, and keeps /api/vrc/execute resilient when MySQL is unreachable', async () => {
+        await ensureSchemaReady(env);
+        const fakeMysql = new FakeMysql57Server();
+        let openedConnections = 0;
+        setMysqlConnectionFactoryForTests(async () => {
+            openedConnections++;
+            return fakeMysql.createConnection();
+        });
+        const headers = { 'Content-Type': 'application/json', Origin: 'http://example.com' };
+        const originalFetch = globalThis.fetch;
+
+        try {
+            // 1. Direct `skip_verify` MUST fail fast with clear 400 UNSUPPORTED_SSL_MODE on both /test and enabled /config
+            const skipVerifyTest = await exports.default.fetch('http://example.com/api/storage/mysql/test', {
+                method: 'POST',
+                headers,
+                body: JSON.stringify({
+                    connectionType: 'direct',
+                    host: 'db.example.com',
+                    port: 3306,
+                    database: 'vrcx_db',
+                    username: 'vrcx',
+                    password: 'secret',
+                    sslMode: 'skip_verify',
+                    tablePrefix: 'vrcx_'
+                })
+            });
+            expect(skipVerifyTest.status).toBe(400);
+            const skipJson = (await skipVerifyTest.json()) as { error?: { code?: string; message?: string } };
+            expect(skipJson.error?.code).toBe('UNSUPPORTED_SSL_MODE');
+            expect(skipJson.error?.message).toContain('Cloudflare Workers');
+            expect(openedConnections).toBe(0);
+
+            // 2. /api/storage/mysql/test reuses a single TCP connection to initialize tables AND inspect usage
+            const okTest = await exports.default.fetch('http://example.com/api/storage/mysql/test', {
+                method: 'POST',
+                headers,
+                body: JSON.stringify({
+                    connectionType: 'direct',
+                    host: 'db.example.com',
+                    port: 3306,
+                    database: 'vrcx_db',
+                    username: 'vrcx',
+                    password: 'secret',
+                    sslMode: 'disabled',
+                    tablePrefix: 'vrcx_'
+                })
+            });
+            expect(okTest.status).toBe(200);
+            const okJson = (await okTest.json()) as {
+                ok: boolean;
+                data: { mysqlVersion: string; tablesReady: number; mysqlUsage?: { connected: boolean } };
+            };
+            expect(okJson.ok).toBe(true);
+            expect(okJson.data.tablesReady).toBe(12);
+            expect(okJson.data.mysqlUsage?.connected).toBe(true);
+            expect(openedConnections).toBe(1);
+
+            // 3. Even when external MySQL is enabled and completely unreachable, /api/vrc/execute (`config`)
+            //    and /api/vrc/execute-batch MUST degrade cache reads cleanly instead of throwing HTTP 500
+            expect(
+                (
+                    await exports.default.fetch('http://example.com/api/storage/mysql/config', {
+                        method: 'PUT',
+                        headers,
+                        body: JSON.stringify({
+                            enabled: true,
+                            mode: 'new_writes_only',
+                            connectionType: 'direct',
+                            host: 'db.example.com',
+                            port: 3306,
+                            database: 'vrcx_db',
+                            username: 'vrcx',
+                            password: 'secret',
+                            sslMode: 'disabled',
+                            tablePrefix: 'vrcx_'
+                        })
+                    })
+                ).status
+            ).toBe(200);
+
+            fakeMysql.failNextConnect = true;
+            globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+                const target = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+                if (target === 'https://api.vrchat.cloud/api/1/config') {
+                    return new Response(JSON.stringify({ clientApiKey: 'test-key', apiUrl: 'https://api.vrchat.cloud/api/1' }), {
+                        status: 200,
+                        headers: { 'Content-Type': 'application/json' }
+                    });
+                }
+                return originalFetch(input, init);
+            }) as typeof fetch;
+
+            const singleRes = await exports.default.fetch('http://example.com/api/vrc/execute', {
+                method: 'POST',
+                headers,
+                body: JSON.stringify({
+                    url: 'https://api.vrchat.cloud/api/1/config',
+                    method: 'GET',
+                    preferCloudDirect: true
+                })
+            });
+            expect(singleRes.status).toBe(200);
+            const singleJson = (await singleRes.json()) as { ok: boolean; data: { status: number; data: string } };
+            expect(singleJson.ok).toBe(true);
+            expect(singleJson.data.status).toBe(200);
+            expect(JSON.parse(singleJson.data.data).clientApiKey).toBe('test-key');
+
+            const batchRes = await exports.default.fetch('http://example.com/api/vrc/execute-batch', {
+                method: 'POST',
+                headers,
+                body: JSON.stringify({
+                    requests: [{ url: 'https://api.vrchat.cloud/api/1/config', method: 'GET' }]
+                })
+            });
+            expect(batchRes.status).toBe(200);
+            const batchJson = (await batchRes.json()) as {
+                ok: boolean;
+                data: { results: Array<{ status: number; data: string }> };
+            };
+            expect(batchJson.ok).toBe(true);
+            expect(batchJson.data.results[0]?.status).toBe(200);
+        } finally {
+            globalThis.fetch = originalFetch;
+            fakeMysql.failNextConnect = false;
+            setMysqlConnectionFactoryForTests(null);
+            await saveExternalDbConfig(env, defaultExternalDbConfig());
+            await saveExternalDbMigrationState(env, defaultExternalDbMigrationState());
+        }
+    });
 });

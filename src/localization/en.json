@@ -4058,7 +4058,7 @@
             "mysql_password_saved_placeholder": "Encrypted & saved (leave blank to keep)",
             "mysql_ssl_label": "TLS / SSL Mode",
             "mysql_ssl_disabled": "Disabled (common self-hosted MySQL 5.7 default)",
-            "mysql_ssl_skip_verify": "TLS Enabled (allow self-signed certificate)",
+            "mysql_ssl_skip_verify": "Skip TLS verification (unsupported on Cloudflare Workers; switch to Disabled or Strict CA)",
             "mysql_ssl_verify": "TLS Enabled (strict CA verification)",
             "mysql_prefix_label": "Table Prefix (Optional, default vrcx_)",
             "mysql_test_btn": "Test & Init Tables",

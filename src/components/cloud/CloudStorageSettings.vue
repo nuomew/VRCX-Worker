@@ -281,7 +281,10 @@
                                         <option class="bg-card text-foreground" value="disabled">
                                             {{ t('cloud_hub.storage.mysql_ssl_disabled') }}
                                         </option>
-                                        <option class="bg-card text-foreground" value="skip_verify">
+                                        <option
+                                            v-if="mysqlFormSslMode === 'skip_verify'"
+                                            class="bg-card text-foreground"
+                                            value="skip_verify">
                                             {{ t('cloud_hub.storage.mysql_ssl_skip_verify') }}
                                         </option>
                                         <option class="bg-card text-foreground" value="verify">

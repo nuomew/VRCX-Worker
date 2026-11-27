@@ -738,12 +738,45 @@ export function buildMysql57SchemaStatements(tablePrefix: string): string[] {
     return stmts;
 }
 
+function isIpAddressLiteral(host: string): boolean {
+    return host.includes(':') || /^\d{1,3}(?:\.\d{1,3}){3}$/.test(host);
+}
+
 /**
- * Opens a short-lived MySQL 5.7+ connection via `mysql2/promise` with `disableEval: true`
+ * Formats low-level Cloudflare workerd TLS handshake errors into actionable guidance.
+ */
+function normalizeWorkersMysqlError(err: unknown, sslMode: ExternalDbSslMode): Error {
+    const rawMsg = err instanceof Error ? err.message : String(err ?? 'Failed to connect to MySQL server');
+    const code = (err as { code?: unknown } | null)?.code;
+    if (
+        sslMode === 'verify' &&
+        (code === 'HANDSHAKE_SSL_ERROR' || /internal error;\s*reference\s*=/i.test(rawMsg))
+    ) {
+        const friendly = new Error(
+            'TLS handshake failed with MySQL server (self-signed/untrusted certificate, hostname mismatch, or TLS not enabled). Use a trusted CA certificate, switch TLS/SSL mode to "Disabled", or connect via Cloudflare Hyperdrive.'
+        );
+        (friendly as { code?: string }).code = 'HANDSHAKE_SSL_ERROR';
+        return friendly;
+    }
+    return err instanceof Error ? err : new Error(rawMsg);
+}
+
+/**
+ * Opens a short-lived MySQL 5.7+ connection via `mysql2` with `disableEval: true`
  * (mandatory inside Cloudflare Workers V8 isolates where dynamic `eval`/`new Function` is disallowed).
+ *
+ * For direct TLS (`sslMode === 'verify'`), bridges `mysql2` onto native `cloudflare:sockets` with
+ * `secureTransport: 'starttls'` + `socket.startTls()` because `workerd`'s `node:tls.connect()` rejects
+ * `mysql2`'s hardcoded `checkServerIdentity` option with `ERR_OPTION_NOT_IMPLEMENTED`.
  */
 async function openRealMysqlConnection(params: ResolvedMysqlConnectionParams): Promise<MysqlConnectionLike> {
-    const connOpts: ConnectionOptions & { disableEval?: boolean } = {
+    if (params.connectionType === 'direct' && params.sslMode === 'skip_verify') {
+        throw new Error(
+            'Cloudflare Workers does not support skipping TLS certificate verification (self-signed certificates). Switch TLS/SSL mode to "Disabled", use "TLS Enabled (strict CA verification)" with a trusted CA certificate, or connect via Cloudflare Hyperdrive.'
+        );
+    }
+
+    const baseOpts: ConnectionOptions & { disableEval?: boolean } = {
         host: params.host,
         port: params.port,
         user: params.username,
@@ -757,16 +790,258 @@ async function openRealMysqlConnection(params: ResolvedMysqlConnectionParams): P
         namedPlaceholders: false,
         disableEval: true
     };
-    if (params.connectionType === 'direct') {
-        if (params.sslMode === 'verify') {
-            connOpts.ssl = { rejectUnauthorized: true };
-        } else if (params.sslMode === 'skip_verify') {
-            connOpts.ssl = { rejectUnauthorized: false };
+
+    if (params.connectionType === 'direct' && params.sslMode === 'verify') {
+        const [{ EventEmitter }, { Buffer }, { connect }, mysqlMod] = await Promise.all([
+            import('node:events'),
+            import('node:buffer'),
+            import('cloudflare:sockets'),
+            import('mysql2')
+        ]);
+
+        const createRawConnection =
+            (mysqlMod as { default?: { createConnection?: unknown }; createConnection?: unknown }).default
+                ?.createConnection ?? (mysqlMod as { createConnection?: unknown }).createConnection;
+        if (typeof createRawConnection !== 'function') {
+            throw new Error('Failed to load mysql2 createConnection');
         }
+
+        const servername = isIpAddressLiteral(params.host) ? undefined : params.host;
+
+        class CloudflareStartTlsStream extends EventEmitter {
+            private socket: Socket;
+            private writerChain: Promise<void> = Promise.resolve();
+            private pausedForTls = false;
+            private closed = false;
+            destroyed = false;
+
+            constructor(host: string, port: number) {
+                super();
+                this.socket = connect(
+                    { hostname: host, port },
+                    { secureTransport: 'starttls', allowHalfOpen: false }
+                );
+                this.socket.opened.catch((err) => {
+                    if (!this.closed && !this.pausedForTls) {
+                        this.emit('error', normalizeWorkersMysqlError(err, 'verify'));
+                    }
+                });
+                this.startReadLoop(this.socket);
+            }
+
+            private startReadLoop(sock: Socket): void {
+                void (async () => {
+                    try {
+                        while (!this.closed && !this.pausedForTls && this.socket === sock) {
+                            const reader = sock.readable.getReader();
+                            let res: ReadableStreamReadResult<Uint8Array>;
+                            try {
+                                res = await reader.read();
+                            } finally {
+                                reader.releaseLock();
+                            }
+                            if (res.done) {
+                                if (!this.pausedForTls && this.socket === sock) {
+                                    this.emit('end');
+                                    this.emit('close');
+                                }
+                                return;
+                            }
+                            if (res.value && res.value.byteLength > 0) {
+                                this.emit('data', Buffer.from(res.value));
+                            }
+                        }
+                    } catch (err) {
+                        if (!this.closed && !this.pausedForTls && this.socket === sock) {
+                            this.emit('error', normalizeWorkersMysqlError(err, 'verify'));
+                        }
+                    }
+                })();
+            }
+
+            write(data: Uint8Array | string, cb?: (err?: Error | null) => void): boolean {
+                if (this.closed) {
+                    cb?.(new Error('Socket closed'));
+                    return false;
+                }
+                const bytes =
+                    typeof data === 'string'
+                        ? new TextEncoder().encode(data)
+                        : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+                const copy = new Uint8Array(bytes);
+                this.writerChain = this.writerChain
+                    .then(async () => {
+                        const sock = this.socket;
+                        const writer = sock.writable.getWriter();
+                        try {
+                            await writer.write(copy);
+                        } finally {
+                            writer.releaseLock();
+                        }
+                    })
+                    .then(() => {
+                        cb?.(null);
+                    })
+                    .catch((err) => {
+                        const normalized = normalizeWorkersMysqlError(err, 'verify');
+                        cb?.(normalized);
+                        if (!this.closed) {
+                            this.emit('error', normalized);
+                        }
+                    });
+                return true;
+            }
+
+            upgradeToTls(onSecure: (err?: Error) => void): void {
+                this.pausedForTls = true;
+                void this.writerChain
+                    .then(async () => {
+                        const tlsSocket = servername
+                            ? this.socket.startTls({ expectedServerHostname: servername })
+                            : this.socket.startTls();
+                        this.socket = tlsSocket;
+                        await tlsSocket.opened;
+                        if (this.closed) return;
+                        this.pausedForTls = false;
+                        this.startReadLoop(tlsSocket);
+                        onSecure();
+                    })
+                    .catch((err) => {
+                        onSecure(normalizeWorkersMysqlError(err, 'verify'));
+                    });
+            }
+
+            setNoDelay(): this {
+                return this;
+            }
+
+            setKeepAlive(): this {
+                return this;
+            }
+
+            pause(): this {
+                return this;
+            }
+
+            resume(): this {
+                return this;
+            }
+
+            end(): void {
+                this.destroy();
+            }
+
+            destroy(): void {
+                if (this.closed) return;
+                this.closed = true;
+                this.destroyed = true;
+                this.socket.close().catch(() => {});
+            }
+        }
+
+        const adapter = new CloudflareStartTlsStream(params.host, params.port);
+        interface RawMysqlConnectionLike {
+            startTLS: (onSecure: (err?: Error) => void) => void;
+            on: (event: string, listener: (...args: unknown[]) => void) => void;
+            once: (event: string, listener: (...args: unknown[]) => void) => void;
+            query: (sql: string, values: unknown[], cb: (err: Error | null, result: unknown) => void) => void;
+            end: (cb: (err?: Error | null) => void) => void;
+            destroy: () => void;
+        }
+        const rawConn = (
+            createRawConnection as (opts: Record<string, unknown>) => RawMysqlConnectionLike
+        )({
+            ...baseOpts,
+            ssl: { rejectUnauthorized: true },
+            stream: () => adapter
+        });
+        rawConn.startTLS = (onSecure: (err?: Error) => void) => {
+            adapter.upgradeToTls(onSecure);
+        };
+
+        await new Promise<void>((resolve, reject) => {
+            let settled = false;
+            rawConn.once('connect', () => {
+                if (settled) return;
+                settled = true;
+                // Keep a no-op error listener after connect so post-handshake disconnects never throw Unhandled 'error' event
+                rawConn.on('error', () => {});
+                resolve();
+            });
+            rawConn.once('error', (err) => {
+                if (settled) return;
+                settled = true;
+                reject(normalizeWorkersMysqlError(err, 'verify'));
+            });
+        });
+
+        return {
+            execute(sql: string, values: unknown[] = []): Promise<MysqlExecResult> {
+                return new Promise<MysqlExecResult>((resolve, reject) => {
+                    rawConn.query(sql, values, (err, result) => {
+                        if (err) {
+                            reject(normalizeWorkersMysqlError(err, 'verify'));
+                            return;
+                        }
+                        if (Array.isArray(result)) {
+                            resolve({
+                                rows: result as Array<Record<string, unknown>>,
+                                affectedRows: 0,
+                                insertId: 0
+                            });
+                            return;
+                        }
+                        const header = result as ResultSetHeader;
+                        resolve({
+                            rows: [],
+                            affectedRows: Number(header?.affectedRows ?? 0) || 0,
+                            insertId: Number(header?.insertId ?? 0) || 0
+                        });
+                    });
+                });
+            },
+            async close(): Promise<void> {
+                if (adapter.destroyed) {
+                    try {
+                        rawConn.destroy();
+                    } catch {
+                        // Ignore close errors
+                    }
+                    return;
+                }
+                await new Promise<void>((resolve) => {
+                    let done = false;
+                    const finish = () => {
+                        if (done) return;
+                        done = true;
+                        clearTimeout(timer);
+                        resolve();
+                    };
+                    const timer = setTimeout(() => {
+                        try {
+                            rawConn.destroy();
+                        } catch {
+                            // Ignore destroy errors
+                        }
+                        finish();
+                    }, 1500);
+                    try {
+                        rawConn.end(() => finish());
+                    } catch {
+                        try {
+                            rawConn.destroy();
+                        } catch {
+                            // Ignore close errors
+                        }
+                        finish();
+                    }
+                });
+            }
+        };
     }
 
     const { createConnection } = await import('mysql2/promise');
-    const conn: Connection = await createConnection(connOpts);
+    const conn: Connection = await createConnection(baseOpts);
     return {
         async execute(sql: string, values: unknown[] = []): Promise<MysqlExecResult> {
             // Use text protocol `query()` rather than server-side prepared statements (`execute()`)
@@ -908,12 +1183,120 @@ export class ExternalMysqlSession {
 }
 
 /**
- * Tests connectivity against a MySQL 5.7+ server, initializes all 8 managed tables idempotently,
- * and returns server version & round-trip latency. Never logs or returns passwords.
+ * Measures MySQL 5.7+ table storage usage on an already-open connection (avoiding a redundant handshake).
+ */
+async function measureExternalMysqlUsageOnConnection(
+    conn: MysqlConnectionLike,
+    params: ResolvedMysqlConnectionParams,
+    knownVersion?: string
+): Promise<ExternalDbUsageSummary> {
+    const checkedAt = new Date().toISOString();
+    const tables: Record<string, { chunks: number; rows: number; bytes: number }> = {};
+    for (const spec of MANAGED_ARCHIVE_TABLES) {
+        tables[spec.table] = { chunks: 0, rows: 0, bytes: 0 };
+    }
+    tables.vrc_api_cache = { chunks: 0, rows: 0, bytes: 0 };
+    for (const rSpec of MANAGED_ROLLUP_TABLES) {
+        tables[rSpec.physicalTable] = { chunks: 0, rows: 0, bytes: 0 };
+    }
+
+    let mysqlVersion = knownVersion ?? '';
+    if (!mysqlVersion) {
+        const verRes = await conn.execute('SELECT VERSION() AS version', []);
+        mysqlVersion = String(verRes.rows[0]?.version ?? 'unknown');
+    }
+
+    const qualifiedNames = [
+        ...MANAGED_ARCHIVE_TABLES.map((s) => qualifyMysqlTableName(params.tablePrefix, s.table)),
+        qualifyMysqlTableName(params.tablePrefix, 'vrc_api_cache'),
+        ...MANAGED_ROLLUP_TABLES.map((s) => qualifyMysqlTableName(params.tablePrefix, s.physicalTable))
+    ];
+    const placeholders = qualifiedNames.map(() => '?').join(', ');
+    let usedBytes = 0;
+    const sizeByQualified = new Map<string, number>();
+    try {
+        const infoRes = await conn.execute(
+            `SELECT TABLE_NAME AS table_name,
+                    COALESCE(DATA_LENGTH, 0) + COALESCE(INDEX_LENGTH, 0) AS total_bytes
+             FROM information_schema.TABLES
+             WHERE TABLE_SCHEMA = ? AND TABLE_NAME IN (${placeholders})`,
+            [params.database, ...qualifiedNames]
+        );
+        for (const row of infoRes.rows) {
+            const name = String(row.table_name ?? '').toLowerCase();
+            const bytes = Math.max(0, Number(row.total_bytes ?? 0) || 0);
+            if (name) {
+                sizeByQualified.set(name, bytes);
+            }
+            usedBytes += bytes;
+        }
+    } catch {
+        // Fallback to 0 bytes if information_schema is restricted on a managed host
+    }
+
+    let totalChunks = 0;
+    let totalLogicalRows = 0;
+    for (const spec of MANAGED_ARCHIVE_TABLES) {
+        const tbl = qualifyMysqlTableName(params.tablePrefix, spec.table);
+        const statRes = await conn.execute(
+            `SELECT COUNT(*) AS chunk_cnt, COALESCE(SUM(row_count), 0) AS row_cnt FROM \`${tbl}\``,
+            []
+        );
+        const chunkCnt = Math.max(0, Number(statRes.rows[0]?.chunk_cnt ?? 0) || 0);
+        const rowCnt = Math.max(0, Number(statRes.rows[0]?.row_cnt ?? 0) || 0);
+        const bytes = sizeByQualified.get(tbl.toLowerCase()) ?? 0;
+        tables[spec.table] = { chunks: chunkCnt, rows: rowCnt, bytes };
+        totalChunks += chunkCnt;
+        totalLogicalRows += rowCnt;
+    }
+
+    const cacheTbl = qualifyMysqlTableName(params.tablePrefix, 'vrc_api_cache');
+    const cacheStat = await conn.execute(`SELECT COUNT(*) AS cnt FROM \`${cacheTbl}\``, []);
+    const cacheRows = Math.max(0, Number(cacheStat.rows[0]?.cnt ?? 0) || 0);
+    tables.vrc_api_cache = {
+        chunks: cacheRows,
+        rows: cacheRows,
+        bytes: sizeByQualified.get(cacheTbl.toLowerCase()) ?? 0
+    };
+
+    for (const rSpec of MANAGED_ROLLUP_TABLES) {
+        const rTbl = qualifyMysqlTableName(params.tablePrefix, rSpec.physicalTable);
+        const rStat = await conn.execute(`SELECT COUNT(*) AS cnt FROM \`${rTbl}\``, []);
+        const rCnt = Math.max(0, Number(rStat.rows[0]?.cnt ?? 0) || 0);
+        tables[rSpec.physicalTable] = {
+            chunks: rCnt,
+            rows: rCnt,
+            bytes: sizeByQualified.get(rTbl.toLowerCase()) ?? 0
+        };
+    }
+
+    return {
+        connected: true,
+        mysqlVersion,
+        usedBytes,
+        totalChunks,
+        totalLogicalRows,
+        cacheRows,
+        tables,
+        checkedAt
+    };
+}
+
+/**
+ * Tests connectivity against a MySQL 5.7+ server, initializes all 12 managed tables idempotently,
+ * and returns server version, round-trip latency, and optional live usage on the SAME TCP connection.
+ * Never logs or returns passwords.
  */
 export async function testExternalMysqlConnection(
-    params: ResolvedMysqlConnectionParams
-): Promise<{ ok: true; mysqlVersion: string; latencyMs: number; tablesReady: number }> {
+    params: ResolvedMysqlConnectionParams,
+    options: { includeUsage?: boolean } = {}
+): Promise<{
+    ok: true;
+    mysqlVersion: string;
+    latencyMs: number;
+    tablesReady: number;
+    mysqlUsage?: ExternalDbUsageSummary;
+}> {
     const startedAt = Date.now();
     const conn = await openMysqlConnection(params);
     try {
@@ -921,11 +1304,31 @@ export async function testExternalMysqlConnection(
         const mysqlVersion = String((verRes.rows[0] as RowDataPacket | undefined)?.version ?? 'unknown');
         await ensureMysqlSchemaOnConnection(conn, params, true);
         const ddlCount = buildMysql57SchemaStatements(params.tablePrefix).length;
+        const latencyMs = Math.max(1, Date.now() - startedAt);
+        let mysqlUsage: ExternalDbUsageSummary | undefined;
+        if (options.includeUsage) {
+            try {
+                mysqlUsage = await measureExternalMysqlUsageOnConnection(conn, params, mysqlVersion);
+            } catch (err) {
+                mysqlUsage = {
+                    connected: false,
+                    mysqlVersion,
+                    usedBytes: 0,
+                    totalChunks: 0,
+                    totalLogicalRows: 0,
+                    cacheRows: 0,
+                    tables: {},
+                    checkedAt: new Date().toISOString(),
+                    error: err instanceof Error ? err.message : 'Failed to inspect MySQL table usage'
+                };
+            }
+        }
         return {
             ok: true,
             mysqlVersion,
-            latencyMs: Math.max(1, Date.now() - startedAt),
-            tablesReady: ddlCount
+            latencyMs,
+            tablesReady: ddlCount,
+            ...(mysqlUsage ? { mysqlUsage } : {})
         };
     } finally {
         await conn.close();
@@ -940,96 +1343,20 @@ export async function measureExternalMysqlUsage(
     params: ResolvedMysqlConnectionParams
 ): Promise<ExternalDbUsageSummary> {
     const checkedAt = new Date().toISOString();
-    const tables: Record<string, { chunks: number; rows: number; bytes: number }> = {};
+    const emptyTables: Record<string, { chunks: number; rows: number; bytes: number }> = {};
     for (const spec of MANAGED_ARCHIVE_TABLES) {
-        tables[spec.table] = { chunks: 0, rows: 0, bytes: 0 };
+        emptyTables[spec.table] = { chunks: 0, rows: 0, bytes: 0 };
     }
-    tables.vrc_api_cache = { chunks: 0, rows: 0, bytes: 0 };
+    emptyTables.vrc_api_cache = { chunks: 0, rows: 0, bytes: 0 };
     for (const rSpec of MANAGED_ROLLUP_TABLES) {
-        tables[rSpec.physicalTable] = { chunks: 0, rows: 0, bytes: 0 };
+        emptyTables[rSpec.physicalTable] = { chunks: 0, rows: 0, bytes: 0 };
     }
 
     let conn: MysqlConnectionLike | null = null;
     try {
         conn = await openMysqlConnection(params);
         await ensureMysqlSchemaOnConnection(conn, params, false);
-        const verRes = await conn.execute('SELECT VERSION() AS version', []);
-        const mysqlVersion = String(verRes.rows[0]?.version ?? 'unknown');
-
-        const qualifiedNames = [
-            ...MANAGED_ARCHIVE_TABLES.map((s) => qualifyMysqlTableName(params.tablePrefix, s.table)),
-            qualifyMysqlTableName(params.tablePrefix, 'vrc_api_cache'),
-            ...MANAGED_ROLLUP_TABLES.map((s) => qualifyMysqlTableName(params.tablePrefix, s.physicalTable))
-        ];
-        const placeholders = qualifiedNames.map(() => '?').join(', ');
-        let usedBytes = 0;
-        const sizeByQualified = new Map<string, number>();
-        try {
-            const infoRes = await conn.execute(
-                `SELECT TABLE_NAME AS table_name,
-                        COALESCE(DATA_LENGTH, 0) + COALESCE(INDEX_LENGTH, 0) AS total_bytes
-                 FROM information_schema.TABLES
-                 WHERE TABLE_SCHEMA = ? AND TABLE_NAME IN (${placeholders})`,
-                [params.database, ...qualifiedNames]
-            );
-            for (const row of infoRes.rows) {
-                const name = String(row.table_name ?? '').toLowerCase();
-                const bytes = Math.max(0, Number(row.total_bytes ?? 0) || 0);
-                if (name) {
-                    sizeByQualified.set(name, bytes);
-                }
-                usedBytes += bytes;
-            }
-        } catch {
-            // Fallback to 0 bytes if information_schema is restricted on a managed host
-        }
-
-        let totalChunks = 0;
-        let totalLogicalRows = 0;
-        for (const spec of MANAGED_ARCHIVE_TABLES) {
-            const tbl = qualifyMysqlTableName(params.tablePrefix, spec.table);
-            const statRes = await conn.execute(
-                `SELECT COUNT(*) AS chunk_cnt, COALESCE(SUM(row_count), 0) AS row_cnt FROM \`${tbl}\``,
-                []
-            );
-            const chunkCnt = Math.max(0, Number(statRes.rows[0]?.chunk_cnt ?? 0) || 0);
-            const rowCnt = Math.max(0, Number(statRes.rows[0]?.row_cnt ?? 0) || 0);
-            const bytes = sizeByQualified.get(tbl.toLowerCase()) ?? 0;
-            tables[spec.table] = { chunks: chunkCnt, rows: rowCnt, bytes };
-            totalChunks += chunkCnt;
-            totalLogicalRows += rowCnt;
-        }
-
-        const cacheTbl = qualifyMysqlTableName(params.tablePrefix, 'vrc_api_cache');
-        const cacheStat = await conn.execute(`SELECT COUNT(*) AS cnt FROM \`${cacheTbl}\``, []);
-        const cacheRows = Math.max(0, Number(cacheStat.rows[0]?.cnt ?? 0) || 0);
-        tables.vrc_api_cache = {
-            chunks: cacheRows,
-            rows: cacheRows,
-            bytes: sizeByQualified.get(cacheTbl.toLowerCase()) ?? 0
-        };
-
-        for (const rSpec of MANAGED_ROLLUP_TABLES) {
-            const rTbl = qualifyMysqlTableName(params.tablePrefix, rSpec.physicalTable);
-            const rStat = await conn.execute(`SELECT COUNT(*) AS cnt FROM \`${rTbl}\``, []);
-            const rCnt = Math.max(0, Number(rStat.rows[0]?.cnt ?? 0) || 0);
-            tables[rSpec.physicalTable] = {
-                chunks: rCnt,
-                rows: rCnt,
-                bytes: sizeByQualified.get(rTbl.toLowerCase()) ?? 0
-            };
-        }
-
-        return {
-            connected: true,
-            mysqlVersion,
-            usedBytes,
-            totalChunks,
-            totalLogicalRows,
-            cacheRows,
-            tables,
-            checkedAt
-        };
+        return await measureExternalMysqlUsageOnConnection(conn, params);
     } catch (err) {
         return {
             connected: false,
@@ -1038,7 +1365,7 @@ export async function measureExternalMysqlUsage(
             totalChunks: 0,
             totalLogicalRows: 0,
             cacheRows: 0,
-            tables,
+            tables: emptyTables,
             checkedAt,
             error: err instanceof Error ? err.message : 'Failed to connect to MySQL server'
         };

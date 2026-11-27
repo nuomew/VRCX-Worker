@@ -1016,7 +1016,7 @@ export async function handleVrcProxyRoutes(request: Request, env: Env, url: URL)
             const webSyncSec = await getConfiguredWebSyncSeconds(env);
             cacheMeta = classifyVrcCacheUrl(payload.url, webSyncSec);
             if (canReadServerCache && cacheMeta) {
-                const hitMap = await getCachedVrcResponses(env, [payload.url]);
+                const hitMap = await getCachedVrcResponses(env, [payload.url]).catch(() => new Map());
                 const hit = hitMap.get(payload.url);
                 if (hit) {
                     return Response.json({
@@ -1402,7 +1402,7 @@ export async function handleVrcProxyRoutes(request: Request, env: Env, url: URL)
         });
         const readPlans = items.map((item, idx) => (item?.bypassCache ? null : writePlans[idx]!));
         const lookupUrls = items.map((item, idx) => (readPlans[idx] ? item.url : '')).filter(Boolean);
-        const cacheHits = await getCachedVrcResponses(env, lookupUrls);
+        const cacheHits = await getCachedVrcResponses(env, lookupUrls).catch(() => new Map());
 
         const missIndexes: number[] = [];
         for (let i = 0; i < items.length; i++) {
