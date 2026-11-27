@@ -2722,7 +2722,7 @@ INSERT INTO {acctPrefix}_friend_log_history (created_at, type, user_id, display_
             Assert.DoesNotContain("127.0.0.1:7890", allSentJson);
 
             // 5. Oversized (>256 KiB) single row in configs is clamped below 180 KiB payload ceiling instead of causing HTTP 413
-            using (var connBig = new SqliteConnection($"Data Source={dbPath}"))
+            using (var connBig = new SqliteConnection($"Data Source={dbPath};Pooling=False"))
             {
                 connBig.Open();
                 using var cmdBig = connBig.CreateCommand();
@@ -2776,7 +2776,7 @@ INSERT INTO {acctPrefix}_friend_log_history (created_at, type, user_id, display_
             }).Ok);
 
             // 7. Concurrent migration (concurrency=4) packs Feed up to 1000 rows/batch, uploads in parallel, retries transient 503 once, and finalizes categoryDone after drain
-            using (var connBulk = new SqliteConnection($"Data Source={dbPath}"))
+            using (var connBulk = new SqliteConnection($"Data Source={dbPath};Pooling=False"))
             {
                 connBulk.Open();
                 using var tx = connBulk.BeginTransaction();
@@ -2971,6 +2971,7 @@ INSERT INTO {acctPrefix}_friend_log_history (created_at, type, user_id, display_
         }
         finally
         {
+            SqliteConnection.ClearAllPools();
             if (Directory.Exists(tempRoot)) Directory.Delete(tempRoot, recursive: true);
         }
     }
