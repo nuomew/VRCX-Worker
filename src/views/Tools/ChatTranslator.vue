@@ -459,7 +459,7 @@
 
             <!-- Footer Counter & Action Buttons -->
             <div class="flex items-center justify-between gap-2 flex-wrap">
-                <div class="flex items-center gap-2 text-xs text-muted-foreground">
+                <div class="flex items-center gap-2.5 flex-wrap text-xs text-muted-foreground">
                     <span :class="draftOscMetrics.truncated ? 'text-amber-600 dark:text-amber-400 font-medium' : ''">
                         {{
                             t('view.tools.chat_translator.osc_counter', {
@@ -473,6 +473,105 @@
                     <span v-if="draftOscMetrics.truncated" class="text-[11px] text-amber-600 dark:text-amber-400">
                         {{ t('view.tools.chat_translator.osc_truncate_warning') }}
                     </span>
+
+                    <!-- Cloudflare Workers AI Daily Free Quota Ring + Hover Breakdown -->
+                    <div
+                        v-if="showWorkersAiQuotaRing"
+                        data-testid="workers-ai-quota-ring"
+                        class="relative inline-flex items-center group/quota">
+                        <button
+                            type="button"
+                            class="inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-[11px] font-mono tabular-nums transition-colors cursor-help focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                            :class="workersAiQuotaTone.pill"
+                            :aria-label="t('view.tools.chat_translator.workers_ai_quota_title')">
+                            <svg class="size-4 -rotate-90 shrink-0" viewBox="0 0 20 20" aria-hidden="true">
+                                <circle
+                                    cx="10"
+                                    cy="10"
+                                    r="7.5"
+                                    fill="none"
+                                    stroke="currentColor"
+                                    stroke-width="2.2"
+                                    class="opacity-20" />
+                                <circle
+                                    cx="10"
+                                    cy="10"
+                                    r="7.5"
+                                    fill="none"
+                                    stroke="currentColor"
+                                    stroke-width="2.2"
+                                    stroke-linecap="round"
+                                    :stroke-dasharray="QUOTA_RING_CIRCUMFERENCE"
+                                    :stroke-dashoffset="workersAiQuotaRingOffset"
+                                    class="transition-[stroke-dashoffset] duration-300" />
+                            </svg>
+                            <span class="font-medium">{{ workersAiQuotaPercentText }}</span>
+                        </button>
+
+                        <div
+                            role="tooltip"
+                            data-testid="workers-ai-quota-tooltip"
+                            class="pointer-events-none invisible opacity-0 group-hover/quota:visible group-hover/quota:opacity-100 group-focus-within/quota:visible group-focus-within/quota:opacity-100 transition-opacity duration-150 absolute bottom-full left-0 mb-2 z-50 w-64 max-w-[calc(100vw-2rem)] rounded-lg border border-border bg-popover p-3 text-xs text-popover-foreground shadow-lg space-y-1.5">
+                            <div class="flex items-center justify-between gap-2 font-medium text-foreground">
+                                <span>{{ t('view.tools.chat_translator.workers_ai_quota_title') }}</span>
+                                <span class="font-mono text-[11px]" :class="workersAiQuotaTone.text">
+                                    {{ workersAiQuotaPercentText }}
+                                </span>
+                            </div>
+                            <div class="h-1.5 w-full overflow-hidden rounded-full bg-muted">
+                                <div
+                                    class="h-full rounded-full transition-all duration-300"
+                                    :class="workersAiQuotaTone.bar"
+                                    :style="{ width: `${workersAiQuotaRemainingPercent}%` }" />
+                            </div>
+                            <div class="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 pt-0.5 text-[11px]">
+                                <span class="text-muted-foreground">
+                                    {{ t('view.tools.chat_translator.workers_ai_quota_daily') }}
+                                </span>
+                                <span class="text-right font-mono text-foreground">
+                                    {{ formatNeurons(effectiveWorkersAiQuota.dailyFreeNeurons) }} Neurons
+                                </span>
+
+                                <span class="text-muted-foreground">
+                                    {{ t('view.tools.chat_translator.workers_ai_quota_used') }}
+                                </span>
+                                <span class="text-right font-mono text-foreground">
+                                    {{ formatNeurons(effectiveWorkersAiQuota.usedNeurons) }} Neurons
+                                </span>
+
+                                <span class="text-muted-foreground">
+                                    {{ t('view.tools.chat_translator.workers_ai_quota_remaining') }}
+                                </span>
+                                <span class="text-right font-mono font-medium" :class="workersAiQuotaTone.text">
+                                    {{ formatNeurons(effectiveWorkersAiQuota.remainingNeurons) }} Neurons
+                                </span>
+
+                                <template v-if="workersAiEstimatedRemainingMsgs !== null">
+                                    <span class="text-muted-foreground">
+                                        {{ t('view.tools.chat_translator.workers_ai_quota_est_msgs') }}
+                                    </span>
+                                    <span class="text-right font-mono text-foreground">
+                                        {{
+                                            t('view.tools.chat_translator.workers_ai_quota_msgs_val', {
+                                                count: workersAiEstimatedRemainingMsgs.toLocaleString()
+                                            })
+                                        }}
+                                    </span>
+                                </template>
+                            </div>
+                            <div class="border-t border-border/70 pt-1.5 text-[10px] text-muted-foreground leading-relaxed space-y-0.5">
+                                <div>
+                                    {{
+                                        t('view.tools.chat_translator.workers_ai_quota_calls_meta', {
+                                            calls: effectiveWorkersAiQuota.requestsToday.toLocaleString(),
+                                            cached: effectiveWorkersAiQuota.cachedHitsToday.toLocaleString()
+                                        })
+                                    }}
+                                </div>
+                                <div>{{ t('view.tools.chat_translator.workers_ai_quota_reset_hint') }}</div>
+                            </div>
+                        </div>
+                    </div>
                 </div>
 
                 <div class="flex items-center gap-2">
@@ -737,6 +836,7 @@
         buildChatTranslationPrompt,
         CHAT_TRANSLATOR_LANGUAGES,
         CHAT_TRANSLATOR_PREFS_KEY,
+        CLOUDFLARE_AI_TRANSLATION_PRESETS,
         composeOscChatboxPayload,
         DEFAULT_CLOUDFLARE_AI_MODEL,
         DEFAULT_OSC_LISTEN_PORT,
@@ -759,11 +859,15 @@
         translationApiType,
         translationApiEndpoint,
         translationApiModel,
-        translationApiPrompt
+        translationApiPrompt,
+        workersAiQuota: storeWorkersAiQuota
     } = storeToRefs(advancedSettingsStore);
 
     const isWebMode = typeof WEB !== 'undefined' && WEB;
     const CHAT_PAGE_SIZE = 20;
+    const QUOTA_RING_RADIUS = 7.5;
+    const QUOTA_RING_CIRCUMFERENCE = 2 * Math.PI * QUOTA_RING_RADIUS;
+    const localWorkersAiQuota = ref(null);
 
     // Distinct gray (off) vs green (on) toggle colors with crisp white thumb in both light & dark modes.
     const TOGGLE_SWITCH_CLASS =
@@ -894,6 +998,95 @@
 
     const draftOscMetrics = computed(() => sanitizeOscChatboxText(draftInput.value));
     const previewOscMetrics = computed(() => sanitizeOscChatboxText(previewText.value));
+
+    const showWorkersAiQuotaRing = computed(
+        () => isWebMode && (translationApiType.value || 'google') === 'cloudflare'
+    );
+
+    const effectiveWorkersAiQuota = computed(() => {
+        const s = storeWorkersAiQuota?.value;
+        const l = localWorkersAiQuota.value;
+        let picked = null;
+        if (s && l) {
+            if (s.utcDate !== l.utcDate) {
+                picked = String(s.utcDate || '') >= String(l.utcDate || '') ? s : l;
+            } else {
+                const sScore = (Number(s.usedNeurons) || 0) * 1000 + (Number(s.cachedHitsToday) || 0);
+                const lScore = (Number(l.usedNeurons) || 0) * 1000 + (Number(l.cachedHitsToday) || 0);
+                picked = sScore >= lScore ? s : l;
+            }
+        } else {
+            picked = s || l;
+        }
+        const dailyFree = Math.max(1, Number(picked?.dailyFreeNeurons ?? 10_000) || 10_000);
+        const exhausted = Boolean(picked?.exhausted);
+        const used = exhausted ? dailyFree : Math.max(0, Number(picked?.usedNeurons ?? 0) || 0);
+        const remaining = exhausted ? 0 : Math.max(0, Math.round((dailyFree - used) * 10) / 10);
+        const remainingPercent = exhausted
+            ? 0
+            : Math.max(0, Math.min(100, Math.round((remaining / dailyFree) * 1000) / 10));
+        return {
+            dailyFreeNeurons: dailyFree,
+            usedNeurons: Math.round(used * 10) / 10,
+            remainingNeurons: remaining,
+            remainingPercent,
+            requestsToday: Math.max(0, Math.floor(Number(picked?.requestsToday ?? 0) || 0)),
+            cachedHitsToday: Math.max(0, Math.floor(Number(picked?.cachedHitsToday ?? 0) || 0)),
+            exhausted
+        };
+    });
+
+    const workersAiQuotaRemainingPercent = computed(() => effectiveWorkersAiQuota.value.remainingPercent);
+
+    const workersAiQuotaPercentText = computed(() => {
+        const pct = workersAiQuotaRemainingPercent.value;
+        if (pct >= 100) return '100%';
+        if (pct <= 0) return '0%';
+        return Number.isInteger(pct) ? `${pct}%` : `${pct.toFixed(1)}%`;
+    });
+
+    const workersAiQuotaRingOffset = computed(
+        () => QUOTA_RING_CIRCUMFERENCE * (1 - workersAiQuotaRemainingPercent.value / 100)
+    );
+
+    const workersAiQuotaTone = computed(() => {
+        const pct = workersAiQuotaRemainingPercent.value;
+        if (pct <= 10) {
+            return {
+                pill: 'border-rose-500/45 bg-rose-500/10 text-rose-600 dark:text-rose-400 hover:bg-rose-500/15',
+                text: 'text-rose-600 dark:text-rose-400',
+                bar: 'bg-rose-500'
+            };
+        }
+        if (pct <= 30) {
+            return {
+                pill: 'border-amber-500/45 bg-amber-500/10 text-amber-600 dark:text-amber-400 hover:bg-amber-500/15',
+                text: 'text-amber-600 dark:text-amber-400',
+                bar: 'bg-amber-500'
+            };
+        }
+        return {
+            pill: 'border-emerald-500/40 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 hover:bg-emerald-500/15',
+            text: 'text-emerald-600 dark:text-emerald-400',
+            bar: 'bg-emerald-500'
+        };
+    });
+
+    const workersAiEstimatedRemainingMsgs = computed(() => {
+        const activeModel = (translationApiModel.value || DEFAULT_CLOUDFLARE_AI_MODEL).trim().toLowerCase();
+        const preset = CLOUDFLARE_AI_TRANSLATION_PRESETS.find((p) => p.id.toLowerCase() === activeModel);
+        const perMsg = preset?.neuronsPerMsg || 1.66;
+        if (perMsg <= 0) return null;
+        return Math.max(0, Math.floor(effectiveWorkersAiQuota.value.remainingNeurons / perMsg));
+    });
+
+    function formatNeurons(val) {
+        const num = Number(val ?? 0) || 0;
+        if (Math.abs(num - Math.round(num)) < 0.05) {
+            return Math.round(num).toLocaleString();
+        }
+        return num.toLocaleString(undefined, { minimumFractionDigits: 1, maximumFractionDigits: 1 });
+    }
 
     function goBack() {
         router.push({ name: 'tools' });
@@ -1156,6 +1349,12 @@
             }
             if (typeof data?.chatDbDedicated === 'boolean') {
                 chatDbDedicated.value = data.chatDbDedicated;
+            }
+            if (data?.workersAiQuota && typeof data.workersAiQuota === 'object') {
+                localWorkersAiQuota.value = data.workersAiQuota;
+                if (typeof advancedSettingsStore.setWorkersAiQuota === 'function') {
+                    advancedSettingsStore.setWorkersAiQuota(data.workersAiQuota);
+                }
             }
         } catch (err) {
             suppressTopLoad = false;

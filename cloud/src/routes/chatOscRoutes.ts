@@ -47,8 +47,219 @@ const MAX_TRANSLATE_INPUT_CHARS = 4000;
 const MAX_TRANSLATE_PROMPT_CHARS = 1200;
 const TRANSLATE_CACHE_MAX_ENTRIES = 200;
 const TRANSLATE_CACHE_TTL_MS = 10 * 60_000;
+const WORKERS_AI_QUOTA_CONFIG_KEY = 'workers_ai_daily_quota';
+export const WORKERS_AI_FREE_DAILY_NEURONS = 10_000;
 
 export const DEFAULT_WORKERS_AI_TRANSLATION_MODEL = '@cf/zai-org/glm-4.7-flash';
+
+export interface WorkersAiDailyQuotaDto {
+    utcDate: string;
+    resetAtUtc: string;
+    aiBound: boolean;
+    dailyFreeNeurons: number;
+    usedNeurons: number;
+    remainingNeurons: number;
+    remainingPercent: number;
+    requestsToday: number;
+    cachedHitsToday: number;
+    inputTokensToday: number;
+    outputTokensToday: number;
+    exhausted: boolean;
+    estimated: boolean;
+}
+
+interface StoredWorkersAiDailyQuota {
+    utcDate: string;
+    usedNeurons: number;
+    requestsToday: number;
+    cachedHitsToday: number;
+    inputTokensToday: number;
+    outputTokensToday: number;
+    exhausted: boolean;
+}
+
+// Official Cloudflare Workers AI Neuron rates per 1M input/output tokens.
+const WORKERS_AI_NEURON_RATES: Record<string, { inPerM: number; outPerM: number }> = {
+    '@cf/zai-org/glm-4.7-flash': { inPerM: 5_500, outPerM: 36_400 },
+    '@cf/meta/llama-3.1-8b-instruct-fp8-fast': { inPerM: 4_119, outPerM: 34_909 },
+    '@cf/meta/llama-3.2-3b-instruct': { inPerM: 4_625, outPerM: 30_475 },
+    '@cf/meta/m2m100-1.2b': { inPerM: 31_050, outPerM: 31_050 },
+    '@cf/zai-org/glm-5.3-flash': { inPerM: 13_636, outPerM: 45_455 },
+    '@cf/deepseek-ai/deepseek-v4.1-flash-1017': { inPerM: 27_273, outPerM: 109_091 }
+};
+const DEFAULT_WORKERS_AI_NEURON_RATE = { inPerM: 6_000, outPerM: 36_000 };
+
+let quotaMemoryByDb = new WeakMap<D1Database, StoredWorkersAiDailyQuota>();
+
+function getUtcDateKey(nowMs: number): string {
+    return new Date(nowMs).toISOString().slice(0, 10);
+}
+
+function getNextUtcResetIso(nowMs: number): string {
+    const d = new Date(nowMs);
+    const nextMidnight = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + 1, 0, 0, 0, 0);
+    return new Date(nextMidnight).toISOString();
+}
+
+function createEmptyDailyQuota(utcDate: string): StoredWorkersAiDailyQuota {
+    return {
+        utcDate,
+        usedNeurons: 0,
+        requestsToday: 0,
+        cachedHitsToday: 0,
+        inputTokensToday: 0,
+        outputTokensToday: 0,
+        exhausted: false
+    };
+}
+
+function toWorkersAiDailyQuotaDto(
+    stored: StoredWorkersAiDailyQuota,
+    aiBound: boolean,
+    nowMs: number
+): WorkersAiDailyQuotaDto {
+    const used = stored.exhausted
+        ? WORKERS_AI_FREE_DAILY_NEURONS
+        : Math.max(0, Math.round(stored.usedNeurons * 10) / 10);
+    const remaining = stored.exhausted
+        ? 0
+        : Math.max(0, Math.round((WORKERS_AI_FREE_DAILY_NEURONS - used) * 10) / 10);
+    const remainingPercent = stored.exhausted
+        ? 0
+        : Math.max(0, Math.min(100, Math.round((remaining / WORKERS_AI_FREE_DAILY_NEURONS) * 1000) / 10));
+    return {
+        utcDate: stored.utcDate,
+        resetAtUtc: getNextUtcResetIso(nowMs),
+        aiBound,
+        dailyFreeNeurons: WORKERS_AI_FREE_DAILY_NEURONS,
+        usedNeurons: used,
+        remainingNeurons: remaining,
+        remainingPercent,
+        requestsToday: Math.max(0, Math.floor(stored.requestsToday)),
+        cachedHitsToday: Math.max(0, Math.floor(stored.cachedHitsToday)),
+        inputTokensToday: Math.max(0, Math.floor(stored.inputTokensToday)),
+        outputTokensToday: Math.max(0, Math.floor(stored.outputTokensToday)),
+        exhausted: stored.exhausted || remaining <= 0,
+        estimated: true
+    };
+}
+
+function estimateTextTokens(text: string): number {
+    if (!text) return 0;
+    let cjk = 0;
+    let other = 0;
+    for (const ch of text) {
+        const cp = ch.codePointAt(0) ?? 0;
+        if (
+            (cp >= 0x3000 && cp <= 0x9fff) ||
+            (cp >= 0xac00 && cp <= 0xd7af) ||
+            (cp >= 0xf900 && cp <= 0xfaff) ||
+            (cp >= 0xff00 && cp <= 0xffef)
+        ) {
+            cjk++;
+        } else {
+            other++;
+        }
+    }
+    return Math.max(1, Math.ceil(cjk * 1.3 + other * 0.35));
+}
+
+function extractWorkersAiTokenUsage(
+    raw: unknown
+): { inputTokens: number; outputTokens: number } | null {
+    if (!raw || typeof raw !== 'object') return null;
+    const obj = raw as Record<string, unknown>;
+    const usage =
+        (obj.usage && typeof obj.usage === 'object' ? (obj.usage as Record<string, unknown>) : null) ??
+        (obj.result &&
+        typeof obj.result === 'object' &&
+        (obj.result as Record<string, unknown>).usage &&
+        typeof (obj.result as Record<string, unknown>).usage === 'object'
+            ? ((obj.result as Record<string, unknown>).usage as Record<string, unknown>)
+            : null);
+    if (!usage) return null;
+    const promptTokens = Number(usage.prompt_tokens ?? usage.input_tokens ?? 0);
+    const completionTokens = Number(usage.completion_tokens ?? usage.output_tokens ?? 0);
+    if (!Number.isFinite(promptTokens) && !Number.isFinite(completionTokens)) return null;
+    if (promptTokens <= 0 && completionTokens <= 0) return null;
+    return {
+        inputTokens: Math.max(0, Math.floor(promptTokens || 0)),
+        outputTokens: Math.max(0, Math.floor(completionTokens || 0))
+    };
+}
+
+function calculateNeuronsForCall(model: string, inputTokens: number, outputTokens: number): number {
+    const rate = WORKERS_AI_NEURON_RATES[model.toLowerCase()] ?? DEFAULT_WORKERS_AI_NEURON_RATE;
+    const raw = (Math.max(0, inputTokens) / 1_000_000) * rate.inPerM + (Math.max(0, outputTokens) / 1_000_000) * rate.outPerM;
+    return Math.max(0.01, Math.round(raw * 100) / 100);
+}
+
+async function loadStoredWorkersAiDailyQuota(
+    env: Env,
+    nowMs: number
+): Promise<StoredWorkersAiDailyQuota> {
+    const utcDate = getUtcDateKey(nowMs);
+    const chatDb = getChatDb(env);
+    const mem = quotaMemoryByDb.get(chatDb);
+    if (mem && mem.utcDate === utcDate) {
+        return { ...mem };
+    }
+    try {
+        const row = await chatDb
+            .prepare('SELECT payload_json FROM cloud_chat_config WHERE config_key = ? LIMIT 1')
+            .bind(WORKERS_AI_QUOTA_CONFIG_KEY)
+            .first<{ payload_json?: string }>();
+        if (row?.payload_json) {
+            const parsed = JSON.parse(row.payload_json) as Partial<StoredWorkersAiDailyQuota>;
+            if (parsed && parsed.utcDate === utcDate) {
+                const loaded: StoredWorkersAiDailyQuota = {
+                    utcDate,
+                    usedNeurons: Math.max(0, Number(parsed.usedNeurons ?? 0) || 0),
+                    requestsToday: Math.max(0, Math.floor(Number(parsed.requestsToday ?? 0) || 0)),
+                    cachedHitsToday: Math.max(0, Math.floor(Number(parsed.cachedHitsToday ?? 0) || 0)),
+                    inputTokensToday: Math.max(0, Math.floor(Number(parsed.inputTokensToday ?? 0) || 0)),
+                    outputTokensToday: Math.max(0, Math.floor(Number(parsed.outputTokensToday ?? 0) || 0)),
+                    exhausted: parsed.exhausted === true
+                };
+                quotaMemoryByDb.set(chatDb, loaded);
+                return { ...loaded };
+            }
+        }
+    } catch {
+        // Fallback to empty quota if table not yet created
+    }
+    const fresh = createEmptyDailyQuota(utcDate);
+    quotaMemoryByDb.set(chatDb, fresh);
+    return { ...fresh };
+}
+
+async function saveStoredWorkersAiDailyQuota(
+    env: Env,
+    stored: StoredWorkersAiDailyQuota,
+    nowIso: string
+): Promise<void> {
+    const chatDb = getChatDb(env);
+    quotaMemoryByDb.set(chatDb, { ...stored });
+    try {
+        await chatDb
+            .prepare(
+                `INSERT INTO cloud_chat_config (config_key, payload_json, updated_at)
+                 VALUES (?, ?, ?)
+                 ON CONFLICT(config_key) DO UPDATE SET
+                    payload_json = excluded.payload_json,
+                    updated_at = excluded.updated_at`
+            )
+            .bind(WORKERS_AI_QUOTA_CONFIG_KEY, JSON.stringify(stored), nowIso)
+            .run();
+    } catch {
+        // Non-fatal in minimal fixtures
+    }
+}
+
+export async function getWorkersAiDailyQuota(env: Env, nowMs = Date.now()): Promise<WorkersAiDailyQuotaDto> {
+    const stored = await loadStoredWorkersAiDailyQuota(env, nowMs);
+    return toWorkersAiDailyQuotaDto(stored, Boolean(testWorkersAiRunner || env.AI), nowMs);
+}
 
 export interface WorkersAiTranslationPreset {
     id: string;
@@ -107,6 +318,7 @@ const translationMemoryCache = new Map<string, { text: string; expiresAt: number
 export function setWorkersAiRunnerForTests(runner: WorkersAiRunner | null): void {
     testWorkersAiRunner = runner;
     translationMemoryCache.clear();
+    quotaMemoryByDb = new WeakMap<D1Database, StoredWorkersAiDailyQuota>();
 }
 
 const LANG_ENGLISH_NAMES: Record<string, string> = {
@@ -1162,10 +1374,11 @@ export async function handleChatOscWebRoutes(request: Request, env: Env, url: UR
                   .bind(limit + 1)
                   .all<ChatMessageRow>();
 
-        const [rowsRes, devices, config] = await Promise.all([
+        const [rowsRes, devices, config, workersAiQuota] = await Promise.all([
             queryPromise,
             isHistoryPage ? Promise.resolve(undefined) : listChatAgentDevices(env),
             isHistoryPage ? Promise.resolve(undefined) : loadChatTranslatorConfig(env),
+            isHistoryPage ? Promise.resolve(undefined) : getWorkersAiDailyQuota(env),
             heartbeat ? touchChatWebActive(env, nowIso) : Promise.resolve()
         ]);
 
@@ -1232,6 +1445,7 @@ export async function handleChatOscWebRoutes(request: Request, env: Env, url: UR
                     nextBeforeId: hasMore && lastRow ? lastRow.id : '',
                     ...(devices !== undefined ? { devices } : {}),
                     ...(config !== undefined ? { config } : {}),
+                    ...(workersAiQuota !== undefined ? { workersAiQuota } : {}),
                     chatDbDedicated: Boolean(env.DB_CHAT),
                     serverTime: nowIso
                 }
@@ -1610,15 +1824,17 @@ export async function handleChatOscWebRoutes(request: Request, env: Env, url: UR
         return Response.json({ ok: true, data: { cleared: true } });
     }
 
-    // 6. Built-in Cloudflare Workers AI translation presets & availability
+    // 6. Built-in Cloudflare Workers AI translation presets, availability & daily free quota
     if (url.pathname === '/api/chat/translate/models' && request.method === 'GET') {
+        const quota = await getWorkersAiDailyQuota(env);
         return Response.json(
             {
                 ok: true,
                 data: {
-                    aiBound: Boolean(testWorkersAiRunner || env.AI),
+                    aiBound: quota.aiBound,
                     defaultModel: DEFAULT_WORKERS_AI_TRANSLATION_MODEL,
-                    presets: WORKERS_AI_TRANSLATION_PRESETS
+                    presets: WORKERS_AI_TRANSLATION_PRESETS,
+                    quota
                 }
             },
             { headers: { 'Cache-Control': 'no-store' } }
@@ -1697,17 +1913,23 @@ export async function handleChatOscWebRoutes(request: Request, env: Env, url: UR
         }
 
         const nowMs = Date.now();
+        const nowIso = new Date(nowMs).toISOString();
         const cacheKey = `${model}|${sourceLang}|${targetLang}|${customPrompt}|${text}`;
         const cached = getCachedTranslation(cacheKey, nowMs);
         if (cached) {
+            const stored = await loadStoredWorkersAiDailyQuota(env, nowMs);
+            stored.cachedHitsToday += 1;
+            quotaMemoryByDb.set(getChatDb(env), { ...stored });
+            const quota = toWorkersAiDailyQuotaDto(stored, true, nowMs);
             return Response.json(
-                { ok: true, data: { translatedText: cached, model, cached: true } },
+                { ok: true, data: { translatedText: cached, model, cached: true, quota } },
                 { headers: { 'Cache-Control': 'no-store' } }
             );
         }
 
         const lowerModel = model.toLowerCase();
         const isM2m100 = lowerModel.includes('m2m100');
+        let effectiveSystemPrompt = '';
 
         try {
             let aiRawResult: unknown;
@@ -1732,10 +1954,10 @@ export async function handleChatOscWebRoutes(request: Request, env: Env, url: UR
                 }
                 aiRawResult = await aiRunner(model, m2mPayload);
             } else {
-                const systemPrompt = buildCompactTranslationSystemPrompt(sourceLang, targetLang, customPrompt);
+                effectiveSystemPrompt = buildCompactTranslationSystemPrompt(sourceLang, targetLang, customPrompt);
                 const llmPayload: Record<string, unknown> = {
                     messages: [
-                        { role: 'system', content: systemPrompt },
+                        { role: 'system', content: effectiveSystemPrompt },
                         { role: 'user', content: text }
                     ],
                     temperature: 0.2,
@@ -1771,14 +1993,37 @@ export async function handleChatOscWebRoutes(request: Request, env: Env, url: UR
                 );
             }
 
+            const rawUsage = extractWorkersAiTokenUsage(aiRawResult);
+            const inputTokens =
+                rawUsage?.inputTokens ??
+                (isM2m100 ? estimateTextTokens(text) : estimateTextTokens(`${effectiveSystemPrompt}\n${text}`));
+            const outputTokens = rawUsage?.outputTokens ?? estimateTextTokens(translatedText);
+            const neuronsDelta = calculateNeuronsForCall(model, inputTokens, outputTokens);
+
+            const stored = await loadStoredWorkersAiDailyQuota(env, nowMs);
+            stored.usedNeurons = Math.round((stored.usedNeurons + neuronsDelta) * 100) / 100;
+            stored.requestsToday += 1;
+            stored.inputTokensToday += inputTokens;
+            stored.outputTokensToday += outputTokens;
+            await saveStoredWorkersAiDailyQuota(env, stored, nowIso);
+            const quota = toWorkersAiDailyQuotaDto(stored, true, nowMs);
+
             setCachedTranslation(cacheKey, translatedText, nowMs);
             return Response.json(
-                { ok: true, data: { translatedText, model, cached: false } },
+                { ok: true, data: { translatedText, model, cached: false, neuronsDelta, quota } },
                 { headers: { 'Cache-Control': 'no-store' } }
             );
         } catch (err) {
             const rawMsg = err instanceof Error ? err.message : String(err);
             const isPaidOnly = /\b(403|paid plan|upgrade|billing|credits|quota|neurons)\b/i.test(rawMsg);
+            const isDailyQuotaExhausted = /\b(daily.*limit|free.*allocation|neurons.*limit|quota.*exceeded)\b/i.test(
+                rawMsg
+            );
+            if (isDailyQuotaExhausted) {
+                const stored = await loadStoredWorkersAiDailyQuota(env, nowMs);
+                stored.exhausted = true;
+                await saveStoredWorkersAiDailyQuota(env, stored, nowIso);
+            }
             return Response.json(
                 {
                     ok: false,

@@ -49,7 +49,8 @@ export const useAdvancedSettingsStore = defineStore('AdvancedSettings', () => {
     const youTubeApiKey = ref('');
     const translationApi = ref(false);
     const translationApiKey = ref('');
-    const translationApiType = ref('google'); // 'google' | 'openai'
+    const translationApiType = ref('google'); // 'cloudflare' | 'google' | 'openai'
+    const workersAiQuota = ref(null);
     const translationApiEndpoint = ref('https://api.openai.com/v1/chat/completions');
     const translationApiModel = ref('gpt-4o-mini');
     const translationApiPrompt = ref('');
@@ -333,6 +334,12 @@ export const useAdvancedSettingsStore = defineStore('AdvancedSettings', () => {
     async function setTranslationApiPrompt(value) {
         translationApiPrompt.value = value;
         await configRepository.setString('VRCX_translationAPIPrompt', translationApiPrompt.value);
+    }
+
+    function setWorkersAiQuota(quota) {
+        if (quota && typeof quota === 'object') {
+            workersAiQuota.value = quota;
+        }
     }
 
     async function fetchAvailableModels(overrides = {}) {
@@ -719,6 +726,9 @@ export const useAdvancedSettingsStore = defineStore('AdvancedSettings', () => {
                         ...(prompt ? { prompt } : {})
                     }
                 });
+                if (data?.quota && typeof data.quota === 'object') {
+                    workersAiQuota.value = data.quota;
+                }
                 const translated = data?.translatedText;
                 return typeof translated === 'string' && translated.trim() ? translated.trim() : null;
             } catch (err) {
@@ -985,6 +995,8 @@ export const useAdvancedSettingsStore = defineStore('AdvancedSettings', () => {
         translationApiEndpoint,
         translationApiModel,
         translationApiPrompt,
+        workersAiQuota,
+        setWorkersAiQuota,
         progressPie,
         progressPieFilter,
         showConfirmationOnSwitchAvatar,

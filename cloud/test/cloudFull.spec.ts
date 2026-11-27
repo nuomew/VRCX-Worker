@@ -10269,20 +10269,36 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
                                 content: '<think>reasoning hidden</think>\n"こんにちは世界"'
                             }
                         }
-                    ]
+                    ],
+                    usage: { prompt_tokens: 1000, completion_tokens: 500, total_tokens: 1500 }
                 };
             }
-            return { response: '"你好，VRChat！"' };
+            return {
+                response: '"你好，VRChat！"',
+                usage: { prompt_tokens: 2000, completion_tokens: 1000, total_tokens: 3000 }
+            };
         });
 
         try {
             const modelsRes = await exports.default.fetch('http://example.com/api/chat/translate/models');
             expect(modelsRes.status).toBe(200);
             const modelsJson = (await modelsRes.json()) as {
-                data: { aiBound: boolean; defaultModel: string; presets: Array<{ id: string; tier: string }> };
+                data: {
+                    aiBound: boolean;
+                    defaultModel: string;
+                    presets: Array<{ id: string; tier: string }>;
+                    quota: {
+                        dailyFreeNeurons: number;
+                        usedNeurons: number;
+                        remainingNeurons: number;
+                        remainingPercent: number;
+                    };
+                };
             };
             expect(modelsJson.data.aiBound).toBe(true);
             expect(modelsJson.data.defaultModel).toBe('@cf/zai-org/glm-4.7-flash');
+            expect(modelsJson.data.quota.dailyFreeNeurons).toBe(10000);
+            expect(modelsJson.data.quota.remainingPercent).toBe(100);
             expect(modelsJson.data.presets.some((p) => p.id === '@cf/zai-org/glm-4.7-flash' && p.tier === 'free')).toBe(
                 true
             );
@@ -10292,17 +10308,37 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
                 )
             ).toBe(true);
 
-            // 3. Default LLM model translates, strips wrapping quotes, and caches identical repeat calls (0 extra Neurons)
+            // 3. Default LLM model translates, strips wrapping quotes, tracks Neurons quota, and caches repeats
             const t1 = await exports.default.fetch('http://example.com/api/chat/translate/workers-ai', {
                 method: 'POST',
                 headers,
                 body: JSON.stringify({ text: 'Hello VRChat!', targetLang: 'zh-CN' })
             });
             expect(t1.status).toBe(200);
-            const j1 = (await t1.json()) as { data: { translatedText: string; model: string; cached: boolean } };
+            const j1 = (await t1.json()) as {
+                data: {
+                    translatedText: string;
+                    model: string;
+                    cached: boolean;
+                    neuronsDelta: number;
+                    quota: {
+                        dailyFreeNeurons: number;
+                        usedNeurons: number;
+                        remainingNeurons: number;
+                        remainingPercent: number;
+                        requestsToday: number;
+                        cachedHitsToday: number;
+                    };
+                };
+            };
             expect(j1.data.translatedText).toBe('你好，VRChat！');
             expect(j1.data.model).toBe('@cf/zai-org/glm-4.7-flash');
             expect(j1.data.cached).toBe(false);
+            expect(j1.data.neuronsDelta).toBeCloseTo(47.4, 1);
+            expect(j1.data.quota.usedNeurons).toBeCloseTo(47.4, 1);
+            expect(j1.data.quota.remainingNeurons).toBeCloseTo(9952.6, 1);
+            expect(j1.data.quota.remainingPercent).toBeCloseTo(99.5, 1);
+            expect(j1.data.quota.requestsToday).toBe(1);
             expect(calls.length).toBe(1);
 
             const t1Cached = await exports.default.fetch('http://example.com/api/chat/translate/workers-ai', {
@@ -10311,10 +10347,28 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
                 body: JSON.stringify({ text: 'Hello VRChat!', targetLang: 'zh-CN' })
             });
             expect(t1Cached.status).toBe(200);
-            const j1Cached = (await t1Cached.json()) as { data: { translatedText: string; cached: boolean } };
+            const j1Cached = (await t1Cached.json()) as {
+                data: {
+                    translatedText: string;
+                    cached: boolean;
+                    quota: { usedNeurons: number; cachedHitsToday: number };
+                };
+            };
             expect(j1Cached.data.translatedText).toBe('你好，VRChat！');
             expect(j1Cached.data.cached).toBe(true);
+            expect(j1Cached.data.quota.usedNeurons).toBeCloseTo(47.4, 1);
+            expect(j1Cached.data.quota.cachedHitsToday).toBe(1);
             expect(calls.length).toBe(1);
+
+            // Verify GET /api/chat/messages returns persisted workersAiQuota with 0 extra requests
+            const chatMsgRes = await exports.default.fetch('http://example.com/api/chat/messages?limit=5');
+            expect(chatMsgRes.status).toBe(200);
+            const chatMsgJson = (await chatMsgRes.json()) as {
+                data: { workersAiQuota?: { dailyFreeNeurons: number; usedNeurons: number; remainingPercent: number } };
+            };
+            expect(chatMsgJson.data.workersAiQuota?.dailyFreeNeurons).toBe(10000);
+            expect(chatMsgJson.data.workersAiQuota?.usedNeurons).toBeCloseTo(47.4, 1);
+            expect(chatMsgJson.data.workersAiQuota?.remainingPercent).toBeCloseTo(99.5, 1);
 
             // 4. Custom model DeepSeek-V4.1-Flash passes reasoning_effort='none', strips <think>, and parses choices[]
             const tDeepSeek = await exports.default.fetch('http://example.com/api/chat/translate/workers-ai', {

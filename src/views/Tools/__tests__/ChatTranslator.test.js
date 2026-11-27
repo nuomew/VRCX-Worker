@@ -23,6 +23,7 @@ const translationApiType = ref('openai');
 const translationApiEndpoint = ref('https://api.openai.com/v1/chat/completions');
 const translationApiModel = ref('gpt-4o-mini');
 const translationApiPrompt = ref('');
+const workersAiQuota = ref(null);
 
 vi.mock('vue-router', async (importOriginal) => {
     const actual = await importOriginal();
@@ -88,6 +89,10 @@ vi.mock('@/stores', () => ({
         translationApiEndpoint,
         translationApiModel,
         translationApiPrompt,
+        workersAiQuota,
+        setWorkersAiQuota: (q) => {
+            workersAiQuota.value = q;
+        },
         translateText: (...args) => mocks.translateText(...args),
         setTranslationApi: (...args) => mocks.setTranslationApi(...args)
     }),
@@ -740,6 +745,51 @@ describe('ChatTranslator.vue', () => {
         const updatedRows = wrapper.findAll('[data-msg-side]');
         expect(updatedRows).toHaveLength(26);
         expect(updatedRows[25].text()).toContain('消息 #26');
+
+        wrapper.unmount();
+    });
+
+    test('renders Workers AI daily free quota ring with remaining percent and detailed hover tooltip', async () => {
+        translationApiType.value = 'cloudflare';
+        translationApiModel.value = '@cf/zai-org/glm-4.7-flash';
+        workersAiQuota.value = null;
+
+        mocks.cloudFetch.mockImplementation(async (url) => {
+            if (url.startsWith('/api/chat/messages')) {
+                return {
+                    chatDbDedicated: true,
+                    messages: [],
+                    hasMore: false,
+                    devices: [],
+                    workersAiQuota: {
+                        utcDate: '2026-11-27',
+                        resetAtUtc: '2026-11-28T00:00:00.000Z',
+                        aiBound: true,
+                        dailyFreeNeurons: 10000,
+                        usedNeurons: 1250.5,
+                        remainingNeurons: 8749.5,
+                        remainingPercent: 87.5,
+                        requestsToday: 120,
+                        cachedHitsToday: 15,
+                        exhausted: false
+                    }
+                };
+            }
+            return {};
+        });
+
+        const wrapper = mount(ChatTranslator);
+        await flushPromises();
+
+        const ring = wrapper.find('[data-testid="workers-ai-quota-ring"]');
+        expect(ring.exists()).toBe(true);
+        expect(ring.text()).toContain('87.5%');
+
+        const tooltip = wrapper.find('[data-testid="workers-ai-quota-tooltip"]');
+        expect(tooltip.exists()).toBe(true);
+        expect(tooltip.text()).toContain('10,000 Neurons');
+        expect(tooltip.text()).toContain('1,250.5 Neurons');
+        expect(tooltip.text()).toContain('8,749.5 Neurons');
 
         wrapper.unmount();
     });
