@@ -10495,4 +10495,327 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
                 .catch(() => {});
         }
     });
+
+    it('gzip-compresses pre-existing uncompressed archive chunks across ALL 6 databases (7 chunk tables + DB_CACHE) in-place, writes new chunks compressed, and decodes transparently', async () => {
+        const legacyDb = env.DB_LEGACY!;
+        const cacheDb = env.DB_CACHE ?? env.DB_CORE;
+        const chatDb = env.DB_CHAT ?? env.DB_CORE;
+        const headers = { 'Content-Type': 'application/json', Origin: 'http://example.com' };
+        const oldIso = '2024-06-15T10:00:00.000Z';
+        const padNote = 'AllSixChunkGzipVerificationPayloadSegment_'.repeat(3);
+
+        // Build >1.5 KiB raw uncompressed JSON arrays for each of the 7 archive chunk tables
+        const rawLegGamelog = JSON.stringify(
+            Array.from({ length: 12 }, (_, i) => [
+                `2024-06-15T10:00:${String(i).padStart(2, '0')}.000Z`,
+                `GzipLegacyEvent_${i}_${padNote}`
+            ])
+        );
+        const rawLegFeed = JSON.stringify(
+            Array.from({ length: 12 }, (_, i) => [
+                `2024-06-15T10:01:${String(i).padStart(2, '0')}.000Z`,
+                'usr_gz_leg_feed',
+                'GzipLegacyFriend',
+                `wrld_gz_leg_${i}:100`,
+                `GzipLegacyWorld_${i}_${padNote}`,
+                '',
+                15000,
+                ''
+            ])
+        );
+        const rawLegCore = JSON.stringify(
+            Array.from({ length: 12 }, (_, i) => [
+                `2024-06-15T10:02:${String(i).padStart(2, '0')}.000Z`,
+                'Friend',
+                `usr_gz_leg_core_${i}`,
+                `GzipLegacyCoreUser_${i}_${padNote}`,
+                '',
+                'Trusted User',
+                '',
+                i + 1
+            ])
+        );
+        const rawActGamelog = JSON.stringify(
+            Array.from({ length: 12 }, (_, i) => [
+                `2024-06-15T10:03:${String(i).padStart(2, '0')}.000Z`,
+                `GzipActiveEvent_${i}_${padNote}`
+            ])
+        );
+        const rawActFeed = JSON.stringify(
+            Array.from({ length: 12 }, (_, i) => [
+                `2024-06-15T10:04:${String(i).padStart(2, '0')}.000Z`,
+                'usr_gz_act_feed',
+                'GzipActiveFriend',
+                `wrld_gz_act_${i}:200`,
+                `GzipActiveWorld_${i}_${padNote}`,
+                '',
+                20000,
+                ''
+            ])
+        );
+        const rawActCore = JSON.stringify(
+            Array.from({ length: 12 }, (_, i) => [
+                `2024-06-15T10:05:${String(i).padStart(2, '0')}.000Z`,
+                'DisplayName',
+                `usr_gz_act_core_${i}`,
+                `GzipActiveCoreUser_${i}_${padNote}`,
+                'OldName',
+                'Known User',
+                'Known User',
+                i + 10
+            ])
+        );
+        const rawActChat = JSON.stringify(
+            Array.from({ length: 12 }, (_, i) => [
+                `2024-06-15T10:06:${String(i).padStart(2, '0')}.000Z`,
+                `chat_gz_hist_${i}`,
+                'dev_gz_test',
+                'web_to_vrc',
+                `Hello raw chunk ${i} ${padNote}`,
+                `你好未压缩分块 ${i} ${padNote}`,
+                `你好未压缩分块 ${i} ${padNote}`,
+                'en',
+                'zh-CN',
+                'translated_only',
+                '/chatbox/input',
+                9000,
+                1,
+                1,
+                'sent',
+                '',
+                ''
+            ])
+        );
+        const rawCacheUrl = 'https://api.vrchat.cloud/api/1/worlds/wrld_gz_all6_cache';
+        const rawCacheBody = JSON.stringify({
+            id: 'wrld_gz_all6_cache',
+            name: 'Gzip Cache Test World',
+            description: padNote.repeat(25)
+        });
+
+        try {
+            // Seed raw uncompressed chunks directly into all 7 archive chunk tables + DB_CACHE
+            await legacyDb.batch([
+                legacyDb
+                    .prepare(
+                        `INSERT OR REPLACE INTO legacy_gamelog_chunks (chunk_key, gamelog_kind, min_created_at, max_created_at, row_count, payload_json)
+                         VALUES ('gz_leg_gl_1', 'event', ?, ?, 12, ?)`
+                    )
+                    .bind(oldIso, '2024-06-15T10:00:11.000Z', rawLegGamelog),
+                legacyDb
+                    .prepare(
+                        `INSERT OR REPLACE INTO legacy_feed_chunks (chunk_key, feed_kind, min_created_at, max_created_at, row_count, payload_json)
+                         VALUES ('gz_leg_fd_1', 'gps', ?, ?, 12, ?)`
+                    )
+                    .bind('2024-06-15T10:01:00.000Z', '2024-06-15T10:01:11.000Z', rawLegFeed),
+                legacyDb
+                    .prepare(
+                        `INSERT OR REPLACE INTO legacy_core_chunks (chunk_key, core_kind, min_created_at, max_created_at, row_count, payload_json)
+                         VALUES ('gz_leg_cr_1', 'friend_log', ?, ?, 12, ?)`
+                    )
+                    .bind('2024-06-15T10:02:00.000Z', '2024-06-15T10:02:11.000Z', rawLegCore),
+                legacyDb
+                    .prepare(
+                        `INSERT INTO legacy_migration_state (state_key, payload_json, updated_at)
+                         VALUES ('imported_stats', ?, ?)
+                         ON CONFLICT(state_key) DO UPDATE SET payload_json = excluded.payload_json, updated_at = excluded.updated_at`
+                    )
+                    .bind(JSON.stringify({ gamelog: 12, feed: 12, friend_log: 12, notifications: 0 }), oldIso)
+            ]);
+            await env.DB_GAMELOG.prepare(
+                `INSERT OR REPLACE INTO gamelog_archive_chunks (chunk_key, gamelog_kind, min_created_at, max_created_at, row_count, payload_json)
+                 VALUES ('gz_act_gl_1', 'event', ?, ?, 12, ?)`
+            )
+                .bind('2024-06-15T10:03:00.000Z', '2024-06-15T10:03:11.000Z', rawActGamelog)
+                .run();
+            await env.DB_FEED.prepare(
+                `INSERT OR REPLACE INTO feed_archive_chunks (chunk_key, feed_kind, min_created_at, max_created_at, row_count, payload_json)
+                 VALUES ('gz_act_fd_1', 'gps', ?, ?, 12, ?)`
+            )
+                .bind('2024-06-15T10:04:00.000Z', '2024-06-15T10:04:11.000Z', rawActFeed)
+                .run();
+            await env.DB_CORE.prepare(
+                `INSERT OR REPLACE INTO core_archive_chunks (chunk_key, core_kind, min_created_at, max_created_at, row_count, payload_json)
+                 VALUES ('gz_act_cr_1', 'friend_log', ?, ?, 12, ?)`
+            )
+                .bind('2024-06-15T10:05:00.000Z', '2024-06-15T10:05:11.000Z', rawActCore)
+                .run();
+            await chatDb
+                .prepare(
+                    `INSERT OR REPLACE INTO chat_archive_chunks (chunk_key, min_created_at, max_created_at, row_count, payload_json)
+                     VALUES ('gz_act_ch_1', ?, ?, 12, ?)`
+                )
+                .bind('2024-06-15T10:06:00.000Z', '2024-06-15T10:06:11.000Z', rawActChat)
+                .run();
+            await cacheDb
+                .prepare(
+                    `INSERT OR REPLACE INTO vrc_api_cache (cache_key, tier, status, body_text, updated_at, expires_at)
+                     VALUES (?, 'world', 200, ?, ?, ?)`
+                )
+                .bind(rawCacheUrl, rawCacheBody, oldIso, Date.now() + 3600_000)
+                .run();
+
+            // Run bounded multi-round compaction until hasMore is false (exercises per-round 6-chunk budget across 7 tables)
+            let rounds = 0;
+            let totalChunksCompressed = 0;
+            let legacyChunksCompressed = 0;
+            let gamelogChunksCompressed = 0;
+            let feedChunksCompressed = 0;
+            let coreChunksCompressed = 0;
+            let chatChunksCompressed = 0;
+            let cacheCompressedRows = 0;
+            let chunkBytesSaved = 0;
+            let totalBytesSaved = 0;
+
+            for (let r = 0; r < 6; r++) {
+                rounds++;
+                const res = await exports.default.fetch('http://example.com/api/admin/storage/compact', {
+                    method: 'POST',
+                    headers,
+                    body: JSON.stringify({ retentionDays: 0, includeLegacy: true })
+                });
+                expect(res.status).toBe(200);
+                const json = (await res.json()) as {
+                    data: {
+                        totalChunksCompressed: number;
+                        legacyChunksCompressed: number;
+                        gamelogChunksCompressed: number;
+                        feedChunksCompressed: number;
+                        coreChunksCompressed: number;
+                        chatChunksCompressed: number;
+                        cacheCompressedRows: number;
+                        chunkBytesSaved: number;
+                        totalBytesSaved: number;
+                        hasMore: boolean;
+                    };
+                };
+                totalChunksCompressed += json.data.totalChunksCompressed;
+                legacyChunksCompressed += json.data.legacyChunksCompressed;
+                gamelogChunksCompressed += json.data.gamelogChunksCompressed;
+                feedChunksCompressed += json.data.feedChunksCompressed;
+                coreChunksCompressed += json.data.coreChunksCompressed;
+                chatChunksCompressed += json.data.chatChunksCompressed;
+                cacheCompressedRows += json.data.cacheCompressedRows;
+                chunkBytesSaved += json.data.chunkBytesSaved;
+                totalBytesSaved += json.data.totalBytesSaved;
+                if (!json.data.hasMore) break;
+            }
+
+            expect(rounds).toBeGreaterThanOrEqual(2);
+            expect(totalChunksCompressed).toBe(7);
+            expect(legacyChunksCompressed).toBe(3);
+            expect(gamelogChunksCompressed).toBe(1);
+            expect(feedChunksCompressed).toBe(1);
+            expect(coreChunksCompressed).toBe(1);
+            expect(chatChunksCompressed).toBe(1);
+            expect(cacheCompressedRows).toBeGreaterThanOrEqual(1);
+            expect(chunkBytesSaved).toBeGreaterThan(8000);
+            expect(totalBytesSaved).toBeGreaterThan(chunkBytesSaved);
+
+            // Every single one of the 7 chunks is now `gz:` compressed, dramatically smaller, with chunk_key preserved
+            const storedChecks: Array<{ db: D1Database; table: string; key: string; rawLen: number }> = [
+                { db: legacyDb, table: 'legacy_gamelog_chunks', key: 'gz_leg_gl_1', rawLen: rawLegGamelog.length },
+                { db: legacyDb, table: 'legacy_feed_chunks', key: 'gz_leg_fd_1', rawLen: rawLegFeed.length },
+                { db: legacyDb, table: 'legacy_core_chunks', key: 'gz_leg_cr_1', rawLen: rawLegCore.length },
+                { db: env.DB_GAMELOG, table: 'gamelog_archive_chunks', key: 'gz_act_gl_1', rawLen: rawActGamelog.length },
+                { db: env.DB_FEED, table: 'feed_archive_chunks', key: 'gz_act_fd_1', rawLen: rawActFeed.length },
+                { db: env.DB_CORE, table: 'core_archive_chunks', key: 'gz_act_cr_1', rawLen: rawActCore.length },
+                { db: chatDb, table: 'chat_archive_chunks', key: 'gz_act_ch_1', rawLen: rawActChat.length }
+            ];
+            for (const c of storedChecks) {
+                const row = await c.db
+                    .prepare(`SELECT chunk_key, payload_json FROM ${c.table} WHERE chunk_key = ?`)
+                    .bind(c.key)
+                    .first<{ chunk_key: string; payload_json: string }>();
+                expect(row?.chunk_key).toBe(c.key);
+                expect(row?.payload_json.startsWith('gz:')).toBe(true);
+                expect(row!.payload_json.length).toBeLessThan(c.rawLen * 0.45);
+            }
+
+            // Re-running compaction immediately is an idempotent 0-write no-op
+            const noopRes = await exports.default.fetch('http://example.com/api/admin/storage/compact', {
+                method: 'POST',
+                headers,
+                body: JSON.stringify({ retentionDays: 0, includeLegacy: true })
+            });
+            const noopJson = (await noopRes.json()) as {
+                data: { totalChunksCompressed: number; hasMore: boolean };
+            };
+            expect(noopJson.data.totalChunksCompressed).toBe(0);
+            expect(noopJson.data.hasMore).toBe(false);
+
+            // Transparent reads across GameLog, Feed, Core, Chat, and Cleanup Preview decode all `gz:` chunks losslessly
+            const glRes = await exports.default.fetch('http://example.com/api/gamelog/query', {
+                method: 'POST',
+                headers,
+                body: JSON.stringify({ types: ['Event'], limit: 100 })
+            });
+            const glJson = (await glRes.json()) as { data: Array<{ data?: string }> };
+            expect(glJson.data.some((r) => r.data?.startsWith('GzipLegacyEvent_0_'))).toBe(true);
+            expect(glJson.data.some((r) => r.data?.startsWith('GzipActiveEvent_0_'))).toBe(true);
+
+            const fdRes = await exports.default.fetch('http://example.com/api/feed/query', {
+                method: 'POST',
+                headers,
+                body: JSON.stringify({ types: ['GPS'], vipList: ['usr_gz_leg_feed', 'usr_gz_act_feed'], limit: 100 })
+            });
+            const fdJson = (await fdRes.json()) as { data: Array<{ worldName?: string }> };
+            expect(fdJson.data.some((r) => r.worldName?.startsWith('GzipLegacyWorld_0_'))).toBe(true);
+            expect(fdJson.data.some((r) => r.worldName?.startsWith('GzipActiveWorld_0_'))).toBe(true);
+
+            const flLegRes = await exports.default.fetch('http://example.com/api/friend-log/history?userId=usr_gz_leg_core_0');
+            const flLegJson = (await flLegRes.json()) as { data: Array<{ display_name?: string }> };
+            expect(flLegJson.data.some((r) => r.display_name?.startsWith('GzipLegacyCoreUser_0_'))).toBe(true);
+
+            const flActRes = await exports.default.fetch('http://example.com/api/friend-log/history?userId=usr_gz_act_core_0');
+            const flActJson = (await flActRes.json()) as { data: Array<{ display_name?: string }> };
+            expect(flActJson.data.some((r) => r.display_name?.startsWith('GzipActiveCoreUser_0_'))).toBe(true);
+
+            const chatRes = await exports.default.fetch('http://example.com/api/chat/messages?limit=50&heartbeat=0');
+            const chatJson = (await chatRes.json()) as { data: { messages: Array<{ id: string; translatedText?: string }> } };
+            expect(chatJson.data.messages.some((m) => m.id === 'chat_gz_hist_0' && m.translatedText?.startsWith('你好未压缩分块 0'))).toBe(true);
+
+            const cleanupPreviewRes = await exports.default.fetch(
+                'http://example.com/api/admin/cleanup/preview?months=1&includeLegacy=1'
+            );
+            expect(cleanupPreviewRes.status).toBe(200);
+            const cleanupPreviewJson = (await cleanupPreviewRes.json()) as { data: { totalRows: number } };
+            expect(cleanupPreviewJson.data.totalRows).toBeGreaterThanOrEqual(72);
+
+            // New write-time tail-chunk appends also store `gz:` directly when >= 512 bytes
+            const newBatchRes = await exports.default.fetch('http://example.com/api/feed', {
+                method: 'POST',
+                headers,
+                body: JSON.stringify({
+                    items: Array.from({ length: 10 }, (_, i) => ({
+                        type: 'GPS',
+                        created_at: `2026-11-28T00:10:${String(i).padStart(2, '0')}.000Z`,
+                        userId: 'usr_gz_write_time',
+                        displayName: 'WriteTimeGzipUser',
+                        location: `wrld_gz_wt_${i}:300`,
+                        worldName: `WriteTimeGzipWorld_${i}_${padNote}`,
+                        previousLocation: '',
+                        time: 1000,
+                        groupName: ''
+                    }))
+                })
+            });
+            expect(newBatchRes.status).toBe(200);
+            const newestFeedChunk = await env.DB_FEED.prepare(
+                "SELECT payload_json FROM feed_archive_chunks WHERE feed_kind = 'gps' ORDER BY id DESC LIMIT 1"
+            ).first<{ payload_json: string }>();
+            expect(newestFeedChunk?.payload_json.startsWith('gz:')).toBe(true);
+        } finally {
+            await legacyDb.batch([
+                legacyDb.prepare("DELETE FROM legacy_gamelog_chunks WHERE chunk_key = 'gz_leg_gl_1'"),
+                legacyDb.prepare("DELETE FROM legacy_feed_chunks WHERE chunk_key = 'gz_leg_fd_1'"),
+                legacyDb.prepare("DELETE FROM legacy_core_chunks WHERE chunk_key = 'gz_leg_cr_1'")
+            ]).catch(() => {});
+            await env.DB_GAMELOG.prepare("DELETE FROM gamelog_archive_chunks WHERE chunk_key = 'gz_act_gl_1'").run().catch(() => {});
+            await env.DB_FEED.prepare('DELETE FROM feed_archive_chunks').run().catch(() => {});
+            await env.DB_CORE.prepare("DELETE FROM core_archive_chunks WHERE chunk_key = 'gz_act_cr_1'").run().catch(() => {});
+            await chatDb.prepare("DELETE FROM chat_archive_chunks WHERE chunk_key = 'gz_act_ch_1'").run().catch(() => {});
+            await cacheDb.prepare('DELETE FROM vrc_api_cache WHERE cache_key = ?').bind(rawCacheUrl).run().catch(() => {});
+        }
+    });
 });

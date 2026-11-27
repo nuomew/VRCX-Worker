@@ -1618,31 +1618,52 @@
             const retentionDays = Number.isInteger(parsedDays) && parsedDays >= 0 && parsedDays <= 365 ? parsedDays : 0;
             let totalPacked = 0;
             let totalChunks = 0;
-            let totalCompressed = 0;
+            let totalChunksCompressed = 0;
+            let totalCacheCompressed = 0;
+            let totalBytesSaved = 0;
             let totalPruned = 0;
-            for (let round = 0; round < 12; round++) {
+            let hasMoreAfterLoop = false;
+            for (let round = 0; round < 120; round++) {
                 const res = await cloudFetch('/api/admin/storage/compact', {
                     method: 'POST',
                     json: { retentionDays, includeLegacy: true, maxChunksPerTable: 8 }
                 });
                 totalPacked += Number(res?.totalPackedRows || 0);
                 totalChunks += Number(res?.totalChunksCreated || 0);
-                totalCompressed += Number(res?.cacheCompressedRows || 0);
+                totalChunksCompressed += Number(res?.totalChunksCompressed || 0);
+                totalCacheCompressed += Number(res?.cacheCompressedRows || 0);
+                totalBytesSaved += Number(res?.totalBytesSaved || res?.cacheBytesSaved || 0);
                 totalPruned += Number(res?.totalPrunedRows || 0);
-                if (!res?.hasMore) break;
+                if (res?.hasMore) {
+                    compactNotice.value = t('cloud_hub.storage.compact_progress_notice', {
+                        chunksCompressed: totalChunksCompressed.toLocaleString(),
+                        cacheCompressed: totalCacheCompressed.toLocaleString(),
+                        saved: formatBytes(totalBytesSaved)
+                    });
+                    if (round === 119) {
+                        hasMoreAfterLoop = true;
+                    }
+                } else {
+                    break;
+                }
             }
-            if (totalPacked > 0 || totalCompressed > 0 || totalPruned > 0) {
+            if (totalPacked > 0 || totalChunksCompressed > 0 || totalCacheCompressed > 0 || totalPruned > 0) {
                 compactNotice.value = t('cloud_hub.storage.compact_done_toast', {
                     packed: totalPacked.toLocaleString(),
                     chunks: totalChunks.toLocaleString(),
-                    compressed: totalCompressed.toLocaleString(),
+                    chunksCompressed: totalChunksCompressed.toLocaleString(),
+                    compressed: totalCacheCompressed.toLocaleString(),
+                    saved: formatBytes(totalBytesSaved),
                     pruned: totalPruned.toLocaleString()
                 });
+                if (hasMoreAfterLoop) {
+                    compactNotice.value += ` ${t('cloud_hub.storage.compact_more_remaining')}`;
+                }
             } else {
                 compactNotice.value = t('cloud_hub.storage.compact_noop_toast');
             }
             toast.success(compactNotice.value);
-            await refreshDatabaseSection();
+            await Promise.all([refreshDatabaseSection(), loadMysqlStatus(mysqlSavedEnabled.value)]);
         } catch (err) {
             compactError.value = err?.message || String(err);
             toast.error(compactError.value);

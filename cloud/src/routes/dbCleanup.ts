@@ -6,6 +6,7 @@ import {
     type CompactArchiveTableName,
     type CoreChunkKind,
     decodeCoreChunkRows,
+    parseCompactChunkTuples,
     decodeFeedChunkForExport,
     decodeGameLogChunkForExport,
     DEFAULT_COMPACT_RETENTION_DAYS,
@@ -297,14 +298,9 @@ async function countBoundaryExpiredRowsInChunkTable(
             .all<{ payload_json: string }>();
         let total = 0;
         for (const r of res.results ?? []) {
-            try {
-                const parsed = JSON.parse(r.payload_json) as unknown;
-                if (!Array.isArray(parsed)) continue;
-                for (const t of parsed) {
-                    if (Array.isArray(t) && String(t[0] ?? '') < cutoffIso) total++;
-                }
-            } catch {
-                // Skip malformed chunk
+            const tuples = parseCompactChunkTuples(r.payload_json);
+            for (const t of tuples) {
+                if (String(t[0] ?? '') < cutoffIso) total++;
             }
         }
         return total;
@@ -1420,13 +1416,7 @@ export async function handleDbCleanupRoutes(
                         const rid = Number(row._rid ?? 0);
                         if (Number.isFinite(rid) && rid > maxRid) maxRid = rid;
                         const kindVal = String(row[spec.chunkKindCol] ?? '');
-                        let tuples: unknown[][] = [];
-                        try {
-                            const parsed = JSON.parse(String(row.payload_json ?? '[]')) as unknown;
-                            if (Array.isArray(parsed)) tuples = parsed.filter(Array.isArray) as unknown[][];
-                        } catch {
-                            tuples = [];
-                        }
+                        const tuples = parseCompactChunkTuples(String(row.payload_json ?? ''));
                         const rowCnt = Math.max(tuples.length, Number(row.row_count ?? 0) || 0);
                         chunkKindCounts.set(kindVal, (chunkKindCounts.get(kindVal) ?? 0) + rowCnt);
                         if (spec.backup !== false && tuples.length > 0) {
@@ -1491,13 +1481,8 @@ export async function handleDbCleanupRoutes(
                     .catch(() => ({ results: [] as Array<{ id: number; kind_val: string; payload_json: string }> }));
                 const matchedChunkIds = new Set<number>();
                 for (const row of res.results ?? []) {
-                    let tuples: unknown[][] = [];
-                    try {
-                        const parsed = JSON.parse(row.payload_json) as unknown;
-                        if (Array.isArray(parsed)) tuples = parsed.filter(Array.isArray) as unknown[][];
-                    } catch {
-                        continue;
-                    }
+                    const tuples = parseCompactChunkTuples(row.payload_json);
+                    if (tuples.length === 0) continue;
                     const expiredTuples = tuples.filter((t) => String(t[0] ?? '') < cutoffIso);
                     if (expiredTuples.length === 0) continue;
                     matchedChunkIds.add(row.id);

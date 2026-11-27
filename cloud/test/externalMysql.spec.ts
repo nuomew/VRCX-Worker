@@ -2038,4 +2038,140 @@ describe('External MySQL 5.7+ Database Integration (Hybrid New-Writes Mode & Ful
             await saveExternalDbMigrationState(env, defaultExternalDbMigrationState());
         }
     });
+
+    it('gzip-compresses both D1 legacy chunks (id < 1M) and external MySQL chunks (id >= 1M) in-place under Compatibility Mode', async () => {
+        await ensureSchemaReady(env);
+        const legacyDb = env.DB_LEGACY!;
+        const fakeMysql = new FakeMysql57Server();
+        setMysqlConnectionFactoryForTests(async () => fakeMysql.createConnection());
+        const headers = { 'Content-Type': 'application/json', Origin: 'http://example.com' };
+        const pad = 'HybridDualStoreGzipCompressionCheck_'.repeat(3);
+
+        const rawD1LegacyJson = JSON.stringify(
+            Array.from({ length: 12 }, (_, i) => [
+                `2024-05-01T08:00:${String(i).padStart(2, '0')}.000Z`,
+                `D1LegacyHybridEvent_${i}_${pad}`
+            ])
+        );
+        const rawMysqlActiveJson = JSON.stringify(
+            Array.from({ length: 12 }, (_, i) => [
+                `2026-11-27T08:00:${String(i).padStart(2, '0')}.000Z`,
+                `MysqlActiveHybridEvent_${i}_${pad}`
+            ])
+        );
+
+        try {
+            // Enable Compatibility Mode (existing data in D1, new writes in MySQL)
+            expect(
+                (
+                    await exports.default.fetch('http://example.com/api/storage/mysql/config', {
+                        method: 'PUT',
+                        headers,
+                        body: JSON.stringify({
+                            enabled: true,
+                            mode: 'new_writes_only',
+                            connectionType: 'direct',
+                            host: 'db.example.com',
+                            port: 3306,
+                            database: 'vrcx_db',
+                            username: 'vrcx',
+                            password: 'secret',
+                            sslMode: 'disabled',
+                            tablePrefix: 'vrcx_'
+                        })
+                    })
+                ).status
+            ).toBe(200);
+
+            // Initialize MySQL tables via /test
+            expect(
+                (
+                    await exports.default.fetch('http://example.com/api/storage/mysql/test', {
+                        method: 'POST',
+                        headers,
+                        body: JSON.stringify({ useSaved: true })
+                    })
+                ).status
+            ).toBe(200);
+
+            // Seed 1 raw uncompressed chunk in native D1 DB_LEGACY (id < 1M) + mark legacy gamelog imported
+            await legacyDb.batch([
+                legacyDb
+                    .prepare(
+                        `INSERT OR REPLACE INTO legacy_gamelog_chunks (chunk_key, gamelog_kind, min_created_at, max_created_at, row_count, payload_json)
+                         VALUES ('hyb_d1_leg_1', 'event', '2024-05-01T08:00:00.000Z', '2024-05-01T08:00:11.000Z', 12, ?)`
+                    )
+                    .bind(rawD1LegacyJson),
+                legacyDb
+                    .prepare(
+                        `INSERT INTO legacy_migration_state (state_key, payload_json, updated_at)
+                         VALUES ('imported_stats', ?, ?)
+                         ON CONFLICT(state_key) DO UPDATE SET payload_json = excluded.payload_json, updated_at = excluded.updated_at`
+                    )
+                    .bind(JSON.stringify({ gamelog: 12, feed: 0, friend_log: 0, notifications: 0 }), '2024-05-01T08:00:11.000Z')
+            ]);
+
+            // Seed 1 raw uncompressed chunk directly in MySQL `vrcx_gamelog_archive_chunks` (id >= 1M)
+            const mysqlGlTbl = fakeMysql.tables.get('vrcx_gamelog_archive_chunks')!;
+            const mysqlId = mysqlGlTbl.autoInc++;
+            expect(mysqlId).toBeGreaterThanOrEqual(MYSQL_CHUNK_AUTO_INCREMENT_START);
+            mysqlGlTbl.rows.push({
+                id: mysqlId,
+                chunk_key: 'hyb_mysql_act_1',
+                gamelog_kind: 'event',
+                min_created_at: '2026-11-27T08:00:00.000Z',
+                max_created_at: '2026-11-27T08:00:11.000Z',
+                row_count: 12,
+                payload_json: rawMysqlActiveJson
+            });
+
+            // Run compaction under Compatibility Mode
+            const compactRes = await exports.default.fetch('http://example.com/api/admin/storage/compact', {
+                method: 'POST',
+                headers,
+                body: JSON.stringify({ retentionDays: 0, includeLegacy: true })
+            });
+            expect(compactRes.status).toBe(200);
+            const compactJson = (await compactRes.json()) as {
+                data: {
+                    legacyChunksCompressed: number;
+                    gamelogChunksCompressed: number;
+                    totalChunksCompressed: number;
+                    chunkBytesSaved: number;
+                };
+            };
+            expect(compactJson.data.legacyChunksCompressed).toBeGreaterThanOrEqual(1);
+            expect(compactJson.data.gamelogChunksCompressed).toBeGreaterThanOrEqual(1);
+            expect(compactJson.data.totalChunksCompressed).toBeGreaterThanOrEqual(2);
+            expect(compactJson.data.chunkBytesSaved).toBeGreaterThan(2000);
+
+            // Verify native D1 chunk was compressed in-place
+            const d1Row = await legacyDb
+                .prepare("SELECT payload_json FROM legacy_gamelog_chunks WHERE chunk_key = 'hyb_d1_leg_1'")
+                .first<{ payload_json: string }>();
+            expect(d1Row?.payload_json.startsWith('gz:')).toBe(true);
+
+            // Verify MySQL chunk was compressed in-place
+            const mysqlRow = mysqlGlTbl.rows.find((r) => r.chunk_key === 'hyb_mysql_act_1');
+            expect(String(mysqlRow?.payload_json ?? '').startsWith('gz:')).toBe(true);
+
+            // Verify unified hybrid query decodes both compressed chunks seamlessly
+            const qRes = await exports.default.fetch('http://example.com/api/gamelog/query', {
+                method: 'POST',
+                headers,
+                body: JSON.stringify({ types: ['Event'], limit: 100 })
+            });
+            expect(qRes.status).toBe(200);
+            const qJson = (await qRes.json()) as { data: Array<{ data?: string }> };
+            expect(qJson.data.some((r) => r.data?.startsWith('D1LegacyHybridEvent_0_'))).toBe(true);
+            expect(qJson.data.some((r) => r.data?.startsWith('MysqlActiveHybridEvent_0_'))).toBe(true);
+        } finally {
+            await legacyDb.prepare("DELETE FROM legacy_gamelog_chunks WHERE chunk_key = 'hyb_d1_leg_1'").run().catch(() => {});
+            setMysqlConnectionFactoryForTests(null);
+            await saveExternalDbConfig(env, defaultExternalDbConfig());
+            await saveExternalDbMigrationState(env, defaultExternalDbMigrationState());
+            invalidateExternalDbConfigCache();
+            clearMysqlSchemaReadyCache();
+        }
+    });
 });

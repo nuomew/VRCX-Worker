@@ -1,4 +1,4 @@
-import { runAllDatabasesCompaction } from '../db/compactArchive';
+import { encodeCompactChunkPayload, runAllDatabasesCompaction } from '../db/compactArchive';
 import {
     attachRawD1Env,
     clearMysqlSchemaReadyCache,
@@ -382,6 +382,7 @@ export async function runExternalMysqlMigrationBatch(
             const qTable = qualifyMysqlTableName(connParams.tablePrefix, spec.table);
 
             for (const row of rows) {
+                const compressedPayload = encodeCompactChunkPayload(row.payload_json);
                 if (spec.kindColumn) {
                     await conn.execute(
                         `INSERT IGNORE INTO \`${qTable}\`
@@ -393,7 +394,7 @@ export async function runExternalMysqlMigrationBatch(
                             row.min_created_at,
                             row.max_created_at,
                             Math.max(0, Number(row.row_count ?? 0) || 0),
-                            row.payload_json
+                            compressedPayload
                         ]
                     );
                 } else {
@@ -406,7 +407,7 @@ export async function runExternalMysqlMigrationBatch(
                             row.min_created_at,
                             row.max_created_at,
                             Math.max(0, Number(row.row_count ?? 0) || 0),
-                            row.payload_json
+                            compressedPayload
                         ]
                     );
                 }
