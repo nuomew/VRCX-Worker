@@ -8,6 +8,7 @@ import {
     MYSQL_CHUNK_ID_MIN,
     qualifyMysqlTableName,
     resolveExternalDbConnectionParams,
+    type ExternalDbShardKey,
     type ManagedMysqlTableName
 } from './externalMysql';
 
@@ -152,15 +153,16 @@ function sanitizeParamsForMysql(sql: string, table: ManagedMysqlTableName, param
 }
 
 /**
- * Rewrites a SQLite/D1 statement targeting one of our 8 managed tables into strict MySQL 5.7+ SQL.
+ * Rewrites a SQLite/D1 statement targeting one of our 12 managed tables into strict MySQL 5.7+ SQL.
  */
 export function rewriteManagedSqlForMysql(
     rawSql: string,
     table: ManagedMysqlTableName,
     tablePrefix: string,
-    params: unknown[]
+    params: unknown[],
+    shard?: ExternalDbShardKey
 ): { sql: string; params: unknown[] } {
-    const qTable = qualifyMysqlTableName(tablePrefix, table);
+    const qTable = qualifyMysqlTableName(tablePrefix, table, shard);
     let sql = rawSql.replace(WRITE_TARGET_ONLY_HINT, '').trim();
 
     // Special MySQL 5.7 rewrite for bounded cache eviction:
@@ -182,9 +184,17 @@ export function rewriteManagedSqlForMysql(
     sql = sql.replace(/\bINSERT\s+OR\s+IGNORE\s+INTO\b/gi, 'INSERT IGNORE INTO');
     sql = sql.replace(/\bINSERT\s+OR\s+REPLACE\s+INTO\b/gi, 'REPLACE INTO');
 
-    if (table === 'vrc_api_cache' && /\bON\s+CONFLICT\s*\(\s*cache_key\s*\)\s*DO\s+UPDATE\s+SET\b/i.test(sql)) {
+    // SQLite 2-arg scalar `MAX(0, expr)` is `GREATEST(0, expr)` in MySQL 5.7 (MySQL MAX() is aggregate-only).
+    if (table === 'gamelog_world_rollup' || table === 'gamelog_user_rollup') {
+        sql = sql.replace(/\bMAX\s*\(\s*0\s*,/gi, 'GREATEST(0,');
+    }
+
+    if (
+        (table === 'vrc_api_cache' || table === 'gamelog_world_rollup' || table === 'gamelog_user_rollup') &&
+        /\bON\s+CONFLICT\s*\([^)]+\)\s*DO\s+UPDATE\s+SET\b/i.test(sql)
+    ) {
         sql = sql.replace(
-            /\bON\s+CONFLICT\s*\(\s*cache_key\s*\)\s*DO\s+UPDATE\s+SET\b([\s\S]*)$/i,
+            /\bON\s+CONFLICT\s*\([^)]+\)\s*DO\s+UPDATE\s+SET\b([\s\S]*)$/i,
             (_full, setClause: string) => {
                 const mysqlSet = setClause.replace(/\bexcluded\.([a-zA-Z_][a-zA-Z0-9_]*)\b/gi, 'VALUES($1)');
                 return `ON DUPLICATE KEY UPDATE${mysqlSet}`;
@@ -494,9 +504,128 @@ function makeD1Result<T>(
     };
 }
 
+function pickTopTwoDistinctIso(candidates: unknown[]): [string, string] {
+    const uniq = Array.from(
+        new Set(
+            candidates
+                .map((c) => String(c ?? '').trim())
+                .filter(Boolean)
+        )
+    );
+    uniq.sort((a, b) => (b < a ? -1 : b > a ? 1 : 0));
+    return [uniq[0] ?? '', uniq[1] ?? ''];
+}
+
+function mergeDualRollupRows(
+    table: 'gamelog_user_rollup' | 'gamelog_world_rollup',
+    rawSql: string,
+    params: unknown[],
+    mysqlRows: Array<Record<string, unknown>>,
+    d1Rows: Array<Record<string, unknown>>,
+    sortKeys: Array<{ key: string; dir: 'ASC' | 'DESC' }>,
+    injectedAliases: string[]
+): Array<Record<string, unknown>> {
+    const all = [...d1Rows, ...mysqlRows];
+    if (all.length === 0) return [];
+
+    const out: Array<Record<string, unknown>> = [];
+    if (table === 'gamelog_world_rollup') {
+        const hasWorldId = all.some((r) => typeof r.world_id === 'string' && r.world_id);
+        const byKey = new Map<string, Record<string, unknown>>();
+        for (const r of all) {
+            const k = hasWorldId ? String(r.world_id ?? '') : '__single__';
+            const prev = byKey.get(k);
+            if (!prev) {
+                byKey.set(k, { ...r });
+                continue;
+            }
+            const next = { ...prev };
+            if ('visit_count' in prev || 'visit_count' in r) {
+                next.visit_count = (Number(prev.visit_count ?? 0) || 0) + (Number(r.visit_count ?? 0) || 0);
+            }
+            if ('visits' in prev || 'visits' in r) {
+                next.visits = (Number(prev.visits ?? 0) || 0) + (Number(r.visits ?? 0) || 0);
+            }
+            if ('total_time' in prev || 'total_time' in r) {
+                next.total_time = (Number(prev.total_time ?? 0) || 0) + (Number(r.total_time ?? 0) || 0);
+            }
+            const prevVisit = String(prev.last_visit ?? '');
+            const curVisit = String(r.last_visit ?? '');
+            if ('last_visit' in prev || 'last_visit' in r) {
+                next.last_visit = curVisit > prevVisit ? curVisit : prevVisit;
+            }
+            if ('world_name' in prev || 'world_name' in r) {
+                const pName = String(prev.world_name ?? '');
+                const cName = String(r.world_name ?? '');
+                next.world_name = curVisit >= prevVisit && cName ? cName : pName || cName;
+            }
+            // Keep injected sort columns in sync with summed counters
+            for (const alias of injectedAliases) {
+                if (alias in next && (typeof next[alias] === 'number' || typeof r[alias] === 'number')) {
+                    next[alias] = (Number(prev[alias] ?? 0) || 0) + (Number(r[alias] ?? 0) || 0);
+                }
+            }
+            byKey.set(k, next);
+        }
+        out.push(...byKey.values());
+    } else {
+        const hasUserId = all.some((r) => typeof r.user_id === 'string' && r.user_id);
+        const byKey = new Map<string, Record<string, unknown>>();
+        for (const r of all) {
+            const k = hasUserId ? String(r.user_id ?? '') : '__single__';
+            const prev = byKey.get(k);
+            if (!prev) {
+                byKey.set(k, { ...r });
+                continue;
+            }
+            const next = { ...prev };
+            if ('join_count' in prev || 'join_count' in r) {
+                next.join_count = (Number(prev.join_count ?? 0) || 0) + (Number(r.join_count ?? 0) || 0);
+            }
+            if ('time_spent' in prev || 'time_spent' in r) {
+                next.time_spent = (Number(prev.time_spent ?? 0) || 0) + (Number(r.time_spent ?? 0) || 0);
+            }
+            const prevLast = String(prev.last_seen ?? '');
+            const curLast = String(r.last_seen ?? '');
+            const [top1, top2] = pickTopTwoDistinctIso([prev.last_seen, prev.second_last_seen, r.last_seen, r.second_last_seen]);
+            if ('last_seen' in prev || 'last_seen' in r) next.last_seen = top1;
+            if ('second_last_seen' in prev || 'second_last_seen' in r) next.second_last_seen = top2;
+            if ('display_name' in prev || 'display_name' in r) {
+                const pName = String(prev.display_name ?? '');
+                const cName = String(r.display_name ?? '');
+                next.display_name = curLast >= prevLast && cName ? cName : pName || cName;
+            }
+            byKey.set(k, next);
+        }
+        out.push(...byKey.values());
+    }
+
+    if (sortKeys.length > 0) {
+        out.sort((a, b) => {
+            for (const s of sortKeys) {
+                const cmp = compareSortValues(a[s.key], b[s.key]);
+                if (cmp !== 0) return s.dir === 'DESC' ? -cmp : cmp;
+            }
+            return 0;
+        });
+    }
+
+    const limit = extractSelectLimit(rawSql, params);
+    const sliced = limit !== null ? out.slice(0, limit) : out;
+    if (injectedAliases.length > 0) {
+        return sliced.map((row) => {
+            const copy = { ...row };
+            for (const alias of injectedAliases) delete copy[alias];
+            return copy;
+        });
+    }
+    return sliced;
+}
+
 class HybridMysqlPreparedStatement {
     private readonly rawD1: D1Database;
     private readonly session: ExternalMysqlSession;
+    private readonly shard: ExternalDbShardKey;
     private readonly rawSql: string;
     private readonly detected: DetectedManagedSql;
     private boundParams: unknown[];
@@ -504,12 +633,14 @@ class HybridMysqlPreparedStatement {
     constructor(
         rawD1: D1Database,
         session: ExternalMysqlSession,
+        shard: ExternalDbShardKey,
         rawSql: string,
         detected: DetectedManagedSql,
         boundParams: unknown[] = []
     ) {
         this.rawD1 = rawD1;
         this.session = session;
+        this.shard = shard;
         this.rawSql = rawSql;
         this.detected = detected;
         this.boundParams = boundParams;
@@ -519,6 +650,7 @@ class HybridMysqlPreparedStatement {
         return new HybridMysqlPreparedStatement(
             this.rawD1,
             this.session,
+            this.shard,
             this.rawSql,
             this.detected,
             values
@@ -528,16 +660,23 @@ class HybridMysqlPreparedStatement {
     private async executeSelect(): Promise<Array<Record<string, unknown>>> {
         const { table, writeTargetOnly } = this.detected;
         const params = this.boundParams;
+        const isRollup = table === 'gamelog_user_rollup' || table === 'gamelog_world_rollup';
 
-        // 1. Write-target tail lookup (`appendTuplesToCompactTailChunk`) MUST read MySQL only so new writes never touch D1
+        // 1. Write-target tail/rollup lookup MUST read MySQL only so new writes never touch/double-count D1
         if (writeTargetOnly) {
-            const rewritten = rewriteManagedSqlForMysql(this.rawSql, table, this.session.params.tablePrefix, params);
+            const rewritten = rewriteManagedSqlForMysql(
+                this.rawSql,
+                table,
+                this.session.params.tablePrefix,
+                params,
+                this.shard
+            );
             const res = await this.session.query(rewritten.sql, rewritten.params);
             return res.rows;
         }
 
         // 2. Direct lookup by chunk ID routes strictly to owning store (MySQL >= 1,000,000; D1 < 1,000,000)
-        if (table !== 'vrc_api_cache') {
+        if (table !== 'vrc_api_cache' && !isRollup) {
             const whereId = extractWhereIdEqualsParam(this.rawSql, params);
             if (whereId !== null) {
                 if (whereId >= MYSQL_CHUNK_ID_MIN) {
@@ -545,7 +684,8 @@ class HybridMysqlPreparedStatement {
                         this.rawSql,
                         table,
                         this.session.params.tablePrefix,
-                        params
+                        params,
+                        this.shard
                     );
                     const res = await this.session.query(rewritten.sql, rewritten.params);
                     return res.rows;
@@ -557,7 +697,13 @@ class HybridMysqlPreparedStatement {
 
         // 3. Fully migrated & drained D1 skips D1 reads completely
         if (this.session.mode === 'full_migrate' && this.session.d1Drained) {
-            const rewritten = rewriteManagedSqlForMysql(this.rawSql, table, this.session.params.tablePrefix, params);
+            const rewritten = rewriteManagedSqlForMysql(
+                this.rawSql,
+                table,
+                this.session.params.tablePrefix,
+                params,
+                this.shard
+            );
             const res = await this.session.query(rewritten.sql, rewritten.params);
             return res.rows;
         }
@@ -565,7 +711,13 @@ class HybridMysqlPreparedStatement {
         // 4. Dual-read merge across MySQL (new/migrated data) + D1 (existing unmigrated data)
         const orderTerms = parseOrderByTerms(this.rawSql);
         const { sql: querySql, injectedAliases, sortKeys } = injectSortColumnsIfNeeded(this.rawSql, orderTerms);
-        const rewritten = rewriteManagedSqlForMysql(querySql, table, this.session.params.tablePrefix, params);
+        const rewritten = rewriteManagedSqlForMysql(
+            querySql,
+            table,
+            this.session.params.tablePrefix,
+            params,
+            this.shard
+        );
 
         const [mysqlRes, d1Rows] = await Promise.all([
             this.session.query(rewritten.sql, rewritten.params),
@@ -577,16 +729,30 @@ class HybridMysqlPreparedStatement {
                 .catch(() => [] as Array<Record<string, unknown>>)
         ]);
 
+        if (isRollup) {
+            const agg = detectScalarAggregates(this.rawSql);
+            if (!agg.isAggregate) {
+                return mergeDualRollupRows(table, this.rawSql, params, mysqlRes.rows, d1Rows, sortKeys, injectedAliases);
+            }
+        }
+
         return mergeDualSelectResults(this.rawSql, params, mysqlRes.rows, d1Rows, sortKeys, injectedAliases);
     }
 
     private async executeMutation(): Promise<D1Result<Record<string, unknown>>> {
         const { verb, table } = this.detected;
         const params = this.boundParams;
+        const isRollup = table === 'gamelog_user_rollup' || table === 'gamelog_world_rollup';
 
         // INSERT always targets external MySQL 5.7+ (Mode 1 & Mode 2 both route all new data to MySQL)
         if (verb === 'INSERT') {
-            const rewritten = rewriteManagedSqlForMysql(this.rawSql, table, this.session.params.tablePrefix, params);
+            const rewritten = rewriteManagedSqlForMysql(
+                this.rawSql,
+                table,
+                this.session.params.tablePrefix,
+                params,
+                this.shard
+            );
             const res = await this.session.query(rewritten.sql, rewritten.params);
             return makeD1Result([], {
                 changes: res.affectedRows,
@@ -597,7 +763,7 @@ class HybridMysqlPreparedStatement {
         }
 
         // UPDATE/DELETE targeting a specific chunk ID routes strictly to the owning store
-        if (table !== 'vrc_api_cache') {
+        if (table !== 'vrc_api_cache' && !isRollup) {
             const whereId = extractWhereIdEqualsParam(this.rawSql, params);
             if (whereId !== null) {
                 if (whereId >= MYSQL_CHUNK_ID_MIN) {
@@ -605,7 +771,8 @@ class HybridMysqlPreparedStatement {
                         this.rawSql,
                         table,
                         this.session.params.tablePrefix,
-                        params
+                        params,
+                        this.shard
                     );
                     const res = await this.session.query(rewritten.sql, rewritten.params);
                     return makeD1Result([], {
@@ -619,9 +786,36 @@ class HybridMysqlPreparedStatement {
             }
         }
 
-        // Broad DELETE / UPDATE (e.g. cleanup range delete, clear chat, cache invalidation):
+        // Rollup delta UPDATE: apply to MySQL first; fall back to D1 ONLY if row did not exist in MySQL
+        // so a single edit/delete never subtracts deltas from both stores.
+        if (isRollup && verb === 'UPDATE') {
+            const rewritten = rewriteManagedSqlForMysql(
+                this.rawSql,
+                table,
+                this.session.params.tablePrefix,
+                params,
+                this.shard
+            );
+            const mysqlRes = await this.session.query(rewritten.sql, rewritten.params);
+            if (mysqlRes.affectedRows > 0 || (this.session.mode === 'full_migrate' && this.session.d1Drained)) {
+                return makeD1Result([], {
+                    changes: mysqlRes.affectedRows,
+                    rows_written: mysqlRes.affectedRows,
+                    changed_db: mysqlRes.affectedRows > 0
+                });
+            }
+            return this.rawD1.prepare(this.rawSql).bind(...params).run();
+        }
+
+        // Broad DELETE / UPDATE (e.g. cleanup range delete, clear chat, cache invalidation, clear legacy rollups):
         // execute on MySQL first; also execute on D1 unless D1 is already fully drained.
-        const rewritten = rewriteManagedSqlForMysql(this.rawSql, table, this.session.params.tablePrefix, params);
+        const rewritten = rewriteManagedSqlForMysql(
+            this.rawSql,
+            table,
+            this.session.params.tablePrefix,
+            params,
+            this.shard
+        );
         const mysqlRes = await this.session.query(rewritten.sql, rewritten.params);
         let totalChanges = mysqlRes.affectedRows;
 
@@ -674,10 +868,14 @@ class HybridMysqlPreparedStatement {
 }
 
 /**
- * Wraps a native Cloudflare D1Database binding so queries against the 8 managed large tables
+ * Wraps a native Cloudflare D1Database binding so queries against the 12 managed large/rollup tables
  * seamlessly route/merge with the user's external MySQL 5.7+ server, while all other tables pass straight to D1.
  */
-export function createHybridMysqlD1Database(rawD1: D1Database, session: ExternalMysqlSession): D1Database {
+export function createHybridMysqlD1Database(
+    rawD1: D1Database,
+    session: ExternalMysqlSession,
+    shard: ExternalDbShardKey = 'core'
+): D1Database {
     const hybrid: Partial<D1Database> = {
         prepare(query: string): D1PreparedStatement {
             const detected = detectManagedMysqlSql(query);
@@ -687,6 +885,7 @@ export function createHybridMysqlD1Database(rawD1: D1Database, session: External
             return new HybridMysqlPreparedStatement(
                 rawD1,
                 session,
+                shard,
                 query,
                 detected
             ) as unknown as D1PreparedStatement;
@@ -753,12 +952,12 @@ export async function runWithExternalMysqlEnv<T>(env: Env, fn: (activeEnv: Env) 
     const session = new ExternalMysqlSession(connParams, config.mode, migration.d1Drained);
     const wrappedEnv: Env = {
         ...rawEnv,
-        DB_CORE: createHybridMysqlD1Database(rawEnv.DB_CORE, session),
-        DB_GAMELOG: createHybridMysqlD1Database(rawEnv.DB_GAMELOG, session),
-        DB_FEED: createHybridMysqlD1Database(rawEnv.DB_FEED, session),
-        DB_CACHE: rawEnv.DB_CACHE ? createHybridMysqlD1Database(rawEnv.DB_CACHE, session) : undefined,
-        DB_LEGACY: rawEnv.DB_LEGACY ? createHybridMysqlD1Database(rawEnv.DB_LEGACY, session) : undefined,
-        DB_CHAT: rawEnv.DB_CHAT ? createHybridMysqlD1Database(rawEnv.DB_CHAT, session) : undefined
+        DB_CORE: createHybridMysqlD1Database(rawEnv.DB_CORE, session, 'core'),
+        DB_GAMELOG: createHybridMysqlD1Database(rawEnv.DB_GAMELOG, session, 'gamelog'),
+        DB_FEED: createHybridMysqlD1Database(rawEnv.DB_FEED, session, 'feed'),
+        DB_CACHE: rawEnv.DB_CACHE ? createHybridMysqlD1Database(rawEnv.DB_CACHE, session, 'cache') : undefined,
+        DB_LEGACY: rawEnv.DB_LEGACY ? createHybridMysqlD1Database(rawEnv.DB_LEGACY, session, 'legacy') : undefined,
+        DB_CHAT: rawEnv.DB_CHAT ? createHybridMysqlD1Database(rawEnv.DB_CHAT, session, 'chat') : undefined
     };
     attachRawD1Env(wrappedEnv, rawEnv);
 

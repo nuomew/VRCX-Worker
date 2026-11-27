@@ -1414,7 +1414,7 @@ export async function applyWorldRollupForPackedLocations(
 ): Promise<void> {
     const agg = new Map<string, { worldName: string; visitCount: number; totalTime: number; lastVisit: string }>();
     for (const r of rows) {
-        const wid = String(r.world_id ?? '').trim();
+        const wid = String(r.world_id ?? '').trim().slice(0, 191);
         if (!wid) continue;
         const ts = String(r.created_at ?? '');
         const wname = String(r.world_name ?? '').trim();
@@ -1433,34 +1433,43 @@ export async function applyWorldRollupForPackedLocations(
             }
         }
     }
+    // Pack up to 18 rows per multi-value INSERT (18 * 5 = 90 <= D1's 100-param limit),
+    // slashing MySQL 5.7 round-trips and SQL statements by ~94% while remaining 100% D1-compatible.
     const entries = Array.from(agg.entries());
-    for (let i = 0; i < entries.length; i += 40) {
-        const slice = entries.slice(i, i + 40);
-        await db.batch(
-            slice.map(([worldId, d]) =>
-                db
-                    .prepare(
-                        `INSERT INTO gamelog_world_rollup (world_id, world_name, visit_count, total_time, last_visit)
-                         VALUES (?, ?, ?, ?, ?)
-                         ON CONFLICT(world_id) DO UPDATE SET
-                            world_name = CASE
-                                WHEN excluded.world_name != '' AND excluded.last_visit >= gamelog_world_rollup.last_visit
-                                    THEN excluded.world_name
-                                WHEN gamelog_world_rollup.world_name = '' AND excluded.world_name != ''
-                                    THEN excluded.world_name
-                                ELSE gamelog_world_rollup.world_name
-                            END,
-                            visit_count = gamelog_world_rollup.visit_count + excluded.visit_count,
-                            total_time = gamelog_world_rollup.total_time + excluded.total_time,
-                            last_visit = CASE
-                                WHEN excluded.last_visit > gamelog_world_rollup.last_visit
-                                    THEN excluded.last_visit
-                                ELSE gamelog_world_rollup.last_visit
-                            END`
-                    )
-                    .bind(worldId, d.worldName, d.visitCount, d.totalTime, d.lastVisit)
-            )
+    const multiStmts: D1PreparedStatement[] = [];
+    for (let i = 0; i < entries.length; i += 18) {
+        const slice = entries.slice(i, i + 18);
+        const valuePlaceholders = slice.map(() => '(?, ?, ?, ?, ?)').join(', ');
+        const binds: unknown[] = [];
+        for (const [worldId, d] of slice) {
+            binds.push(worldId, d.worldName, d.visitCount, d.totalTime, d.lastVisit);
+        }
+        multiStmts.push(
+            db
+                .prepare(
+                    `INSERT INTO gamelog_world_rollup (world_id, world_name, visit_count, total_time, last_visit)
+                     VALUES ${valuePlaceholders}
+                     ON CONFLICT(world_id) DO UPDATE SET
+                        world_name = CASE
+                            WHEN excluded.world_name != '' AND excluded.last_visit >= gamelog_world_rollup.last_visit
+                                THEN excluded.world_name
+                            WHEN gamelog_world_rollup.world_name = '' AND excluded.world_name != ''
+                                THEN excluded.world_name
+                            ELSE gamelog_world_rollup.world_name
+                        END,
+                        visit_count = gamelog_world_rollup.visit_count + excluded.visit_count,
+                        total_time = gamelog_world_rollup.total_time + excluded.total_time,
+                        last_visit = CASE
+                            WHEN excluded.last_visit > gamelog_world_rollup.last_visit
+                                THEN excluded.last_visit
+                            ELSE gamelog_world_rollup.last_visit
+                        END`
+                )
+                .bind(...binds)
         );
+    }
+    for (let i = 0; i < multiStmts.length; i += 20) {
+        await db.batch(multiStmts.slice(i, i + 20));
     }
 }
 
@@ -1504,7 +1513,8 @@ export async function applyUserRollupForPackedJoinLeave(
     for (const r of rows) {
         const uid = String(r.user_id ?? '').trim();
         const dname = String(r.display_name ?? '').trim();
-        const key = uid || (dname ? `name:${dname.toLowerCase()}` : '');
+        const rawKey = uid || (dname ? `name:${dname.toLowerCase()}` : '');
+        const key = rawKey.slice(0, 191);
         if (!key) continue;
         const ts = String(r.created_at ?? '').trim();
         const loc = String(r.location ?? '').trim();
@@ -1548,9 +1558,12 @@ export async function applyUserRollupForPackedJoinLeave(
     for (let i = 0; i < keys.length; i += 60) {
         const chunk = keys.slice(i, i + 60);
         const ph = chunk.map(() => '?').join(', ');
+        // Read strictly from the active write target (`/* vrcx:write-target */`) so Compatibility Mode
+        // never copies pre-existing D1 counters into MySQL and double-counts them on merged reads.
         const res = await db
             .prepare(
-                `SELECT user_id, display_name, join_count, time_spent, last_seen, second_last_seen
+                `/* vrcx:write-target */
+                 SELECT user_id, display_name, join_count, time_spent, last_seen, second_last_seen
                  FROM gamelog_user_rollup
                  WHERE user_id IN (${ph})`
             )
@@ -1568,7 +1581,7 @@ export async function applyUserRollupForPackedJoinLeave(
         }
     }
 
-    const stmts: D1PreparedStatement[] = [];
+    const mergedRows: Array<[string, string, number, number, string, string]> = [];
     for (const [key, delta] of agg.entries()) {
         const prev = existing.get(key);
         // Compute distinct-instance top-2 timestamps so Join + Leave in the same instance never sets second_last_seen.
@@ -1585,19 +1598,30 @@ export async function applyUserRollupForPackedJoinLeave(
                 : prev?.display_name || delta.displayName;
         const mergedJoinCount = Number(prev?.join_count ?? 0) + delta.locations.size;
         const mergedTimeSpent = Number(prev?.time_spent ?? 0) + delta.timeSpent;
+        mergedRows.push([key, mergedName, mergedJoinCount, mergedTimeSpent, mergedLast, mergedSecond]);
+    }
+
+    // Pack up to 15 rows per multi-value INSERT OR REPLACE (15 * 6 = 90 <= D1's 100-param limit),
+    // slashing MySQL 5.7 round-trips by ~93% while keeping D1 and MySQL 5.7 100% compatible.
+    const stmts: D1PreparedStatement[] = [];
+    for (let i = 0; i < mergedRows.length; i += 15) {
+        const slice = mergedRows.slice(i, i + 15);
+        const valuePlaceholders = slice.map(() => '(?, ?, ?, ?, ?, ?)').join(', ');
+        const binds: unknown[] = [];
+        for (const row of slice) binds.push(...row);
         stmts.push(
             db
                 .prepare(
                     `INSERT OR REPLACE INTO gamelog_user_rollup
                      (user_id, display_name, join_count, time_spent, last_seen, second_last_seen)
-                     VALUES (?, ?, ?, ?, ?, ?)`
+                     VALUES ${valuePlaceholders}`
                 )
-                .bind(key, mergedName, mergedJoinCount, mergedTimeSpent, mergedLast, mergedSecond)
+                .bind(...binds)
         );
     }
 
-    for (let i = 0; i < stmts.length; i += 40) {
-        await db.batch(stmts.slice(i, i + 40));
+    for (let i = 0; i < stmts.length; i += 20) {
+        await db.batch(stmts.slice(i, i + 20));
     }
 }
 

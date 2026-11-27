@@ -712,37 +712,32 @@ async function readLegacyMigrationSettings(db: D1Database): Promise<LegacyMigrat
 }
 
 /**
- * Atomically increments one category counter inside `imported_stats` so concurrent
- * migration batch uploads never overwrite each other's counts.
+/**
+ * Builds a single-row atomic UPSERT statement that increments one category counter inside `imported_stats`,
+ * cutting per-batch D1 state writes by 50% compared to separate INSERT OR IGNORE + UPDATE.
  */
-async function incrementLegacyCategoryStatAtomic(
+function buildIncrementLegacyCategoryStatStmt(
     legacyDb: D1Database,
     category: LegacyCategory,
     delta: number,
     nowIso: string
-): Promise<void> {
-    if (delta <= 0) return;
+): D1PreparedStatement | null {
+    if (delta <= 0) return null;
     const jsonPath = `$.${category}`;
-    await legacyDb.batch([
-        legacyDb
-            .prepare(
-                `INSERT OR IGNORE INTO legacy_migration_state (state_key, payload_json, updated_at)
-                 VALUES (?, ?, ?)`
-            )
-            .bind(STATE_KEY_IMPORTED_STATS, JSON.stringify(emptyImportedStats()), nowIso),
-        legacyDb
-            .prepare(
-                `UPDATE legacy_migration_state
-                 SET payload_json = json_set(
-                         payload_json,
-                         ?,
-                         COALESCE(CAST(json_extract(payload_json, ?) AS INTEGER), 0) + ?
-                     ),
-                     updated_at = ?
-                 WHERE state_key = ?`
-            )
-            .bind(jsonPath, jsonPath, delta, nowIso, STATE_KEY_IMPORTED_STATS)
-    ]);
+    const seed = { ...emptyImportedStats(), [category]: delta };
+    return legacyDb
+        .prepare(
+            `INSERT INTO legacy_migration_state (state_key, payload_json, updated_at)
+             VALUES (?, ?, ?)
+             ON CONFLICT(state_key) DO UPDATE SET
+                payload_json = json_set(
+                    legacy_migration_state.payload_json,
+                    ?,
+                    COALESCE(CAST(json_extract(legacy_migration_state.payload_json, ?) AS INTEGER), 0) + ?
+                ),
+                updated_at = excluded.updated_at`
+        )
+        .bind(STATE_KEY_IMPORTED_STATS, JSON.stringify(seed), nowIso, jsonPath, jsonPath, delta);
 }
 
 /**
@@ -811,8 +806,39 @@ async function readLegacyCursorStore(db: D1Database): Promise<LegacyCursorStore>
 }
 
 /**
- * Atomically persists one table resume watermark inside `legacy_migration_state(state_key='cursors')`.
+ * Builds a single-row atomic UPSERT statement persisting one table resume watermark inside `cursors`,
+ * cutting per-batch D1 cursor writes from 3 statements (2 UPDATEs + 1 INSERT) down to 1 single-row UPSERT.
  */
+function buildSaveLegacyTableCursorStmt(
+    legacyDb: D1Database,
+    scopeKey: string,
+    tableName: string,
+    cursor: LegacyTableCursor,
+    nowIso: string
+): D1PreparedStatement | null {
+    if (!SAFE_LOGICAL_TABLE_RE.test(tableName)) return null;
+    const scopePath = `$."${scopeKey}"`;
+    const tablePath = `$."${scopeKey}"."${tableName}"`;
+    const seedJson = JSON.stringify({ [scopeKey]: { [tableName]: cursor } });
+    return legacyDb
+        .prepare(
+            `INSERT INTO legacy_migration_state (state_key, payload_json, updated_at)
+             VALUES (?, ?, ?)
+             ON CONFLICT(state_key) DO UPDATE SET
+                payload_json = json_set(
+                    CASE
+                        WHEN json_type(legacy_migration_state.payload_json, ?) IS NULL
+                            THEN json_set(legacy_migration_state.payload_json, ?, json('{}'))
+                        ELSE legacy_migration_state.payload_json
+                    END,
+                    ?,
+                    json(?)
+                ),
+                updated_at = excluded.updated_at`
+        )
+        .bind(STATE_KEY_CURSORS, seedJson, nowIso, scopePath, scopePath, tablePath, JSON.stringify(cursor));
+}
+
 async function saveLegacyTableCursorAtomic(
     legacyDb: D1Database,
     scopeKey: string,
@@ -820,36 +846,8 @@ async function saveLegacyTableCursorAtomic(
     cursor: LegacyTableCursor,
     nowIso: string
 ): Promise<void> {
-    if (!SAFE_LOGICAL_TABLE_RE.test(tableName)) return;
-    const scopePath = `$."${scopeKey}"`;
-    const tablePath = `$."${scopeKey}"."${tableName}"`;
-    await legacyDb.batch([
-        legacyDb
-            .prepare(
-                `INSERT OR IGNORE INTO legacy_migration_state (state_key, payload_json, updated_at)
-                 VALUES (?, '{}', ?)`
-            )
-            .bind(STATE_KEY_CURSORS, nowIso),
-        legacyDb
-            .prepare(
-                `UPDATE legacy_migration_state
-                 SET payload_json = CASE
-                         WHEN json_type(payload_json, ?) IS NULL THEN json_set(payload_json, ?, json('{}'))
-                         ELSE payload_json
-                     END,
-                     updated_at = ?
-                 WHERE state_key = ?`
-            )
-            .bind(scopePath, scopePath, nowIso, STATE_KEY_CURSORS),
-        legacyDb
-            .prepare(
-                `UPDATE legacy_migration_state
-                 SET payload_json = json_set(payload_json, ?, json(?)),
-                     updated_at = ?
-                 WHERE state_key = ?`
-            )
-            .bind(tablePath, JSON.stringify(cursor), nowIso, STATE_KEY_CURSORS)
-    ]);
+    const stmt = buildSaveLegacyTableCursorStmt(legacyDb, scopeKey, tableName, cursor, nowIso);
+    if (stmt) await stmt.run();
 }
 
 async function clearLegacyCursors(
@@ -1845,23 +1843,25 @@ export async function handleLegacyMigrationAgentRoutes(
                 }
                 throw err;
             }
-
-            if (inserted > 0) {
-                await incrementLegacyCategoryStatAtomic(legacyDb, category, inserted, nowIso);
-            }
         } else {
             const probe = await legacyDb.prepare('SELECT 1 AS ok').all();
             legacyDbBytes = probe.meta?.size_after ?? 0;
         }
 
+        const postStateStmts: D1PreparedStatement[] = [];
+        if (categoryRaw && LEGACY_CATEGORY_SET.has(categoryRaw) && inserted > 0) {
+            const statStmt = buildIncrementLegacyCategoryStatStmt(legacyDb, categoryRaw as LegacyCategory, inserted, nowIso);
+            if (statStmt) postStateStmts.push(statStmt);
+        }
         if (parsedCursorUpdate) {
-            await saveLegacyTableCursorAtomic(
+            const cursorStmt = buildSaveLegacyTableCursorStmt(
                 legacyDb,
                 cursorScopeKey,
                 parsedCursorTable,
                 parsedCursorUpdate,
                 nowIso
             );
+            if (cursorStmt) postStateStmts.push(cursorStmt);
         }
 
         const batchExternalMysqlActive = isExternalMysqlActiveOnEnv(env);
@@ -1878,46 +1878,48 @@ export async function handleLegacyMigrationAgentRoutes(
               ? 'completed'
               : 'running';
 
-        // Atomically accumulate counters so concurrent worker uploads never clobber each other's progress
-        await legacyDb
-            .prepare(
-                `UPDATE legacy_migration_state
-                 SET payload_json = json_set(
-                         payload_json,
-                         '$.deviceId', ?,
-                         '$.updatedAt', ?,
-                         '$.currentCategory', CASE
-                             WHEN ? = 1 THEN ''
-                             WHEN ? != '' THEN ?
-                             ELSE COALESCE(json_extract(payload_json, '$.currentCategory'), '')
-                         END,
-                         '$.processedRows', COALESCE(CAST(json_extract(payload_json, '$.processedRows') AS INTEGER), 0) + ?,
-                         '$.insertedRows', COALESCE(CAST(json_extract(payload_json, '$.insertedRows') AS INTEGER), 0) + ?,
-                         '$.skippedRows', COALESCE(CAST(json_extract(payload_json, '$.skippedRows') AS INTEGER), 0) + ?,
-                         '$.status', CASE
-                             WHEN json_extract(payload_json, '$.status') IN ('queued', 'running') THEN ?
-                             ELSE json_extract(payload_json, '$.status')
-                         END
-                     ),
-                     updated_at = ?
-                 WHERE state_key = ?
-                   AND json_extract(payload_json, '$.jobId') = ?`
-            )
-            .bind(
-                auth.deviceId,
-                nowIso,
-                allDone ? 1 : 0,
-                categoryRaw,
-                categoryRaw,
-                rawItems.length,
-                inserted,
-                skipped,
-                nextStatus,
-                nowIso,
-                STATE_KEY_JOB,
-                jobId
-            )
-            .run();
+        // Fold imported_stats + cursor + job progress into ONE single D1 batch round-trip (<=3 rows written total)
+        postStateStmts.push(
+            legacyDb
+                .prepare(
+                    `UPDATE legacy_migration_state
+                     SET payload_json = json_set(
+                             payload_json,
+                             '$.deviceId', ?,
+                             '$.updatedAt', ?,
+                             '$.currentCategory', CASE
+                                 WHEN ? = 1 THEN ''
+                                 WHEN ? != '' THEN ?
+                                 ELSE COALESCE(json_extract(payload_json, '$.currentCategory'), '')
+                             END,
+                             '$.processedRows', COALESCE(CAST(json_extract(payload_json, '$.processedRows') AS INTEGER), 0) + ?,
+                             '$.insertedRows', COALESCE(CAST(json_extract(payload_json, '$.insertedRows') AS INTEGER), 0) + ?,
+                             '$.skippedRows', COALESCE(CAST(json_extract(payload_json, '$.skippedRows') AS INTEGER), 0) + ?,
+                             '$.status', CASE
+                                 WHEN json_extract(payload_json, '$.status') IN ('queued', 'running') THEN ?
+                                 ELSE json_extract(payload_json, '$.status')
+                             END
+                         ),
+                         updated_at = ?
+                     WHERE state_key = ?
+                       AND json_extract(payload_json, '$.jobId') = ?`
+                )
+                .bind(
+                    auth.deviceId,
+                    nowIso,
+                    allDone ? 1 : 0,
+                    categoryRaw,
+                    categoryRaw,
+                    rawItems.length,
+                    inserted,
+                    skipped,
+                    nextStatus,
+                    nowIso,
+                    STATE_KEY_JOB,
+                    jobId
+                )
+        );
+        await legacyDb.batch(postStateStmts);
 
         if (categoryDone || allDone || quotaReached) {
             const latestJob = await readLegacyState<LegacyMigrationJob>(legacyDb, STATE_KEY_JOB);

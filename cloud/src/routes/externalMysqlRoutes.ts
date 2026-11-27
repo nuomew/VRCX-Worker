@@ -9,6 +9,7 @@ import {
     getRawD1Env,
     loadExternalDbConfigAndMigration,
     MANAGED_ARCHIVE_TABLES,
+    MANAGED_ROLLUP_TABLES,
     measureExternalMysqlUsage,
     normalizeExternalDbConnectionType,
     normalizeExternalDbMode,
@@ -57,6 +58,7 @@ export interface D1PendingMigrationSummary {
     totalChunks: number;
     totalChunkRows: number;
     totalCacheRows: number;
+    totalRollupRows: number;
     totalLegacySingleRows: number;
     tables: Record<string, { chunks: number; rows: number }>;
 }
@@ -156,10 +158,27 @@ export async function measureD1PendingMigration(env: Env): Promise<D1PendingMigr
         })
     );
 
+    let totalRollupRows = 0;
+    await Promise.all(
+        MANAGED_ROLLUP_TABLES.map(async (rSpec) => {
+            const db = getRawShardDb(rawEnv, rSpec.shard);
+            if (!db) return;
+            try {
+                const r = await db.prepare(`SELECT COUNT(*) AS cnt FROM ${rSpec.table}`).first<{ cnt?: number }>();
+                const cnt = Math.max(0, Number(r?.cnt ?? 0) || 0);
+                tables[rSpec.physicalTable] = { chunks: cnt, rows: cnt };
+                totalRollupRows += cnt;
+            } catch {
+                tables[rSpec.physicalTable] = { chunks: 0, rows: 0 };
+            }
+        })
+    );
+
     return {
         totalChunks,
         totalChunkRows,
         totalCacheRows,
+        totalRollupRows,
         totalLegacySingleRows,
         tables
     };
@@ -171,6 +190,7 @@ export interface MysqlMigrationBatchReport {
     compactedSingleRows: number;
     movedChunks: number;
     movedRows: number;
+    movedRollupRows: number;
     movedCacheRows: number;
     remaining: D1PendingMigrationSummary;
     migration: ExternalDbMigrationState;
@@ -219,6 +239,7 @@ export async function runExternalMysqlMigrationBatch(
     let compactedSingleRows = 0;
     let movedChunks = 0;
     let movedRows = 0;
+    let movedRollupRows = 0;
     let movedCacheRows = 0;
 
     // Step 1: Compact any remaining legacy single-row history rows straight into MySQL via hybrid env
@@ -228,12 +249,12 @@ export async function runExternalMysqlMigrationBatch(
         const session = new ExternalMysqlSession(connParams, config.mode, false);
         const hybridEnv: Env = {
             ...rawEnv,
-            DB_CORE: createHybridMysqlD1Database(rawEnv.DB_CORE, session),
-            DB_GAMELOG: createHybridMysqlD1Database(rawEnv.DB_GAMELOG, session),
-            DB_FEED: createHybridMysqlD1Database(rawEnv.DB_FEED, session),
-            DB_CACHE: rawEnv.DB_CACHE ? createHybridMysqlD1Database(rawEnv.DB_CACHE, session) : undefined,
-            DB_LEGACY: rawEnv.DB_LEGACY ? createHybridMysqlD1Database(rawEnv.DB_LEGACY, session) : undefined,
-            DB_CHAT: rawEnv.DB_CHAT ? createHybridMysqlD1Database(rawEnv.DB_CHAT, session) : undefined
+            DB_CORE: createHybridMysqlD1Database(rawEnv.DB_CORE, session, 'core'),
+            DB_GAMELOG: createHybridMysqlD1Database(rawEnv.DB_GAMELOG, session, 'gamelog'),
+            DB_FEED: createHybridMysqlD1Database(rawEnv.DB_FEED, session, 'feed'),
+            DB_CACHE: rawEnv.DB_CACHE ? createHybridMysqlD1Database(rawEnv.DB_CACHE, session, 'cache') : undefined,
+            DB_LEGACY: rawEnv.DB_LEGACY ? createHybridMysqlD1Database(rawEnv.DB_LEGACY, session, 'legacy') : undefined,
+            DB_CHAT: rawEnv.DB_CHAT ? createHybridMysqlD1Database(rawEnv.DB_CHAT, session, 'chat') : undefined
         };
         attachRawD1Env(hybridEnv, rawEnv);
         try {
@@ -356,8 +377,203 @@ export async function runExternalMysqlMigrationBatch(
             }
         }
 
-        // Step 3: When all archive chunks are moved, migrate remaining unexpired `vrc_api_cache` & drain D1 cache
+        // Step 2.5: When archive chunks are moved, migrate all 4 D1 GameLog rollup tables into MySQL 5.7
+        // using additive merges so Compatibility-Mode deltas + historical D1 counts sum accurately.
         if (movedChunks === 0 && chunkBudget > 0) {
+            const maxRollupRows = 120;
+            let rollupBudget = maxRollupRows;
+            for (const rSpec of MANAGED_ROLLUP_TABLES) {
+                if (rollupBudget <= 0) break;
+                const d1 = getRawShardDb(rawEnv, rSpec.shard);
+                if (!d1) continue;
+                const qRollup = qualifyMysqlTableName(connParams.tablePrefix, rSpec.physicalTable);
+
+                if (rSpec.table === 'gamelog_world_rollup') {
+                    const res = await d1
+                        .prepare(
+                            `SELECT world_id, world_name, visit_count, total_time, last_visit
+                             FROM gamelog_world_rollup
+                             ORDER BY world_id ASC
+                             LIMIT ?`
+                        )
+                        .bind(rollupBudget)
+                        .all<{
+                            world_id: string;
+                            world_name: string;
+                            visit_count: number;
+                            total_time: number;
+                            last_visit: string;
+                        }>()
+                        .catch(() => ({ results: [] }));
+                    const rows = res.results ?? [];
+                    if (rows.length === 0) continue;
+                    state.phase = 'move_chunks';
+                    state.lastTable = rSpec.physicalTable;
+
+                    for (let i = 0; i < rows.length; i += 25) {
+                        const slice = rows.slice(i, i + 25);
+                        const ph = slice.map(() => '(?, ?, ?, ?, ?)').join(', ');
+                        const binds: unknown[] = [];
+                        for (const r of slice) {
+                            binds.push(
+                                String(r.world_id ?? '').slice(0, 191),
+                                String(r.world_name ?? ''),
+                                Math.max(0, Number(r.visit_count ?? 0) || 0),
+                                Math.max(0, Number(r.total_time ?? 0) || 0),
+                                String(r.last_visit ?? '')
+                            );
+                        }
+                        await conn.execute(
+                            `INSERT INTO \`${qRollup}\` (\`world_id\`, \`world_name\`, \`visit_count\`, \`total_time\`, \`last_visit\`)
+                             VALUES ${ph}
+                             ON DUPLICATE KEY UPDATE
+                                \`world_name\` = CASE
+                                    WHEN VALUES(\`world_name\`) != '' AND VALUES(\`last_visit\`) >= \`${qRollup}\`.\`last_visit\`
+                                        THEN VALUES(\`world_name\`)
+                                    WHEN \`${qRollup}\`.\`world_name\` = '' AND VALUES(\`world_name\`) != ''
+                                        THEN VALUES(\`world_name\`)
+                                    ELSE \`${qRollup}\`.\`world_name\`
+                                END,
+                                \`visit_count\` = \`${qRollup}\`.\`visit_count\` + VALUES(\`visit_count\`),
+                                \`total_time\` = \`${qRollup}\`.\`total_time\` + VALUES(\`total_time\`),
+                                \`last_visit\` = CASE
+                                    WHEN VALUES(\`last_visit\`) > \`${qRollup}\`.\`last_visit\`
+                                        THEN VALUES(\`last_visit\`)
+                                    ELSE \`${qRollup}\`.\`last_visit\`
+                                END`,
+                            binds
+                        );
+                    }
+                    const keys = rows.map((r) => String(r.world_id ?? '').slice(0, 191));
+                    const verifyPh = keys.map(() => '?').join(', ');
+                    const verifyRes = await conn.execute(
+                        `SELECT \`world_id\` FROM \`${qRollup}\` WHERE \`world_id\` IN (${verifyPh})`,
+                        keys
+                    );
+                    const verified = new Set(verifyRes.rows.map((r) => String(r.world_id ?? '')));
+                    const toDelete = rows.filter((r) => verified.has(String(r.world_id ?? '').slice(0, 191)));
+                    for (let i = 0; i < toDelete.length; i += 25) {
+                        const batch = toDelete.slice(i, i + 25);
+                        await d1.batch(
+                            batch.map((r) =>
+                                d1.prepare('DELETE FROM gamelog_world_rollup WHERE world_id = ?').bind(r.world_id)
+                            )
+                        );
+                    }
+                    movedRollupRows += toDelete.length;
+                    rollupBudget -= toDelete.length;
+                } else {
+                    const res = await d1
+                        .prepare(
+                            `SELECT user_id, display_name, join_count, time_spent, last_seen, second_last_seen
+                             FROM gamelog_user_rollup
+                             ORDER BY user_id ASC
+                             LIMIT ?`
+                        )
+                        .bind(rollupBudget)
+                        .all<{
+                            user_id: string;
+                            display_name: string;
+                            join_count: number;
+                            time_spent: number;
+                            last_seen: string;
+                            second_last_seen: string;
+                        }>()
+                        .catch(() => ({ results: [] }));
+                    const rows = res.results ?? [];
+                    if (rows.length === 0) continue;
+                    state.phase = 'move_chunks';
+                    state.lastTable = rSpec.physicalTable;
+
+                    const normKeys = rows.map((r) => String(r.user_id ?? '').slice(0, 191));
+                    const existingMap = new Map<
+                        string,
+                        { display_name: string; join_count: number; time_spent: number; last_seen: string; second_last_seen: string }
+                    >();
+                    for (let i = 0; i < normKeys.length; i += 50) {
+                        const sliceKeys = normKeys.slice(i, i + 50);
+                        const ph = sliceKeys.map(() => '?').join(', ');
+                        const exRes = await conn.execute(
+                            `SELECT \`user_id\`, \`display_name\`, \`join_count\`, \`time_spent\`, \`last_seen\`, \`second_last_seen\`
+                             FROM \`${qRollup}\`
+                             WHERE \`user_id\` IN (${ph})`,
+                            sliceKeys
+                        );
+                        for (const er of exRes.rows) {
+                            existingMap.set(String(er.user_id ?? ''), {
+                                display_name: String(er.display_name ?? ''),
+                                join_count: Number(er.join_count ?? 0) || 0,
+                                time_spent: Number(er.time_spent ?? 0) || 0,
+                                last_seen: String(er.last_seen ?? ''),
+                                second_last_seen: String(er.second_last_seen ?? '')
+                            });
+                        }
+                    }
+
+                    const mergedBatch: Array<[string, string, number, number, string, string]> = [];
+                    for (const r of rows) {
+                        const k = String(r.user_id ?? '').slice(0, 191);
+                        const prev = existingMap.get(k);
+                        const tsList = Array.from(
+                            new Set(
+                                [prev?.last_seen, prev?.second_last_seen, r.last_seen, r.second_last_seen]
+                                    .map((x) => String(x ?? '').trim())
+                                    .filter(Boolean)
+                            )
+                        ).sort((a, b) => (b < a ? -1 : b > a ? 1 : 0));
+                        const top1 = tsList[0] ?? '';
+                        const top2 = tsList[1] ?? '';
+                        const dName = String(r.display_name ?? '');
+                        const pName = prev?.display_name ?? '';
+                        const mergedName =
+                            dName && (!pName || String(r.last_seen ?? '') >= (prev?.last_seen ?? ''))
+                                ? dName
+                                : pName || dName;
+                        mergedBatch.push([
+                            k,
+                            mergedName,
+                            (prev?.join_count ?? 0) + Math.max(0, Number(r.join_count ?? 0) || 0),
+                            (prev?.time_spent ?? 0) + Math.max(0, Number(r.time_spent ?? 0) || 0),
+                            top1,
+                            top2
+                        ]);
+                    }
+
+                    for (let i = 0; i < mergedBatch.length; i += 25) {
+                        const slice = mergedBatch.slice(i, i + 25);
+                        const ph = slice.map(() => '(?, ?, ?, ?, ?, ?)').join(', ');
+                        const binds: unknown[] = [];
+                        for (const item of slice) binds.push(...item);
+                        await conn.execute(
+                            `REPLACE INTO \`${qRollup}\` (\`user_id\`, \`display_name\`, \`join_count\`, \`time_spent\`, \`last_seen\`, \`second_last_seen\`)
+                             VALUES ${ph}`,
+                            binds
+                        );
+                    }
+
+                    const verifyPh = normKeys.map(() => '?').join(', ');
+                    const verifyRes = await conn.execute(
+                        `SELECT \`user_id\` FROM \`${qRollup}\` WHERE \`user_id\` IN (${verifyPh})`,
+                        normKeys
+                    );
+                    const verified = new Set(verifyRes.rows.map((r) => String(r.user_id ?? '')));
+                    const toDelete = rows.filter((r) => verified.has(String(r.user_id ?? '').slice(0, 191)));
+                    for (let i = 0; i < toDelete.length; i += 25) {
+                        const batch = toDelete.slice(i, i + 25);
+                        await d1.batch(
+                            batch.map((r) =>
+                                d1.prepare('DELETE FROM gamelog_user_rollup WHERE user_id = ?').bind(r.user_id)
+                            )
+                        );
+                    }
+                    movedRollupRows += toDelete.length;
+                    rollupBudget -= toDelete.length;
+                }
+            }
+        }
+
+        // Step 3: When all archive chunks & rollups are moved, migrate remaining unexpired `vrc_api_cache` & drain D1 cache
+        if (movedChunks === 0 && movedRollupRows === 0 && chunkBudget > 0) {
             const cacheDb = getCacheDb(rawEnv);
             const nowMs = Date.now();
             // Purge already-expired rows from D1 cache first
@@ -433,13 +649,16 @@ export async function runExternalMysqlMigrationBatch(
     const remaining = await measureD1PendingMigration(rawEnv);
     const done =
         remaining.totalChunks === 0 &&
+        remaining.totalRollupRows === 0 &&
         remaining.totalCacheRows === 0 &&
-        (remaining.totalLegacySingleRows === 0 || (compactedSingleRows === 0 && movedChunks === 0 && movedCacheRows === 0));
+        (remaining.totalLegacySingleRows === 0 ||
+            (compactedSingleRows === 0 && movedChunks === 0 && movedRollupRows === 0 && movedCacheRows === 0));
 
     if (done) {
         state.status = 'completed';
         state.phase = 'done';
-        state.d1Drained = remaining.totalChunks === 0 && remaining.totalCacheRows === 0;
+        state.d1Drained =
+            remaining.totalChunks === 0 && remaining.totalRollupRows === 0 && remaining.totalCacheRows === 0;
         state.completedAt = new Date().toISOString();
     } else {
         state.status = 'running';
@@ -454,6 +673,7 @@ export async function runExternalMysqlMigrationBatch(
         compactedSingleRows,
         movedChunks,
         movedRows,
+        movedRollupRows,
         movedCacheRows,
         remaining,
         migration: state

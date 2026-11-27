@@ -28,12 +28,33 @@ export type ManagedArchiveTableName =
     | 'legacy_core_chunks'
     | 'chat_archive_chunks';
 
-export type ManagedMysqlTableName = ManagedArchiveTableName | 'vrc_api_cache';
+export type ManagedRollupTableName = 'gamelog_user_rollup' | 'gamelog_world_rollup';
+
+export type ManagedMysqlTableName = ManagedArchiveTableName | ManagedRollupTableName | 'vrc_api_cache';
+
+export type QualifiedMysqlPhysicalTableName =
+    | ManagedArchiveTableName
+    | 'vrc_api_cache'
+    | 'gamelog_user_rollup'
+    | 'gamelog_world_rollup'
+    | 'legacy_gamelog_user_rollup'
+    | 'legacy_gamelog_world_rollup';
 
 export interface ManagedArchiveTableSpec {
     table: ManagedArchiveTableName;
     shard: Exclude<ExternalDbShardKey, 'cache'>;
     kindColumn: 'core_kind' | 'gamelog_kind' | 'feed_kind' | null;
+}
+
+export interface ManagedRollupTableSpec {
+    table: ManagedRollupTableName;
+    physicalTable:
+        | 'gamelog_user_rollup'
+        | 'gamelog_world_rollup'
+        | 'legacy_gamelog_user_rollup'
+        | 'legacy_gamelog_world_rollup';
+    shard: 'gamelog' | 'legacy';
+    pkCol: 'user_id' | 'world_id';
 }
 
 export const MANAGED_ARCHIVE_TABLES: readonly ManagedArchiveTableSpec[] = [
@@ -46,8 +67,17 @@ export const MANAGED_ARCHIVE_TABLES: readonly ManagedArchiveTableSpec[] = [
     { table: 'chat_archive_chunks', shard: 'chat', kindColumn: null }
 ] as const;
 
+export const MANAGED_ROLLUP_TABLES: readonly ManagedRollupTableSpec[] = [
+    { table: 'gamelog_user_rollup', physicalTable: 'gamelog_user_rollup', shard: 'gamelog', pkCol: 'user_id' },
+    { table: 'gamelog_world_rollup', physicalTable: 'gamelog_world_rollup', shard: 'gamelog', pkCol: 'world_id' },
+    { table: 'gamelog_user_rollup', physicalTable: 'legacy_gamelog_user_rollup', shard: 'legacy', pkCol: 'user_id' },
+    { table: 'gamelog_world_rollup', physicalTable: 'legacy_gamelog_world_rollup', shard: 'legacy', pkCol: 'world_id' }
+] as const;
+
 export const MANAGED_MYSQL_TABLE_SET: ReadonlySet<string> = new Set<string>([
     ...MANAGED_ARCHIVE_TABLES.map((s) => s.table),
+    'gamelog_user_rollup',
+    'gamelog_world_rollup',
     'vrc_api_cache'
 ]);
 
@@ -368,9 +398,30 @@ export function normalizeExternalDbConnectionType(raw: unknown): ExternalDbConne
     return raw === 'hyperdrive' ? 'hyperdrive' : 'direct';
 }
 
-export function qualifyMysqlTableName(tablePrefix: string, baseTable: ManagedMysqlTableName): string {
+export function resolvePhysicalMysqlTable(
+    baseTable: ManagedMysqlTableName,
+    shard?: ExternalDbShardKey
+): QualifiedMysqlPhysicalTableName {
+    if (baseTable === 'gamelog_user_rollup') {
+        return shard === 'legacy' ? 'legacy_gamelog_user_rollup' : 'gamelog_user_rollup';
+    }
+    if (baseTable === 'gamelog_world_rollup') {
+        return shard === 'legacy' ? 'legacy_gamelog_world_rollup' : 'gamelog_world_rollup';
+    }
+    return baseTable;
+}
+
+export function qualifyMysqlTableName(
+    tablePrefix: string,
+    baseTable: ManagedMysqlTableName | QualifiedMysqlPhysicalTableName,
+    shard?: ExternalDbShardKey
+): string {
     const safePrefix = validateMysqlTablePrefix(tablePrefix).valid ? tablePrefix.trim() : 'vrcx_';
-    return `${safePrefix}${baseTable}`;
+    const physical =
+        baseTable === 'legacy_gamelog_user_rollup' || baseTable === 'legacy_gamelog_world_rollup'
+            ? baseTable
+            : resolvePhysicalMysqlTable(baseTable, shard);
+    return `${safePrefix}${physical}`;
 }
 
 export async function encryptMysqlPassword(env: Env, plaintext: string): Promise<string> {
@@ -649,6 +700,38 @@ export function buildMysql57SchemaStatements(tablePrefix: string): string[] {
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`
     );
 
+    // 4 GameLog rollup tables (active DB_GAMELOG + dedicated DB_LEGACY) so desktop/live imports write 0 rollup rows to D1.
+    // `user_id` uses utf8mb4_bin VARCHAR(191) (764 bytes < MySQL 5.7 767-byte COMPACT index limit, case-sensitive, Emoji-safe).
+    for (const rollupSpec of MANAGED_ROLLUP_TABLES) {
+        const rTbl = qualifyMysqlTableName(tablePrefix, rollupSpec.physicalTable);
+        if (rollupSpec.table === 'gamelog_user_rollup') {
+            stmts.push(
+                `CREATE TABLE IF NOT EXISTS \`${rTbl}\` (
+                    \`user_id\` VARCHAR(191) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+                    \`display_name\` VARCHAR(256) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL DEFAULT '',
+                    \`join_count\` INT NOT NULL DEFAULT 0,
+                    \`time_spent\` BIGINT NOT NULL DEFAULT 0,
+                    \`last_seen\` VARCHAR(40) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT '',
+                    \`second_last_seen\` VARCHAR(40) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT '',
+                    PRIMARY KEY (\`user_id\`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`
+            );
+        } else {
+            stmts.push(
+                `CREATE TABLE IF NOT EXISTS \`${rTbl}\` (
+                    \`world_id\` VARCHAR(191) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                    \`world_name\` VARCHAR(512) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL DEFAULT '',
+                    \`visit_count\` INT NOT NULL DEFAULT 0,
+                    \`total_time\` BIGINT NOT NULL DEFAULT 0,
+                    \`last_visit\` VARCHAR(40) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT '',
+                    PRIMARY KEY (\`world_id\`),
+                    KEY \`idx_visits\` (\`visit_count\`, \`total_time\`),
+                    KEY \`idx_time\` (\`total_time\`, \`visit_count\`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`
+            );
+        }
+    }
+
     return stmts;
 }
 
@@ -869,7 +952,8 @@ export async function measureExternalMysqlUsage(
 
         const qualifiedNames = [
             ...MANAGED_ARCHIVE_TABLES.map((s) => qualifyMysqlTableName(params.tablePrefix, s.table)),
-            qualifyMysqlTableName(params.tablePrefix, 'vrc_api_cache')
+            qualifyMysqlTableName(params.tablePrefix, 'vrc_api_cache'),
+            ...MANAGED_ROLLUP_TABLES.map((s) => qualifyMysqlTableName(params.tablePrefix, s.physicalTable))
         ];
         const placeholders = qualifiedNames.map(() => '?').join(', ');
         let usedBytes = 0;
@@ -916,6 +1000,17 @@ export async function measureExternalMysqlUsage(
             rows: cacheRows,
             bytes: sizeByQualified.get(cacheTbl) ?? 0
         };
+
+        for (const rSpec of MANAGED_ROLLUP_TABLES) {
+            const rTbl = qualifyMysqlTableName(params.tablePrefix, rSpec.physicalTable);
+            const rStat = await conn.execute(`SELECT COUNT(*) AS cnt FROM \`${rTbl}\``, []);
+            const rCnt = Math.max(0, Number(rStat.rows[0]?.cnt ?? 0) || 0);
+            tables[rSpec.physicalTable] = {
+                chunks: rCnt,
+                rows: rCnt,
+                bytes: sizeByQualified.get(rTbl) ?? 0
+            };
+        }
 
         return {
             connected: true,

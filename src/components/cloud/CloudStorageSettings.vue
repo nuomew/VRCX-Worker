@@ -1157,7 +1157,8 @@
         return (
             Number(p.totalChunks || 0) +
             Number(p.totalLegacySingleRows || 0) +
-            Number(p.totalCacheRows || 0)
+            Number(p.totalCacheRows || 0) +
+            Number(p.totalRollupRows || 0)
         );
     });
 

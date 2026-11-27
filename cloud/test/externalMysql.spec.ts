@@ -69,6 +69,9 @@ class FakeMysql57Server {
                 if (/^SELECT\s+[^*,\n]+,\s*\*\s+FROM\b/i.test(sql)) {
                     throw new Error(`MySQL 5.7 Syntax Error 1064: '*' must come first in SELECT list: ${sql}`);
                 }
+                if (/\bMAX\s*\(\s*0\s*,/i.test(sql)) {
+                    throw new Error(`MySQL 5.7 rejects 2-arg SQLite MAX(0, x); must use GREATEST(0, x): ${sql}`);
+                }
 
                 if (/^SELECT\s+VERSION\(\)/i.test(sql)) {
                     return { rows: [{ version: '5.7.44-log' }], affectedRows: 0, insertId: 0 };
@@ -100,43 +103,87 @@ class FakeMysql57Server {
                     return { rows: out, affectedRows: 0, insertId: 0 };
                 }
 
-                // INSERT [IGNORE] INTO `tbl` (cols...) VALUES (...) [ON DUPLICATE KEY UPDATE ...]
+                // INSERT [IGNORE] / REPLACE INTO `tbl` (cols...) VALUES (...)[, (...)] [ON DUPLICATE KEY UPDATE ...]
                 const insertMatch =
-                    /^INSERT\s+(IGNORE\s+)?INTO\s+`([^`]+)`\s*\(([^)]+)\)\s*VALUES\s*\(([^)]+)\)(?:\s+ON\s+DUPLICATE\s+KEY\s+UPDATE([\s\S]*))?$/i.exec(
+                    /^(INSERT\s+(?:IGNORE\s+)?|REPLACE\s+)INTO\s+`([^`]+)`\s*\(([^)]+)\)\s*VALUES\s*([\s\S]+?)(?:\s+ON\s+DUPLICATE\s+KEY\s+UPDATE([\s\S]*))?$/i.exec(
                         sql
                     );
                 if (insertMatch) {
-                    const isIgnore = Boolean(insertMatch[1]);
+                    const verbPrefix = insertMatch[1]!.trim().toUpperCase();
+                    const isReplace = verbPrefix.startsWith('REPLACE');
+                    const isIgnore = verbPrefix.includes('IGNORE');
                     const tblName = insertMatch[2]!;
                     const cols = insertMatch[3]!.split(',').map((c) => c.trim().replace(/^`|`$/g, ''));
-                    const isUpsert = Boolean(insertMatch[5]);
+                    const valuesSpec = insertMatch[4]!;
+                    const upsertClause = insertMatch[5] ?? '';
+                    const isUpsert = Boolean(upsertClause);
                     const tbl = self.tables.get(tblName);
                     if (!tbl) throw new Error(`Table '${tblName}' doesn't exist`);
-                    const row: Record<string, unknown> = {};
-                    cols.forEach((c, idx) => {
-                        row[c] = params[idx];
-                    });
 
+                    const tupleMatches = valuesSpec.match(/\([^)]+\)/g) ?? [];
+                    const rowCount = Math.max(1, tupleMatches.length);
                     const isCache = tblName.endsWith('vrc_api_cache');
-                    const uniqCol = isCache ? 'cache_key' : 'chunk_key';
-                    const existingIdx = tbl.rows.findIndex((r) => r[uniqCol] === row[uniqCol]);
-                    if (existingIdx >= 0) {
-                        if (isUpsert) {
-                            tbl.rows[existingIdx] = { ...tbl.rows[existingIdx], ...row };
-                            return { rows: [], affectedRows: 2, insertId: 0 };
+                    const isUserRollup = tblName.endsWith('gamelog_user_rollup');
+                    const isWorldRollup = tblName.endsWith('gamelog_world_rollup');
+                    const uniqCol = isCache
+                        ? 'cache_key'
+                        : isUserRollup
+                          ? 'user_id'
+                          : isWorldRollup
+                            ? 'world_id'
+                            : 'chunk_key';
+                    const hasAutoId = !isCache && !isUserRollup && !isWorldRollup;
+
+                    let totalAffected = 0;
+                    let lastInsertId = 0;
+                    for (let rIdx = 0; rIdx < rowCount; rIdx++) {
+                        const row: Record<string, unknown> = {};
+                        cols.forEach((c, cIdx) => {
+                            row[c] = params[rIdx * cols.length + cIdx];
+                        });
+                        const existingIdx = tbl.rows.findIndex((r) => r[uniqCol] === row[uniqCol]);
+                        if (existingIdx >= 0) {
+                            if (isReplace) {
+                                tbl.rows[existingIdx] = { ...row };
+                                totalAffected += 2;
+                                continue;
+                            }
+                            if (isUpsert) {
+                                const prev = tbl.rows[existingIdx]!;
+                                if (isWorldRollup) {
+                                    const prevLast = String(prev.last_visit ?? '');
+                                    const incLast = String(row.last_visit ?? '');
+                                    const incName = String(row.world_name ?? '');
+                                    const prevName = String(prev.world_name ?? '');
+                                    tbl.rows[existingIdx] = {
+                                        ...prev,
+                                        world_name:
+                                            incName && incLast >= prevLast
+                                                ? incName
+                                                : prevName || incName,
+                                        visit_count:
+                                            (Number(prev.visit_count ?? 0) || 0) + (Number(row.visit_count ?? 0) || 0),
+                                        total_time:
+                                            (Number(prev.total_time ?? 0) || 0) + (Number(row.total_time ?? 0) || 0),
+                                        last_visit: incLast > prevLast ? incLast : prevLast
+                                    };
+                                } else {
+                                    tbl.rows[existingIdx] = { ...prev, ...row };
+                                }
+                                totalAffected += 2;
+                                continue;
+                            }
+                            if (isIgnore) continue;
+                            throw new Error(`Duplicate entry for key '${uniqCol}'`);
                         }
-                        if (isIgnore) {
-                            return { rows: [], affectedRows: 0, insertId: 0 };
+                        if (hasAutoId) {
+                            lastInsertId = tbl.autoInc++;
+                            row.id = lastInsertId;
                         }
-                        throw new Error(`Duplicate entry for key '${uniqCol}'`);
+                        tbl.rows.push(row);
+                        totalAffected += 1;
                     }
-                    let insertId = 0;
-                    if (!isCache) {
-                        insertId = tbl.autoInc++;
-                        row.id = insertId;
-                    }
-                    tbl.rows.push(row);
-                    return { rows: [], affectedRows: 1, insertId };
+                    return { rows: [], affectedRows: totalAffected, insertId: lastInsertId };
                 }
 
                 // UPDATE `tbl` SET ... WHERE ...
@@ -147,14 +194,25 @@ class FakeMysql57Server {
                     const whereStr = updateMatch[3]!;
                     const tbl = self.tables.get(tblName);
                     if (!tbl) throw new Error(`Table '${tblName}' doesn't exist`);
-                    const setCols = setStr.split(',').map((part) => part.split('=')[0]!.trim().replace(/^`|`$/g, ''));
-                    const setParams = params.slice(0, setCols.length);
-                    const whereParams = params.slice(setCols.length);
+                    const setParts = splitTopLevelComma(setStr);
+                    const setAssigns = setParts.map((part) => {
+                        const eqIdx = part.indexOf('=');
+                        const col = part.slice(0, eqIdx).trim().replace(/^`|`$/g, '');
+                        const rhs = part.slice(eqIdx + 1).trim();
+                        const isGreatestDelta = /^GREATEST\s*\(\s*0\s*,/i.test(rhs);
+                        return { col, isGreatestDelta };
+                    });
+                    const setParams = params.slice(0, setAssigns.length);
+                    const whereParams = params.slice(setAssigns.length);
                     let changes = 0;
                     for (const row of tbl.rows) {
                         if (matchWhereClause(row, whereStr, whereParams)) {
-                            setCols.forEach((c, i) => {
-                                row[c] = setParams[i];
+                            setAssigns.forEach((a, i) => {
+                                if (a.isGreatestDelta) {
+                                    row[a.col] = Math.max(0, (Number(row[a.col] ?? 0) || 0) + (Number(setParams[i] ?? 0) || 0));
+                                } else {
+                                    row[a.col] = setParams[i];
+                                }
                             });
                             changes++;
                         }
@@ -475,13 +533,13 @@ describe('External MySQL 5.7+ Database Integration (Hybrid New-Writes Mode & Ful
         expect(validateMysqlTablePrefix('bad`prefix').valid).toBe(false);
         expect(validateMysqlTablePrefix('123invalid').valid).toBe(false);
 
-        // MySQL 5.7 DDL safety checks
+        // MySQL 5.7 DDL safety checks (7 archive chunks + 1 cache + 4 gamelog rollups = 12 tables)
         const ddls = buildMysql57SchemaStatements('vrcx_');
-        expect(ddls.length).toBe(8);
+        expect(ddls.length).toBe(12);
         for (const ddl of ddls) {
             expect(ddl).not.toMatch(/utf8mb4_0900_ai_ci/i);
             expect(ddl).toMatch(/ENGINE=InnoDB/i);
-            expect(ddl).toMatch(/CHARACTER SET ascii COLLATE ascii_bin/i);
+            expect(ddl).toMatch(/COLLATE (?:ascii_bin|utf8mb4_bin)/i);
         }
         for (const archiveDdl of ddls.slice(0, 7)) {
             expect(archiveDdl).toContain(`AUTO_INCREMENT=${MYSQL_CHUNK_AUTO_INCREMENT_START}`);
@@ -624,7 +682,7 @@ describe('External MySQL 5.7+ Database Integration (Hybrid New-Writes Mode & Ful
             };
             expect(testJson.ok).toBe(true);
             expect(testJson.data.mysqlVersion).toBe('5.7.44-log');
-            expect(testJson.data.tablesReady).toBe(8);
+            expect(testJson.data.tablesReady).toBe(12);
 
             // 2. Enable Mode 1: keep existing data in D1, route ALL new writes to MySQL 5.7
             const saveMode1Res = await exports.default.fetch('http://example.com/api/storage/mysql/config', {
@@ -1216,6 +1274,228 @@ describe('External MySQL 5.7+ Database Integration (Hybrid New-Writes Mode & Ful
                 env.DB_GAMELOG.prepare('DELETE FROM gamelog_archive_chunks')
             ]);
             await legacyDb.prepare('DELETE FROM legacy_gamelog_chunks').run().catch(() => {});
+        }
+    });
+
+    it('offloads gamelog_user_rollup & gamelog_world_rollup to MySQL 5.7 (zero D1 rollup writes), sums dual reads accurately, and migrates D1 rollups cleanly', async () => {
+        await ensureSchemaReady(env);
+        const fakeMysql = new FakeMysql57Server();
+        setMysqlConnectionFactoryForTests(async () => fakeMysql.createConnection());
+        const headers = { 'Content-Type': 'application/json', Origin: 'http://example.com' };
+
+        try {
+            // 1. Seed existing D1 rollup stats BEFORE enabling MySQL 5.7
+            await env.DB_GAMELOG.batch([
+                env.DB_GAMELOG.prepare(
+                    `INSERT OR REPLACE INTO gamelog_world_rollup (world_id, world_name, visit_count, total_time, last_visit)
+                     VALUES ('wrld_rollup_both', 'Old World Title', 3, 300, '2025-05-01T10:00:00.000Z')`
+                ),
+                env.DB_GAMELOG.prepare(
+                    `INSERT OR REPLACE INTO gamelog_user_rollup (user_id, display_name, join_count, time_spent, last_seen, second_last_seen)
+                     VALUES ('usr_rollup_both', 'OldPalName', 2, 200, '2025-05-01T10:00:00.000Z', '2025-04-20T10:00:00.000Z')`
+                )
+            ]);
+
+            // 2. Enable MySQL 5.7 Compatibility Mode
+            expect(
+                (
+                    await exports.default.fetch('http://example.com/api/storage/mysql/config', {
+                        method: 'PUT',
+                        headers,
+                        body: JSON.stringify({
+                            enabled: true,
+                            mode: 'new_writes_only',
+                            connectionType: 'direct',
+                            host: 'mysql57.example.com',
+                            port: 3306,
+                            database: 'vrcx_prod',
+                            username: 'vrcx_user',
+                            password: 'RollupTestPassword123',
+                            sslMode: 'disabled',
+                            tablePrefix: 'vrcx_'
+                        })
+                    })
+                ).status
+            ).toBe(200);
+
+            // 3. Ingest new Location + Join/Leave events while MySQL 5.7 is active
+            expect(
+                (
+                    await exports.default.fetch('http://example.com/api/gamelog', {
+                        method: 'POST',
+                        headers,
+                        body: JSON.stringify({
+                            items: [
+                                {
+                                    type: 'Location',
+                                    created_at: '2026-08-01T12:00:00.000Z',
+                                    location: 'wrld_rollup_both:99',
+                                    worldId: 'wrld_rollup_both',
+                                    worldName: 'New World Title',
+                                    time: 120,
+                                    groupName: ''
+                                },
+                                {
+                                    type: 'Location',
+                                    created_at: '2026-08-02T12:00:00.000Z',
+                                    location: 'wrld_rollup_mysql_only:1',
+                                    worldId: 'wrld_rollup_mysql_only',
+                                    worldName: 'MySQL Only World',
+                                    time: 500,
+                                    groupName: ''
+                                },
+                                {
+                                    type: 'OnPlayerJoined',
+                                    created_at: '2026-08-01T12:05:00.000Z',
+                                    location: 'wrld_rollup_both:99',
+                                    userId: 'usr_rollup_both',
+                                    displayName: 'NewPalName',
+                                    time: 120
+                                },
+                                {
+                                    type: 'OnPlayerJoined',
+                                    created_at: '2026-08-02T12:05:00.000Z',
+                                    location: 'wrld_rollup_mysql_only:1',
+                                    userId: 'usr_rollup_mysql_only',
+                                    displayName: 'MySQLOnlyPal',
+                                    time: 250
+                                }
+                            ]
+                        })
+                    })
+                ).status
+            ).toBe(200);
+
+            // Verify ZERO new rollup rows were written to native D1!
+            expect(
+                Number(
+                    (
+                        await env.DB_GAMELOG.prepare(
+                            "SELECT COUNT(*) AS cnt FROM gamelog_world_rollup WHERE world_id = 'wrld_rollup_mysql_only'"
+                        ).first<{ cnt: number }>()
+                    )?.cnt ?? -1
+                )
+            ).toBe(0);
+            expect(
+                Number(
+                    (
+                        await env.DB_GAMELOG.prepare(
+                            "SELECT COUNT(*) AS cnt FROM gamelog_user_rollup WHERE user_id = 'usr_rollup_mysql_only'"
+                        ).first<{ cnt: number }>()
+                    )?.cnt ?? -1
+                )
+            ).toBe(0);
+            // D1 original count for wrld_rollup_both MUST remain 3 (untouched), while MySQL has delta 1
+            const d1OrigWorld = await env.DB_GAMELOG.prepare(
+                "SELECT visit_count, total_time FROM gamelog_world_rollup WHERE world_id = 'wrld_rollup_both'"
+            ).first<{ visit_count: number; total_time: number }>();
+            expect(d1OrigWorld?.visit_count).toBe(3);
+            expect(d1OrigWorld?.total_time).toBe(300);
+
+            // 4. Compatibility Mode merged stats query MUST sum D1 (3/300) + MySQL (1/120) => 4 / 420
+            const worldStatsCompatRes = await exports.default.fetch(
+                'http://example.com/api/gamelog/stats?kind=world&worldId=wrld_rollup_both',
+                { headers }
+            );
+            expect(worldStatsCompatRes.status).toBe(200);
+            const worldStatsCompat = (await worldStatsCompatRes.json()) as {
+                data: { visitCount: number; timeSpent: number };
+            };
+            expect(worldStatsCompat.data.visitCount).toBe(4);
+            expect(worldStatsCompat.data.timeSpent).toBe(420);
+
+            const userStatsCompatRes = await exports.default.fetch(
+                'http://example.com/api/gamelog/stats?kind=user&userId=usr_rollup_both',
+                { headers }
+            );
+            expect(userStatsCompatRes.status).toBe(200);
+            const userStatsCompat = (await userStatsCompatRes.json()) as {
+                data: { joinCount: number; timeSpent: number; lastSeen: string };
+            };
+            expect(userStatsCompat.data.joinCount).toBe(3);
+            expect(userStatsCompat.data.timeSpent).toBe(320);
+            expect(userStatsCompat.data.lastSeen).toBe('2026-08-01T12:05:00.000Z');
+
+            // 5. Switch to MySQL Mode and run full migration -> D1 rollups merge additively into MySQL and drain to 0
+            expect(
+                (
+                    await exports.default.fetch('http://example.com/api/storage/mysql/config', {
+                        method: 'PUT',
+                        headers,
+                        body: JSON.stringify({ enabled: true, mode: 'full_migrate' })
+                    })
+                ).status
+            ).toBe(200);
+
+            let drained = false;
+            for (let i = 0; i < 10; i++) {
+                const migRes = await exports.default.fetch('http://example.com/api/storage/mysql/migrate', {
+                    method: 'POST',
+                    headers,
+                    body: JSON.stringify({ maxChunks: 4 })
+                });
+                expect(migRes.status).toBe(200);
+                const migJson = (await migRes.json()) as {
+                    data: { done: boolean; remaining: { totalRollupRows: number }; migration: { d1Drained: boolean } };
+                };
+                if (migJson.data.done) {
+                    drained = migJson.data.migration.d1Drained && migJson.data.remaining.totalRollupRows === 0;
+                    break;
+                }
+            }
+            expect(drained).toBe(true);
+
+            // Verify native D1 rollup tables are now completely drained (0 rows)
+            expect(
+                Number(
+                    (await env.DB_GAMELOG.prepare('SELECT COUNT(*) AS cnt FROM gamelog_world_rollup').first<{ cnt: number }>())
+                        ?.cnt ?? -1
+                )
+            ).toBe(0);
+            expect(
+                Number(
+                    (await env.DB_GAMELOG.prepare('SELECT COUNT(*) AS cnt FROM gamelog_user_rollup').first<{ cnt: number }>())
+                        ?.cnt ?? -1
+                )
+            ).toBe(0);
+
+            // Verify post-migration stats served 100% from MySQL 5.7 still equal 4/420 and 3/320 exactly!
+            const worldStatsAfterRes = await exports.default.fetch(
+                'http://example.com/api/gamelog/stats?kind=world&worldId=wrld_rollup_both',
+                { headers }
+            );
+            expect(worldStatsAfterRes.status).toBe(200);
+            const worldStatsAfter = (await worldStatsAfterRes.json()) as {
+                data: { visitCount: number; timeSpent: number };
+            };
+            expect(worldStatsAfter.data.visitCount).toBe(4);
+            expect(worldStatsAfter.data.timeSpent).toBe(420);
+
+            const userStatsAfterRes = await exports.default.fetch(
+                'http://example.com/api/gamelog/stats?kind=user&userId=usr_rollup_both',
+                { headers }
+            );
+            expect(userStatsAfterRes.status).toBe(200);
+            const userStatsAfter = (await userStatsAfterRes.json()) as {
+                data: { joinCount: number; timeSpent: number; lastSeen: string };
+            };
+            expect(userStatsAfter.data.joinCount).toBe(3);
+            expect(userStatsAfter.data.timeSpent).toBe(320);
+            expect(userStatsAfter.data.lastSeen).toBe('2026-08-01T12:05:00.000Z');
+            expect(fakeMysql.activeConnections).toBe(0);
+        } finally {
+            setMysqlConnectionFactoryForTests(null);
+            await saveExternalDbConfig(env, defaultExternalDbConfig());
+            await saveExternalDbMigrationState(env, defaultExternalDbMigrationState());
+            await env.DB_GAMELOG.batch([
+                env.DB_GAMELOG.prepare(
+                    "DELETE FROM gamelog_world_rollup WHERE world_id IN ('wrld_rollup_both', 'wrld_rollup_mysql_only')"
+                ),
+                env.DB_GAMELOG.prepare(
+                    "DELETE FROM gamelog_user_rollup WHERE user_id IN ('usr_rollup_both', 'usr_rollup_mysql_only')"
+                ),
+                env.DB_GAMELOG.prepare('DELETE FROM gamelog_archive_chunks')
+            ]);
         }
     });
 });
