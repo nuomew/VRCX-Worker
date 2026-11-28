@@ -353,11 +353,17 @@ function castMysqlCol(col: string, alias: string): string {
     return `CAST(\`${col}\` AS CHAR CHARACTER SET utf8mb4) AS ${alias}`;
 }
 
+type BootstrapBusinessGroup = 'all' | 'memos' | 'favorites' | 'profiles';
+
 /**
- * Builds a single MySQL 5.7-compatible UNION ALL query covering all 12 active (and optionally 11 legacy)
- * bootstrap business tables in 1 round-trip instead of 23+ serial queries.
+ * Builds a single MySQL 5.7-compatible UNION ALL query covering the requested bootstrap table group
+ * (active + optional legacy) in 1 round-trip instead of serial per-table queries.
  */
-function buildBootstrapMysqlUnionSql(tablePrefix: string, includeLegacy: boolean): string {
+function buildBootstrapMysqlUnionSql(
+    tablePrefix: string,
+    includeLegacy: boolean,
+    scope: BootstrapBusinessGroup | 'stats' = 'all'
+): string {
     const branches: string[] = [];
     const pushBranch = (
         slot: string,
@@ -374,22 +380,32 @@ function buildBootstrapMysqlUnionSql(tablePrefix: string, includeLegacy: boolean
     };
 
     const addTableFamily = (prefix: 'a' | 'l', tblPrefix: '' | 'legacy_') => {
-        pushBranch(`${prefix}_memos`, `${tblPrefix}memos`, ['user_id', 'edited_at', 'memo', null, null]);
-        pushBranch(`${prefix}_world_memos`, `${tblPrefix}world_memos`, ['world_id', 'edited_at', 'memo', null, null]);
-        pushBranch(`${prefix}_avatar_memos`, `${tblPrefix}avatar_memos`, ['avatar_id', 'edited_at', 'memo', null, null]);
-        pushBranch(`${prefix}_notes`, `${tblPrefix}notes`, ['user_id', 'display_name', 'note', 'created_at', null]);
-        pushBranch(`${prefix}_fav_friend`, `${tblPrefix}favorite_friend`, ['id', 'created_at', 'user_id', 'group_name', null]);
-        pushBranch(`${prefix}_fav_world`, `${tblPrefix}favorite_world`, ['id', 'created_at', 'world_id', 'group_name', null]);
-        pushBranch(`${prefix}_fav_avatar`, `${tblPrefix}favorite_avatar`, ['id', 'created_at', 'avatar_id', 'group_name', null]);
-        pushBranch(`${prefix}_fav_print`, `${tblPrefix}favorite_print`, ['id', 'print_id', 'created_at', null, null]);
-        pushBranch(`${prefix}_avatar_tags`, `${tblPrefix}avatar_tags`, ['avatar_id', 'tag', 'color', null, null]);
-        pushBranch(`${prefix}_moderation`, `${tblPrefix}moderation`, ['user_id', 'updated_at', 'display_name', 'block', 'mute']);
-        pushBranch(`${prefix}_user_profile`, `${tblPrefix}user_profile`, ['user_id', 'bio', 'bio_links', 'updated_at', null]);
+        if (scope === 'all' || scope === 'memos') {
+            pushBranch(`${prefix}_memos`, `${tblPrefix}memos`, ['user_id', 'edited_at', 'memo', null, null]);
+            pushBranch(`${prefix}_world_memos`, `${tblPrefix}world_memos`, ['world_id', 'edited_at', 'memo', null, null]);
+            pushBranch(`${prefix}_avatar_memos`, `${tblPrefix}avatar_memos`, ['avatar_id', 'edited_at', 'memo', null, null]);
+            pushBranch(`${prefix}_notes`, `${tblPrefix}notes`, ['user_id', 'display_name', 'note', 'created_at', null]);
+        }
+        if (scope === 'all' || scope === 'favorites') {
+            pushBranch(`${prefix}_fav_friend`, `${tblPrefix}favorite_friend`, ['id', 'created_at', 'user_id', 'group_name', null]);
+            pushBranch(`${prefix}_fav_world`, `${tblPrefix}favorite_world`, ['id', 'created_at', 'world_id', 'group_name', null]);
+            pushBranch(`${prefix}_fav_avatar`, `${tblPrefix}favorite_avatar`, ['id', 'created_at', 'avatar_id', 'group_name', null]);
+            pushBranch(`${prefix}_fav_print`, `${tblPrefix}favorite_print`, ['id', 'print_id', 'created_at', null, null]);
+            pushBranch(`${prefix}_avatar_tags`, `${tblPrefix}avatar_tags`, ['avatar_id', 'tag', 'color', null, null]);
+        }
+        if (scope === 'all' || scope === 'profiles') {
+            pushBranch(`${prefix}_moderation`, `${tblPrefix}moderation`, ['user_id', 'updated_at', 'display_name', 'block', 'mute']);
+            pushBranch(`${prefix}_user_profile`, `${tblPrefix}user_profile`, ['user_id', 'bio', 'bio_links', 'updated_at', null]);
+        }
     };
 
-    addTableFamily('a', '');
-    pushBranch('a_stats_counters', 'stats_counters', ['counter_key', 'row_count', 'updated_at', null, null]);
-    if (includeLegacy) {
+    if (scope !== 'stats') {
+        addTableFamily('a', '');
+    }
+    if (scope === 'all' || scope === 'stats') {
+        pushBranch('a_stats_counters', 'stats_counters', ['counter_key', 'row_count', 'updated_at', null, null]);
+    }
+    if (includeLegacy && scope !== 'stats') {
         addTableFamily('l', 'legacy_');
     }
     return branches.join(' UNION ALL ');
@@ -589,34 +605,148 @@ async function runBootstrapD1BatchSafe(
     }
 }
 
-const BOOTSTRAP_CORE_BUSINESS_SQLS = [
+const BOOTSTRAP_MEMOS_SQLS = [
     'SELECT user_id, edited_at, memo FROM memos',
     'SELECT world_id, edited_at, memo FROM world_memos',
     'SELECT avatar_id, edited_at, memo FROM avatar_memos',
-    'SELECT user_id, display_name, note, created_at FROM notes',
+    'SELECT user_id, display_name, note, created_at FROM notes'
+] as const;
+
+const BOOTSTRAP_FAVORITES_ACTIVE_SQLS = [
     'SELECT id, created_at, user_id, group_name FROM favorite_friend',
     'SELECT id, created_at, world_id, group_name FROM favorite_world',
     'SELECT id, created_at, avatar_id, group_name FROM favorite_avatar',
     'SELECT id, print_id, created_at FROM favorite_print',
-    'SELECT avatar_id, tag, color FROM avatar_tags',
-    'SELECT user_id, updated_at, display_name, block, mute FROM moderation',
-    'SELECT user_id, bio, bio_links, updated_at FROM user_profile',
-    'SELECT counter_key, row_count, updated_at FROM stats_counters'
+    'SELECT avatar_id, tag, color FROM avatar_tags'
 ] as const;
 
-const BOOTSTRAP_LEGACY_BUSINESS_SQLS = [
-    'SELECT user_id, edited_at, memo FROM memos',
-    'SELECT world_id, edited_at, memo FROM world_memos',
-    'SELECT avatar_id, edited_at, memo FROM avatar_memos',
-    'SELECT user_id, display_name, note, created_at FROM notes',
+const BOOTSTRAP_FAVORITES_LEGACY_SQLS = [
     'SELECT -id AS id, created_at, user_id, group_name FROM favorite_friend',
     'SELECT -id AS id, created_at, world_id, group_name FROM favorite_world',
     'SELECT -id AS id, created_at, avatar_id, group_name FROM favorite_avatar',
     'SELECT -id AS id, print_id, created_at FROM favorite_print',
-    'SELECT avatar_id, tag, color FROM avatar_tags',
+    'SELECT avatar_id, tag, color FROM avatar_tags'
+] as const;
+
+const BOOTSTRAP_PROFILES_SQLS = [
     'SELECT user_id, updated_at, display_name, block, mute FROM moderation',
     'SELECT user_id, bio, bio_links, updated_at FROM user_profile'
 ] as const;
+
+const BOOTSTRAP_CORE_BUSINESS_SQLS = [
+    ...BOOTSTRAP_MEMOS_SQLS,
+    ...BOOTSTRAP_FAVORITES_ACTIVE_SQLS,
+    ...BOOTSTRAP_PROFILES_SQLS,
+    'SELECT counter_key, row_count, updated_at FROM stats_counters'
+] as const;
+
+const BOOTSTRAP_LEGACY_BUSINESS_SQLS = [
+    ...BOOTSTRAP_MEMOS_SQLS,
+    ...BOOTSTRAP_FAVORITES_LEGACY_SQLS,
+    ...BOOTSTRAP_PROFILES_SQLS
+] as const;
+
+const BOOTSTRAP_LEGACY_CONFIGS_PAGE_ROWS = 60;
+const BOOTSTRAP_LEGACY_CONFIGS_PAGE_BYTES = 160_000;
+
+function mapGroupBusinessSlices(
+    group: Exclude<BootstrapBusinessGroup, 'all'>,
+    slices: Array<Array<Record<string, unknown>>>
+): BootstrapBusinessTables {
+    const out = emptyBootstrapBusinessTables();
+    if (group === 'memos') {
+        out.memos = slices[0] ?? [];
+        out.worldMemos = slices[1] ?? [];
+        out.avatarMemos = slices[2] ?? [];
+        out.notes = slices[3] ?? [];
+    } else if (group === 'favorites') {
+        out.favoriteFriends = slices[0] ?? [];
+        out.favoriteWorlds = slices[1] ?? [];
+        out.favoriteAvatars = slices[2] ?? [];
+        out.favoritePrints = slices[3] ?? [];
+        out.avatarTags = slices[4] ?? [];
+    } else {
+        out.moderations = slices[0] ?? [];
+        out.userProfiles = slices[1] ?? [];
+    }
+    return out;
+}
+
+/**
+ * Loads a single focused bootstrap business table group (`memos` | `favorites` | `profiles`)
+ * so each HTTP request stays far below Cloudflare Workers Free's 10ms CPU ceiling.
+ */
+async function loadBootstrapBusinessGroupPart(
+    env: Env,
+    rawEnv: Env,
+    mysqlSession: ReturnType<typeof getHybridMysqlSession>,
+    group: Exclude<BootstrapBusinessGroup, 'all'>
+): Promise<{ business: BootstrapBusinessTables; degradedReason: StorageDegradedReason | null }> {
+    const activeSqls =
+        group === 'memos'
+            ? BOOTSTRAP_MEMOS_SQLS
+            : group === 'favorites'
+              ? BOOTSTRAP_FAVORITES_ACTIVE_SQLS
+              : BOOTSTRAP_PROFILES_SQLS;
+    const legacySqls =
+        group === 'memos'
+            ? BOOTSTRAP_MEMOS_SQLS
+            : group === 'favorites'
+              ? BOOTSTRAP_FAVORITES_LEGACY_SQLS
+              : BOOTSTRAP_PROFILES_SQLS;
+
+    let degradedReason: StorageDegradedReason | null = null;
+    if (mysqlSession) {
+        const rawLegacyDb = getLegacyDb(rawEnv);
+        const readD1 = !(mysqlSession.mode === 'full_migrate' && mysqlSession.d1Drained);
+        const unionSql = buildBootstrapMysqlUnionSql(mysqlSession.params.tablePrefix, Boolean(rawLegacyDb), group);
+        const [d1ActiveSlices, d1LegacySlices, mysqlRes] = await Promise.all([
+            readD1 ? runBootstrapD1BatchSafe(rawEnv.DB_CORE, activeSqls) : Promise.resolve([]),
+            readD1 && rawLegacyDb ? runBootstrapD1BatchSafe(rawLegacyDb, legacySqls) : Promise.resolve([]),
+            mysqlSession.query(unionSql, []).catch((err) => {
+                const reason: StorageDegradedReason =
+                    classifyStorageWriteDegradation(err) ?? 'external_db_unavailable';
+                mysqlSession.markDegraded(reason);
+                degradedReason = mergeStorageDegradedReason(degradedReason, reason);
+                return { rows: [] as Array<Record<string, unknown>>, affectedRows: 0, insertId: 0 };
+            })
+        ]);
+        const unpacked = unpackBootstrapMysqlRows(mysqlRes.rows);
+        const mergedActive = readD1
+            ? mergeBootstrapTableSets(unpacked.active, mapGroupBusinessSlices(group, d1ActiveSlices))
+            : unpacked.active;
+        const mergedLegacy =
+            readD1 && rawLegacyDb
+                ? mergeBootstrapTableSets(unpacked.legacy, mapGroupBusinessSlices(group, d1LegacySlices))
+                : unpacked.legacy;
+        return {
+            business: mergeBootstrapTableSets(mergedActive, mergedLegacy),
+            degradedReason
+        };
+    }
+
+    const legacyDb = getLegacyDb(env);
+    const [activeSlices, legacyStats] = await Promise.all([
+        runBootstrapD1BatchSafe(env.DB_CORE, activeSqls),
+        legacyDb ? getLegacyImportedStats(env) : Promise.resolve(null)
+    ]);
+    const activeTables = mapGroupBusinessSlices(group, activeSlices);
+    const hasLegacyForGroup = Boolean(
+        legacyDb &&
+            legacyStats &&
+            ((group === 'memos' && legacyStats.memos_notes > 0) ||
+                (group === 'favorites' && legacyStats.favorites > 0) ||
+                (group === 'profiles' && legacyStats.moderation_profiles > 0))
+    );
+    if (!hasLegacyForGroup || !legacyDb) {
+        return { business: activeTables, degradedReason: null };
+    }
+    const legacySlices = await runBootstrapD1BatchSafe(legacyDb, legacySqls);
+    return {
+        business: mergeBootstrapTableSets(activeTables, mapGroupBusinessSlices(group, legacySlices)),
+        degradedReason: null
+    };
+}
 
 function mapBusinessSlices(slices: Array<Array<Record<string, unknown>>>, offset = 0): BootstrapBusinessTables {
     return {
@@ -724,13 +854,331 @@ export async function getCloudSyncIntervalSeconds(env: Env): Promise<number> {
 }
 
 export async function handleCoreDataRoutes(request: Request, env: Env, url: URL): Promise<Response | null> {
-    // 1. Single-request bootstrap: replaces ~400 startup SQLite queries on Web mode.
-    // When external MySQL is active, consolidates all 23 active + legacy business tables into 1 MySQL
-    // UNION ALL RTT + parallel native D1 batches so Cloudflare Workers Free stays well below 10ms CPU.
+    // 1. Bootstrap hydration: supports chunked `?part=` sub-requests (each well under Workers Free 10ms CPU)
+    // as well as full single-request mode (no `part` param) for backward compatibility.
     if (url.pathname === '/api/bootstrap' && request.method === 'GET') {
-        const hub = env.AGENT_HUB.get(env.AGENT_HUB.idFromName('primary'));
+        const part = (url.searchParams.get('part') ?? '').trim().toLowerCase();
         const mysqlSession = getHybridMysqlSession(env.DB_CORE);
         const rawEnv = getRawD1Env(env);
+
+        // Chunked Part A: pure D1 + AgentHubDO core metadata (0 MySQL RTT, no large storage/legacy_configs)
+        if (part === 'core') {
+            const hub = env.AGENT_HUB.get(env.AGENT_HUB.idFromName('primary'));
+            const rawLegacyDb = getLegacyDb(rawEnv);
+            const nowIso = new Date().toISOString();
+            const nowMs = Date.parse(nowIso);
+            let degradedReason: StorageDegradedReason | null = null;
+
+            const [coreSlices, fetchedHubRes, extStorageCfg] = await Promise.all([
+                runBootstrapD1BatchSafe(rawEnv.DB_CORE, [
+                    "SELECT payload_json FROM config_bundles WHERE bundle_key = 'vrcx_config' LIMIT 1",
+                    'SELECT device_id, device_name, last_seen_at FROM cloud_devices',
+                    'SELECT device_id, state_json, updated_at FROM cloud_device_states'
+                ]),
+                hub
+                    .fetch(new Request('https://agent-hub.internal/status'))
+                    .then((r) => r.json() as Promise<{ data?: unknown }>),
+                loadExternalStorageConfig(rawEnv)
+            ]);
+
+            const cfgRow = (coreSlices[0]?.[0] ?? null) as { payload_json?: string } | null;
+            const vrcxConfigs = safeJsonParse<Record<string, string>>(cfgRow?.payload_json, {});
+            sanitizeConfigBundleMap(vrcxConfigs);
+
+            const syncIntervalSeconds = parseCloudSyncIntervalSeconds(vrcxConfigs['cloud:syncIntervalSeconds']);
+            const webSyncIntervalSeconds = parseWebSyncIntervalSeconds(vrcxConfigs['cloud:webSyncIntervalSeconds']);
+            try {
+                await markWebClientActive(rawEnv, nowIso, false);
+            } catch (err) {
+                const reason = classifyStorageWriteDegradation(err);
+                if (reason) degradedReason = mergeStorageDegradedReason(degradedReason, reason);
+            }
+
+            const rawHub = (fetchedHubRes?.data ?? {
+                agentsOnline: [],
+                webClientsCount: 0,
+                deviceStates: {}
+            }) as {
+                agentsOnline?: string[];
+                webClientsCount?: number;
+                deviceStates?: Record<string, { state: Record<string, unknown>; updatedAt: string }>;
+            };
+            const wsAgentsOnline = Array.isArray(rawHub.agentsOnline) ? rawHub.agentsOnline : [];
+            const deviceRows = (coreSlices[1] ?? []) as Array<{
+                device_id: string;
+                device_name: string;
+                last_seen_at: string;
+            }>;
+            const { httpAgentsOnline, deviceLastSeen } = resolveRecentHttpAgents(
+                deviceRows,
+                nowMs,
+                getAgentOnlineWindowMs(syncIntervalSeconds)
+            );
+            const mergedAgentsOnline = Array.from(new Set([...wsAgentsOnline, ...httpAgentsOnline]));
+            const persistedStateRows = (coreSlices[2] ?? []) as Array<{
+                device_id: string;
+                state_json: string;
+                updated_at: string;
+            }>;
+            const mergedDeviceStates: Record<string, { state: Record<string, unknown>; updatedAt: string }> = {
+                ...(rawHub.deviceStates ?? {})
+            };
+            for (const row of persistedStateRows) {
+                if (!row.device_id) continue;
+                const parsedState = safeJsonParse<Record<string, unknown>>(row.state_json, {});
+                const prev = mergedDeviceStates[row.device_id];
+                const prevTs = prev?.updatedAt ? Date.parse(prev.updatedAt) : 0;
+                const rowTs = row.updated_at ? Date.parse(row.updated_at) : 0;
+                if (!prev || !Number.isFinite(prevTs) || rowTs >= prevTs) {
+                    mergedDeviceStates[row.device_id] = {
+                        state: parsedState,
+                        updatedAt: row.updated_at || nowIso
+                    };
+                }
+            }
+            const b2Enabled = Boolean(
+                extStorageCfg.enabled &&
+                    extStorageCfg.endpoint &&
+                    extStorageCfg.bucket &&
+                    extStorageCfg.accessKeyId &&
+                    extStorageCfg.secretAccessKeyEnc
+            );
+            const nextParts: string[] = rawLegacyDb
+                ? ['storage', 'legacy_configs', 'presence', 'memos', 'favorites', 'profiles']
+                : ['storage', 'presence', 'memos', 'favorites', 'profiles'];
+
+            return withStorageDegradedHeader(
+                Response.json({
+                    ok: true,
+                    data: {
+                        part: 'core',
+                        nextParts,
+                        configs: vrcxConfigs,
+                        syncIntervalSeconds,
+                        webSyncIntervalSeconds,
+                        agentStatus: {
+                            ...rawHub,
+                            agentsOnline: mergedAgentsOnline,
+                            wsAgentsOnline,
+                            deviceLastSeen,
+                            deviceStates: mergedDeviceStates
+                        },
+                        r2Enabled: Boolean(env.R2_MEDIA),
+                        b2Enabled,
+                        ...(degradedReason ? { degraded: degradedReason } : {})
+                    }
+                }),
+                degradedReason
+            );
+        }
+
+        // Chunked Part B: VRCXStorage bundle isolated in its own 10ms budget (0 MySQL RTT)
+        if (part === 'storage') {
+            const row = await rawEnv.DB_CORE.prepare(
+                "SELECT payload_json FROM config_bundles WHERE bundle_key = 'vrcx_storage' LIMIT 1"
+            ).first<{ payload_json?: string }>();
+            const storage = safeJsonParse<Record<string, string>>(row?.payload_json, {});
+            return Response.json({
+                ok: true,
+                data: {
+                    part: 'storage',
+                    storage
+                }
+            });
+        }
+
+        // Chunked Part C: byte-budgeted cursor pagination over migrated desktop `legacy_configs` (0 MySQL RTT)
+        if (part === 'legacy_configs') {
+            const rawLegacyDb = getLegacyDb(rawEnv);
+            if (!rawLegacyDb) {
+                return Response.json({
+                    ok: true,
+                    data: { part: 'legacy_configs', legacyConfigs: {}, nextCursor: null, hasMore: false }
+                });
+            }
+            const cursor = url.searchParams.get('cursor') ?? '';
+            const rows = await (cursor
+                ? rawLegacyDb
+                      .prepare(
+                          'SELECT config_key, config_value FROM legacy_configs WHERE config_key > ? ORDER BY config_key ASC LIMIT ?'
+                      )
+                      .bind(cursor, BOOTSTRAP_LEGACY_CONFIGS_PAGE_ROWS)
+                : rawLegacyDb
+                      .prepare('SELECT config_key, config_value FROM legacy_configs ORDER BY config_key ASC LIMIT ?')
+                      .bind(BOOTSTRAP_LEGACY_CONFIGS_PAGE_ROWS)
+            )
+                .all<{ config_key?: string; config_value?: string }>()
+                .then((r) => r.results ?? [])
+                .catch(() => [] as Array<{ config_key?: string; config_value?: string }>);
+
+            const legacyConfigs: Record<string, string> = {};
+            let usedBytes = 0;
+            let includedCount = 0;
+            let lastProcessedKey = cursor;
+            let stoppedEarly = false;
+
+            for (const r of rows) {
+                const k = typeof r.config_key === 'string' ? r.config_key : '';
+                if (!k) continue;
+                const v = typeof r.config_value === 'string' ? r.config_value : '';
+                if (!isSafeLegacyConfigKey(k)) {
+                    lastProcessedKey = k;
+                    continue;
+                }
+                const entryBytes = k.length + v.length;
+                if (includedCount > 0 && usedBytes + entryBytes > BOOTSTRAP_LEGACY_CONFIGS_PAGE_BYTES) {
+                    stoppedEarly = true;
+                    break;
+                }
+                legacyConfigs[k] = v;
+                usedBytes += entryBytes;
+                includedCount++;
+                lastProcessedKey = k;
+            }
+
+            const hasMore = stoppedEarly || rows.length >= BOOTSTRAP_LEGACY_CONFIGS_PAGE_ROWS;
+            const nextCursor = hasMore && lastProcessedKey && lastProcessedKey !== cursor ? lastProcessedKey : null;
+            return Response.json({
+                ok: true,
+                data: {
+                    part: 'legacy_configs',
+                    legacyConfigs,
+                    nextCursor,
+                    hasMore: Boolean(nextCursor)
+                }
+            });
+        }
+
+        // Chunked Part D: stats_counters + uptime accrual + friendPresenceTimes (also warms MySQL schema cache)
+        if (part === 'presence') {
+            const syncIntervalSeconds = parseCloudSyncIntervalSeconds(url.searchParams.get('syncInterval'));
+            const nowIso = new Date().toISOString();
+            let degradedReason: StorageDegradedReason | null = null;
+            let mysqlFailed = false;
+            let statsCounterMap = new Map<string, StatsCounterBootstrapRow>();
+            let snapshotRow: { payload_json?: string } | null = null;
+
+            if (mysqlSession) {
+                const readD1 = !(mysqlSession.mode === 'full_migrate' && mysqlSession.d1Drained);
+                const d1Sqls: string[] = [
+                    "SELECT payload_json FROM cloud_bg_sync_state WHERE state_key = 'friends_snapshot' LIMIT 1",
+                    ...(readD1 ? ['SELECT counter_key, row_count, updated_at FROM stats_counters'] : [])
+                ];
+                const statsUnionSql = buildBootstrapMysqlUnionSql(mysqlSession.params.tablePrefix, false, 'stats');
+                const [d1Slices, mysqlRes] = await Promise.all([
+                    runBootstrapD1BatchSafe(rawEnv.DB_CORE, d1Sqls),
+                    mysqlSession.query(statsUnionSql, []).catch((err) => {
+                        mysqlFailed = true;
+                        const reason: StorageDegradedReason =
+                            classifyStorageWriteDegradation(err) ?? 'external_db_unavailable';
+                        mysqlSession.markDegraded(reason);
+                        degradedReason = mergeStorageDegradedReason(degradedReason, reason);
+                        return { rows: [] as Array<Record<string, unknown>>, affectedRows: 0, insertId: 0 };
+                    })
+                ]);
+                snapshotRow = (d1Slices[0]?.[0] ?? null) as { payload_json?: string } | null;
+                const unpacked = unpackBootstrapMysqlRows(mysqlRes.rows);
+                const d1StatsRows = readD1
+                    ? ((d1Slices[1] ?? []) as unknown as StatsCounterBootstrapRow[])
+                    : [];
+                statsCounterMap = mergeBootstrapStatsCounters(unpacked.statsCounters, d1StatsRows);
+            } else {
+                const d1Slices = await runBootstrapD1BatchSafe(env.DB_CORE, [
+                    "SELECT payload_json FROM cloud_bg_sync_state WHERE state_key = 'friends_snapshot' LIMIT 1",
+                    'SELECT counter_key, row_count, updated_at FROM stats_counters'
+                ]);
+                snapshotRow = (d1Slices[0]?.[0] ?? null) as { payload_json?: string } | null;
+                statsCounterMap = mergeBootstrapStatsCounters(
+                    [],
+                    (d1Slices[1] ?? []) as unknown as StatsCounterBootstrapRow[]
+                );
+            }
+
+            const counters: Record<string, number> = {};
+            for (const [key, row] of statsCounterMap.entries()) {
+                counters[key] = row.row_count;
+            }
+            const preloadedUptimeRow = statsCounterMap.get(CLOUD_TOTAL_UPTIME_COUNTER_KEY) ?? null;
+            let totalUptimeSeconds = Number(counters[CLOUD_TOTAL_UPTIME_COUNTER_KEY] ?? 0) || 0;
+            if (!mysqlFailed) {
+                try {
+                    totalUptimeSeconds = await accrueCloudUptime(
+                        env.DB_CORE,
+                        nowIso,
+                        Math.max(syncIntervalSeconds * 3, 360),
+                        preloadedUptimeRow
+                    );
+                } catch (err) {
+                    const reason = classifyStorageWriteDegradation(err);
+                    if (!reason) throw err;
+                    degradedReason = mergeStorageDegradedReason(degradedReason, reason);
+                }
+            }
+            counters[CLOUD_TOTAL_UPTIME_COUNTER_KEY] = totalUptimeSeconds;
+
+            const friendPresenceTimes = snapshotRow?.payload_json
+                ? await buildBootstrapFriendPresenceTimes(mysqlFailed ? rawEnv : env, snapshotRow.payload_json)
+                : {};
+
+            return withStorageDegradedHeader(
+                Response.json({
+                    ok: true,
+                    data: {
+                        part: 'presence',
+                        statsCounters: counters,
+                        totalUptimeSeconds,
+                        friendPresenceTimes,
+                        ...(degradedReason ? { degraded: degradedReason } : {})
+                    }
+                }),
+                degradedReason
+            );
+        }
+
+        // Chunked Parts E / F / G: small table groups (`memos` | `favorites` | `profiles`)
+        if (part === 'memos' || part === 'favorites' || part === 'profiles') {
+            const { business: grp, degradedReason } = await loadBootstrapBusinessGroupPart(
+                env,
+                rawEnv,
+                mysqlSession,
+                part
+            );
+            const payload =
+                part === 'memos'
+                    ? {
+                          part,
+                          memos: grp.memos,
+                          worldMemos: grp.worldMemos,
+                          avatarMemos: grp.avatarMemos,
+                          notes: grp.notes
+                      }
+                    : part === 'favorites'
+                      ? {
+                            part,
+                            favoriteFriends: grp.favoriteFriends,
+                            favoriteWorlds: grp.favoriteWorlds,
+                            favoriteAvatars: grp.favoriteAvatars,
+                            favoritePrints: grp.favoritePrints,
+                            avatarTags: grp.avatarTags
+                        }
+                      : {
+                            part,
+                            moderations: grp.moderations,
+                            userProfiles: grp.userProfiles
+                        };
+            return withStorageDegradedHeader(
+                Response.json({
+                    ok: true,
+                    data: {
+                        ...payload,
+                        ...(degradedReason ? { degraded: degradedReason } : {})
+                    }
+                }),
+                degradedReason
+            );
+        }
+
+        const hub = env.AGENT_HUB.get(env.AGENT_HUB.idFromName('primary'));
         let degradedReason: StorageDegradedReason | null = null;
         let mysqlBootstrapFailed = false;
 

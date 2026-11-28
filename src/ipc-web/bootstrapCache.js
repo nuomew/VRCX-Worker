@@ -101,83 +101,162 @@ let flushStorageTimer = null;
 let flushStorageDueAt = 0;
 let storageRetryCount = 0;
 
-export async function loadBootstrap() {
-    const data = await cloudFetch('/api/bootstrap');
-    bootstrapCache.configs = { ...(data.configs || {}) };
-    bootstrapCache.storage = { ...(data.storage || {}) };
+const BOOTSTRAP_MAX_LEGACY_CONFIG_PAGES = 50;
+const BOOTSTRAP_PART_RETRY_DELAY_MS = 300;
 
-    bootstrapCache.memos.clear();
-    for (const r of data.memos || []) {
-        bootstrapCache.memos.set(r.user_id, { userId: r.user_id, editedAt: r.edited_at, memo: r.memo });
-    }
-    bootstrapCache.worldMemos.clear();
-    for (const r of data.worldMemos || []) {
-        bootstrapCache.worldMemos.set(r.world_id, { worldId: r.world_id, editedAt: r.edited_at, memo: r.memo });
-    }
-    bootstrapCache.avatarMemos.clear();
-    for (const r of data.avatarMemos || []) {
-        bootstrapCache.avatarMemos.set(r.avatar_id, { avatarId: r.avatar_id, editedAt: r.edited_at, memo: r.memo });
-    }
-    bootstrapCache.notes.clear();
-    for (const r of data.notes || []) {
-        bootstrapCache.notes.set(r.user_id, {
-            userId: r.user_id,
-            displayName: r.display_name || '',
-            note: r.note || '',
-            createdAt: r.created_at || ''
-        });
-    }
-
-    bootstrapCache.favoriteFriends = data.favoriteFriends || [];
-    bootstrapCache.favoriteWorlds = data.favoriteWorlds || [];
-    bootstrapCache.favoriteAvatars = data.favoriteAvatars || [];
-    bootstrapCache.favoritePrints = data.favoritePrints || [];
-    bootstrapCache.avatarTags = data.avatarTags || [];
-
-    bootstrapCache.moderations.clear();
-    for (const r of data.moderations || []) {
-        bootstrapCache.moderations.set(r.user_id, {
-            userId: r.user_id,
-            updatedAt: r.updated_at || '',
-            displayName: r.display_name || '',
-            block: Boolean(r.block),
-            mute: Boolean(r.mute)
-        });
-    }
-
-    bootstrapCache.userProfiles.clear();
-    for (const r of data.userProfiles || []) {
-        let links = [];
-        try {
-            links = JSON.parse(r.bio_links || '[]');
-        } catch {
-            links = [];
+/**
+ * Fetches one lightweight `/api/bootstrap` chunk with 1 automatic short retry on transient
+ * 502/503/504/network/non-JSON responses (e.g. cold-start Worker spikes), never retrying 401/Access gates.
+ *
+ * @param {string} path
+ * @returns {Promise<any>}
+ */
+async function fetchBootstrapPartWithRetry(path) {
+    try {
+        return await cloudFetch(path);
+    } catch (err) {
+        const status = Number(err?.status ?? 0);
+        const code = String(err?.code ?? '');
+        const msg = err instanceof Error ? err.message : String(err ?? '');
+        const isAuthBlock =
+            status === 401 ||
+            status === 403 ||
+            code === 'CLOUDFLARE_ACCESS_REQUIRED' ||
+            /authentication required/i.test(msg);
+        if (isAuthBlock) {
+            throw err;
         }
-        bootstrapCache.userProfiles.set(r.user_id, {
-            userId: r.user_id,
-            bio: r.bio || '',
-            bioLinks: links,
-            updatedAt: r.updated_at || ''
-        });
+        const isTransient =
+            status === 502 ||
+            status === 503 ||
+            status === 504 ||
+            /Invalid JSON|HTTP 50[234]|Failed to fetch|NetworkError/i.test(msg);
+        if (!isTransient) {
+            throw err;
+        }
+        await new Promise((resolve) => setTimeout(resolve, BOOTSTRAP_PART_RETRY_DELAY_MS));
+        return cloudFetch(path);
+    }
+}
+
+/**
+ * Applies any subset of bootstrap payload fields into `bootstrapCache` and `cloudState`.
+ * Works identically for both legacy single-shot responses and chunked `?part=` responses.
+ *
+ * @param {Record<string, any>} data
+ */
+function applyBootstrapChunk(data) {
+    if (!data || typeof data !== 'object') return;
+
+    if (data.configs && typeof data.configs === 'object') {
+        bootstrapCache.configs = { ...data.configs };
+    }
+    if (data.legacyConfigs && typeof data.legacyConfigs === 'object') {
+        // Active cloud config keys always take precedence over migrated desktop legacy_configs.
+        for (const [k, v] of Object.entries(data.legacyConfigs)) {
+            if (!Object.prototype.hasOwnProperty.call(bootstrapCache.configs, k)) {
+                bootstrapCache.configs[k] = String(v ?? '');
+            }
+        }
+    }
+    if (data.storage && typeof data.storage === 'object') {
+        bootstrapCache.storage = { ...data.storage };
     }
 
-    bootstrapCache.friendPresenceTimes.clear();
+    if (Array.isArray(data.memos)) {
+        bootstrapCache.memos.clear();
+        for (const r of data.memos) {
+            bootstrapCache.memos.set(r.user_id, { userId: r.user_id, editedAt: r.edited_at, memo: r.memo });
+        }
+    }
+    if (Array.isArray(data.worldMemos)) {
+        bootstrapCache.worldMemos.clear();
+        for (const r of data.worldMemos) {
+            bootstrapCache.worldMemos.set(r.world_id, { worldId: r.world_id, editedAt: r.edited_at, memo: r.memo });
+        }
+    }
+    if (Array.isArray(data.avatarMemos)) {
+        bootstrapCache.avatarMemos.clear();
+        for (const r of data.avatarMemos) {
+            bootstrapCache.avatarMemos.set(r.avatar_id, { avatarId: r.avatar_id, editedAt: r.edited_at, memo: r.memo });
+        }
+    }
+    if (Array.isArray(data.notes)) {
+        bootstrapCache.notes.clear();
+        for (const r of data.notes) {
+            bootstrapCache.notes.set(r.user_id, {
+                userId: r.user_id,
+                displayName: r.display_name || '',
+                note: r.note || '',
+                createdAt: r.created_at || ''
+            });
+        }
+    }
+
+    if (Array.isArray(data.favoriteFriends)) bootstrapCache.favoriteFriends = data.favoriteFriends;
+    if (Array.isArray(data.favoriteWorlds)) bootstrapCache.favoriteWorlds = data.favoriteWorlds;
+    if (Array.isArray(data.favoriteAvatars)) bootstrapCache.favoriteAvatars = data.favoriteAvatars;
+    if (Array.isArray(data.favoritePrints)) bootstrapCache.favoritePrints = data.favoritePrints;
+    if (Array.isArray(data.avatarTags)) bootstrapCache.avatarTags = data.avatarTags;
+
+    if (Array.isArray(data.moderations)) {
+        bootstrapCache.moderations.clear();
+        for (const r of data.moderations) {
+            bootstrapCache.moderations.set(r.user_id, {
+                userId: r.user_id,
+                updatedAt: r.updated_at || '',
+                displayName: r.display_name || '',
+                block: Boolean(r.block),
+                mute: Boolean(r.mute)
+            });
+        }
+    }
+
+    if (Array.isArray(data.userProfiles)) {
+        bootstrapCache.userProfiles.clear();
+        for (const r of data.userProfiles) {
+            let links = [];
+            try {
+                links = JSON.parse(r.bio_links || '[]');
+            } catch {
+                links = [];
+            }
+            bootstrapCache.userProfiles.set(r.user_id, {
+                userId: r.user_id,
+                bio: r.bio || '',
+                bioLinks: links,
+                updatedAt: r.updated_at || ''
+            });
+        }
+    }
+
     if (data.friendPresenceTimes && typeof data.friendPresenceTimes === 'object') {
+        bootstrapCache.friendPresenceTimes.clear();
         for (const [uid, entry] of Object.entries(data.friendPresenceTimes)) {
             if (!uid || !entry || typeof entry !== 'object') continue;
             setCloudFriendPresenceTime(uid, /** @type {any} */ (entry));
         }
     }
 
-    bootstrapCache.statsCounters = { ...(data.statsCounters || {}) };
-    cloudState.r2Enabled = Boolean(data.r2Enabled);
-    cloudState.b2Enabled = Boolean(data.b2Enabled);
-    cloudState.syncIntervalSeconds = clampSyncIntervalSeconds(
-        data.syncIntervalSeconds ?? bootstrapCache.configs['cloud:syncIntervalSeconds']
-    );
-    cloudState.webSyncIntervalSeconds = clampWebSyncIntervalSeconds(
-        data.webSyncIntervalSeconds ?? bootstrapCache.configs['cloud:webSyncIntervalSeconds']
-    );
+    if (data.statsCounters && typeof data.statsCounters === 'object') {
+        bootstrapCache.statsCounters = { ...data.statsCounters };
+    }
+    if (data.r2Enabled !== undefined) {
+        cloudState.r2Enabled = Boolean(data.r2Enabled);
+    }
+    if (data.b2Enabled !== undefined) {
+        cloudState.b2Enabled = Boolean(data.b2Enabled);
+    }
+    if (data.syncIntervalSeconds !== undefined || data.configs) {
+        cloudState.syncIntervalSeconds = clampSyncIntervalSeconds(
+            data.syncIntervalSeconds ?? bootstrapCache.configs['cloud:syncIntervalSeconds']
+        );
+    }
+    if (data.webSyncIntervalSeconds !== undefined || data.configs) {
+        cloudState.webSyncIntervalSeconds = clampWebSyncIntervalSeconds(
+            data.webSyncIntervalSeconds ?? bootstrapCache.configs['cloud:webSyncIntervalSeconds']
+        );
+    }
 
     if (data.agentStatus) {
         const wsOnline = Array.isArray(data.agentStatus.wsAgentsOnline)
@@ -187,21 +266,79 @@ export async function loadBootstrap() {
               : [];
         cloudState.wsAgentsOnline = [...wsOnline];
         cloudState.deviceStates = data.agentStatus.deviceStates || {};
-    }
 
-    const deviceLastSeen =
-        data.agentStatus && typeof data.agentStatus.deviceLastSeen === 'object' ? data.agentStatus.deviceLastSeen : {};
-    const mergedAgentsOnline = Array.isArray(data.agentStatus?.agentsOnline) ? data.agentStatus.agentsOnline : [];
-    const totalUptimeSeconds = Number(
-        data.totalUptimeSeconds ?? bootstrapCache.statsCounters.cloud_total_uptime_seconds ?? 0
-    );
-    applyCloudPresenceUpdate({
-        deviceLastSeen,
-        httpAgentsOnline: mergedAgentsOnline,
-        deviceStates: data.agentStatus?.deviceStates,
-        totalUptimeSeconds,
-        replaceDeviceMap: true
-    });
+        const deviceLastSeen =
+            typeof data.agentStatus.deviceLastSeen === 'object' && data.agentStatus.deviceLastSeen
+                ? data.agentStatus.deviceLastSeen
+                : {};
+        const mergedAgentsOnline = Array.isArray(data.agentStatus.agentsOnline) ? data.agentStatus.agentsOnline : [];
+        const totalUptimeSeconds = Number(
+            data.totalUptimeSeconds ?? bootstrapCache.statsCounters.cloud_total_uptime_seconds ?? 0
+        );
+        applyCloudPresenceUpdate({
+            deviceLastSeen,
+            httpAgentsOnline: mergedAgentsOnline,
+            deviceStates: data.agentStatus.deviceStates,
+            totalUptimeSeconds,
+            replaceDeviceMap: true
+        });
+    } else if (data.totalUptimeSeconds !== undefined || data.statsCounters) {
+        const totalUptimeSeconds = Number(
+            data.totalUptimeSeconds ?? bootstrapCache.statsCounters.cloud_total_uptime_seconds ?? 0
+        );
+        applyCloudPresenceUpdate({ totalUptimeSeconds });
+    }
+}
+
+export async function loadBootstrap() {
+    // Request lightweight chunked `/api/bootstrap?part=core` first so every single Worker invocation
+    // stays safely under Cloudflare Workers Free's 10ms CPU limit; seamlessly falls back to single-shot
+    // hydration if an older server or test mock returns a full payload without `nextParts`.
+    const first = await fetchBootstrapPartWithRetry('/api/bootstrap?part=core');
+
+    bootstrapCache.configs = {};
+    bootstrapCache.storage = {};
+    bootstrapCache.memos.clear();
+    bootstrapCache.worldMemos.clear();
+    bootstrapCache.avatarMemos.clear();
+    bootstrapCache.notes.clear();
+    bootstrapCache.favoriteFriends = [];
+    bootstrapCache.favoriteWorlds = [];
+    bootstrapCache.favoriteAvatars = [];
+    bootstrapCache.favoritePrints = [];
+    bootstrapCache.avatarTags = [];
+    bootstrapCache.moderations.clear();
+    bootstrapCache.userProfiles.clear();
+    bootstrapCache.friendPresenceTimes.clear();
+    bootstrapCache.statsCounters = {};
+
+    applyBootstrapChunk(first);
+
+    const nextParts = Array.isArray(first?.nextParts) ? first.nextParts : [];
+    for (const partName of nextParts) {
+        if (typeof partName !== 'string' || !partName) continue;
+        if (partName === 'legacy_configs') {
+            let cursor = '';
+            for (let page = 0; page < BOOTSTRAP_MAX_LEGACY_CONFIG_PAGES; page++) {
+                const qs = cursor
+                    ? `/api/bootstrap?part=legacy_configs&cursor=${encodeURIComponent(cursor)}`
+                    : '/api/bootstrap?part=legacy_configs';
+                const pageData = await fetchBootstrapPartWithRetry(qs);
+                applyBootstrapChunk(pageData);
+                if (!pageData?.hasMore || !pageData?.nextCursor || pageData.nextCursor === cursor) {
+                    break;
+                }
+                cursor = String(pageData.nextCursor);
+            }
+            continue;
+        }
+        const path =
+            partName === 'presence'
+                ? `/api/bootstrap?part=presence&syncInterval=${encodeURIComponent(String(cloudState.syncIntervalSeconds))}`
+                : `/api/bootstrap?part=${encodeURIComponent(partName)}`;
+        const partData = await fetchBootstrapPartWithRetry(path);
+        applyBootstrapChunk(partData);
+    }
 
     if (flushConfigTimer) {
         clearTimeout(flushConfigTimer);

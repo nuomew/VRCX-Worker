@@ -4989,5 +4989,141 @@ describe('External MySQL 5.7+ Database Integration (Hybrid New-Writes Mode & Ful
         expect(outageJson.ok).toBe(true);
         expect(outageJson.data.degraded).toBe('external_db_unavailable');
         expect(outageJson.data.memos.some((m) => m.user_id === 'usr_d1_only')).toBe(true);
+
+        // 6. Chunked `?part=` sub-requests keep every single Worker invocation well under 10ms CPU:
+        //    - core / storage / legacy_configs (byte-budgeted cursor pagination) perform 0 MySQL queries
+        //    - presence / memos / favorites / profiles each issue 1 small targeted MySQL query
+        await env.DB_CORE.prepare(
+            "INSERT OR REPLACE INTO config_bundles (bundle_key, version, payload_json, updated_at) VALUES ('vrcx_storage', 1, ?, ?)"
+        )
+            .bind(JSON.stringify({ VRCX_lastUser: 'usr_me' }), uptimeNow)
+            .run();
+        // Seed 3 oversized legacy_configs (~100 KiB each) + 1 sensitive key to verify 160 KiB pagination & sanitization
+        await legacyDb.batch([
+            legacyDb.prepare('DELETE FROM legacy_configs'),
+            legacyDb
+                .prepare('INSERT INTO legacy_configs (config_key, config_value, updated_at) VALUES (?, ?, ?)')
+                .bind('VRCX_big_a', 'A'.repeat(100_000), uptimeNow),
+            legacyDb
+                .prepare('INSERT INTO legacy_configs (config_key, config_value, updated_at) VALUES (?, ?, ?)')
+                .bind('VRCX_big_b', 'B'.repeat(100_000), uptimeNow),
+            legacyDb
+                .prepare('INSERT INTO legacy_configs (config_key, config_value, updated_at) VALUES (?, ?, ?)')
+                .bind('VRCX_big_c', 'C'.repeat(100_000), uptimeNow),
+            legacyDb
+                .prepare('INSERT INTO legacy_configs (config_key, config_value, updated_at) VALUES (?, ?, ?)')
+                .bind('savedCredentials', '{"secret":"must-strip"}', uptimeNow)
+        ]);
+
+        // 6a. `core` + `storage` + paginated `legacy_configs` must trigger ZERO MySQL queries
+        fakeMysql.executedSqls = [];
+        const corePartRes = await exports.default.fetch('http://example.com/api/bootstrap?part=core', { headers });
+        expect(corePartRes.status).toBe(200);
+        const corePartJson = (await corePartRes.json()) as {
+            ok: boolean;
+            data: { part: string; nextParts: string[]; configs: Record<string, string>; syncIntervalSeconds: number };
+        };
+        expect(corePartJson.ok).toBe(true);
+        expect(corePartJson.data.part).toBe('core');
+        expect(corePartJson.data.nextParts).toEqual([
+            'storage',
+            'legacy_configs',
+            'presence',
+            'memos',
+            'favorites',
+            'profiles'
+        ]);
+
+        const storagePartRes = await exports.default.fetch('http://example.com/api/bootstrap?part=storage', { headers });
+        expect(storagePartRes.status).toBe(200);
+        const storagePartJson = (await storagePartRes.json()) as {
+            ok: boolean;
+            data: { part: string; storage: Record<string, string> };
+        };
+        expect(storagePartJson.data.storage.VRCX_lastUser).toBe('usr_me');
+
+        const collectedLegacyConfigs: Record<string, string> = {};
+        let legacyCursor = '';
+        let legacyPages = 0;
+        for (let i = 0; i < 10; i++) {
+            const url = legacyCursor
+                ? `http://example.com/api/bootstrap?part=legacy_configs&cursor=${encodeURIComponent(legacyCursor)}`
+                : 'http://example.com/api/bootstrap?part=legacy_configs';
+            const pgRes = await exports.default.fetch(url, { headers });
+            expect(pgRes.status).toBe(200);
+            const pgJson = (await pgRes.json()) as {
+                ok: boolean;
+                data: { legacyConfigs: Record<string, string>; nextCursor: string | null; hasMore: boolean };
+            };
+            legacyPages++;
+            Object.assign(collectedLegacyConfigs, pgJson.data.legacyConfigs);
+            if (!pgJson.data.hasMore || !pgJson.data.nextCursor) break;
+            legacyCursor = pgJson.data.nextCursor;
+        }
+        // 3 × 100 KiB entries exceed 160 KiB page cap -> must split across >= 3 lightweight pages
+        expect(legacyPages).toBeGreaterThanOrEqual(3);
+        expect(collectedLegacyConfigs.VRCX_big_a?.length).toBe(100_000);
+        expect(collectedLegacyConfigs.VRCX_big_b?.length).toBe(100_000);
+        expect(collectedLegacyConfigs.VRCX_big_c?.length).toBe(100_000);
+        expect(collectedLegacyConfigs.savedCredentials).toBeUndefined();
+        // Zero MySQL queries across core + storage + all legacy_configs pages
+        expect(fakeMysql.executedSqls.length).toBe(0);
+
+        // 6b. `presence`, `memos`, `favorites`, `profiles` each run 1 small targeted MySQL query
+        const presenceRes = await exports.default.fetch(
+            `http://example.com/api/bootstrap?part=presence&syncInterval=${corePartJson.data.syncIntervalSeconds}`,
+            { headers }
+        );
+        expect(presenceRes.status).toBe(200);
+        const presenceJson = (await presenceRes.json()) as {
+            ok: boolean;
+            data: { statsCounters: Record<string, number>; totalUptimeSeconds: number };
+        };
+        expect(presenceJson.data.statsCounters.feed_gps).toBe(420);
+        expect(presenceJson.data.totalUptimeSeconds).toBeGreaterThanOrEqual(1500);
+
+        fakeMysql.executedSqls = [];
+        const memosRes = await exports.default.fetch('http://example.com/api/bootstrap?part=memos', { headers });
+        expect(memosRes.status).toBe(200);
+        const memosJson = (await memosRes.json()) as {
+            ok: boolean;
+            data: { memos: Array<{ user_id: string; memo: string }> };
+        };
+        expect(memosJson.data.memos.find((m) => m.user_id === 'usr_override')?.memo).toBe('mysql-active-wins');
+        expect(memosJson.data.memos.some((m) => m.user_id === 'usr_legacy_mysql')).toBe(true);
+        const memosSqls = fakeMysql.executedSqls.filter((s) => /^SELECT\b/i.test(s) && /\bUNION\s+ALL\b/i.test(s));
+        expect(memosSqls.length).toBe(1);
+        expect(memosSqls[0]).not.toContain('vrcx_favorite_friend');
+        expect(memosSqls[0]).not.toContain('vrcx_user_profile');
+
+        fakeMysql.executedSqls = [];
+        const favRes = await exports.default.fetch('http://example.com/api/bootstrap?part=favorites', { headers });
+        expect(favRes.status).toBe(200);
+        const favJson = (await favRes.json()) as {
+            ok: boolean;
+            data: {
+                favoriteFriends: Array<{ id: number; user_id: string }>;
+                avatarTags: Array<{ avatar_id: string; tag: string; color: string | null }>;
+            };
+        };
+        expect(favJson.data.favoriteFriends.some((f) => f.user_id === 'usr_fav_leg' && f.id < 0)).toBe(true);
+        expect(favJson.data.avatarTags).toContainEqual({ avatar_id: 'avtr_01', tag: 'cute', color: null });
+        const favSqls = fakeMysql.executedSqls.filter((s) => /^SELECT\b/i.test(s) && /\bUNION\s+ALL\b/i.test(s));
+        expect(favSqls.length).toBe(1);
+        expect(favSqls[0]).not.toContain('vrcx_memos');
+
+        fakeMysql.executedSqls = [];
+        const profRes = await exports.default.fetch('http://example.com/api/bootstrap?part=profiles', { headers });
+        expect(profRes.status).toBe(200);
+        const profJson = (await profRes.json()) as {
+            ok: boolean;
+            data: { moderations: Array<{ user_id: string; block: number; mute: number }> };
+        };
+        expect(profJson.data.moderations).toContainEqual(
+            expect.objectContaining({ user_id: 'usr_mod_1', block: 1, mute: 0 })
+        );
+        const profSqls = fakeMysql.executedSqls.filter((s) => /^SELECT\b/i.test(s) && /\bUNION\s+ALL\b/i.test(s));
+        expect(profSqls.length).toBe(1);
+        expect(profSqls[0]).not.toContain('vrcx_favorite_friend');
     });
 });
