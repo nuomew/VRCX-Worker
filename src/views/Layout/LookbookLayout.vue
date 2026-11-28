@@ -561,12 +561,6 @@
                                         ({{ onlineFriendCount }}/{{ friends.size }})
                                     </span>
                                 </span>
-                                <button
-                                    type="button"
-                                    class="text-[11px] font-semibold text-primary hover:underline cursor-pointer"
-                                    @click="salonDrawerOpen = true">
-                                    {{ t('view.settings.appearance.appearance.editorial_lookbook_open_salon') }} →
-                                </button>
                             </div>
                             <div class="lb-folio-friends-scroll flex-1 min-h-0 flex flex-col overflow-hidden -mx-1.5">
                                 <FriendsSidebar hide-me :render-edit-profile-dialog="false" class="flex-1 min-h-0" />
