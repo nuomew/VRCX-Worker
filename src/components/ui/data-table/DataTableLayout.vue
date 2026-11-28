@@ -4,10 +4,19 @@
             <slot name="toolbar"></slot>
         </div>
 
-        <div :class="['rounded-md border', autoHeight && 'flex-1 min-h-0 flex flex-col overflow-hidden']">
+        <div
+            :class="[
+                'rounded-md border',
+                autoHeight && 'dt-auto-fill w-full flex-1 min-h-0 flex flex-col overflow-hidden'
+            ]"
+            :style="autoFillStyle">
             <div
                 ref="tableScrollRef"
-                :class="['max-w-full overflow-auto relative', autoHeight && 'flex-1 min-h-0']"
+                tabindex="0"
+                :class="[
+                    'max-w-full overflow-auto relative focus-visible:outline-none',
+                    autoHeight && 'dt-auto-fill-scroll flex-1 min-h-0'
+                ]"
                 :style="tableStyle">
                 <Table :class="tableClassValue" :style="tableElementStyle">
                     <colgroup>
@@ -199,6 +208,7 @@
                                 <ContextMenu v-if="$slots['row-context-menu']">
                                     <ContextMenuTrigger as-child>
                                         <TableRow
+                                            data-dt-row="data"
                                             @click="handleRowClick(row)"
                                             :class="[
                                                 'group/row',
@@ -220,6 +230,7 @@
                                 </ContextMenu>
                                 <TableRow
                                     v-else
+                                    data-dt-row="data"
                                     @click="handleRowClick(row)"
                                     :class="[
                                         'group/row',
@@ -234,7 +245,9 @@
                                         <FlexRender :render="cell.column.columnDef.cell" :props="cell.getContext()" />
                                     </TableCell>
                                 </TableRow>
-                                <TableRow v-if="row.getIsExpanded() && (expandedRenderer || $slots.expanded)">
+                                <TableRow
+                                    v-if="row.getIsExpanded() && (expandedRenderer || $slots.expanded)"
+                                    data-dt-row="expanded">
                                     <TableCell :colspan="row.getVisibleCells().length">
                                         <template v-if="$slots.expanded">
                                             <slot name="expanded" :row="row"></slot>
@@ -750,4 +763,104 @@
         if (!props.onRowClick) return;
         props.onRowClick(row);
     };
+
+    const autoFillStyle = computed(() => {
+        if (!props.autoHeight) return null;
+        const renderedRows = props.table?.getRowModel?.().rows?.length ?? 0;
+        const configuredPageSize = Number(pageSizeProxy.value) || 0;
+        const targetRows =
+            props.showPagination && configuredPageSize > 0
+                ? Math.max(configuredPageSize, renderedRows)
+                : Math.max(15, renderedRows);
+        return {
+            '--dt-page-rows': String(Math.max(1, targetRows))
+        };
+    });
 </script>
+
+<style scoped>
+    .dt-auto-fill {
+        container-type: size;
+        container-name: dt-viewport;
+        --dt-header-h: 44px;
+        --dt-row-min: 42px;
+        --dt-row-max: 72px;
+    }
+
+    .dt-auto-fill-scroll {
+        /* Fallback when container block-size units (cqb) are unavailable */
+        --dt-row-h: clamp(
+            var(--dt-row-min),
+            calc((100dvh - 220px) / var(--dt-page-rows, 20)),
+            var(--dt-row-max)
+        );
+    }
+
+    @supports (height: 1cqb) {
+        .dt-auto-fill-scroll {
+            /* Evaluated on child of .dt-auto-fill so 100cqb resolves strictly to dt-viewport container height */
+            --dt-row-h: clamp(
+                var(--dt-row-min),
+                calc((100cqb - var(--dt-header-h) - 1px) / var(--dt-page-rows, 20)),
+                var(--dt-row-max)
+            );
+        }
+    }
+
+    :global(.is-comfortable-table) .dt-auto-fill {
+        --dt-header-h: 46px;
+        --dt-row-min: 46px;
+        --dt-row-max: 76px;
+    }
+
+    :global(.is-compact-table) .dt-auto-fill {
+        --dt-header-h: 32px;
+        --dt-row-min: 32px;
+        --dt-row-max: 52px;
+    }
+
+    .dt-auto-fill :deep(table[data-slot='table']) {
+        font-size: clamp(13.5px, calc(12.8px + 0.12vw), 15px);
+        line-height: 1.45;
+    }
+
+    @supports (font-size: 1cqi) {
+        .dt-auto-fill :deep(table[data-slot='table']) {
+            font-size: clamp(13.5px, calc(12.8px + 0.12cqi), 15px);
+        }
+    }
+
+    :global(.is-compact-table) .dt-auto-fill :deep(table[data-slot='table']) {
+        font-size: 12.5px;
+        line-height: 1.35;
+    }
+
+    .dt-auto-fill :deep(thead th[data-slot='table-head']) {
+        height: var(--dt-header-h);
+        font-size: clamp(13px, calc(12.5px + 0.1vw), 14.5px);
+    }
+
+    @supports (font-size: 1cqi) {
+        .dt-auto-fill :deep(thead th[data-slot='table-head']) {
+            font-size: clamp(13px, calc(12.5px + 0.1cqi), 14.5px);
+        }
+    }
+
+    .dt-auto-fill :deep(tbody tr[data-dt-row='data'] > td[data-slot='table-cell']) {
+        height: var(--dt-row-h);
+        padding-block: 4px;
+    }
+
+    .dt-auto-fill :deep(tbody tr[data-dt-row='data'] [data-slot='badge']) {
+        font-size: clamp(12px, 0.88em, 13.5px);
+        padding-block: 0.22rem;
+        padding-inline: 0.65rem;
+        line-height: 1.25;
+    }
+
+    :global(.is-compact-table) .dt-auto-fill :deep(tbody tr[data-dt-row='data'] [data-slot='badge']) {
+        font-size: 11.5px;
+        padding-block: 0.125rem;
+        padding-inline: 0.5rem;
+    }
+</style>

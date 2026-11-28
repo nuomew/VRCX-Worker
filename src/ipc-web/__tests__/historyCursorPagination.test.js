@@ -729,6 +729,7 @@ describe('Cloud history cursor pagination (adapter + Feed store)', () => {
                 <DataTableLayout
                     :table="table"
                     :loading="feedStore.feedTable.loading"
+                    auto-height
                     :total-items="feedStore.feedTableData.length"
                     :page-sizes="[10, 20, 25, 50, 100]"
                     :on-page-size-change="handlePageSizeChange"
@@ -751,6 +752,7 @@ describe('Cloud history cursor pagination (adapter + Feed store)', () => {
         expect(feedStore.feedTableData.length).toBe(20);
         expect(feedStore.feedTable.hasMore).toBe(true);
         expect(wrapper.vm.table.getRowModel().rows.length).toBe(20);
+        expect(wrapper.find('.dt-auto-fill').attributes('style')).toContain('--dt-page-rows: 20');
 
         // 2) Switch pageSize 20 -> 25 -> resets to page 1 and re-fetches strictly 25 rows (1 request with limit=26)
         wrapper.vm.handlePageSizeChange(25);
@@ -762,6 +764,7 @@ describe('Cloud history cursor pagination (adapter + Feed store)', () => {
         expect(feedStore.feedTable.hasMore).toBe(true);
         expect(wrapper.vm.pagination.pageIndex).toBe(0);
         expect(wrapper.vm.pagination.pageSize).toBe(25);
+        expect(wrapper.find('.dt-auto-fill').attributes('style')).toContain('--dt-page-rows: 25');
 
         // 3) Click Next -> fetches strictly the next 25 rows (limit = 25 + 1 same-ts + 1 lookahead = 27) and advances to page 2
         const nextBtn = wrapper.findAll('button').find((b) => b.text().includes('table.pagination.next'));
