@@ -21,7 +21,7 @@
 
 ## 1. デプロイ方法（Cloudflare Workers 無料プラン）
 
-VRCX-Worker は **単一の Cloudflare Worker** として動作し、ビルド済み Vue 3 Web SPA（`./build/web`）とクラウド API / Cron / WebSocket バックエンド（`cloud/src/index.ts`）の両方を配信します。データ層は **自動プロビジョニングされる 4 つの D1 シャード**（`DB_CORE`、`DB_GAMELOG`、`DB_FEED`、`DB_CACHE`）、SQLite WebSocket Hibernation 対応 Durable Object（`AgentHubDO`）、および任意のプライベート R2 バケット（`R2_MEDIA`）で構成されます。
+VRCX-Worker は **単一の Cloudflare Worker** として動作し、ビルド済み Vue 3 Web SPA（`./build/web`）とクラウド API / Cron / WebSocket バックエンド（`cloud/src/index.ts`）の両方を配信します。データ層は **自動プロビジョニングされる 6 つの D1 シャード**（`DB_CORE`、`DB_GAMELOG`、`DB_FEED`、`DB_CACHE`、`DB_LEGACY`、`DB_CHAT`）、SQLite WebSocket Hibernation 対応 Durable Object（`AgentHubDO`）、Cloudflare Workers `AI`、任意の **外部 MySQL 5.7+ / MariaDB**、および任意のプライベート **R2（`R2_MEDIA`）/ Backblaze B2** ストレージで構成されます。
 
 ### 方法 A：ワンクリック / Cloudflare ダッシュボード Git 自動デプロイ（推奨）
 
@@ -31,7 +31,7 @@ VRCX-Worker は **単一の Cloudflare Worker** として動作し、ビルド�
    - **ビルドコマンド**：*空欄のままで問題ありません* — ルートの [`wrangler.jsonc`](../../wrangler.jsonc) に `"build": { "command": "npm run build:web" }` が定義されているため、デプロイ時にフロントエンドが自動ビルドされます。
    - **デプロイコマンド**：`npx wrangler deploy`
 3. デプロイを実行します。初回デプロイ時は以下が自動で完了します：
-   - Cloudflare Automatic Resource Provisioning により 4 つの D1 データベース（`vrcx-core`、`vrcx-gamelog`、`vrcx-feed`、`vrcx-cache`）と `AgentHubDO` が自動作成されます（`R2_MEDIA` は R2 未契約環境でも初回デプロイが確実に通るよう既定でオフになっています）。
+   - Cloudflare Automatic Resource Provisioning により 6 つの D1 データベース（`vrcx-core`、`vrcx-gamelog`、`vrcx-feed`、`vrcx-cache`、`vrcx-legacy`、`vrcx-chat`）、`AgentHubDO`、`AI` バインディングが自動作成されます（`R2_MEDIA` は R2 未契約環境でも確実に通るよう既定オフであり、`keep_vars` と `unsafe.metadata.keep_bindings` により手動設定済みのシークレット・変数・R2 バケットは Git 自動デプロイ後も保持されます）。
    - 初回 HTTP アクセス時に [`cloud/src/db/schemaBootstrap.ts`](../../cloud/src/db/schemaBootstrap.ts) が全テーブル・インデックス・FTS5 `trigram` 検索辞書を冪等に初期化します（手動 SQL マイグレーション不要）。
    - 以降 `master` ブランチへプッシュするだけでフロントエンドと Worker が自動再デプロイされます。
 
@@ -182,7 +182,7 @@ dotnet build desktop/Dotnet/VRCX-Cef.csproj -c Release -p:Platform=x64 -r win-x6
 
 - **Q：デプロイ後にトップページを開くと `open_setup` と表示されます。**
   - シークレット未設定時の初期状態です。Cloudflare Worker の **Variables and Secrets** に `ADMIN_PASSCODE` と `COOKIE_MASTER_KEY` を設定して再読み込みしてください。
-- **Q：4 つの D1 シャードやキャッシュ、R2 バインディングが正しく動いているか確認したい。**
+- **Q：6 つの D1 シャードやキャッシュ、R2 バインディングが正しく動いているか確認したい。**
   - Web UI 下部の **Cloud Hub** を開くか、Worker URL の `/health` にアクセスすると、`DB_CORE`・`DB_GAMELOG`・`DB_FEED`・`DB_CACHE`（`cacheDbDedicated: true`）・`R2_MEDIA` の状態を確認できます。
 - **Q：`VRCX.Agent` からクラウドへの接続がタイムアウトします。**
   - プロキシが必要なネットワーク環境ではトレイメニューから **Proxy モード** に切り替え、システムプロキシ・HTTP/SOCKS5・`vmess://` のいずれかを設定して **Test & Save** で接続確認を行ってください。

@@ -21,7 +21,7 @@
 
 ## 1. 部署方式（Cloudflare Workers 免费套餐）
 
-VRCX-Worker 以**单个 Cloudflare Worker** 的形态运行，同时托管编译后的 Vue 3 前端 SPA（`./build/web`）与云端 API / Cron / WebSocket 后端（`cloud/src/index.ts`），背后由 **4 个自动创建的 D1 分片数据库**（`DB_CORE`、`DB_GAMELOG`、`DB_FEED`、`DB_CACHE`）、SQLite WebSocket 休眠持久化对象（`AgentHubDO`）以及可选的私有 R2 存储桶（`R2_MEDIA`）支撑。
+VRCX-Worker 以**单个 Cloudflare Worker** 的形态运行，同时托管编译后的 Vue 3 前端 SPA（`./build/web`）与云端 API / Cron / WebSocket 后端（`cloud/src/index.ts`），背后由 **6 个自动创建的 D1 分片数据库**（`DB_CORE`、`DB_GAMELOG`、`DB_FEED`、`DB_CACHE`、`DB_LEGACY`、`DB_CHAT`）、SQLite WebSocket 休眠持久化对象（`AgentHubDO`）、Cloudflare Workers `AI`，以及可选的**外接 MySQL 5.7+ / MariaDB** 与私有 **R2（`R2_MEDIA`）/ Backblaze B2** 存储支撑。
 
 ### 方式 A：一键部署 / Cloudflare 控制台 Git 自动部署（推荐）
 
@@ -31,7 +31,7 @@ VRCX-Worker 以**单个 Cloudflare Worker** 的形态运行，同时托管编译
    - **构建命令（Build command）**：*可留空* —— 根目录 [`wrangler.jsonc`](../../wrangler.jsonc) 已配置 `"build": { "command": "npm run build:web" }`，执行部署时会自动编译前端。
    - **部署命令（Deploy command）**：`npx wrangler deploy`
 3. 点击部署。首次部署时：
-   - Cloudflare 自动资源编排会自动创建 `vrcx-core`、`vrcx-gamelog`、`vrcx-feed`、`vrcx-cache` 4 个 D1 数据库与 `AgentHubDO`（`R2_MEDIA` 默认关闭，确保未开通 R2 的账号也能零报错一键部署）。
+   - Cloudflare 自动资源编排会自动创建 6 个 D1 数据库（`vrcx-core`、`vrcx-gamelog`、`vrcx-feed`、`vrcx-cache`、`vrcx-legacy`、`vrcx-chat`）、`AgentHubDO` 与 `AI` 绑定（`R2_MEDIA` 默认关闭，确保未开通 R2 的账号也能零报错一键部署；且 `keep_vars` 与 `unsafe.metadata.keep_bindings` 会在后续 Git 自动部署时保留已绑定的机密、变量与 R2 存储桶）。
    - 收到首个 HTTP 请求时，[`cloud/src/db/schemaBootstrap.ts`](../../cloud/src/db/schemaBootstrap.ts) 会自动幂等创建全部数据表、索引与 FTS5 `trigram` 搜索字典，无需手动执行 SQL 迁移。
    - 后续向 `master` 分支推送代码时，Cloudflare 会自动重新编译前端并更新线上 Worker。
 
@@ -185,7 +185,7 @@ dotnet build desktop/Dotnet/VRCX-Cef.csproj -c Release -p:Platform=x64 -r win-x6
 
 - **问：部署完成后打开网址提示 `open_setup` 或没有密码保护？**
   - 首次未设置密钥时默认以 `open_setup` 开放启动。在 Cloudflare 控制台 Worker 设置 → 变量和机密中添加 `ADMIN_PASSCODE` 与 `COOKIE_MASTER_KEY` 后刷新即可生效。
-- **问：如何确认 4 个 D1 分片、缓存和 R2 是否全部绑定正常？**
+- **问：如何确认 6 个 D1 分片、缓存和 R2 是否全部绑定正常？**
   - 在网页底部打开 **云端中心**，或直接访问你的 Worker 域名下的 `/health` 接口，即可查看 `DB_CORE`、`DB_GAMELOG`、`DB_FEED`、`DB_CACHE`（`cacheDbDedicated: true`）与 `R2_MEDIA` 状态。
 - **问：中国大陆环境下 `VRCX.Agent` 提示连接超时怎么办？**
   - 右键托盘图标切换至 **中国大陆代理**，或在设置界面填入本地 HTTP/SOCKS5 代理地址或 `vmess://` 链接，点击 **测试连接并保存**。

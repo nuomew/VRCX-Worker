@@ -21,7 +21,7 @@
 
 ## 1. Deployment Options (Cloudflare Workers Free Tier)
 
-VRCX-Worker runs as a **single Cloudflare Worker** serving both the compiled VRCX Vue 3 SPA (`./build/web`) and the cloud API/Cron/WebSocket backend (`cloud/src/index.ts`), backed by **4 auto-provisioned D1 shards** (`DB_CORE`, `DB_GAMELOG`, `DB_FEED`, `DB_CACHE`), a SQLite-backed Hibernation Durable Object (`AgentHubDO`), and an optional private R2 bucket (`R2_MEDIA`).
+VRCX-Worker runs as a **single Cloudflare Worker** serving both the compiled VRCX Vue 3 SPA (`./build/web`) and the cloud API/Cron/WebSocket backend (`cloud/src/index.ts`), backed by **6 auto-provisioned D1 shards** (`DB_CORE`, `DB_GAMELOG`, `DB_FEED`, `DB_CACHE`, `DB_LEGACY`, `DB_CHAT`), a SQLite-backed Hibernation Durable Object (`AgentHubDO`), Cloudflare Workers `AI`, optional **External MySQL 5.7+ / MariaDB**, and optional private **R2 (`R2_MEDIA`) / Backblaze B2** storage.
 
 ### Option A: One-Click / Cloudflare Dashboard Git Auto-Deploy (Recommended)
 
@@ -31,7 +31,7 @@ VRCX-Worker runs as a **single Cloudflare Worker** serving both the compiled VRC
    - **Build command**: *(may be left blank)* — root [`wrangler.jsonc`](../../wrangler.jsonc) defines `"build": { "command": "npm run build:web" }`, so the full Web SPA builds automatically during deploy.
    - **Deploy command**: `npx wrangler deploy`
 3. Deploy. On first deployment:
-   - Cloudflare Automatic Resource Provisioning creates `vrcx-core`, `vrcx-gamelog`, `vrcx-feed`, `vrcx-cache` D1 databases and `AgentHubDO` (`R2_MEDIA` is disabled by default so first-time deploys succeed without an R2 subscription).
+   - Cloudflare Automatic Resource Provisioning creates all 6 D1 databases (`vrcx-core`, `vrcx-gamelog`, `vrcx-feed`, `vrcx-cache`, `vrcx-legacy`, `vrcx-chat`), `AgentHubDO`, and the `AI` binding (`R2_MEDIA` is disabled by default so first-time deploys succeed without an R2 subscription; `keep_vars` and `unsafe.metadata.keep_bindings` preserve Dashboard Secrets, env vars, and manually bound R2 buckets across future Git auto-deploys).
    - On the first HTTP request, [`cloud/src/db/schemaBootstrap.ts`](../../cloud/src/db/schemaBootstrap.ts) idempotently initializes all tables, indexes, and FTS5 `trigram` entity dictionaries (zero manual SQL migrations required).
    - Pushing future commits to `master` automatically rebuilds and redeploys both frontend and backend.
 
@@ -186,7 +186,7 @@ dotnet build desktop/Dotnet/VRCX-Cef.csproj -c Release -p:Platform=x64 -r win-x6
 - **Q: Cloudflare Dashboard deploy succeeded, why does the root URL show the Cloud Gate or `open_setup` warning?**
   - Fresh deployments default to `open_setup` when no auth secrets are set. Add `ADMIN_PASSCODE` (and `COOKIE_MASTER_KEY`) in Worker Settings → Variables and Secrets, then refresh the page.
 - **Q: How do I check database shards, cache hit status, and Free-tier quota usage?**
-  - Open **Cloud Hub** in the bottom status bar, or visit `/health` on your Worker URL to verify `DB_CORE`, `DB_GAMELOG`, `DB_FEED`, `DB_CACHE` (`cacheDbDedicated: true`), and `R2_MEDIA`.
+  - Open **Cloud Hub** in the bottom status bar, or visit `/health` on your Worker URL to verify `DB_CORE`, `DB_GAMELOG`, `DB_FEED`, `DB_CACHE` (`cacheDbDedicated: true`), `DB_LEGACY`, `DB_CHAT`, and `R2_MEDIA`.
 - **Q: Why did `VRCX.Agent` fail to connect from Mainland China?**
   - Right-click the tray icon → switch to **Mainland China (Proxy)**, or open Settings and configure your local HTTP/SOCKS5 proxy or a `vmess://` link, then click **Test & Save**.
 - **Q: Screenshots appear in GameLog / metadata, but not as images in Cloud Gallery?**
