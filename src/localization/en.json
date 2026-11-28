@@ -4229,6 +4229,7 @@
             "status_queued": "Queued",
             "status_running": "Syncing",
             "status_completed": "Completed",
+            "status_incomplete_mismatch": "Count Mismatch",
             "status_cancelled": "Cancelled",
             "status_failed": "Failed",
             "status_stopped_quota_limit": "Paused (Near 500 MB Cap)",
@@ -4303,7 +4304,16 @@
             "resetting_cursors": "Resetting...",
             "reset_cursors_toast": "Saved resume checkpoints cleared. Next sync will scan from the beginning.",
             "cursor_checkpoint_badge": "Checkpoint · {count} synced",
-            "cursor_resume_hint": "Saved checkpoints detected — syncing will resume directly from the last confirmed row without re-uploading completed tables."
+            "cursor_resume_hint": "Saved checkpoints detected — syncing will resume directly from the last confirmed row without re-uploading completed tables.",
+            "synced_complete_badge": "{count} synced",
+            "missing_rows_badge": "Missing {count}",
+            "excess_rows_badge": "+{count} extra",
+            "repair_mismatched_btn": "Repair Mismatched ({count})",
+            "repair_started_toast": "Cleared stale cloud data & checkpoints for {count} mismatched category(ies); re-syncing cleanly from scratch.",
+            "already_synced_toast": "Selected categories already match desktop counts exactly — nothing left to upload.",
+            "job_mismatch_toast": "Migration ended with row count mismatches between cloud and desktop. Review the differences or click Repair Mismatched.",
+            "mismatch_detail_missing": "{name}: {cloud} in cloud / {desktop} on desktop (missing {missing})",
+            "mismatch_detail_excess": "{name}: {cloud} in cloud / {desktop} on desktop (+{excess} extra duplicates)"
         }
     }
 }

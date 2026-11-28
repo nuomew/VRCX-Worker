@@ -27,8 +27,8 @@ import {
     gamelogTupleDedupKey,
     sanitizeMysqlSafeText
 } from '../db/compactArchive';
-import { MANAGED_MYSQL_TABLE_SET } from '../db/externalMysql';
-import { isExternalMysqlActiveOnEnv } from '../db/externalMysqlProxy';
+import { getRawD1Env, MANAGED_MYSQL_TABLE_SET, qualifyMysqlTableName } from '../db/externalMysql';
+import { getHybridMysqlSession, isExternalMysqlActiveOnEnv } from '../db/externalMysqlProxy';
 import { getLegacyDb } from '../db/schemaBootstrap';
 import type { Env } from '../env';
 import {
@@ -725,13 +725,28 @@ export interface LegacyTableCursor {
 
 export type LegacyCursorStore = Record<string, Record<string, LegacyTableCursor>>;
 
+export interface LegacyCategoryMismatch {
+    category: LegacyCategory;
+    desktopRows: number;
+    cloudRows: number;
+    delta: number;
+}
+
 export interface LegacyMigrationJob {
     jobId: string;
     deviceId: string;
     accountPrefix: string;
     categories: LegacyCategory[];
     concurrency?: number;
-    status: 'queued' | 'running' | 'completed' | 'cancelled' | 'failed' | 'stopped_quota_limit' | 'paused_daily_quota';
+    status:
+        | 'queued'
+        | 'running'
+        | 'completed'
+        | 'incomplete_mismatch'
+        | 'cancelled'
+        | 'failed'
+        | 'stopped_quota_limit'
+        | 'paused_daily_quota';
     startedAt: string;
     updatedAt: string;
     finishedAt: string;
@@ -743,6 +758,8 @@ export interface LegacyMigrationJob {
     skippedRows: number;
     estimatedBytes: number;
     errorMessage: string;
+    mismatches?: LegacyCategoryMismatch[];
+    repairedCategories?: LegacyCategory[];
 }
 
 export interface LegacyMigrationSettings {
@@ -867,6 +884,12 @@ async function readLegacyCursorStore(db: D1Database): Promise<LegacyCursorStore>
 /**
  * Builds a single-row atomic UPSERT statement persisting one table resume watermark inside `cursors`,
  * cutting per-batch D1 cursor writes from 3 statements (2 UPDATEs + 1 INSERT) down to 1 single-row UPSERT.
+ *
+ * Enforces strict monotonicity under multi-threaded uploads (`concurrency > 1`):
+ * - An already-completed table cursor (`completed = true`) is NEVER downgraded back to `completed = false`
+ *   by a slower out-of-order batch or stale error checkpoint.
+ * - An in-progress cursor never regresses `rowsDone` backwards.
+ * - Sealing `completed = true` preserves `MAX(existing.rowsDone, incoming.rowsDone)`.
  */
 function buildSaveLegacyTableCursorStmt(
     legacyDb: D1Database,
@@ -878,7 +901,43 @@ function buildSaveLegacyTableCursorStmt(
     if (!SAFE_LOGICAL_TABLE_RE.test(tableName)) return null;
     const scopePath = `$."${scopeKey}"`;
     const tablePath = `$."${scopeKey}"."${tableName}"`;
+    const completedPath = `${tablePath}.completed`;
+    const rowsDonePath = `${tablePath}.rowsDone`;
     const seedJson = JSON.stringify({ [scopeKey]: { [tableName]: cursor } });
+    const incomingJson = JSON.stringify(cursor);
+
+    if (cursor.completed) {
+        return legacyDb
+            .prepare(
+                `INSERT INTO legacy_migration_state (state_key, payload_json, updated_at)
+                 VALUES (?, ?, ?)
+                 ON CONFLICT(state_key) DO UPDATE SET
+                    payload_json = CASE
+                        WHEN json_valid(legacy_migration_state.payload_json)
+                         AND json_type(legacy_migration_state.payload_json) = 'object'
+                            THEN json_set(
+                                CASE
+                                    WHEN json_type(legacy_migration_state.payload_json, ?) IS NULL
+                                        THEN json_set(legacy_migration_state.payload_json, ?, json('{}'))
+                                    ELSE legacy_migration_state.payload_json
+                                END,
+                                ?,
+                                json_set(
+                                    json(?),
+                                    '$.rowsDone',
+                                    MAX(
+                                        COALESCE(CAST(json_extract(legacy_migration_state.payload_json, ?) AS INTEGER), 0),
+                                        ?
+                                    )
+                                )
+                            )
+                        ELSE excluded.payload_json
+                    END,
+                    updated_at = excluded.updated_at`
+            )
+            .bind(STATE_KEY_CURSORS, seedJson, nowIso, scopePath, scopePath, tablePath, incomingJson, rowsDonePath, cursor.rowsDone);
+    }
+
     return legacyDb
         .prepare(
             `INSERT INTO legacy_migration_state (state_key, payload_json, updated_at)
@@ -887,20 +946,37 @@ function buildSaveLegacyTableCursorStmt(
                 payload_json = CASE
                     WHEN json_valid(legacy_migration_state.payload_json)
                      AND json_type(legacy_migration_state.payload_json) = 'object'
-                        THEN json_set(
-                            CASE
-                                WHEN json_type(legacy_migration_state.payload_json, ?) IS NULL
-                                    THEN json_set(legacy_migration_state.payload_json, ?, json('{}'))
-                                ELSE legacy_migration_state.payload_json
-                            END,
-                            ?,
-                            json(?)
-                        )
+                        THEN CASE
+                            WHEN COALESCE(json_extract(legacy_migration_state.payload_json, ?), 0) IN (1, 'true')
+                                THEN legacy_migration_state.payload_json
+                            WHEN COALESCE(CAST(json_extract(legacy_migration_state.payload_json, ?) AS INTEGER), 0) > ?
+                                THEN legacy_migration_state.payload_json
+                            ELSE json_set(
+                                CASE
+                                    WHEN json_type(legacy_migration_state.payload_json, ?) IS NULL
+                                        THEN json_set(legacy_migration_state.payload_json, ?, json('{}'))
+                                    ELSE legacy_migration_state.payload_json
+                                END,
+                                ?,
+                                json(?)
+                            )
+                        END
                     ELSE excluded.payload_json
                 END,
                 updated_at = excluded.updated_at`
         )
-        .bind(STATE_KEY_CURSORS, seedJson, nowIso, scopePath, scopePath, tablePath, JSON.stringify(cursor));
+        .bind(
+            STATE_KEY_CURSORS,
+            seedJson,
+            nowIso,
+            completedPath,
+            rowsDonePath,
+            cursor.rowsDone,
+            scopePath,
+            scopePath,
+            tablePath,
+            incomingJson
+        );
 }
 
 async function saveLegacyTableCursorAtomic(
@@ -1078,6 +1154,441 @@ export async function getLegacyImportedStats(env: Env): Promise<LegacyImportedSt
     return anyPositive ? out : null;
 }
 
+const LEGACY_MYSQL_FLAT_COUNT_TABLES = [
+    'memos',
+    'world_memos',
+    'avatar_memos',
+    'notes',
+    'favorite_friend',
+    'favorite_world',
+    'favorite_avatar',
+    'favorite_print',
+    'avatar_tags',
+    'avatar_history',
+    'friend_log_current',
+    'moderation',
+    'user_profile'
+] as const;
+
+const LEGACY_D1_SINGLE_HISTORY_TABLES = [
+    'friend_log_history',
+    'notifications',
+    'notifications_v2',
+    'gamelog_location',
+    'gamelog_join_leave',
+    'gamelog_portal_spawn',
+    'gamelog_video_play',
+    'gamelog_event',
+    'gamelog_external',
+    'feed_gps',
+    'feed_online_offline',
+    'feed_status',
+    'feed_bio'
+] as const;
+
+const LEGACY_TABLES_BY_CATEGORY_DELETE: Record<LegacyCategory, readonly string[]> = {
+    memos_notes: ['memos', 'world_memos', 'avatar_memos', 'notes'],
+    favorites: ['favorite_friend', 'favorite_world', 'favorite_avatar', 'favorite_print', 'avatar_tags'],
+    avatar_history: ['avatar_history'],
+    friend_log: ['friend_log_current', 'friend_log_history'],
+    notifications: ['notifications', 'notifications_v2'],
+    moderation_profiles: ['moderation', 'user_profile'],
+    gamelog: [
+        'gamelog_location',
+        'gamelog_join_leave',
+        'gamelog_portal_spawn',
+        'gamelog_video_play',
+        'gamelog_event',
+        'gamelog_external',
+        'legacy_gamelog_chunks',
+        'gamelog_user_rollup',
+        'gamelog_world_rollup'
+    ],
+    feed: ['feed_gps', 'feed_online_offline', 'feed_status', 'feed_bio', 'legacy_feed_chunks'],
+    settings: ['legacy_configs']
+};
+
+export interface ActualLegacyCountsReport {
+    stats: LegacyImportedStats;
+    tableCounts: Record<string, number>;
+    degraded: boolean;
+}
+
+/**
+ * Measures true stored row counts across all 9 legacy categories and their 27 logical tables
+ * directly from actual DB_LEGACY tables & archive chunks (transparently merging native D1 + external MySQL 5.7
+ * in at most 1 MySQL UNION ALL RTT + 1 D1 batch RTT), eliminating additive `imported_stats` drift.
+ */
+async function measureActualLegacyCategoryStats(
+    env: Env,
+    legacyDb: D1Database
+): Promise<ActualLegacyCountsReport> {
+    const tableCounts: Record<string, number> = {
+        configs: 0,
+        memos: 0,
+        world_memos: 0,
+        avatar_memos: 0,
+        notes: 0,
+        favorite_friend: 0,
+        favorite_world: 0,
+        favorite_avatar: 0,
+        favorite_print: 0,
+        avatar_tags: 0,
+        avatar_history: 0,
+        friend_log_current: 0,
+        friend_log_history: 0,
+        notifications: 0,
+        notifications_v2: 0,
+        moderation: 0,
+        user_profile: 0,
+        gamelog_location: 0,
+        gamelog_join_leave: 0,
+        gamelog_portal_spawn: 0,
+        gamelog_video_play: 0,
+        gamelog_event: 0,
+        gamelog_external: 0,
+        feed_gps: 0,
+        feed_online_offline: 0,
+        feed_status: 0,
+        feed_bio: 0
+    };
+    const addCount = (logicalTable: string, delta: unknown) => {
+        const n = Math.max(0, Math.floor(Number(delta ?? 0) || 0));
+        if (n > 0) {
+            tableCounts[logicalTable] = (tableCounts[logicalTable] ?? 0) + n;
+        }
+    };
+
+    const mysqlSession = getHybridMysqlSession(legacyDb);
+    const rawEnv = getRawD1Env(env);
+    const rawLegacyDb = getLegacyDb(rawEnv) ?? legacyDb;
+    let degraded = false;
+
+    const runD1CountBatch = async (
+        db: D1Database,
+        entries: Array<{ key: string; sql: string; isGrouped?: boolean; kindCol?: string; kindMap?: Readonly<Record<string, string>> }>
+    ): Promise<void> => {
+        if (entries.length === 0) return;
+        try {
+            const batchRes = await db.batch(entries.map((e) => db.prepare(e.sql)));
+            for (let i = 0; i < entries.length; i++) {
+                const entry = entries[i]!;
+                const rows = (batchRes[i]?.results ?? []) as Array<Record<string, unknown>>;
+                if (entry.isGrouped && entry.kindCol && entry.kindMap) {
+                    for (const r of rows) {
+                        const mapped = entry.kindMap[String(r[entry.kindCol] ?? '')];
+                        if (mapped) addCount(mapped, r.cnt);
+                    }
+                } else {
+                    addCount(entry.key, rows[0]?.cnt);
+                }
+            }
+            return;
+        } catch {
+            // Minimal fixture fallback: query each statement individually so one missing table never fails all counts
+        }
+        await Promise.all(
+            entries.map(async (entry) => {
+                try {
+                    const res = await db.prepare(entry.sql).all<Record<string, unknown>>();
+                    const rows = res.results ?? [];
+                    if (entry.isGrouped && entry.kindCol && entry.kindMap) {
+                        for (const r of rows) {
+                            const mapped = entry.kindMap[String(r[entry.kindCol] ?? '')];
+                            if (mapped) addCount(mapped, r.cnt);
+                        }
+                    } else {
+                        addCount(entry.key, rows[0]?.cnt);
+                    }
+                } catch {
+                    // Ignore missing optional tables
+                }
+            })
+        );
+    };
+
+    if (mysqlSession) {
+        const prefix = mysqlSession.params.tablePrefix;
+        const mysqlUnionBranches: string[] = [];
+        for (const tbl of LEGACY_MYSQL_FLAT_COUNT_TABLES) {
+            const qTbl = qualifyMysqlTableName(prefix, tbl, 'legacy');
+            mysqlUnionBranches.push(`SELECT '${tbl}' AS tbl_key, COUNT(*) AS cnt FROM \`${qTbl}\``);
+        }
+        const qFeedChunks = qualifyMysqlTableName(prefix, 'legacy_feed_chunks', 'legacy');
+        for (const [kind, logical] of Object.entries(CHUNK_KIND_TO_FEED_TABLE)) {
+            mysqlUnionBranches.push(
+                `SELECT '${logical}' AS tbl_key, COALESCE(SUM(row_count), 0) AS cnt FROM \`${qFeedChunks}\` WHERE feed_kind = '${kind}'`
+            );
+        }
+        const qGamelogChunks = qualifyMysqlTableName(prefix, 'legacy_gamelog_chunks', 'legacy');
+        for (const [kind, logical] of Object.entries(CHUNK_KIND_TO_GAMELOG_TABLE)) {
+            mysqlUnionBranches.push(
+                `SELECT '${logical}' AS tbl_key, COALESCE(SUM(row_count), 0) AS cnt FROM \`${qGamelogChunks}\` WHERE gamelog_kind = '${kind}'`
+            );
+        }
+        const qCoreChunks = qualifyMysqlTableName(prefix, 'legacy_core_chunks', 'legacy');
+        for (const [kind, logical] of Object.entries(CHUNK_KIND_TO_CORE_TABLE)) {
+            mysqlUnionBranches.push(
+                `SELECT '${logical}' AS tbl_key, COALESCE(SUM(row_count), 0) AS cnt FROM \`${qCoreChunks}\` WHERE core_kind = '${kind}'`
+            );
+        }
+
+        const d1Entries: Array<{
+            key: string;
+            sql: string;
+            isGrouped?: boolean;
+            kindCol?: string;
+            kindMap?: Readonly<Record<string, string>>;
+        }> = [
+            { key: 'configs', sql: 'SELECT COUNT(*) AS cnt FROM legacy_configs' },
+            ...LEGACY_D1_SINGLE_HISTORY_TABLES.map((t) => ({ key: t, sql: `SELECT COUNT(*) AS cnt FROM ${t}` }))
+        ];
+        if (!(mysqlSession.mode === 'full_migrate' && mysqlSession.d1Drained)) {
+            for (const tbl of LEGACY_MYSQL_FLAT_COUNT_TABLES) {
+                d1Entries.push({ key: tbl, sql: `SELECT COUNT(*) AS cnt FROM ${tbl}` });
+            }
+            d1Entries.push(
+                {
+                    key: 'legacy_feed_chunks',
+                    sql: 'SELECT feed_kind, COALESCE(SUM(row_count), 0) AS cnt FROM legacy_feed_chunks GROUP BY feed_kind',
+                    isGrouped: true,
+                    kindCol: 'feed_kind',
+                    kindMap: CHUNK_KIND_TO_FEED_TABLE
+                },
+                {
+                    key: 'legacy_gamelog_chunks',
+                    sql: 'SELECT gamelog_kind, COALESCE(SUM(row_count), 0) AS cnt FROM legacy_gamelog_chunks GROUP BY gamelog_kind',
+                    isGrouped: true,
+                    kindCol: 'gamelog_kind',
+                    kindMap: CHUNK_KIND_TO_GAMELOG_TABLE
+                },
+                {
+                    key: 'legacy_core_chunks',
+                    sql: 'SELECT core_kind, COALESCE(SUM(row_count), 0) AS cnt FROM legacy_core_chunks GROUP BY core_kind',
+                    isGrouped: true,
+                    kindCol: 'core_kind',
+                    kindMap: CHUNK_KIND_TO_CORE_TABLE
+                }
+            );
+        }
+
+        const [mysqlRows] = await Promise.all([
+            mysqlSession
+                .query(mysqlUnionBranches.join(' UNION ALL '), [])
+                .then((res) => res.rows)
+                .catch(() => {
+                    degraded = true;
+                    return [] as Array<Record<string, unknown>>;
+                }),
+            runD1CountBatch(rawLegacyDb, d1Entries)
+        ]);
+        for (const r of mysqlRows) {
+            const key = String(r.tbl_key ?? '');
+            if (key) addCount(key, r.cnt);
+        }
+    } else {
+        const d1Entries: Array<{
+            key: string;
+            sql: string;
+            isGrouped?: boolean;
+            kindCol?: string;
+            kindMap?: Readonly<Record<string, string>>;
+        }> = [
+            { key: 'configs', sql: 'SELECT COUNT(*) AS cnt FROM legacy_configs' },
+            ...LEGACY_MYSQL_FLAT_COUNT_TABLES.map((t) => ({ key: t, sql: `SELECT COUNT(*) AS cnt FROM ${t}` })),
+            ...LEGACY_D1_SINGLE_HISTORY_TABLES.map((t) => ({ key: t, sql: `SELECT COUNT(*) AS cnt FROM ${t}` })),
+            {
+                key: 'legacy_feed_chunks',
+                sql: 'SELECT feed_kind, COALESCE(SUM(row_count), 0) AS cnt FROM legacy_feed_chunks GROUP BY feed_kind',
+                isGrouped: true,
+                kindCol: 'feed_kind',
+                kindMap: CHUNK_KIND_TO_FEED_TABLE
+            },
+            {
+                key: 'legacy_gamelog_chunks',
+                sql: 'SELECT gamelog_kind, COALESCE(SUM(row_count), 0) AS cnt FROM legacy_gamelog_chunks GROUP BY gamelog_kind',
+                isGrouped: true,
+                kindCol: 'gamelog_kind',
+                kindMap: CHUNK_KIND_TO_GAMELOG_TABLE
+            },
+            {
+                key: 'legacy_core_chunks',
+                sql: 'SELECT core_kind, COALESCE(SUM(row_count), 0) AS cnt FROM legacy_core_chunks GROUP BY core_kind',
+                isGrouped: true,
+                kindCol: 'core_kind',
+                kindMap: CHUNK_KIND_TO_CORE_TABLE
+            }
+        ];
+        await runD1CountBatch(rawLegacyDb, d1Entries);
+    }
+
+    const stats = emptyImportedStats();
+    for (const cat of LEGACY_CATEGORIES) {
+        let sum = 0;
+        for (const logical of LEGACY_LOGICAL_TABLES_BY_CATEGORY[cat]) {
+            sum += tableCounts[logical] ?? 0;
+        }
+        stats[cat] = sum;
+    }
+
+    return { stats, tableCounts, degraded };
+}
+
+function areImportedStatsEqual(a: LegacyImportedStats | null | undefined, b: LegacyImportedStats): boolean {
+    if (!a) return false;
+    for (const cat of LEGACY_CATEGORIES) {
+        if (Math.max(0, asFiniteInt(a[cat], 0)) !== b[cat]) return false;
+    }
+    return true;
+}
+
+interface DesktopCategoryFootprint {
+    rowCount: number;
+    estimatedDbBytes: number;
+    logicalTables: string[];
+}
+
+function normalizeInventoryPhysicalTableToLogical(physicalTable: string, accountPrefix: string): string {
+    const trimmed = physicalTable.trim();
+    if (!trimmed) return '';
+    if (accountPrefix && trimmed.startsWith(`${accountPrefix}_`)) {
+        return trimmed.slice(accountPrefix.length + 1);
+    }
+    return trimmed;
+}
+
+function buildDesktopCategoryMap(
+    inventory: LegacyDesktopInventory | null,
+    accountPrefix: string
+): Map<LegacyCategory, DesktopCategoryFootprint> {
+    const out = new Map<LegacyCategory, DesktopCategoryFootprint>();
+    if (!inventory || !inventory.dbFound) return out;
+    const mergeItem = (item: LegacyCategoryInventory) => {
+        const prev = out.get(item.key) ?? { rowCount: 0, estimatedDbBytes: 0, logicalTables: [] };
+        prev.rowCount += Math.max(0, asFiniteInt(item.rowCount, 0));
+        prev.estimatedDbBytes += Math.max(0, asFiniteInt(item.estimatedDbBytes, 0));
+        for (const t of item.tables ?? []) {
+            const logical = normalizeInventoryPhysicalTableToLogical(t, accountPrefix);
+            if (logical && !prev.logicalTables.includes(logical)) {
+                prev.logicalTables.push(logical);
+            }
+        }
+        out.set(item.key, prev);
+    };
+    for (const c of inventory.sharedCategories ?? []) mergeItem(c);
+    const acc = (inventory.accounts ?? []).find((a) => a.prefix === accountPrefix);
+    if (acc) {
+        for (const c of acc.categories ?? []) mergeItem(c);
+    }
+    return out;
+}
+
+function evaluateMigrationCategoryMismatches(
+    categories: readonly LegacyCategory[],
+    desktopMap: Map<LegacyCategory, DesktopCategoryFootprint>,
+    actualStats: LegacyImportedStats,
+    options: {
+        processedRows?: number;
+        skippedRows?: number;
+        allowExactFullUploadDedup?: boolean;
+    } = {}
+): {
+    mismatches: LegacyCategoryMismatch[];
+    hasBlockingMismatch: boolean;
+    summaryMessage: string;
+} {
+    const mismatches: LegacyCategoryMismatch[] = [];
+    let totalDesktopRows = 0;
+    let totalShortfall = 0;
+    let hasExcess = false;
+
+    for (const cat of categories) {
+        const desktopRows = desktopMap.get(cat)?.rowCount ?? 0;
+        const cloudRows = actualStats[cat] ?? 0;
+        totalDesktopRows += desktopRows;
+        if (desktopRows <= 0 && cloudRows <= 0) continue;
+        const delta = cloudRows - desktopRows;
+        if (delta !== 0) {
+            mismatches.push({ category: cat, desktopRows, cloudRows, delta });
+            if (delta > 0) hasExcess = true;
+            if (delta < 0) totalShortfall += -delta;
+        }
+    }
+
+    if (mismatches.length === 0) {
+        return { mismatches: [], hasBlockingMismatch: false, summaryMessage: '' };
+    }
+
+    const processedRows = Math.max(0, Number(options.processedRows ?? 0) || 0);
+    const skippedRows = Math.max(0, Number(options.skippedRows ?? 0) || 0);
+    const explainedByFullDedup =
+        options.allowExactFullUploadDedup === true &&
+        !hasExcess &&
+        totalDesktopRows > 0 &&
+        processedRows >= totalDesktopRows &&
+        totalShortfall <= skippedRows;
+
+    const hasBlockingMismatch = !explainedByFullDedup;
+    const summaryParts = mismatches.map((m) => {
+        if (m.delta < 0) {
+            return `${m.category}: cloud ${m.cloudRows.toLocaleString()} / desktop ${m.desktopRows.toLocaleString()} (missing ${(-m.delta).toLocaleString()})`;
+        }
+        return `${m.category}: cloud ${m.cloudRows.toLocaleString()} / desktop ${m.desktopRows.toLocaleString()} (+${m.delta.toLocaleString()} extra)`;
+    });
+    const summaryMessage = hasBlockingMismatch
+        ? `Cloud row count does not match desktop database — ${summaryParts.join('; ')}.`
+        : '';
+
+    return { mismatches, hasBlockingMismatch, summaryMessage };
+}
+
+/**
+ * Deletes legacy rows, archive chunks, rollups, and saved resume cursors for the specified categories
+ * across both D1 and external MySQL (when enabled), keeping all other categories intact.
+ */
+async function clearLegacyCategoriesData(
+    legacyDb: D1Database,
+    targetCategories: readonly LegacyCategory[],
+    options: { clearAllAux?: boolean; scopeKey?: string; nowIso?: string } = {}
+): Promise<void> {
+    if (targetCategories.length === 0) return;
+    const nowIso = options.nowIso || new Date().toISOString();
+    const deleteStmts: D1PreparedStatement[] = [];
+    for (const cat of targetCategories) {
+        for (const t of LEGACY_TABLES_BY_CATEGORY_DELETE[cat]) {
+            deleteStmts.push(legacyDb.prepare(`DELETE FROM ${t}`));
+        }
+        if (cat === 'friend_log') {
+            deleteStmts.push(legacyDb.prepare("DELETE FROM legacy_core_chunks WHERE core_kind = 'friend_log'"));
+        } else if (cat === 'notifications') {
+            deleteStmts.push(
+                legacyDb.prepare("DELETE FROM legacy_core_chunks WHERE core_kind IN ('notif_v1', 'notif_v2')")
+            );
+        }
+    }
+    if (options.clearAllAux) {
+        deleteStmts.push(
+            legacyDb.prepare('DELETE FROM legacy_core_chunks'),
+            legacyDb.prepare('DELETE FROM entity_users'),
+            legacyDb.prepare('DELETE FROM entity_worlds')
+        );
+    }
+    for (let i = 0; i < deleteStmts.length; i += 20) {
+        await legacyDb.batch(deleteStmts.slice(i, i + 20));
+    }
+    const existingStats =
+        (await readLegacyState<LegacyImportedStats>(legacyDb, STATE_KEY_IMPORTED_STATS)) ?? emptyImportedStats();
+    const nextStats: LegacyImportedStats = { ...emptyImportedStats(), ...existingStats };
+    for (const cat of targetCategories) {
+        nextStats[cat] = 0;
+    }
+    await writeLegacyState(legacyDb, STATE_KEY_IMPORTED_STATS, nextStats, nowIso);
+    await clearLegacyCursors(legacyDb, {
+        scopeKey: options.scopeKey,
+        categories: options.clearAllAux ? undefined : targetCategories
+    });
+}
+
 function sanitizeCategoryInventoryList(raw: unknown): LegacyCategoryInventory[] {
     if (!Array.isArray(raw)) return [];
     const seen = new Set<string>();
@@ -1136,7 +1647,17 @@ async function ingestLegacyCategoryBatch(
     const feedBioRows: unknown[][] = [];
     const userEntities = new Map<string, string>();
     const worldEntities = new Map<string, string>();
-    const nowIso = new Date().toISOString();
+    const nowMs = Date.now();
+    const nowIso = new Date(nowMs).toISOString();
+    const pendingSettings = new Map<string, string>();
+    let missingTsSeq = 0;
+    const resolveCreatedAt = (rawTs: unknown): string => {
+        const s = asStr(rawTs, 64).trim();
+        if (s) return s;
+        // Generate distinct fallback timestamps within the batch so legacy rows with blank created_at
+        // are never collapsed together by in-batch deduplication keys.
+        return new Date(nowMs + missingTsSeq++).toISOString();
+    };
 
     for (const raw of items) {
         if (!isPlainObject(raw)) continue;
@@ -1371,8 +1892,25 @@ async function ingestLegacyCategoryBatch(
                 if (displayName) userEntities.set(userId, displayName);
             }
         } else if (category === 'gamelog') {
-            const type = asStr(raw.type ?? kind, 64).trim();
-            const createdAt = asStr(raw.created_at ?? raw.createdAt, 64).trim() || nowIso;
+            const rawType = asStr(raw.type ?? kind, 64).trim();
+            const lowerType = rawType.toLowerCase();
+            const type =
+                lowerType === 'location'
+                    ? 'Location'
+                    : lowerType === 'onplayerjoined'
+                      ? 'OnPlayerJoined'
+                      : lowerType === 'onplayerleft'
+                        ? 'OnPlayerLeft'
+                        : lowerType === 'portalspawn'
+                          ? 'PortalSpawn'
+                          : lowerType === 'videoplay'
+                            ? 'VideoPlay'
+                            : lowerType === 'event'
+                              ? 'Event'
+                              : lowerType === 'external'
+                                ? 'External'
+                                : rawType;
+            const createdAt = resolveCreatedAt(raw.created_at ?? raw.createdAt);
             if (type === 'Location') {
                 const location = asStr(raw.location, 512);
                 const rawWorldId = asStr(raw.worldId ?? raw.world_id, 128).trim() || (location.split(':')[0] ?? '').trim();
@@ -1433,8 +1971,21 @@ async function ingestLegacyCategoryBatch(
                 ]);
             }
         } else if (category === 'feed') {
-            const type = asStr(raw.type ?? kind, 64).trim();
-            const createdAt = asStr(raw.created_at ?? raw.createdAt, 64).trim() || nowIso;
+            const rawType = asStr(raw.type ?? kind, 64).trim();
+            const lowerType = rawType.toLowerCase();
+            const type =
+                lowerType === 'gps'
+                    ? 'GPS'
+                    : lowerType === 'online'
+                      ? 'Online'
+                      : lowerType === 'offline'
+                        ? 'Offline'
+                        : lowerType === 'status'
+                          ? 'Status'
+                          : lowerType === 'bio'
+                            ? 'Bio'
+                            : rawType;
+            const createdAt = resolveCreatedAt(raw.created_at ?? raw.createdAt);
             const userId = asStr(raw.userId ?? raw.user_id, 128);
             const displayName = asStr(raw.displayName ?? raw.display_name, 256);
             if (type === 'GPS') {
@@ -1497,7 +2048,25 @@ async function ingestLegacyCategoryBatch(
             if (!rawKey || !isSafeLegacyConfigKey(rawKey)) continue;
             const normKey = normalizeLegacyConfigKey(rawKey);
             const val = raw.value == null ? '' : asStr(String(raw.value), 16_384);
-            stmts.push(
+            pendingSettings.set(normKey, val);
+        }
+    }
+
+    let inserted = 0;
+    let legacyDbBytes = 0;
+    if (pendingSettings.size > 0) {
+        const existingCfgRes = await legacyDb
+            .prepare('SELECT config_key FROM legacy_configs')
+            .all<{ config_key: string }>()
+            .catch(() => ({ results: [] as Array<{ config_key: string }> }));
+        const existingCfgKeys = new Set((existingCfgRes.results ?? []).map((r) => String(r.config_key ?? '')));
+        const cfgStmts: D1PreparedStatement[] = [];
+        let newlyInsertedConfigs = 0;
+        for (const [normKey, val] of pendingSettings.entries()) {
+            if (!existingCfgKeys.has(normKey)) {
+                newlyInsertedConfigs++;
+            }
+            cfgStmts.push(
                 legacyDb
                     .prepare(
                         `INSERT INTO legacy_configs (config_key, config_value, updated_at)
@@ -1509,10 +2078,16 @@ async function ingestLegacyCategoryBatch(
                     .bind(normKey, val, nowIso)
             );
         }
+        for (let i = 0; i < cfgStmts.length; i += 50) {
+            const res = await legacyDb.batch(cfgStmts.slice(i, i + 50));
+            for (const r of res) {
+                if (typeof r.meta?.size_after === 'number' && r.meta.size_after > legacyDbBytes) {
+                    legacyDbBytes = r.meta.size_after;
+                }
+            }
+        }
+        inserted += newlyInsertedConfigs;
     }
-
-    let inserted = 0;
-    let legacyDbBytes = 0;
     for (let i = 0; i < stmts.length; i += 50) {
         const res = await legacyDb.batch(stmts.slice(i, i + 50));
         for (const r of res) {
@@ -2006,11 +2581,9 @@ export async function handleLegacyMigrationAgentRoutes(
         const quotaReached = legacyDbBytes >= (batchOffloaded ? LEGACY_DB_HARD_CEILING_BYTES : LEGACY_DB_SOFT_STOP_BYTES);
         const allDone = body.allDone === true;
         const categoryDone = body.categoryDone === true && Boolean(categoryRaw) && LEGACY_CATEGORY_SET.has(categoryRaw);
-        const nextStatus: LegacyMigrationJob['status'] = quotaReached
-            ? 'stopped_quota_limit'
-            : allDone
-              ? 'completed'
-              : 'running';
+        // Keep status as 'running' during `allDone` until real DB row-count reconciliation decides
+        // whether the job truly `completed` or ended in `incomplete_mismatch`.
+        const nextStatus: LegacyMigrationJob['status'] = quotaReached ? 'stopped_quota_limit' : 'running';
 
         // Fold imported_stats + cursor + job progress into ONE single D1 batch round-trip (<=3 rows written total)
         postStateStmts.push(
@@ -2076,24 +2649,62 @@ export async function handleLegacyMigrationAgentRoutes(
                 if (categoryDone) {
                     completedCategories.add(categoryRaw);
                 }
-                const finalizedStatus: LegacyMigrationJob['status'] = quotaReached
+                let finalizedStatus: LegacyMigrationJob['status'] = quotaReached
                     ? 'stopped_quota_limit'
                     : allDone
                       ? 'completed'
                       : latestJob.status;
+                let finalizedErrorMessage = quotaReached
+                    ? 'Legacy database reached 480 MB safety limit (500 MB Free-tier ceiling).'
+                    : latestJob.errorMessage;
+                let finalizedMismatches: LegacyCategoryMismatch[] | undefined = latestJob.mismatches;
+
+                if (allDone && !quotaReached) {
+                    const [actualReport, inventory] = await Promise.all([
+                        measureActualLegacyCategoryStats(env, legacyDb),
+                        readLegacyState<LegacyDesktopInventory>(legacyDb, STATE_KEY_INVENTORY)
+                    ]);
+                    if (!actualReport.degraded) {
+                        await writeLegacyState(legacyDb, STATE_KEY_IMPORTED_STATS, actualReport.stats, nowIso).catch(
+                            () => {}
+                        );
+                        if (inventory?.dbFound) {
+                            const desktopMap = buildDesktopCategoryMap(inventory, latestJob.accountPrefix || '');
+                            const check = evaluateMigrationCategoryMismatches(
+                                latestJob.categories,
+                                desktopMap,
+                                actualReport.stats,
+                                {
+                                    processedRows: latestJob.processedRows,
+                                    skippedRows: latestJob.skippedRows,
+                                    allowExactFullUploadDedup: true
+                                }
+                            );
+                            finalizedMismatches = check.mismatches;
+                            if (check.hasBlockingMismatch) {
+                                finalizedStatus = 'incomplete_mismatch';
+                                finalizedErrorMessage = check.summaryMessage;
+                            } else {
+                                finalizedErrorMessage = '';
+                            }
+                        }
+                    }
+                }
+
                 const finalizedJob: LegacyMigrationJob = {
                     ...latestJob,
                     status: finalizedStatus,
                     updatedAt: nowIso,
                     finishedAt:
-                        finalizedStatus === 'completed' || finalizedStatus === 'stopped_quota_limit'
+                        finalizedStatus === 'completed' ||
+                        finalizedStatus === 'incomplete_mismatch' ||
+                        finalizedStatus === 'stopped_quota_limit'
                             ? nowIso
                             : latestJob.finishedAt,
                     currentCategory: allDone ? '' : latestJob.currentCategory,
                     completedCategories: Array.from(completedCategories),
-                    errorMessage: quotaReached
-                        ? 'Legacy database reached 480 MB safety limit (500 MB Free-tier ceiling).'
-                        : latestJob.errorMessage
+                    errorMessage: finalizedErrorMessage,
+                    ...(finalizedMismatches ? { mismatches: finalizedMismatches } : {})
                 };
                 await writeLegacyState(legacyDb, STATE_KEY_JOB, finalizedJob, nowIso);
             }
@@ -2202,15 +2813,68 @@ export async function handleLegacyMigrationWebRoutes(
             );
         }
 
-        const [probe, inventory, job, stats, scanRequest, settings, cursors] = await Promise.all([
+        const [probe, inventory, rawJob, cachedStats, scanRequest, settings, cursors, actualReport] = await Promise.all([
             legacyDb.prepare('SELECT 1 AS ok').all(),
             readLegacyState<LegacyDesktopInventory>(legacyDb, STATE_KEY_INVENTORY),
             readLegacyState<LegacyMigrationJob>(legacyDb, STATE_KEY_JOB),
             readLegacyState<LegacyImportedStats>(legacyDb, STATE_KEY_IMPORTED_STATS),
             readLegacyState<Record<string, unknown>>(legacyDb, STATE_KEY_SCAN_REQUEST),
             readLegacyMigrationSettings(legacyDb),
-            readLegacyCursorStore(legacyDb)
+            readLegacyCursorStore(legacyDb),
+            measureActualLegacyCategoryStats(env, legacyDb)
         ]);
+
+        const effectiveImportedStats: LegacyImportedStats = actualReport.degraded
+            ? { ...emptyImportedStats(), ...(cachedStats ?? {}) }
+            : actualReport.stats;
+
+        const isActiveJob = rawJob?.status === 'queued' || rawJob?.status === 'running';
+        if (!actualReport.degraded && !isActiveJob && !areImportedStatsEqual(cachedStats, actualReport.stats)) {
+            await writeLegacyState(legacyDb, STATE_KEY_IMPORTED_STATS, actualReport.stats).catch(() => {});
+        }
+
+        // Reconcile any previously stamped 'completed' job against live cloud row counts so stale
+        // false-completed badges (e.g. 0-row no-op runs when cloud rows are missing or duplicated)
+        // immediately surface as `incomplete_mismatch` on reload.
+        let job = rawJob;
+        if (
+            rawJob &&
+            (rawJob.status === 'completed' || rawJob.status === 'incomplete_mismatch') &&
+            !actualReport.degraded &&
+            inventory?.dbFound
+        ) {
+            const desktopMap = buildDesktopCategoryMap(inventory, rawJob.accountPrefix || '');
+            const check = evaluateMigrationCategoryMismatches(
+                rawJob.categories,
+                desktopMap,
+                effectiveImportedStats,
+                {
+                    processedRows: rawJob.processedRows,
+                    skippedRows: rawJob.skippedRows,
+                    allowExactFullUploadDedup: rawJob.processedRows > 0
+                }
+            );
+            if (check.hasBlockingMismatch) {
+                job = {
+                    ...rawJob,
+                    status: 'incomplete_mismatch',
+                    mismatches: check.mismatches,
+                    errorMessage: check.summaryMessage
+                };
+            } else if (rawJob.status === 'incomplete_mismatch' && check.mismatches.length === 0) {
+                job = {
+                    ...rawJob,
+                    status: 'completed',
+                    mismatches: [],
+                    errorMessage: ''
+                };
+            } else if (check.mismatches.length > 0) {
+                job = {
+                    ...rawJob,
+                    mismatches: check.mismatches
+                };
+            }
+        }
 
         const legacyDbBytes = probe.meta?.size_after ?? 0;
         const legacyDbPercent = Number(((legacyDbBytes / LEGACY_DB_FREE_LIMIT_BYTES) * 100).toFixed(2));
@@ -2230,7 +2894,8 @@ export async function handleLegacyMigrationWebRoutes(
                     scanRequest,
                     job,
                     cursors,
-                    importedStats: { ...emptyImportedStats(), ...(stats ?? {}) }
+                    importedStats: effectiveImportedStats,
+                    tableCounts: actualReport.tableCounts
                 }
             },
             { headers: { 'Cache-Control': 'no-store' } }
@@ -2414,9 +3079,10 @@ export async function handleLegacyMigrationWebRoutes(
             }
         }
 
-        const [probe, inventory] = await Promise.all([
+        const [probe, inventory, actualReport] = await Promise.all([
             legacyDb.prepare('SELECT 1 AS ok').all(),
-            readLegacyState<LegacyDesktopInventory>(legacyDb, STATE_KEY_INVENTORY)
+            readLegacyState<LegacyDesktopInventory>(legacyDb, STATE_KEY_INVENTORY),
+            measureActualLegacyCategoryStats(env, legacyDb)
         ]);
         const currentBytes = probe.meta?.size_after ?? 0;
         const startOffloadedOnly =
@@ -2433,44 +3099,6 @@ export async function handleLegacyMigrationWebRoutes(
                     }
                 },
                 { status: 409 }
-            );
-        }
-
-        let totalEstimatedRows = 0;
-        let estimatedBytes = 0;
-        if (inventory) {
-            const selectedSet = new Set<string>(categories);
-            for (const c of inventory.sharedCategories ?? []) {
-                if (selectedSet.has(c.key)) {
-                    totalEstimatedRows += c.rowCount;
-                    estimatedBytes += c.estimatedDbBytes;
-                }
-            }
-            const acc = (inventory.accounts ?? []).find((a) => a.prefix === accountPrefix);
-            if (acc) {
-                for (const c of acc.categories ?? []) {
-                    if (selectedSet.has(c.key)) {
-                        totalEstimatedRows += c.rowCount;
-                        estimatedBytes += c.estimatedDbBytes;
-                    }
-                }
-            }
-        }
-
-        if (
-            estimatedBytes > LEGACY_DB_FREE_LIMIT_BYTES ||
-            currentBytes + estimatedBytes > LEGACY_DB_FREE_LIMIT_BYTES
-        ) {
-            return Response.json(
-                {
-                    ok: false,
-                    error: {
-                        code: 'SELECTION_EXCEEDS_LIMIT',
-                        message:
-                            'Selected legacy data plus current DB_LEGACY usage exceeds the 500 MB single-database maximum. Please uncheck larger categories.'
-                    }
-                },
-                { status: 400 }
             );
         }
 
@@ -2501,14 +3129,113 @@ export async function handleLegacyMigrationWebRoutes(
         }
 
         const resumeRequested = rawBody.resume !== false;
+        const repairMismatched = rawBody.repairMismatched === true;
         const cursorScopeKey = getCursorScopeKey(accountPrefix);
         if (!resumeRequested) {
             await clearLegacyCursors(legacyDb, { scopeKey: cursorScopeKey, categories });
         }
         const cursorStore = resumeRequested ? await readLegacyCursorStore(legacyDb) : {};
-        const activeCursors: Record<string, LegacyTableCursor> = {};
         const scopeCursors = cursorStore[cursorScopeKey] ?? {};
-        const allowedTablesForJob = new Set(categories.flatMap((c) => LEGACY_LOGICAL_TABLES_BY_CATEGORY[c] ?? []));
+        const desktopMap = buildDesktopCategoryMap(inventory, accountPrefix);
+        const liveStats: LegacyImportedStats = { ...actualReport.stats };
+
+        const categoriesToResetAndResync: LegacyCategory[] = [];
+        const alreadySyncedSet = new Set<LegacyCategory>();
+        const cursorRowsDoneByCat = new Map<LegacyCategory, number>();
+
+        if (!actualReport.degraded && desktopMap.size > 0) {
+            for (const cat of categories) {
+                const footprint = desktopMap.get(cat);
+                const desktopRows = footprint?.rowCount ?? 0;
+                if (desktopRows <= 0) continue;
+                const cloudRows = liveStats[cat] ?? 0;
+                const logicalTables = LEGACY_LOGICAL_TABLES_BY_CATEGORY[cat] ?? [];
+                let hasUnfinishedTable = false;
+                let hasAnyCompletedTable = false;
+                let cursorRowsDone = 0;
+                for (const tbl of logicalTables) {
+                    const cur = scopeCursors[tbl];
+                    if (!cur) continue;
+                    cursorRowsDone += Math.max(0, Number(cur.rowsDone || 0));
+                    if (cur.completed) {
+                        hasAnyCompletedTable = true;
+                    } else if (cur.rowsDone > 0 || cur.rowId > 0 || cur.createdAt) {
+                        hasUnfinishedTable = true;
+                    }
+                }
+                cursorRowsDoneByCat.set(cat, cursorRowsDone);
+                const willSkipOnResume = (!hasUnfinishedTable && hasAnyCompletedTable) || cursorRowsDone >= desktopRows;
+
+                if (cloudRows !== desktopRows) {
+                    // Automatically wipe & cleanly re-upload any mismatched category that has excess duplicates,
+                    // completed/exhausted cursors that would skip rows on resume, or explicit repair request.
+                    if (repairMismatched || !resumeRequested || cloudRows > desktopRows || willSkipOnResume) {
+                        categoriesToResetAndResync.push(cat);
+                    }
+                } else if (resumeRequested && !repairMismatched && !hasUnfinishedTable && hasAnyCompletedTable) {
+                    alreadySyncedSet.add(cat);
+                }
+            }
+        }
+
+        const effectiveCategories = categories.filter((c) => !alreadySyncedSet.has(c));
+        if (effectiveCategories.length === 0) {
+            return Response.json({
+                ok: true,
+                data: {
+                    alreadySynced: true,
+                    importedStats: liveStats,
+                    job: existingJob
+                }
+            });
+        }
+
+        let totalEstimatedRows = 0;
+        let estimatedBytes = 0;
+        const resetSet = new Set<LegacyCategory>(categoriesToResetAndResync);
+        for (const cat of effectiveCategories) {
+            const footprint = desktopMap.get(cat);
+            if (!footprint) continue;
+            const desktopRows = footprint.rowCount;
+            const doneRows = resetSet.has(cat) ? 0 : (cursorRowsDoneByCat.get(cat) ?? 0);
+            const remainingRows =
+                resumeRequested && doneRows > 0 && doneRows < desktopRows ? desktopRows - doneRows : desktopRows;
+            totalEstimatedRows += remainingRows;
+            estimatedBytes += footprint.estimatedDbBytes;
+        }
+
+        if (
+            estimatedBytes > LEGACY_DB_FREE_LIMIT_BYTES ||
+            currentBytes + estimatedBytes > LEGACY_DB_FREE_LIMIT_BYTES
+        ) {
+            return Response.json(
+                {
+                    ok: false,
+                    error: {
+                        code: 'SELECTION_EXCEEDS_LIMIT',
+                        message:
+                            'Selected legacy data plus current DB_LEGACY usage exceeds the 500 MB single-database maximum. Please uncheck larger categories.'
+                    }
+                },
+                { status: 400 }
+            );
+        }
+
+        if (categoriesToResetAndResync.length > 0) {
+            await clearLegacyCategoriesData(legacyDb, categoriesToResetAndResync, {
+                scopeKey: cursorScopeKey
+            });
+            for (const cat of categoriesToResetAndResync) {
+                liveStats[cat] = 0;
+            }
+        }
+
+        const activeCursors: Record<string, LegacyTableCursor> = {};
+        const allowedTablesForJob = new Set(
+            effectiveCategories
+                .filter((c) => !resetSet.has(c))
+                .flatMap((c) => LEGACY_LOGICAL_TABLES_BY_CATEGORY[c] ?? [])
+        );
         for (const [tableName, cur] of Object.entries(scopeCursors)) {
             if (allowedTablesForJob.has(tableName)) {
                 activeCursors[tableName] = cur;
@@ -2522,7 +3249,7 @@ export async function handleLegacyMigrationWebRoutes(
             params: {
                 jobId,
                 accountPrefix,
-                categories,
+                categories: effectiveCategories,
                 concurrency: effectiveConcurrency,
                 cursors: activeCursors
             },
@@ -2542,7 +3269,7 @@ export async function handleLegacyMigrationWebRoutes(
             jobId,
             deviceId: dispatch.deviceId || effectiveDeviceId,
             accountPrefix,
-            categories,
+            categories: effectiveCategories,
             concurrency: effectiveConcurrency,
             status: 'queued',
             startedAt: nowIso,
@@ -2555,7 +3282,8 @@ export async function handleLegacyMigrationWebRoutes(
             insertedRows: 0,
             skippedRows: 0,
             estimatedBytes,
-            errorMessage: ''
+            errorMessage: '',
+            ...(categoriesToResetAndResync.length > 0 ? { repairedCategories: categoriesToResetAndResync } : {})
         };
         await writeLegacyState(legacyDb, STATE_KEY_JOB, job, nowIso);
 
@@ -2564,7 +3292,8 @@ export async function handleLegacyMigrationWebRoutes(
             data: {
                 job,
                 cmdId: dispatch.cmdId,
-                delivery: dispatch.deliveryStatus
+                delivery: dispatch.deliveryStatus,
+                repairedCategories: categoriesToResetAndResync
             }
         });
     }
@@ -2610,29 +3339,6 @@ export async function handleLegacyMigrationWebRoutes(
         }
         const categoryParam = url.searchParams.get('category')?.trim() ?? '';
         const nowIso = new Date().toISOString();
-        const stats = (await readLegacyState<LegacyImportedStats>(legacyDb, STATE_KEY_IMPORTED_STATS)) ?? emptyImportedStats();
-
-        const tablesByCategory: Record<LegacyCategory, readonly string[]> = {
-            memos_notes: ['memos', 'world_memos', 'avatar_memos', 'notes'],
-            favorites: ['favorite_friend', 'favorite_world', 'favorite_avatar', 'favorite_print', 'avatar_tags'],
-            avatar_history: ['avatar_history'],
-            friend_log: ['friend_log_current', 'friend_log_history'],
-            notifications: ['notifications', 'notifications_v2'],
-            moderation_profiles: ['moderation', 'user_profile'],
-            gamelog: [
-                'gamelog_location',
-                'gamelog_join_leave',
-                'gamelog_portal_spawn',
-                'gamelog_video_play',
-                'gamelog_event',
-                'gamelog_external',
-                'legacy_gamelog_chunks',
-                'gamelog_user_rollup',
-                'gamelog_world_rollup'
-            ],
-            feed: ['feed_gps', 'feed_online_offline', 'feed_status', 'feed_bio', 'legacy_feed_chunks'],
-            settings: ['legacy_configs']
-        };
 
         const targetCategories: LegacyCategory[] = categoryParam
             ? LEGACY_CATEGORY_SET.has(categoryParam)
@@ -2647,33 +3353,10 @@ export async function handleLegacyMigrationWebRoutes(
             );
         }
 
-        const deleteStmts: D1PreparedStatement[] = [];
-        for (const cat of targetCategories) {
-            for (const t of tablesByCategory[cat]) {
-                deleteStmts.push(legacyDb.prepare(`DELETE FROM ${t}`));
-            }
-            if (cat === 'friend_log') {
-                deleteStmts.push(legacyDb.prepare("DELETE FROM legacy_core_chunks WHERE core_kind = 'friend_log'"));
-            } else if (cat === 'notifications') {
-                deleteStmts.push(
-                    legacyDb.prepare("DELETE FROM legacy_core_chunks WHERE core_kind IN ('notif_v1', 'notif_v2')")
-                );
-            }
-            stats[cat] = 0;
-        }
-        if (!categoryParam) {
-            deleteStmts.push(
-                legacyDb.prepare('DELETE FROM legacy_core_chunks'),
-                legacyDb.prepare('DELETE FROM entity_users'),
-                legacyDb.prepare('DELETE FROM entity_worlds')
-            );
-        }
-
-        for (let i = 0; i < deleteStmts.length; i += 20) {
-            await legacyDb.batch(deleteStmts.slice(i, i + 20));
-        }
-        await writeLegacyState(legacyDb, STATE_KEY_IMPORTED_STATS, stats, nowIso);
-        await clearLegacyCursors(legacyDb, categoryParam ? { categories: targetCategories } : {});
+        await clearLegacyCategoriesData(legacyDb, targetCategories, {
+            clearAllAux: !categoryParam,
+            nowIso
+        });
         if (!categoryParam) {
             await legacyDb
                 .prepare("DELETE FROM legacy_migration_state WHERE state_key = 'job'")

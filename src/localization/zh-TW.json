@@ -3876,6 +3876,7 @@
             "status_queued": "排隊中",
             "status_running": "同步中",
             "status_completed": "已完成",
+            "status_incomplete_mismatch": "資料量不符",
             "status_cancelled": "已取消",
             "status_failed": "失敗",
             "status_stopped_quota_limit": "已觸發 500 MB 保護暫停",
@@ -3950,7 +3951,16 @@
             "resetting_cursors": "重設中...",
             "reset_cursors_toast": "已清除續傳斷點，下次同步將從頭重新掃描。",
             "cursor_checkpoint_badge": "斷點已存 · 已傳 {count} 筆",
-            "cursor_resume_hint": "偵測到已儲存的同步斷點：本次將直接從上次已確認位置續傳，自動略過已完成的資料表。"
+            "cursor_resume_hint": "偵測到已儲存的同步斷點：本次將直接從上次已確認位置續傳，自動略過已完成的資料表。",
+            "synced_complete_badge": "已完整匯入 {count} 筆",
+            "missing_rows_badge": "缺失 {count} 筆",
+            "excess_rows_badge": "多出 {count} 筆重複",
+            "repair_mismatched_btn": "修復異常分類（重傳 {count} 項）",
+            "repair_started_toast": "已清除 {count} 個異常分類的舊資料與失效斷點，正在從頭乾淨重傳。",
+            "already_synced_toast": "所選分類的雲端筆數已與桌面端完全一致，無需重複傳輸。",
+            "job_mismatch_toast": "同步結束但雲端筆數與桌面端不符，請檢視下方差異或點擊「修復異常分類」重傳。",
+            "mismatch_detail_missing": "{name}：雲端僅 {cloud} 筆 / 桌面 {desktop} 筆（缺失 {missing} 筆）",
+            "mismatch_detail_excess": "{name}：雲端 {cloud} 筆 / 桌面 {desktop} 筆（多出 {excess} 筆重複記錄）"
         }
     }
 }

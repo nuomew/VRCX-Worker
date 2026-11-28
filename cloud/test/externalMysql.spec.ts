@@ -3890,4 +3890,369 @@ describe('External MySQL 5.7+ Database Integration (Hybrid New-Writes Mode & Ful
             ]).catch(() => {});
         }
     });
+
+    it('reconciles true legacy row counts across MySQL + D1, prevents false completed on mismatches, guards cursor monotonicity, and auto-repairs mismatched categories', async () => {
+        await ensureSchemaReady(env);
+        const legacyDb = env.DB_LEGACY!;
+        const fakeMysql = new FakeMysql57Server();
+        setMysqlConnectionFactoryForTests(async () => fakeMysql.createConnection());
+        clearMysqlSchemaReadyCache();
+        invalidateExternalDbConfigCache();
+
+        const webHeaders = { 'Content-Type': 'application/json', Origin: 'http://example.com' };
+        let deviceId = '';
+        try {
+            // Enable external MySQL 5.7
+            const saveRes = await exports.default.fetch('http://example.com/api/storage/mysql/config', {
+                method: 'PUT',
+                headers: webHeaders,
+                body: JSON.stringify({
+                    enabled: true,
+                    mode: 'new_writes_only',
+                    connectionType: 'direct',
+                    host: 'mysql-reconcile.example.com',
+                    port: 3306,
+                    database: 'vrcx_reconcile',
+                    username: 'vrcx_user',
+                    password: 'secret-reconcile-pw',
+                    sslMode: 'disabled',
+                    tablePrefix: 'vrcx_'
+                })
+            });
+            expect(saveRes.status).toBe(200);
+
+            // Issue Agent sync key
+            const keyRes = await exports.default.fetch('http://example.com/api/agent/sync-key', {
+                method: 'POST',
+                headers: webHeaders,
+                body: JSON.stringify({ deviceName: 'Reconcile-PC' })
+            });
+            expect(keyRes.status).toBe(200);
+            const keyJson = (await keyRes.json()) as { data: { deviceId: string; syncKey: string } };
+            deviceId = keyJson.data.deviceId;
+            const agentHeaders = {
+                'Content-Type': 'application/json',
+                Authorization: `Bearer ${keyJson.data.syncKey}`,
+                'X-Device-Id': deviceId
+            };
+            const accountPrefix = 'usrreconcile0000000000000000000001';
+
+            // 1. Upload desktop inventory: settings=3, gamelog=10, feed=20
+            const invRes = await exports.default.fetch('http://example.com/api/agent/migration/inventory', {
+                method: 'POST',
+                headers: agentHeaders,
+                body: JSON.stringify({
+                    dbFound: true,
+                    dbFileName: 'VRCX.sqlite3',
+                    dbFileBytes: 1024 * 1024,
+                    sharedCategories: [
+                        { key: 'settings', rowCount: 3, rawBytes: 256, estimatedDbBytes: 4096, tables: ['configs'] },
+                        {
+                            key: 'gamelog',
+                            rowCount: 10,
+                            rawBytes: 2048,
+                            estimatedDbBytes: 8192,
+                            tables: ['gamelog_location']
+                        }
+                    ],
+                    accounts: [
+                        {
+                            prefix: accountPrefix,
+                            label: 'usr_reconcile',
+                            categories: [
+                                {
+                                    key: 'feed',
+                                    rowCount: 20,
+                                    rawBytes: 4096,
+                                    estimatedDbBytes: 16384,
+                                    tables: [`${accountPrefix}_feed_gps`, `${accountPrefix}_feed_online_offline`]
+                                }
+                            ]
+                        }
+                    ]
+                })
+            });
+            expect(invRes.status).toBe(200);
+
+            // 2. Start initial migration job
+            const start1Res = await exports.default.fetch('http://example.com/api/migration/start', {
+                method: 'POST',
+                headers: webHeaders,
+                body: JSON.stringify({
+                    deviceId,
+                    accountPrefix,
+                    categories: ['settings', 'gamelog', 'feed'],
+                    concurrency: 4,
+                    resume: true
+                })
+            });
+            expect(start1Res.status).toBe(200);
+            const start1Json = (await start1Res.json()) as { data: { job: { jobId: string } } };
+            const jobId1 = start1Json.data.job.jobId;
+
+            // 3. Upload settings TWICE -> second upload must report inserted=0 (no 2x inflation!)
+            const settingsItems = [
+                { kind: 'config', key: 'VRCX_Theme', value: 'dark' },
+                { kind: 'config', key: 'VRCX_Locale', value: 'zh-CN' },
+                { kind: 'config', key: 'VRCX_Sort', value: 'recent' }
+            ];
+            const set1 = await exports.default.fetch('http://example.com/api/agent/migration/batch', {
+                method: 'POST',
+                headers: agentHeaders,
+                body: JSON.stringify({
+                    jobId: jobId1,
+                    category: 'settings',
+                    items: settingsItems,
+                    categoryDone: false,
+                    allDone: false,
+                    cursorUpdate: { table: 'configs', rowId: 3, completed: true, rowsDone: 3 }
+                })
+            });
+            expect(set1.status).toBe(200);
+            expect(((await set1.json()) as { data: { inserted: number } }).data.inserted).toBe(3);
+
+            const set2 = await exports.default.fetch('http://example.com/api/agent/migration/batch', {
+                method: 'POST',
+                headers: agentHeaders,
+                body: JSON.stringify({
+                    jobId: jobId1,
+                    category: 'settings',
+                    items: settingsItems,
+                    categoryDone: true,
+                    allDone: false,
+                    // Out-of-order stale cursor trying to downgrade completed=true -> false must be rejected
+                    cursorUpdate: { table: 'configs', rowId: 1, completed: false, rowsDone: 1 }
+                })
+            });
+            expect(set2.status).toBe(200);
+            const set2Json = (await set2.json()) as { data: { inserted: number; skipped: number } };
+            expect(set2Json.data.inserted).toBe(0);
+            expect(set2Json.data.skipped).toBe(3);
+
+            // 4. Upload ONLY 10 of 20 feed rows (missing 10!) and 14 gamelog rows (+4 excess!) then seal cursors + allDone
+            const partialFeed = Array.from({ length: 10 }, (_, i) => ({
+                type: 'GPS',
+                created_at: `2025-10-01T00:00:${String(i).padStart(2, '0')}.000Z`,
+                userId: `usr_f_${i}`,
+                displayName: `Friend ${i}`,
+                location: `wrld_f:${i}`,
+                worldName: `World ${i}`,
+                previousLocation: '',
+                time: 30,
+                groupName: ''
+            }));
+            const feedPartialRes = await exports.default.fetch('http://example.com/api/agent/migration/batch', {
+                method: 'POST',
+                headers: agentHeaders,
+                body: JSON.stringify({
+                    jobId: jobId1,
+                    category: 'feed',
+                    items: partialFeed,
+                    categoryDone: true,
+                    allDone: false,
+                    cursorUpdate: { table: 'feed_gps', createdAt: '2025-10-01T00:00:09.000Z', rowId: 10, completed: true, rowsDone: 10 }
+                })
+            });
+            expect(feedPartialRes.status).toBe(200);
+
+            // Out-of-order late batch attempting to downgrade feed_gps cursor must be ignored
+            await exports.default.fetch('http://example.com/api/agent/migration/batch', {
+                method: 'POST',
+                headers: agentHeaders,
+                body: JSON.stringify({
+                    jobId: jobId1,
+                    category: 'feed',
+                    items: [],
+                    categoryDone: false,
+                    allDone: false,
+                    cursorUpdate: { table: 'feed_gps', createdAt: '2025-10-01T00:00:02.000Z', rowId: 3, completed: false, rowsDone: 3 }
+                })
+            });
+
+            const excessGamelog = Array.from({ length: 14 }, (_, i) => ({
+                type: 'Location',
+                created_at: `2025-10-02T00:00:${String(i).padStart(2, '0')}.000Z`,
+                location: `wrld_gl:${i}`,
+                worldId: `wrld_gl_${i}`,
+                worldName: `GL World ${i}`,
+                time: 120,
+                groupName: ''
+            }));
+            const glRes = await exports.default.fetch('http://example.com/api/agent/migration/batch', {
+                method: 'POST',
+                headers: agentHeaders,
+                body: JSON.stringify({
+                    jobId: jobId1,
+                    category: 'gamelog',
+                    items: excessGamelog,
+                    categoryDone: true,
+                    allDone: true,
+                    cursorUpdate: { table: 'gamelog_location', createdAt: '2025-10-02T00:00:13.000Z', rowId: 14, completed: true, rowsDone: 14 }
+                })
+            });
+            expect(glRes.status).toBe(200);
+
+            // Deliberately poison cached `imported_stats` (like old 2x settings bug) to prove GET /api/migration/state
+            // reconciles true counts directly from DB_LEGACY + MySQL and refuses to show false 'completed'
+            await legacyDb
+                .prepare("UPDATE legacy_migration_state SET payload_json = ? WHERE state_key = 'imported_stats'")
+                .bind(JSON.stringify({ settings: 226, gamelog: 9999, feed: 1 }))
+                .run();
+
+            const state1Res = await exports.default.fetch('http://example.com/api/migration/state');
+            expect(state1Res.status).toBe(200);
+            const state1Json = (await state1Res.json()) as {
+                data: {
+                    importedStats: Record<string, number>;
+                    cursors: Record<string, Record<string, { completed: boolean; rowsDone: number }>>;
+                    job: {
+                        status: string;
+                        mismatches?: Array<{ category: string; desktopRows: number; cloudRows: number; delta: number }>;
+                    };
+                };
+            };
+            expect(state1Json.data.importedStats.settings).toBe(3);
+            expect(state1Json.data.importedStats.gamelog).toBe(14);
+            expect(state1Json.data.importedStats.feed).toBe(10);
+            expect(state1Json.data.cursors[accountPrefix]?.configs?.completed).toBe(true);
+            expect(state1Json.data.cursors[accountPrefix]?.configs?.rowsDone).toBe(3);
+            expect(state1Json.data.cursors[accountPrefix]?.feed_gps?.completed).toBe(true);
+            expect(state1Json.data.cursors[accountPrefix]?.feed_gps?.rowsDone).toBe(10);
+            expect(state1Json.data.job.status).toBe('incomplete_mismatch');
+            expect(state1Json.data.job.mismatches).toEqual(
+                expect.arrayContaining([
+                    { category: 'gamelog', desktopRows: 10, cloudRows: 14, delta: 4 },
+                    { category: 'feed', desktopRows: 20, cloudRows: 10, delta: -10 }
+                ])
+            );
+
+            // 5. Starting migration again with all 3 categories auto-skips exact-match `settings`,
+            // wipes stale chunks/cursors ONLY for mismatched `gamelog` & `feed`, and dispatches clean re-upload
+            const start2Res = await exports.default.fetch('http://example.com/api/migration/start', {
+                method: 'POST',
+                headers: webHeaders,
+                body: JSON.stringify({
+                    deviceId,
+                    accountPrefix,
+                    categories: ['settings', 'gamelog', 'feed'],
+                    concurrency: 4,
+                    resume: true
+                })
+            });
+            expect(start2Res.status).toBe(200);
+            const start2Json = (await start2Res.json()) as {
+                data: {
+                    repairedCategories: string[];
+                    job: { jobId: string; categories: string[]; totalEstimatedRows: number };
+                };
+            };
+            expect(start2Json.data.repairedCategories).toEqual(['gamelog', 'feed']);
+            expect(start2Json.data.job.categories).toEqual(['gamelog', 'feed']);
+            expect(start2Json.data.job.totalEstimatedRows).toBe(30);
+            // Verify stale MySQL feed & gamelog chunks were wiped while `settings` stayed untouched
+            expect((fakeMysql.tables.get('vrcx_legacy_feed_chunks')?.rows ?? []).length).toBe(0);
+            expect((fakeMysql.tables.get('vrcx_legacy_gamelog_chunks')?.rows ?? []).length).toBe(0);
+            expect(
+                (await legacyDb.prepare('SELECT COUNT(*) AS cnt FROM legacy_configs').first<{ cnt: number }>())?.cnt
+            ).toBe(3);
+
+            // 6. Cleanly upload exact 10 gamelog + 20 feed rows (including lowercase 'online'/'offline' & blank created_at)
+            const jobId2 = start2Json.data.job.jobId;
+            const exactGamelog = Array.from({ length: 10 }, (_, i) => ({
+                type: 'location',
+                created_at: `2025-10-03T00:00:${String(i).padStart(2, '0')}.000Z`,
+                location: `wrld_clean:${i}`,
+                worldId: `wrld_clean_${i}`,
+                worldName: `Clean GL ${i}`,
+                time: 60,
+                groupName: ''
+            }));
+            const exactFeed = Array.from({ length: 20 }, (_, i) => ({
+                type: i < 10 ? 'GPS' : i % 2 === 0 ? 'online' : 'offline',
+                // Include two rows with blank created_at to verify distinct fallback timestamps prevent accidental collapse
+                created_at: i < 2 ? '' : `2025-10-04T00:00:${String(i).padStart(2, '0')}.000Z`,
+                userId: 'usr_same_friend',
+                displayName: 'Same Friend',
+                location: 'private',
+                worldName: '',
+                previousLocation: '',
+                time: 0,
+                groupName: ''
+            }));
+
+            const glCleanRes = await exports.default.fetch('http://example.com/api/agent/migration/batch', {
+                method: 'POST',
+                headers: agentHeaders,
+                body: JSON.stringify({
+                    jobId: jobId2,
+                    category: 'gamelog',
+                    items: exactGamelog,
+                    categoryDone: true,
+                    allDone: false,
+                    cursorUpdate: { table: 'gamelog_location', createdAt: '2025-10-03T00:00:09.000Z', rowId: 10, completed: true, rowsDone: 10 }
+                })
+            });
+            expect(glCleanRes.status).toBe(200);
+            expect(((await glCleanRes.json()) as { data: { inserted: number } }).data.inserted).toBe(10);
+
+            const feedCleanRes = await exports.default.fetch('http://example.com/api/agent/migration/batch', {
+                method: 'POST',
+                headers: agentHeaders,
+                body: JSON.stringify({
+                    jobId: jobId2,
+                    category: 'feed',
+                    items: exactFeed,
+                    categoryDone: true,
+                    allDone: true,
+                    cursorUpdate: { table: 'feed_gps', createdAt: '2025-10-04T00:00:19.000Z', rowId: 20, completed: true, rowsDone: 20 }
+                })
+            });
+            expect(feedCleanRes.status).toBe(200);
+            expect(((await feedCleanRes.json()) as { data: { inserted: number } }).data.inserted).toBe(20);
+
+            const state2Res = await exports.default.fetch('http://example.com/api/migration/state');
+            expect(state2Res.status).toBe(200);
+            const state2Json = (await state2Res.json()) as {
+                data: {
+                    importedStats: Record<string, number>;
+                    job: { status: string; mismatches?: unknown[] };
+                };
+            };
+            expect(state2Json.data.importedStats).toMatchObject({ settings: 3, gamelog: 10, feed: 20 });
+            expect(state2Json.data.job.status).toBe('completed');
+            expect(state2Json.data.job.mismatches ?? []).toHaveLength(0);
+
+            // 7. Re-starting with all already-exact categories returns alreadySynced=true instead of 0-row no-op job
+            const start3Res = await exports.default.fetch('http://example.com/api/migration/start', {
+                method: 'POST',
+                headers: webHeaders,
+                body: JSON.stringify({
+                    deviceId,
+                    accountPrefix,
+                    categories: ['settings', 'gamelog', 'feed'],
+                    concurrency: 4,
+                    resume: true
+                })
+            });
+            expect(start3Res.status).toBe(200);
+            const start3Json = (await start3Res.json()) as { data: { alreadySynced?: boolean } };
+            expect(start3Json.data.alreadySynced).toBe(true);
+        } finally {
+            setMysqlConnectionFactoryForTests(null);
+            await legacyDb.batch([
+                legacyDb.prepare('DELETE FROM legacy_configs'),
+                legacyDb.prepare('DELETE FROM legacy_migration_state')
+            ]).catch(() => {});
+            if (deviceId) {
+                await env.DB_CORE.batch([
+                    env.DB_CORE.prepare('DELETE FROM cloud_devices WHERE device_id = ?').bind(deviceId),
+                    env.DB_CORE.prepare('DELETE FROM cloud_commands WHERE device_id = ?').bind(deviceId)
+                ]).catch(() => {});
+            }
+            await saveExternalDbConfig(env, defaultExternalDbConfig());
+            await saveExternalDbMigrationState(env, defaultExternalDbMigrationState());
+            invalidateExternalDbConfigCache();
+            clearMysqlSchemaReadyCache();
+        }
+    });
 });

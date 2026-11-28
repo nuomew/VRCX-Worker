@@ -1065,6 +1065,10 @@ public static class DesktopLegacyMigrator
                             Interlocked.Exchange(ref stoppedByServer, 1);
                             return true;
                         }
+                        if (isFinalTableBatch)
+                        {
+                            lastKnownSafeCursor = null;
+                        }
                         return false;
                     }
 
@@ -1161,6 +1165,9 @@ public static class DesktopLegacyMigrator
                                 }
                                 return true;
                             }
+                            // Clear cross-table safe cursor once this table is sealed completed so a failure
+                            // in a subsequent table can never replay an older Completed=false watermark.
+                            lastKnownSafeCursor = null;
                         }
                         else if (!anyValidRowSent && existingCursor != null && !existingCursor.Completed)
                         {
@@ -1191,6 +1198,7 @@ public static class DesktopLegacyMigrator
                                 }
                                 return true;
                             }
+                            lastKnownSafeCursor = null;
                         }
 
                         return false;

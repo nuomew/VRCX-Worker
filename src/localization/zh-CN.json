@@ -4227,6 +4227,7 @@
             "status_queued": "排队中",
             "status_running": "同步中",
             "status_completed": "已完成",
+            "status_incomplete_mismatch": "数据量不匹配",
             "status_cancelled": "已取消",
             "status_failed": "失败",
             "status_stopped_quota_limit": "已触发 500 MB 保护暂停",
@@ -4301,7 +4302,16 @@
             "resetting_cursors": "重置中...",
             "reset_cursors_toast": "已清空续传断点，下次同步将从头重新扫描。",
             "cursor_checkpoint_badge": "断点已存 · 已传 {count} 条",
-            "cursor_resume_hint": "检测到已保存的同步断点：本次将直接从上次已确认位置续传，自动跳过已完成的数据表。"
+            "cursor_resume_hint": "检测到已保存的同步断点：本次将直接从上次已确认位置续传，自动跳过已完成的数据表。",
+            "synced_complete_badge": "已完整导入 {count} 条",
+            "missing_rows_badge": "缺失 {count} 条",
+            "excess_rows_badge": "多出 {count} 条重复",
+            "repair_mismatched_btn": "修复异常分类（重传 {count} 项）",
+            "repair_started_toast": "已清理 {count} 个异常分类的旧数据与失效断点，正在从头干净重传。",
+            "already_synced_toast": "所选分类的云端条数已与桌面端完全一致，无需重复传输。",
+            "job_mismatch_toast": "同步结束但云端条数与桌面端不匹配，请查看下方差异或点击「修复异常分类」重传。",
+            "mismatch_detail_missing": "{name}：云端仅 {cloud} 条 / 桌面 {desktop} 条（缺失 {missing} 条）",
+            "mismatch_detail_excess": "{name}：云端 {cloud} 条 / 桌面 {desktop} 条（多出 {excess} 条重复记录）"
         }
     }
 }

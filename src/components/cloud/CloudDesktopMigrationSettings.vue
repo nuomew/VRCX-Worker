@@ -176,24 +176,40 @@
                         {{ t('cloud_hub.migration.concurrency_badge', { count: job.concurrency }) }}
                     </span>
                 </div>
-                <Button
-                    v-if="isJobActive"
-                    size="sm"
-                    variant="outline"
-                    class="h-7 border-destructive/40 px-2.5 text-[11px] text-destructive hover:bg-destructive/10"
-                    :disabled="cancellingJob"
-                    @click="cancelMigrationJob">
-                    {{
-                        cancellingJob
-                            ? t('cloud_hub.migration.cancelling')
-                            : t('cloud_hub.migration.cancel_job_btn')
-                    }}
-                </Button>
+                <div class="flex items-center gap-2">
+                    <Button
+                        v-if="!isJobActive && job.status === 'incomplete_mismatch' && mismatchedCategoryItems.length > 0"
+                        size="sm"
+                        variant="outline"
+                        class="h-7 border-amber-500/50 px-2.5 text-[11px] text-amber-600 hover:bg-amber-500/10 dark:text-amber-400"
+                        :disabled="startingJob || !legacyDbBound"
+                        @click="repairMismatchedCategories">
+                        {{
+                            startingJob
+                                ? t('cloud_hub.migration.starting_btn')
+                                : t('cloud_hub.migration.repair_mismatched_btn', { count: mismatchedCategoryItems.length })
+                        }}
+                    </Button>
+                    <Button
+                        v-if="isJobActive"
+                        size="sm"
+                        variant="outline"
+                        class="h-7 border-destructive/40 px-2.5 text-[11px] text-destructive hover:bg-destructive/10"
+                        :disabled="cancellingJob"
+                        @click="cancelMigrationJob">
+                        {{
+                            cancellingJob
+                                ? t('cloud_hub.migration.cancelling')
+                                : t('cloud_hub.migration.cancel_job_btn')
+                        }}
+                    </Button>
+                </div>
             </div>
 
             <div class="h-2 w-full overflow-hidden rounded-full bg-muted">
                 <div
-                    class="h-full bg-primary transition-all"
+                    class="h-full transition-all"
+                    :class="job.status === 'incomplete_mismatch' ? 'bg-amber-500' : 'bg-primary'"
                     :style="{ width: `${jobProgressPercent}%` }" />
             </div>
 
@@ -212,11 +228,32 @@
                     {{ t('cloud_hub.migration.current_category', { name: categoryLabel(job.currentCategory) }) }}
                 </span>
             </div>
+            <div
+                v-if="Array.isArray(job.mismatches) && job.mismatches.length > 0"
+                class="space-y-1 rounded-md border border-amber-500/35 bg-amber-500/10 px-3 py-2 text-[11px] text-amber-700 dark:text-amber-300">
+                <div v-for="m in job.mismatches" :key="m.category">
+                    {{
+                        m.delta < 0
+                            ? t('cloud_hub.migration.mismatch_detail_missing', {
+                                  name: categoryLabel(m.category),
+                                  cloud: Number(m.cloudRows || 0).toLocaleString(),
+                                  desktop: Number(m.desktopRows || 0).toLocaleString(),
+                                  missing: Math.abs(Number(m.delta || 0)).toLocaleString()
+                              })
+                            : t('cloud_hub.migration.mismatch_detail_excess', {
+                                  name: categoryLabel(m.category),
+                                  cloud: Number(m.cloudRows || 0).toLocaleString(),
+                                  desktop: Number(m.desktopRows || 0).toLocaleString(),
+                                  excess: Math.abs(Number(m.delta || 0)).toLocaleString()
+                              })
+                    }}
+                </div>
+            </div>
             <p
-                v-if="job.errorMessage"
+                v-else-if="job.errorMessage"
                 class="text-[11px]"
                 :class="
-                    job.status === 'paused_daily_quota'
+                    job.status === 'paused_daily_quota' || job.status === 'incomplete_mismatch'
                         ? 'text-amber-600 dark:text-amber-400'
                         : 'text-destructive'
                 ">
@@ -280,6 +317,19 @@
                             {{ t('cloud_hub.migration.clear_selection_btn') }}
                         </Button>
                         <Button
+                            v-if="mismatchedCategoryItems.length > 0"
+                            size="sm"
+                            variant="outline"
+                            class="h-7 border-amber-500/50 px-2.5 text-[11px] text-amber-600 hover:bg-amber-500/10 dark:text-amber-400"
+                            :disabled="isJobActive || startingJob || !legacyDbBound"
+                            @click="repairMismatchedCategories">
+                            {{
+                                startingJob
+                                    ? t('cloud_hub.migration.starting_btn')
+                                    : t('cloud_hub.migration.repair_mismatched_btn', { count: mismatchedCategoryItems.length })
+                            }}
+                        </Button>
+                        <Button
                             v-if="hasAnySavedCursor"
                             size="sm"
                             variant="outline"
@@ -317,16 +367,39 @@
                                 <div class="flex flex-wrap items-center gap-2">
                                     <span class="font-medium text-foreground">{{ categoryLabel(item.key) }}</span>
                                     <span
-                                        v-if="importedStats[item.key] > 0"
+                                        v-if="item.rowCount > 0 && importedStats[item.key] === item.rowCount"
+                                        class="rounded bg-status-online/15 px-1.5 py-0.5 text-[10px] font-medium text-status-online">
+                                        {{ t('cloud_hub.migration.synced_complete_badge', { count: importedStats[item.key].toLocaleString() }) }}
+                                    </span>
+                                    <span
+                                        v-else-if="importedStats[item.key] > 0"
                                         class="rounded bg-primary/15 px-1.5 py-0.5 text-[10px] font-medium text-primary">
                                         {{ t('cloud_hub.migration.already_imported_badge', { count: importedStats[item.key].toLocaleString() }) }}
                                     </span>
                                     <span
-                                        v-if="categoryCursorInfo(item.key).hasPartial"
+                                        v-if="item.rowCount > 0 && importedStats[item.key] > 0 && importedStats[item.key] < item.rowCount"
+                                        class="rounded bg-destructive/15 px-1.5 py-0.5 text-[10px] font-medium text-destructive">
+                                        {{
+                                            t('cloud_hub.migration.missing_rows_badge', {
+                                                count: (item.rowCount - importedStats[item.key]).toLocaleString()
+                                            })
+                                        }}
+                                    </span>
+                                    <span
+                                        v-else-if="item.rowCount > 0 && importedStats[item.key] > item.rowCount"
+                                        class="rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium text-amber-600 dark:text-amber-400">
+                                        {{
+                                            t('cloud_hub.migration.excess_rows_badge', {
+                                                count: (importedStats[item.key] - item.rowCount).toLocaleString()
+                                            })
+                                        }}
+                                    </span>
+                                    <span
+                                        v-if="categoryCursorInfo(item.key, item.rowCount).hasPartial"
                                         class="rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium text-amber-600 dark:text-amber-400">
                                         {{
                                             t('cloud_hub.migration.cursor_checkpoint_badge', {
-                                                count: categoryCursorInfo(item.key).rowsDone.toLocaleString()
+                                                count: categoryCursorInfo(item.key, item.rowCount).rowsDone.toLocaleString()
                                             })
                                         }}
                                     </span>
@@ -393,7 +466,7 @@
                                 projectedExceedsLimit ||
                                 !legacyDbBound
                             "
-                            @click="startMigration">
+                            @click="startMigration()">
                             {{
                                 startingJob
                                     ? t('cloud_hub.migration.starting_btn')
@@ -524,7 +597,7 @@
     });
     const hasAnySavedCursor = computed(() => Object.keys(activeScopeCursors.value).length > 0);
 
-    function categoryCursorInfo(categoryKey) {
+    function categoryCursorInfo(categoryKey, desktopRows = null) {
         const tables = CATEGORY_LOGICAL_TABLES[categoryKey] || [];
         const scopeMap = activeScopeCursors.value;
         let savedCount = 0;
@@ -542,9 +615,15 @@
                 hasUnfinishedTable = true;
             }
         }
+        const expectedRows = desktopRows === null ? null : Math.max(0, Number(desktopRows || 0));
+        const cloudRows = Math.max(0, Number(importedStats[categoryKey] || 0));
+        // Only display an active partial-checkpoint badge when a table genuinely stopped mid-stream
+        // AND the category has not already reached full desktop parity (avoid false badges from empty sibling tables).
+        const isAlreadyExactMatch = expectedRows !== null && expectedRows > 0 && cloudRows === expectedRows;
         return {
             hasAny: savedCount > 0,
-            hasPartial: hasUnfinishedTable || (completedCount > 0 && completedCount < tables.length),
+            hasPartial: !isAlreadyExactMatch && hasUnfinishedTable,
+            completedCount,
             rowsDone
         };
     }
@@ -582,8 +661,16 @@
             .filter((item) => item.rowCount > 0 && selectedCategories[item.key])
             .map((item) => item.key)
     );
+    const mismatchedCategoryItems = computed(() =>
+        mergedCategoryList.value.filter(
+            (item) => item.rowCount > 0 && importedStats[item.key] > 0 && importedStats[item.key] !== item.rowCount
+        )
+    );
     const hasSelectedResumeCursor = computed(() =>
-        selectedCategoryKeys.value.some((key) => categoryCursorInfo(key).hasAny)
+        selectedCategoryKeys.value.some((key) => {
+            const item = mergedCategoryList.value.find((c) => c.key === key);
+            return categoryCursorInfo(key, item?.rowCount ?? null).hasPartial;
+        })
     );
     const selectedTotalRows = computed(() =>
         mergedCategoryList.value
@@ -618,6 +705,22 @@
     const jobProgressPercent = computed(() => {
         if (!job.value) return 0;
         if (job.value.status === 'completed') return 100;
+        if (job.value.status === 'incomplete_mismatch') {
+            const cats = Array.isArray(job.value.categories) ? job.value.categories : [];
+            let expected = 0;
+            let covered = 0;
+            for (const cat of cats) {
+                const item = mergedCategoryList.value.find((c) => c.key === cat);
+                const desk = Number(item?.rowCount || 0);
+                if (desk <= 0) continue;
+                expected += desk;
+                covered += Math.min(desk, Math.max(0, Number(importedStats[cat] || 0)));
+            }
+            if (expected > 0) {
+                return Math.min(99, Math.round((covered / expected) * 100));
+            }
+            return 0;
+        }
         const total = Math.max(1, Number(job.value.totalEstimatedRows || 0));
         return Math.min(99, Math.round((Number(job.value.processedRows || 0) / total) * 100));
     });
@@ -630,7 +733,9 @@
     const jobStatusBadgeClass = computed(() => {
         const s = job.value?.status;
         if (s === 'completed') return 'border-status-online/40 bg-status-online/10 text-foreground';
-        if (s === 'paused_daily_quota') return 'border-amber-500/40 bg-amber-500/10 text-amber-600 dark:text-amber-400';
+        if (s === 'paused_daily_quota' || s === 'incomplete_mismatch') {
+            return 'border-amber-500/40 bg-amber-500/10 text-amber-600 dark:text-amber-400';
+        }
         if (s === 'failed' || s === 'stopped_quota_limit') return 'border-destructive/40 bg-destructive/10 text-destructive';
         if (s === 'queued' || s === 'running') return 'border-primary/40 bg-primary/10 text-primary';
         return 'border-border bg-muted/50 text-muted-foreground';
@@ -762,6 +867,14 @@
             ) {
                 lastCompletedJobId = job.value.jobId;
                 toast.success(t('cloud_hub.migration.job_completed_toast'));
+            } else if (
+                job.value?.status === 'incomplete_mismatch' &&
+                prevStatus &&
+                prevStatus !== 'incomplete_mismatch' &&
+                job.value.jobId !== lastCompletedJobId
+            ) {
+                lastCompletedJobId = job.value.jobId;
+                toast.warning(t('cloud_hub.migration.job_mismatch_toast'));
             }
         } catch (err) {
             if (!silent) {
@@ -817,8 +930,9 @@
         }
     }
 
-    async function startMigration() {
-        if (startingJob.value || selectedCategoryKeys.value.length === 0) return;
+    async function startMigration({ categoriesOverride = null, repairMismatched = false } = {}) {
+        const targetCategories = Array.isArray(categoriesOverride) ? categoriesOverride : selectedCategoryKeys.value;
+        if (startingJob.value || targetCategories.length === 0) return;
         startingJob.value = true;
         actionError.value = '';
         try {
@@ -827,19 +941,40 @@
                 json: {
                     deviceId: selectedDeviceId.value || inventory.value?.deviceId || undefined,
                     accountPrefix: selectedAccountPrefix.value || '',
-                    categories: selectedCategoryKeys.value,
+                    categories: targetCategories,
                     concurrency: migrationConcurrency.value,
-                    resume: true
+                    resume: true,
+                    repairMismatched
                 }
             });
+            if (res?.alreadySynced) {
+                toast.info(t('cloud_hub.migration.already_synced_toast'));
+                await loadMigrationState({ silent: true });
+                return;
+            }
             job.value = res?.job || null;
-            toast.success(t('cloud_hub.migration.job_started_toast'));
+            if (Array.isArray(res?.repairedCategories) && res.repairedCategories.length > 0) {
+                toast.info(t('cloud_hub.migration.repair_started_toast', { count: res.repairedCategories.length }));
+                await loadMigrationState({ silent: true });
+            } else {
+                toast.success(t('cloud_hub.migration.job_started_toast'));
+            }
             ensurePolling();
         } catch (err) {
             actionError.value = err?.message || String(err);
         } finally {
             startingJob.value = false;
         }
+    }
+
+    async function repairMismatchedCategories() {
+        const targets = mismatchedCategoryItems.value.map((item) => item.key);
+        if (targets.length === 0) return;
+        resetSelectionsToOff();
+        for (const key of targets) {
+            selectedCategories[key] = true;
+        }
+        await startMigration({ categoriesOverride: targets, repairMismatched: true });
     }
 
     async function cancelMigrationJob() {
