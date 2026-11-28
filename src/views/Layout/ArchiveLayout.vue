@@ -15,7 +15,7 @@
 
         <!-- Crisp White & Azure Slanted Official-Site Topbar -->
         <header class="arc-topbar relative z-20 shrink-0 px-3 sm:px-5">
-            <div class="max-w-[1720px] mx-auto h-13 flex items-center justify-between gap-2.5">
+            <div class="max-w-[1520px] mx-auto h-13 flex items-center justify-between gap-2.5">
                 <!-- Left Slanted Brand Badge + Online Strip Toggle -->
                 <TooltipWrapper side="bottom" :content="t('view.settings.appearance.appearance.editorial_archive_toggle_strip')">
                     <button
@@ -468,7 +468,7 @@
 
         <!-- Signature Horizontal Online Friends Halo Strip (Collapsible) -->
         <section v-if="onlineStripOpen" class="relative z-10 shrink-0 px-3 sm:px-5 pt-2.5">
-            <div class="arc-strip-card max-w-[1440px] mx-auto px-3.5 py-2 flex items-center gap-3">
+            <div class="arc-strip-card max-w-[1520px] mx-auto px-3.5 py-2 flex items-center gap-3">
                 <!-- Current User Quick Anchor -->
                 <button
                     type="button"
@@ -553,7 +553,7 @@
 
         <!-- Asymmetric Blueprint Workspace: Crisp Main Stage + Right Friends Roster -->
         <div class="relative z-10 flex-1 min-h-0 min-w-0 overflow-hidden px-3 sm:px-5 py-2.5">
-            <div class="max-w-[1440px] mx-auto h-full flex gap-3 min-h-0 min-w-0">
+            <div class="max-w-[1520px] mx-auto h-full flex gap-3 min-h-0 min-w-0">
                 <main class="arc-main-stage flex-1 min-h-0 min-w-0 flex flex-col overflow-hidden">
                     <div
                         v-if="isWeb && cloudState.storageDegraded.active && !cloudState.storageDegraded.dismissed"

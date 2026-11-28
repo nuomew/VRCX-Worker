@@ -16,8 +16,8 @@
         </svg>
 
         <!-- Borderless High-Fashion Editorial Topbar -->
-        <header class="lb-topbar relative z-20 shrink-0 px-3 sm:px-5">
-            <div class="max-w-[1720px] mx-auto h-14 flex items-center justify-between gap-2.5">
+        <header class="lb-topbar relative z-20 shrink-0 px-3 sm:px-6">
+            <div class="max-w-[1520px] mx-auto h-14 flex items-center justify-between gap-2.5">
                 <!-- Left Serif Brand + Cover Toggle -->
                 <TooltipWrapper side="bottom" :content="t('view.settings.appearance.appearance.editorial_lookbook_toggle_cover')">
                     <button
@@ -456,7 +456,7 @@
 
         <!-- Centered Editorial Lookbook 2-Column Workspace -->
         <div class="relative z-10 flex-1 min-h-0 min-w-0 overflow-hidden px-3 sm:px-6 py-3">
-            <div class="max-w-[1440px] mx-auto h-full flex gap-4 min-h-0 min-w-0">
+            <div class="max-w-[1520px] mx-auto h-full flex gap-4 min-h-0 min-w-0">
                 <!-- Left Collapsible Lookbook Cover & Profile Folio -->
                 <aside
                     v-if="coverOpen && !isCompactViewport"
