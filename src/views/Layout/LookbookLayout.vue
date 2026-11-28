@@ -294,6 +294,50 @@
                                         @click="handleThemeColorSelect(color)" />
                                 </TooltipWrapper>
                             </div>
+                            <DropdownMenuSeparator />
+                            <div class="px-2 pt-1.5 pb-2 flex flex-col gap-1.5" @keydown.stop>
+                                <div class="flex items-center justify-between text-xs">
+                                    <span class="inline-flex items-center gap-1.5 font-semibold">
+                                        <Sun class="size-3.5 lb-gold-text shrink-0" />
+                                        <span>{{ t('view.settings.appearance.appearance.editorial_theme_brightness') }}</span>
+                                    </span>
+                                    <button
+                                        type="button"
+                                        class="text-[11px] font-bold tabular-nums cursor-pointer transition-colors"
+                                        :class="
+                                            themeBrightness < 100
+                                                ? 'text-primary hover:underline'
+                                                : 'text-muted-foreground'
+                                        "
+                                        :title="t('view.settings.appearance.appearance.editorial_theme_brightness_reset')"
+                                        @click="resetThemeBrightness">
+                                        {{ themeBrightness }}%
+                                    </button>
+                                </div>
+                                <div class="flex items-center gap-2">
+                                    <button
+                                        type="button"
+                                        class="inline-flex items-center justify-center size-5 rounded-full text-muted-foreground hover:text-primary transition-colors cursor-pointer shrink-0"
+                                        :aria-label="t('view.settings.appearance.appearance.editorial_theme_brightness')"
+                                        @click="stepThemeBrightness(-10)">
+                                        <Moon class="size-3.5" />
+                                    </button>
+                                    <Slider
+                                        v-model="themeBrightnessSlider"
+                                        class="flex-1"
+                                        :min="MIN_THEME_BRIGHTNESS"
+                                        :max="MAX_THEME_BRIGHTNESS"
+                                        :step="1"
+                                        :aria-label="t('view.settings.appearance.appearance.editorial_theme_brightness')" />
+                                    <button
+                                        type="button"
+                                        class="inline-flex items-center justify-center size-5 rounded-full text-muted-foreground hover:text-primary transition-colors cursor-pointer shrink-0"
+                                        :aria-label="t('view.settings.appearance.appearance.editorial_theme_brightness')"
+                                        @click="stepThemeBrightness(10)">
+                                        <Sun class="size-3.5" />
+                                    </button>
+                                </div>
+                            </div>
                         </DropdownMenuContent>
                     </DropdownMenu>
 
@@ -546,55 +590,11 @@
                             </div>
                         </div>
 
-                        <!-- Theme Brightness Control & New Dashboard -->
-                        <div class="flex flex-col gap-2.5 pt-2.5 border-t border-border/70">
-                            <div class="flex flex-col gap-1.5">
-                                <div class="flex items-center justify-between text-xs">
-                                    <span class="inline-flex items-center gap-1.5 font-semibold">
-                                        <Sun class="size-3.5 lb-gold-text shrink-0" />
-                                        <span>{{ t('view.settings.appearance.appearance.editorial_theme_brightness') }}</span>
-                                    </span>
-                                    <button
-                                        type="button"
-                                        class="text-[11px] font-bold tabular-nums cursor-pointer transition-colors"
-                                        :class="
-                                            themeBrightness < 100
-                                                ? 'text-primary hover:underline'
-                                                : 'text-muted-foreground'
-                                        "
-                                        :title="t('view.settings.appearance.appearance.editorial_theme_brightness_reset')"
-                                        @click="resetThemeBrightness">
-                                        {{ themeBrightness }}%
-                                    </button>
-                                </div>
-                                <div class="flex items-center gap-2">
-                                    <button
-                                        type="button"
-                                        class="inline-flex items-center justify-center size-5 rounded-full text-muted-foreground hover:text-primary transition-colors cursor-pointer shrink-0"
-                                        :aria-label="t('view.settings.appearance.appearance.editorial_theme_brightness')"
-                                        @click="stepThemeBrightness(-10)">
-                                        <Moon class="size-3.5" />
-                                    </button>
-                                    <Slider
-                                        v-model="themeBrightnessSlider"
-                                        class="flex-1"
-                                        :min="MIN_THEME_BRIGHTNESS"
-                                        :max="MAX_THEME_BRIGHTNESS"
-                                        :step="1"
-                                        :aria-label="t('view.settings.appearance.appearance.editorial_theme_brightness')" />
-                                    <button
-                                        type="button"
-                                        class="inline-flex items-center justify-center size-5 rounded-full text-muted-foreground hover:text-primary transition-colors cursor-pointer shrink-0"
-                                        :aria-label="t('view.settings.appearance.appearance.editorial_theme_brightness')"
-                                        @click="stepThemeBrightness(10)">
-                                        <Sun class="size-3.5" />
-                                    </button>
-                                </div>
-                            </div>
+                        <!-- Quick New Dashboard Action -->
+                        <div v-if="showNewDashboardButton" class="pt-2 border-t border-border/70">
                             <button
-                                v-if="showNewDashboardButton"
                                 type="button"
-                                class="lb-create-btn mt-0.5 flex items-center justify-center gap-1.5 h-8 w-full rounded-full text-xs font-semibold cursor-pointer"
+                                class="lb-create-btn flex items-center justify-center gap-1.5 h-8 w-full rounded-full text-xs font-semibold cursor-pointer"
                                 @click="handleQuickCreateDashboard">
                                 <Plus class="size-3.5" />
                                 <span>{{ t('dashboard.new_dashboard') }}</span>
@@ -737,6 +737,7 @@
     import { useNavLayout } from '../../components/nav-menu/composables/useNavLayout';
     import { useNavTheme } from '../../components/nav-menu/composables/useNavTheme';
     import { usePriorityNav } from './composables/usePriorityNav';
+    import { useThemeBrightness } from './composables/useThemeBrightness';
     import { isEntryNotified as checkEntryNotified } from '../../components/nav-menu/navMenuUtils';
     import { useToolActions } from '../../composables/useToolActions';
     import { useToolNavPinning } from '../../composables/useToolNavPinning';
@@ -765,9 +766,6 @@
     import Sidebar from '../Sidebar/Sidebar.vue';
 
     const COVER_STORAGE_KEY = 'vrcx-lookbook-cover-open';
-    const BRIGHTNESS_STORAGE_KEY = 'vrcx-lookbook-brightness';
-    const MIN_THEME_BRIGHTNESS = 50;
-    const MAX_THEME_BRIGHTNESS = 100;
 
     const { t, locale } = useI18n();
     const router = useRouter();
@@ -863,55 +861,15 @@
 
     const coverOpen = ref(readStoredBoolean(COVER_STORAGE_KEY, true));
 
-    function clampThemeBrightness(value) {
-        const parsed = Math.round(Number(value));
-        if (!Number.isFinite(parsed)) {
-            return MAX_THEME_BRIGHTNESS;
-        }
-        return Math.min(MAX_THEME_BRIGHTNESS, Math.max(MIN_THEME_BRIGHTNESS, parsed));
-    }
-
-    function readStoredBrightness() {
-        try {
-            const raw = localStorage.getItem(BRIGHTNESS_STORAGE_KEY);
-            if (raw !== null && raw !== '') {
-                return clampThemeBrightness(raw);
-            }
-        } catch {
-            // ignore
-        }
-        return MAX_THEME_BRIGHTNESS;
-    }
-
-    const themeBrightness = ref(readStoredBrightness());
-
-    const setThemeBrightness = (value) => {
-        const next = clampThemeBrightness(value);
-        themeBrightness.value = next;
-        try {
-            localStorage.setItem(BRIGHTNESS_STORAGE_KEY, String(next));
-        } catch {
-            // ignore
-        }
-    };
-
-    const themeBrightnessSlider = computed({
-        get: () => [themeBrightness.value],
-        set: (value) => {
-            const next = Array.isArray(value) ? value[0] : value;
-            if (typeof next === 'number') {
-                setThemeBrightness(next);
-            }
-        }
-    });
-
-    const stepThemeBrightness = (delta) => setThemeBrightness(themeBrightness.value + delta);
-    const resetThemeBrightness = () => setThemeBrightness(MAX_THEME_BRIGHTNESS);
-
-    const dimOverlayOpacity = computed(() => {
-        const dimRatio = (MAX_THEME_BRIGHTNESS - themeBrightness.value) / 100;
-        return dimRatio > 0 ? Number((dimRatio * 0.85).toFixed(3)) : 0;
-    });
+    const {
+        MIN_THEME_BRIGHTNESS,
+        MAX_THEME_BRIGHTNESS,
+        themeBrightness,
+        themeBrightnessSlider,
+        dimOverlayOpacity,
+        stepThemeBrightness,
+        resetThemeBrightness
+    } = useThemeBrightness();
 
     const issueLabel = computed(() => {
         const now = new Date();

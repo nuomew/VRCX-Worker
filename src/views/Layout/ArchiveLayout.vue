@@ -303,6 +303,50 @@
                                         @click="handleThemeColorSelect(color)" />
                                 </TooltipWrapper>
                             </div>
+                            <DropdownMenuSeparator />
+                            <div class="px-2 pt-1.5 pb-2 flex flex-col gap-1.5" @keydown.stop>
+                                <div class="flex items-center justify-between text-xs">
+                                    <span class="inline-flex items-center gap-1.5 font-semibold">
+                                        <Sun class="size-3.5 text-primary shrink-0" />
+                                        <span>{{ t('view.settings.appearance.appearance.editorial_theme_brightness') }}</span>
+                                    </span>
+                                    <button
+                                        type="button"
+                                        class="text-[11px] font-bold tabular-nums cursor-pointer transition-colors"
+                                        :class="
+                                            themeBrightness < 100
+                                                ? 'text-primary hover:underline'
+                                                : 'text-muted-foreground'
+                                        "
+                                        :title="t('view.settings.appearance.appearance.editorial_theme_brightness_reset')"
+                                        @click="resetThemeBrightness">
+                                        {{ themeBrightness }}%
+                                    </button>
+                                </div>
+                                <div class="flex items-center gap-2">
+                                    <button
+                                        type="button"
+                                        class="inline-flex items-center justify-center size-5 rounded-md text-muted-foreground hover:text-primary transition-colors cursor-pointer shrink-0"
+                                        :aria-label="t('view.settings.appearance.appearance.editorial_theme_brightness')"
+                                        @click="stepThemeBrightness(-10)">
+                                        <Moon class="size-3.5" />
+                                    </button>
+                                    <Slider
+                                        v-model="themeBrightnessSlider"
+                                        class="flex-1"
+                                        :min="MIN_THEME_BRIGHTNESS"
+                                        :max="MAX_THEME_BRIGHTNESS"
+                                        :step="1"
+                                        :aria-label="t('view.settings.appearance.appearance.editorial_theme_brightness')" />
+                                    <button
+                                        type="button"
+                                        class="inline-flex items-center justify-center size-5 rounded-md text-muted-foreground hover:text-primary transition-colors cursor-pointer shrink-0"
+                                        :aria-label="t('view.settings.appearance.appearance.editorial_theme_brightness')"
+                                        @click="stepThemeBrightness(10)">
+                                        <Sun class="size-3.5" />
+                                    </button>
+                                </div>
+                            </div>
                         </DropdownMenuContent>
                     </DropdownMenu>
 
@@ -582,6 +626,15 @@
             :definitions="allNavDefinitions"
             @save="handleCustomNavSave"
             @dashboard-created="handleDashboardCreated" />
+
+        <!-- Non-interactive viewport dimmer scoped strictly to Archive lifecycle -->
+        <Teleport to="body">
+            <div
+                v-if="dimOverlayOpacity > 0"
+                class="arc-brightness-dimmer pointer-events-none fixed inset-0 z-[9999]"
+                :style="{ backgroundColor: `rgba(14, 24, 38, ${dimOverlayOpacity})` }"
+                aria-hidden="true" />
+        </Teleport>
     </div>
 </template>
 
@@ -590,10 +643,11 @@
     import { storeToRefs } from 'pinia';
     import { useI18n } from 'vue-i18n';
     import { useRouter } from 'vue-router';
-    import { ChevronDown, Cloud, Heart, Palette, Search, Settings, User, Users } from 'lucide-vue-next';
+    import { ChevronDown, Cloud, Heart, Moon, Palette, Search, Settings, Sun, User, Users } from 'lucide-vue-next';
 
     import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar';
     import { Button } from '@/components/ui/button';
+    import { Slider } from '@/components/ui/slider';
     import {
         ContextMenu,
         ContextMenuContent,
@@ -618,6 +672,7 @@
     import { useNavLayout } from '../../components/nav-menu/composables/useNavLayout';
     import { useNavTheme } from '../../components/nav-menu/composables/useNavTheme';
     import { usePriorityNav } from './composables/usePriorityNav';
+    import { useThemeBrightness } from './composables/useThemeBrightness';
     import { isEntryNotified as checkEntryNotified } from '../../components/nav-menu/navMenuUtils';
     import { useToolActions } from '../../composables/useToolActions';
     import { useToolNavPinning } from '../../composables/useToolNavPinning';
@@ -742,6 +797,16 @@
     const onlineStripOpen = ref(readStoredBoolean(STRIP_STORAGE_KEY, true));
     const friendsPanelOpen = ref(readStoredBoolean(PANEL_STORAGE_KEY, true));
     const mobileFriendsOpen = ref(false);
+
+    const {
+        MIN_THEME_BRIGHTNESS,
+        MAX_THEME_BRIGHTNESS,
+        themeBrightness,
+        themeBrightnessSlider,
+        dimOverlayOpacity,
+        stepThemeBrightness,
+        resetThemeBrightness
+    } = useThemeBrightness();
 
     const stripOnlineFriends = computed(() => {
         const seen = new Set();

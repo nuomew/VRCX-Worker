@@ -22,6 +22,11 @@ import { changeAppThemeStyle, getThemeMode } from '../../shared/utils/base/ui';
 import { normalizePublicUiPreferences } from '../cloudState';
 import { computePriorityNavSplit } from '../../views/Layout/composables/usePriorityNav';
 import {
+    clampThemeBrightness,
+    computeDimOverlayOpacity,
+    useThemeBrightness
+} from '../../views/Layout/composables/useThemeBrightness';
+import {
     DropdownMenu,
     DropdownMenuCheckboxItem,
     DropdownMenuContent,
@@ -190,12 +195,38 @@ describe('Official Anime-Site Dual Themes (Lookbook & Azure Archive) registratio
             expect(src).not.toMatch(/<TooltipWrapper[\s\S]{0,200}<DropdownMenuTrigger/);
             // Regression guard: top nav rail must never use horizontal overflow-x-auto that slices labels mid-character
             expect(src).not.toMatch(/<nav[\s\S]{0,220}overflow-x-auto/);
+            // Both Lookbook & Archive place Theme Brightness directly below Accent Palette inside the Theme dropdown
+            const accentIdx = src.indexOf('editorial_accent_colors');
+            const brightnessIdx = src.indexOf('editorial_theme_brightness');
+            expect(accentIdx).toBeGreaterThan(-1);
+            expect(brightnessIdx).toBeGreaterThan(accentIdx);
+            expect(src).toContain('useThemeBrightness');
         }
 
-        // Lookbook left folio card uses Theme Brightness slider + teleported dimmer instead of redundant color dots
-        expect(lookbookSrc).toContain('editorial_theme_brightness');
         expect(lookbookSrc).toContain('lb-brightness-dimmer');
-        expect(lookbookSrc).toContain('vrcx-lookbook-brightness');
+        expect(archiveSrc).toContain('arc-brightness-dimmer');
+    });
+
+    it('clamps theme brightness and computes viewport dimmer opacity accurately', () => {
+        expect(clampThemeBrightness(100)).toBe(100);
+        expect(clampThemeBrightness(75.4)).toBe(75);
+        expect(clampThemeBrightness(10)).toBe(50);
+        expect(clampThemeBrightness(150)).toBe(100);
+        expect(clampThemeBrightness('invalid')).toBe(100);
+
+        expect(computeDimOverlayOpacity(100)).toBe(0);
+        expect(computeDimOverlayOpacity(80)).toBe(0.17);
+        expect(computeDimOverlayOpacity(50)).toBe(0.425);
+
+        const ctrl = useThemeBrightness();
+        ctrl.resetThemeBrightness();
+        expect(ctrl.themeBrightness.value).toBe(100);
+        ctrl.stepThemeBrightness(-10);
+        expect(ctrl.themeBrightness.value).toBe(90);
+        expect(ctrl.dimOverlayOpacity.value).toBe(0.085);
+        ctrl.resetThemeBrightness();
+        expect(ctrl.themeBrightness.value).toBe(100);
+        expect(ctrl.dimOverlayOpacity.value).toBe(0);
     });
 
     it('splits priority-plus nav items cleanly on whole-item boundaries with zero mid-character clipping', () => {
