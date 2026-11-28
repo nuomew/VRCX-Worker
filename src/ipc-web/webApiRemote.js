@@ -4,7 +4,9 @@ import { clampWebSyncIntervalSeconds, cloudState } from './cloudState.js';
 
 const MAX_CACHE_ENTRIES = 800;
 const MAX_CACHE_ENTRY_CHARS = 256 * 1024; // Avoid retaining multi-MB image Data URLs or oversized payloads in browser RAM
-const MAX_BATCH_SIZE = 12;
+// Keep each `/api/vrc/execute-batch` call small (<= 4 GETs) so Cloudflare Workers Free's 10ms CPU
+// budget is never breached even when multiple large favorites/worlds/avatars JSON payloads miss cache.
+const MAX_BATCH_SIZE = 4;
 
 /**
  * Classifies read-only VRChat GET requests into tiered cache TTL categories so stable entity
@@ -411,9 +413,31 @@ export function createWebApiBridge() {
                     if (err?.code === 'AGENT_OFFLINE_READONLY') {
                         cloudState.lastVrcRoute = 'offline';
                     }
+                    const status = Number(err?.status ?? 0);
+                    const code = String(err?.code ?? '');
+                    const msg = err instanceof Error ? err.message : String(err);
+                    const canFallbackToSingle =
+                        code !== 'AGENT_OFFLINE_READONLY' &&
+                        code !== 'CLOUDFLARE_ACCESS_REQUIRED' &&
+                        status !== 401 &&
+                        status !== 403 &&
+                        (status === 502 ||
+                            status === 503 ||
+                            status === 504 ||
+                            /Invalid JSON|HTTP 50[234]|Failed to fetch|NetworkError/i.test(msg));
+                    if (canFallbackToSingle) {
+                        // Auto-split a rejected batch (e.g. Cloudflare 503 / Error 1102 CPU spike) into
+                        // individual `/api/vrc/execute` calls so each item gets its own 10ms Worker budget.
+                        for (const item of chunk) {
+                            executeSingleRequest(item.options, item.tier, item.cacheKey, item.startGen).then(
+                                item.resolve
+                            );
+                        }
+                        return;
+                    }
                     const errJson = JSON.stringify({
                         status: -1,
-                        message: err instanceof Error ? err.message : String(err)
+                        message: msg
                     });
                     for (const item of chunk) {
                         item.resolve(errJson);

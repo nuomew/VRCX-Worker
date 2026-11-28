@@ -137,11 +137,12 @@ public static class DesktopLegacyMigrator
     public const int DefaultConcurrency = 2;
     private const int BatchRowsLimit = 240;
     private const int MaxBatchPayloadBytes = 180 * 1024;
-    // Keep each HTTP batch tightly bounded (~180 rows / 96 KiB -> ~1.8ms Worker CPU with 100% gzip)
-    // so Cloudflare Workers Free (10ms CPU limit) stays >5x below Error 1102 even under 4x concurrency.
-    private const int CompactBatchRowsLimit = 180;
-    private const int CompactMaxBatchPayloadBytes = 96 * 1024;
-    private const int MinAdaptiveSplitBatchRows = 15;
+    // Keep each HTTP batch tightly bounded (~140 rows / 64 KiB -> ~1.2-2.0ms Worker CPU with 100% gzip)
+    // and allow adaptive 503/1102 half-splitting all the way down to 1 row for dense multi-KB `feed_bio` rows
+    // so Cloudflare Workers Free (10ms CPU limit) never aborts a migration job mid-stream.
+    private const int CompactBatchRowsLimit = 140;
+    private const int CompactMaxBatchPayloadBytes = 64 * 1024;
+    private const int MinAdaptiveSplitBatchRows = 1;
     private static readonly HashSet<string> CompactChunkLogicalTables = new(StringComparer.Ordinal)
     {
         "feed_gps",
@@ -806,8 +807,9 @@ public static class DesktopLegacyMigrator
                 for (int i = 0; i < mid; i++) left.Add(items[i]);
                 for (int i = mid; i < items.Count; i++) right.Add(items[i]);
 
-                Log.Warn(ex, "Worker CPU limit (503/1102) on {JobId}/{Category} ({Count} rows); splitting batch into {Left}+{Right}.",
+                Log.Warn(ex, "Worker CPU limit (503/1102) on {JobId}/{Category} ({Count} rows); backing off 250ms and splitting batch into {Left}+{Right}.",
                     jobId, category, items.Count, left.Count, right.Count);
+                await Task.Delay(250, ct).ConfigureAwait(false);
 
                 LegacyMigrationBatchResponse leftRes = await PostMigrationBatchWithRetryAsync(
                     syncClient, config, jobId, category, left,

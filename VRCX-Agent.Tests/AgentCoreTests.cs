@@ -2886,7 +2886,7 @@ INSERT INTO {acctPrefix}_friend_log_history (created_at, type, user_id, display_
                 CancellationToken.None,
                 concurrency: 4);
             Assert.True(completedConc);
-            Assert.Equal(14, concBatches); // 2501 rows packed at 180 rows/batch = 14 batches (13 * 180 + 161)
+            Assert.Equal(18, concBatches); // 2501 rows packed at 140 rows/batch = 18 batches (17 * 140 + 121)
             Assert.True(maxInFlight >= 2, $"Expected parallel in-flight batches >= 2, observed {maxInFlight}");
             Assert.Equal(1, categoryDoneCount);
             Assert.Equal(2501, totalConcurrentItems);

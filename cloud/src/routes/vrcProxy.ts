@@ -1599,17 +1599,31 @@ export async function handleVrcProxyRoutes(request: Request, env: Env, url: URL)
     return null;
 }
 
+let cachedWebSyncSeconds: { value: number; expiresAt: number } | null = null;
+
 async function getConfiguredWebSyncSeconds(env: Env): Promise<number> {
+    const now = Date.now();
+    if (cachedWebSyncSeconds && now < cachedWebSyncSeconds.expiresAt) {
+        return cachedWebSyncSeconds.value;
+    }
     try {
         const row = await env.DB_CORE.prepare(
             "SELECT payload_json FROM config_bundles WHERE bundle_key = 'vrcx_config' LIMIT 1"
         ).first<{ payload_json?: string }>();
         if (row?.payload_json) {
-            const cfg = JSON.parse(row.payload_json) as Record<string, unknown>;
-            return parseWebSyncIntervalSeconds(cfg['cloud:webSyncIntervalSeconds']);
+            // Fast regex lookup avoids parsing hundreds of KiB of unrelated vrcx_config JSON on every batch call.
+            const fastMatch = /"cloud:webSyncIntervalSeconds"\s*:\s*"?(\d+)"?/.exec(row.payload_json);
+            const parsedVal = fastMatch
+                ? parseWebSyncIntervalSeconds(fastMatch[1])
+                : parseWebSyncIntervalSeconds(
+                      (JSON.parse(row.payload_json) as Record<string, unknown>)['cloud:webSyncIntervalSeconds']
+                  );
+            cachedWebSyncSeconds = { value: parsedVal, expiresAt: now + 30_000 };
+            return parsedVal;
         }
     } catch {
         // Fallback to default 300s
     }
+    cachedWebSyncSeconds = { value: 300, expiresAt: now + 15_000 };
     return 300;
 }

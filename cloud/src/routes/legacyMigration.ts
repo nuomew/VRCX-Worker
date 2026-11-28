@@ -1679,13 +1679,16 @@ async function ingestLegacyCategoryBatch(
     legacyDb: D1Database,
     category: LegacyCategory,
     items: Array<Record<string, unknown>>,
-    options: { externalMysqlActive?: boolean; batchTextClean?: boolean } = {}
+    options: { externalMysqlActive?: boolean; batchTextClean?: boolean; rawPayloadBytes?: number } = {}
 ): Promise<{ inserted: number; skipped: number; legacyDbBytes: number }> {
     const effectiveChunkMaxBytes = options.externalMysqlActive ? EXTERNAL_MYSQL_CHUNK_MAX_BYTES : COMPACT_CHUNK_MAX_BYTES;
     const effectiveStoredMaxBytes = options.externalMysqlActive ? EXTERNAL_MYSQL_STORED_PAYLOAD_MAX_BYTES : 0;
-    // Skip synchronous gzip only for oversized legacy v1.14.2 batches (>= 600 rows) on external MySQL,
-    // where JSON.parse + SHA-256 already spend ~4.5ms; <= 400-row batches stay 100% gzip-compressed.
-    const skipGzipForHugeBatch = Boolean(options.externalMysqlActive && items.length >= 600);
+    // Skip synchronous gzip on oversized batches (either >= 600 rows OR >= 512 KiB raw payload) on external
+    // MySQL so JSON.parse + SHA-256 + zlib can never breach Cloudflare Workers Free's 10ms CPU limit;
+    // normal <= 480 KiB / <= 400-row batches remain 100% `gz:` compressed.
+    const skipGzipForHugeBatch = Boolean(
+        options.externalMysqlActive && (items.length >= 600 || (options.rawPayloadBytes ?? 0) >= 512 * 1024)
+    );
     const fastStr = (val: unknown, maxLen: number): string => {
         if (options.batchTextClean && typeof val === 'string') {
             if (val.length <= maxLen) return val;
@@ -2066,14 +2069,14 @@ async function ingestLegacyCategoryBatch(
                     fastStr(raw.bio, 4096),
                     fastStr(raw.previousBio ?? raw.previous_bio, 4096),
                     typeof raw.bioLinks === 'string'
-                        ? raw.bioLinks.slice(0, 4096)
+                        ? fastStr(raw.bioLinks, 4096)
                         : typeof raw.bio_links === 'string'
-                          ? raw.bio_links.slice(0, 4096)
+                          ? fastStr(raw.bio_links, 4096)
                           : JSON.stringify(raw.bioLinks ?? []),
                     typeof raw.previousBioLinks === 'string'
-                        ? raw.previousBioLinks.slice(0, 4096)
+                        ? fastStr(raw.previousBioLinks, 4096)
                         : typeof raw.previous_bio_links === 'string'
-                          ? raw.previous_bio_links.slice(0, 4096)
+                          ? fastStr(raw.previous_bio_links, 4096)
                           : JSON.stringify(raw.previousBioLinks ?? [])
                 ]);
             }
@@ -2561,7 +2564,7 @@ export async function handleLegacyMigrationAgentRoutes(
                     legacyDb,
                     category,
                     rawItems as Array<Record<string, unknown>>,
-                    { externalMysqlActive, batchTextClean }
+                    { externalMysqlActive, batchTextClean, rawPayloadBytes: rawBytes.byteLength }
                 );
                 inserted = result.inserted;
                 skipped = result.skipped;

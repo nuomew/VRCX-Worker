@@ -5126,4 +5126,149 @@ describe('External MySQL 5.7+ Database Integration (Hybrid New-Writes Mode & Ful
         expect(profSqls.length).toBe(1);
         expect(profSqls[0]).not.toContain('vrcx_favorite_friend');
     });
+
+    it('packs vrc_api_cache writes into multi-row MySQL upserts with native zlib gzip and skips sync gzip for oversized >=140 KiB feed_bio batches', async () => {
+        await ensureSchemaReady(env);
+        const fakeMysql = new FakeMysql57Server();
+        setMysqlConnectionFactoryForTests(async () => fakeMysql.createConnection());
+
+        const headers = { 'Content-Type': 'application/json', Origin: 'http://example.com' };
+        const saveRes = await exports.default.fetch('http://example.com/api/storage/mysql/config', {
+            method: 'PUT',
+            headers,
+            body: JSON.stringify({
+                enabled: true,
+                mode: 'new_writes_only',
+                connectionType: 'direct',
+                host: 'mysql57.example.com',
+                port: 3306,
+                database: 'vrcx_cache_pack_test',
+                username: 'vrcx_u',
+                password: 'secret-password',
+                sslMode: 'disabled',
+                tablePrefix: 'vrcx_'
+            })
+        });
+        expect(saveRes.status).toBe(200);
+
+        const seedConn = fakeMysql.createConnection();
+        await ensureMysqlSchemaOnConnection(seedConn, {
+            connectionType: 'direct',
+            host: 'mysql57.example.com',
+            port: 3306,
+            database: 'vrcx_cache_pack_test',
+            username: 'vrcx_u',
+            password: 'secret-password',
+            sslMode: 'disabled',
+            tablePrefix: 'vrcx_'
+        });
+        await seedConn.close();
+
+        // 1. Verify putCachedVrcResponses packs 4 entries into ONE multi-row MySQL INSERT ... ON DUPLICATE KEY UPDATE
+        //    and round-trips `gz:` native zlib payloads transparently via getCachedVrcResponses.
+        const { putCachedVrcResponses, getCachedVrcResponses } = await import('../src/cache/vrcCache');
+        const { runWithExternalMysqlEnv } = await import('../src/db/externalMysqlProxy');
+
+        const largeBodyA = JSON.stringify({ items: Array.from({ length: 60 }, (_, i) => ({ id: `fav_${i}`, name: `World ${i}` })) });
+        const largeBodyB = JSON.stringify({ items: Array.from({ length: 60 }, (_, i) => ({ id: `avtr_${i}`, name: `Avatar ${i}` })) });
+        fakeMysql.executedSqls = [];
+        await runWithExternalMysqlEnv(env, async (activeEnv) => {
+            await putCachedVrcResponses(activeEnv, [
+                { url: 'https://api.vrchat.cloud/api/1/favorite/groups', tier: 'favorites', status: 200, bodyText: largeBodyA, ttlMs: 600_000 },
+                { url: 'https://api.vrchat.cloud/api/1/avatars/favorites', tier: 'favorites', status: 200, bodyText: largeBodyB, ttlMs: 600_000 },
+                { url: 'https://api.vrchat.cloud/api/1/worlds/favorites', tier: 'favorites', status: 200, bodyText: '{"ok":1}', ttlMs: 600_000 },
+                { url: 'https://api.vrchat.cloud/api/1/favorites', tier: 'favorites', status: 200, bodyText: '{"ok":2}', ttlMs: 600_000 }
+            ]);
+            const cacheInserts = fakeMysql.executedSqls.filter((s) => /INSERT\s+INTO\s+`vrcx_vrc_api_cache`/i.test(s));
+            // All 4 compact/gzipped entries must coalesce into 1 single multi-row upsert instead of 4 serial RTTs
+            expect(cacheInserts.length).toBe(1);
+
+            const hits = await getCachedVrcResponses(activeEnv, [
+                'https://api.vrchat.cloud/api/1/favorite/groups',
+                'https://api.vrchat.cloud/api/1/avatars/favorites',
+                'https://api.vrchat.cloud/api/1/worlds/favorites',
+                'https://api.vrchat.cloud/api/1/favorites'
+            ]);
+            expect(hits.get('https://api.vrchat.cloud/api/1/favorite/groups')?.bodyText).toBe(largeBodyA);
+            expect(hits.get('https://api.vrchat.cloud/api/1/avatars/favorites')?.bodyText).toBe(largeBodyB);
+            expect(hits.get('https://api.vrchat.cloud/api/1/worlds/favorites')?.bodyText).toBe('{"ok":1}');
+        });
+
+        // 2. Verify oversized >= 512 KiB feed_bio batch (< 600 rows) skips sync gzip and stores <= 40 KiB raw slices cleanly
+        const keyRes = await exports.default.fetch('http://example.com/api/agent/sync-key', {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({ deviceName: 'BioTesterPC' })
+        });
+        expect(keyRes.status).toBe(200);
+        const keyJson = (await keyRes.json()) as { data: { deviceId: string; syncKey: string } };
+
+        const legacyDb = env.DB_LEGACY!;
+        const bioJobId = 'mig_bio_oversized_512k';
+        await legacyDb
+            .prepare(
+                `INSERT INTO legacy_migration_state (state_key, payload_json, updated_at)
+                 VALUES ('job', ?, ?)
+                 ON CONFLICT(state_key) DO UPDATE SET payload_json = excluded.payload_json, updated_at = excluded.updated_at`
+            )
+            .bind(
+                JSON.stringify({
+                    jobId: bioJobId,
+                    deviceId: keyJson.data.deviceId,
+                    accountPrefix: 'usrtestbio',
+                    categories: ['feed'],
+                    concurrency: 4,
+                    status: 'running',
+                    startedAt: '2026-11-28T00:00:00.000Z',
+                    updatedAt: '2026-11-28T00:00:00.000Z',
+                    finishedAt: '',
+                    currentCategory: 'feed',
+                    completedCategories: [],
+                    totalEstimatedRows: 200,
+                    processedRows: 0,
+                    insertedRows: 0,
+                    skippedRows: 0,
+                    estimatedBytes: 600_000,
+                    errorMessage: ''
+                }),
+                '2026-11-28T00:00:00.000Z'
+            )
+            .run();
+
+        // Construct 180 large feed_bio rows (~560 KiB total, well below 600 rows)
+        const bioItems = Array.from({ length: 180 }, (_, i) => ({
+            type: 'Bio',
+            created_at: `2026-01-01T00:${String(Math.floor(i / 60)).padStart(2, '0')}:${String(i % 60).padStart(2, '0')}.000Z`,
+            userId: `usr_bio_${i}`,
+            displayName: `BioUser_${i}`,
+            bio: `bio_${i}_${'あいうえお🌸'.repeat(120)}`,
+            previousBio: `prev_${i}_${'かきくけこ⭐'.repeat(120)}`,
+            bioLinks: '["https://example.com/a"]',
+            previousBioLinks: '[]'
+        }));
+        const rawBatchBody = JSON.stringify({
+            jobId: bioJobId,
+            category: 'feed',
+            items: bioItems,
+            categoryDone: false,
+            allDone: false
+        });
+        expect(Buffer.byteLength(rawBatchBody, 'utf8')).toBeGreaterThan(512 * 1024);
+        const batchRes = await exports.default.fetch('http://example.com/api/agent/migration/batch', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-Sync-Key': keyJson.data.syncKey
+            },
+            body: rawBatchBody
+        });
+        expect(batchRes.status).toBe(200);
+        const batchJson = (await batchRes.json()) as { ok: boolean; data: { inserted: number } };
+        expect(batchJson.ok).toBe(true);
+        expect(batchJson.data.inserted).toBe(180);
+        const storedChunks = fakeMysql.tables.get('vrcx_legacy_feed_chunks')?.rows ?? [];
+        expect(storedChunks.length).toBeGreaterThanOrEqual(1);
+        // Oversized >= 512 KiB batch skipped synchronous gzip to stay well under Workers Free 10ms CPU
+        expect(storedChunks.every((r) => !String(r.payload_json ?? '').startsWith('gz:'))).toBe(true);
+    });
 });

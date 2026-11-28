@@ -1,3 +1,7 @@
+import { Buffer } from 'node:buffer';
+import { gunzipSync, gzipSync } from 'node:zlib';
+import { qualifyMysqlTableName } from '../db/externalMysql';
+import { getHybridMysqlSession } from '../db/externalMysqlProxy';
 import { getCacheDb } from '../db/schemaBootstrap';
 import type { Env } from '../env';
 
@@ -35,64 +39,44 @@ const MAX_CACHE_BODY_BYTES = 512 * 1024; // Avoid stuffing oversized payloads in
 const MAX_RSS_SNAPSHOT_JSON_BYTES = 1_400_000; // Keep well below D1's 2 MB single-row limit
 const GZIP_TEXT_PREFIX = 'gz:';
 const GZIP_MIN_RAW_BYTES = 2048;
+// Cap total synchronous gzip input bytes per Worker request so large multi-item batches
+// never burn through Cloudflare Workers Free's 10ms CPU limit just to populate cache.
+const MAX_BATCH_GZIP_RAW_BYTES = 128 * 1024;
+const MYSQL_CACHE_MULTI_INSERT_MAX_BYTES = 34 * 1024;
 
 const utf8Encoder = new TextEncoder();
 
-function uint8ToBase64(bytes: Uint8Array): string {
-    const chunkSize = 8192;
-    let binary = '';
-    for (let i = 0; i < bytes.length; i += chunkSize) {
-        const slice = bytes.subarray(i, Math.min(i + chunkSize, bytes.length));
-        let chunkStr = '';
-        for (let j = 0; j < slice.length; j++) {
-            chunkStr += String.fromCharCode(slice[j]!);
-        }
-        binary += chunkStr;
-    }
-    return btoa(binary);
-}
-
-function base64ToUint8(b64: string): Uint8Array {
-    const binary = atob(b64);
-    const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) {
-        bytes[i] = binary.charCodeAt(i);
-    }
-    return bytes;
-}
-
 /**
- * Compresses large JSON cache bodies with native Workers gzip + base64 (`gz:` prefix),
- * shrinking typical VRChat API payloads in DB_CACHE by 75%-88%.
- * Falls back safely to raw text if small, unsupported, or incompressible.
+ * Compresses large JSON cache bodies with native synchronous zlib gzip (level 1) + Buffer base64
+ * (`gz:` prefix), ~5-10x lower CPU than Web Streams + JS char-loop base64 while remaining
+ * 100% wire-compatible with existing `gz:` rows.
  */
 export async function compressCacheTextIfBeneficial(raw: string): Promise<string> {
     if (!raw || raw.startsWith(GZIP_TEXT_PREFIX)) return raw;
-    const rawBytes = utf8Encoder.encode(raw);
-    if (rawBytes.byteLength < GZIP_MIN_RAW_BYTES || typeof CompressionStream === 'undefined') {
+    const rawBuf = Buffer.from(raw, 'utf8');
+    if (rawBuf.byteLength < GZIP_MIN_RAW_BYTES) {
         return raw;
     }
     try {
-        const compressedStream = new Blob([rawBytes]).stream().pipeThrough(new CompressionStream('gzip'));
-        const compressedBuf = await new Response(compressedStream).arrayBuffer();
-        const encoded = `${GZIP_TEXT_PREFIX}${uint8ToBase64(new Uint8Array(compressedBuf))}`;
-        return encoded.length < raw.length ? encoded : raw;
+        const compressed = gzipSync(rawBuf, { level: 1 });
+        const encoded = `${GZIP_TEXT_PREFIX}${compressed.toString('base64')}`;
+        return encoded.length < rawBuf.byteLength ? encoded : raw;
     } catch {
         return raw;
     }
 }
 
 /**
- * Transparently decompresses `gz:`-prefixed DB_CACHE values back into original JSON text.
+ * Transparently decompresses `gz:`-prefixed DB_CACHE values back into original JSON text
+ * via synchronous native zlib gunzip.
  */
 export async function decompressCacheText(stored: string): Promise<string> {
-    if (!stored || !stored.startsWith(GZIP_TEXT_PREFIX) || typeof DecompressionStream === 'undefined') {
+    if (!stored || !stored.startsWith(GZIP_TEXT_PREFIX)) {
         return stored;
     }
     try {
-        const rawBytes = base64ToUint8(stored.slice(GZIP_TEXT_PREFIX.length));
-        const decompressedStream = new Blob([rawBytes]).stream().pipeThrough(new DecompressionStream('gzip'));
-        return await new Response(decompressedStream).text();
+        const rawBuf = Buffer.from(stored.slice(GZIP_TEXT_PREFIX.length), 'base64');
+        return gunzipSync(rawBuf).toString('utf8');
     } catch {
         return stored;
     }
@@ -446,16 +430,83 @@ export async function buildPutCachedVrcStatementsAsync(
 }
 
 /**
- * Upserts one or more successful VRChat API GET responses into dedicated DB_CACHE (gzip-compressed when beneficial).
+ * Upserts one or more successful VRChat API GET responses into dedicated DB_CACHE (gzip-compressed
+ * within a per-request CPU budget; packed into multi-row MySQL upserts when external MySQL is active
+ * to avoid N serial MySQL round-trips inside `/api/vrc/execute-batch`).
  */
 export async function putCachedVrcResponses(
     env: Env,
     entries: Array<{ url: string; tier: VrcCacheTier; status: number; bodyText: string; ttlMs: number }>,
     nowMs = Date.now()
 ): Promise<void> {
-    const stmts = await buildPutCachedVrcStatementsAsync(env, entries, nowMs);
+    const candidates = entries.filter((e) => e.url && e.status >= 200 && e.status < 300 && e.bodyText.length > 0);
+    if (candidates.length === 0) return;
+
+    const db = getCacheDb(env);
+    const mysqlSession = getHybridMysqlSession(db);
+    let gzipBudgetRemaining = MAX_BATCH_GZIP_RAW_BYTES;
+    const prepared: Array<{ url: string; tier: VrcCacheTier; status: number; bodyText: string; ttlMs: number }> = [];
+
+    for (const e of candidates) {
+        const rawLen = Buffer.byteLength(e.bodyText, 'utf8');
+        let storedText = e.bodyText;
+        if (rawLen >= GZIP_MIN_RAW_BYTES && rawLen <= gzipBudgetRemaining) {
+            storedText = await compressCacheTextIfBeneficial(e.bodyText);
+            gzipBudgetRemaining -= rawLen;
+        }
+        const storedBytes = storedText.startsWith(GZIP_TEXT_PREFIX)
+            ? storedText.length
+            : Buffer.byteLength(storedText, 'utf8');
+        if (storedBytes <= MAX_CACHE_BODY_BYTES) {
+            prepared.push({ ...e, bodyText: storedText });
+        }
+    }
+    if (prepared.length === 0) return;
+
+    if (mysqlSession) {
+        const qTbl = qualifyMysqlTableName(mysqlSession.params.tablePrefix, 'vrc_api_cache');
+        const nowIso = new Date(nowMs).toISOString();
+        // Pack multiple small cache entries into 1 MySQL multi-row upsert (capped at ~34 KiB per query)
+        let batchRows: Array<[string, VrcCacheTier, number, string, string, number]> = [];
+        let batchEstBytes = 128;
+
+        const flushMysqlBatch = async (): Promise<void> => {
+            if (batchRows.length === 0) return;
+            const placeholders = batchRows.map(() => '(?, ?, ?, ?, ?, ?)').join(', ');
+            const params: unknown[] = [];
+            for (const row of batchRows) {
+                params.push(row[0], row[1], row[2], row[3], row[4], row[5]);
+            }
+            await mysqlSession.query(
+                `INSERT INTO \`${qTbl}\` (\`cache_key\`, \`tier\`, \`status\`, \`body_text\`, \`updated_at\`, \`expires_at\`)
+                 VALUES ${placeholders}
+                 ON DUPLICATE KEY UPDATE
+                    \`tier\` = VALUES(\`tier\`),
+                    \`status\` = VALUES(\`status\`),
+                    \`body_text\` = VALUES(\`body_text\`),
+                    \`updated_at\` = VALUES(\`updated_at\`),
+                    \`expires_at\` = VALUES(\`expires_at\`)`,
+                params
+            );
+            batchRows = [];
+            batchEstBytes = 128;
+        };
+
+        for (const e of prepared) {
+            const key = normalizeVrcCacheKey(e.url);
+            const rowBytes = key.length + e.bodyText.length + 96;
+            if (batchRows.length > 0 && batchEstBytes + rowBytes > MYSQL_CACHE_MULTI_INSERT_MAX_BYTES) {
+                await flushMysqlBatch();
+            }
+            batchRows.push([key, e.tier, e.status, e.bodyText, nowIso, nowMs + e.ttlMs]);
+            batchEstBytes += rowBytes;
+        }
+        await flushMysqlBatch();
+        return;
+    }
+
+    const stmts = buildPutCachedVrcStatements(env, prepared, nowMs);
     if (stmts.length > 0) {
-        const db = getCacheDb(env);
         await db.batch(stmts);
     }
 }
