@@ -84,18 +84,20 @@
                         <span class="text-xs text-muted-foreground shrink-0">
                             {{ t('table.pagination.date_recorded_months') }}
                         </span>
-                        <NativeSelect
-                            class="h-7 text-xs flex-1"
-                            data-testid="history-date-month-jump"
-                            :model-value="visibleMonthKey"
-                            @update:modelValue="handleQuickMonthJump">
-                            <NativeSelectOption
-                                v-for="item in nav.months.value"
-                                :key="item.month"
-                                :value="item.month">
-                                {{ item.month }} ({{ formatCompactCount(item.approxRows) }})
-                            </NativeSelectOption>
-                        </NativeSelect>
+                        <div class="flex-1 min-w-0 [&_[data-slot=native-select-wrapper]]:w-full">
+                            <NativeSelect
+                                class="h-8 py-0 pl-2.5 pr-9 text-xs leading-normal tabular-nums"
+                                data-testid="history-date-month-jump"
+                                :model-value="visibleMonthKey"
+                                @update:modelValue="handleQuickMonthJump">
+                                <NativeSelectOption
+                                    v-for="item in nav.months.value"
+                                    :key="item.month"
+                                    :value="item.month">
+                                    {{ item.month }} ({{ formatCompactCount(item.approxRows) }})
+                                </NativeSelectOption>
+                            </NativeSelect>
+                        </div>
                     </div>
 
                     <Calendar
