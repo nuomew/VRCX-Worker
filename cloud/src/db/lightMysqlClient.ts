@@ -361,7 +361,24 @@ class LightMysqlSocketConn implements MysqlConnectionLike {
         }
     }
 
+    private tryReadBufferedPacket(): { seq: number; payload: Buffer } | null {
+        if (this.bufferedBytes < 4) return null;
+        const head = this.chunks[0]!;
+        if (head.length < 4) return null;
+        const len = head[0]! | (head[1]! << 8) | (head[2]! << 16);
+        // Multi-packet (>=16 MiB) frames fall back to async readPacket
+        if (len >= 0xffffff || this.bufferedBytes < 4 + len) {
+            return null;
+        }
+        const seq = head[3]!;
+        this.consumeBytes(4);
+        const payload = len > 0 ? this.consumeBytes(len) : Buffer.alloc(0);
+        return { seq, payload };
+    }
+
     private async readPacket(timeoutMs = DEFAULT_QUERY_TIMEOUT_MS): Promise<{ seq: number; payload: Buffer }> {
+        const fast = this.tryReadBufferedPacket();
+        if (fast) return fast;
         let seq = 0;
         let parts: Buffer[] | null = null;
         while (true) {
@@ -571,23 +588,24 @@ class LightMysqlSocketConn implements MysqlConnectionLike {
         }
 
         // ResultSet: column count -> N column definitions -> EOF -> rows -> EOF
+        // Use synchronous buffered packet reads inside loops to avoid hundreds of Promise microtasks per ResultSet.
         const colCount = readLenEncInt(first.payload, 0).value;
         const columns: Array<{ name: string; columnType: number }> = [];
         for (let i = 0; i < colCount; i++) {
-            const colPkt = await this.readPacket(DEFAULT_QUERY_TIMEOUT_MS);
+            const colPkt = this.tryReadBufferedPacket() ?? (await this.readPacket(DEFAULT_QUERY_TIMEOUT_MS));
             if (colPkt.payload[0] === 0xff) {
                 throw parseMysqlErrorPacket(colPkt.payload);
             }
             columns.push(parseColumnDefinition(colPkt.payload));
         }
-        const colEof = await this.readPacket(DEFAULT_QUERY_TIMEOUT_MS);
+        const colEof = this.tryReadBufferedPacket() ?? (await this.readPacket(DEFAULT_QUERY_TIMEOUT_MS));
         if (colEof.payload[0] === 0xff) {
             throw parseMysqlErrorPacket(colEof.payload);
         }
 
         const rows: Array<Record<string, unknown>> = [];
         while (true) {
-            const rowPkt = await this.readPacket(DEFAULT_QUERY_TIMEOUT_MS);
+            const rowPkt = this.tryReadBufferedPacket() ?? (await this.readPacket(DEFAULT_QUERY_TIMEOUT_MS));
             const rm = rowPkt.payload[0];
             if (rm === 0xff) {
                 throw parseMysqlErrorPacket(rowPkt.payload);
@@ -616,7 +634,7 @@ class LightMysqlSocketConn implements MysqlConnectionLike {
         try {
             this.reader.releaseLock();
         } catch {
-            // Ignore reader release errors
+            void this.reader.cancel().catch(() => {});
         }
         try {
             await this.socket.close();

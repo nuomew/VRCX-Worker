@@ -808,9 +808,24 @@ function projectColumns(selectExpr: string, rows: Array<Record<string, unknown>>
             }
             const asMatch = /^([\s\S]+?)\s+AS\s+`?(\w+)`?\s*$/i.exec(p);
             if (asMatch) {
-                const expr = asMatch[1]!.trim().replace(/^`|`$/g, '');
+                const rawExpr = asMatch[1]!.trim();
                 const alias = asMatch[2]!;
-                out[alias] = r[expr];
+                const litMatch = /^'([^']*)'$/.exec(rawExpr);
+                const castMatch =
+                    /^CAST\(\s*`?(\w+)`?\s+AS\s+CHAR(?:\s+CHARACTER\s+SET\s+\w+)?(?:\s+COLLATE\s+\w+)?\s*\)$/i.exec(
+                        rawExpr
+                    );
+                if (litMatch) {
+                    out[alias] = litMatch[1]!;
+                } else if (/^NULL$/i.test(rawExpr)) {
+                    out[alias] = null;
+                } else if (castMatch) {
+                    const v = r[castMatch[1]!];
+                    out[alias] = v === null || v === undefined ? null : String(v);
+                } else {
+                    const expr = rawExpr.replace(/^`|`$/g, '');
+                    out[alias] = r[expr];
+                }
             } else {
                 const col = p.trim().replace(/^`|`$/g, '');
                 out[col] = r[col];
@@ -4695,6 +4710,49 @@ describe('External MySQL 5.7+ Database Integration (Hybrid New-Writes Mode & Ful
         });
         await conn.close();
 
+        // 2b. Coalesced single-TCP-chunk multi-row ResultSet exercises synchronous buffered packet fast path
+        const hsBulk = buildHandshakeV10('mysql_native_password', false);
+        let bulkAuthed = false;
+        const mockBulk = createMockSocket(
+            (seq, body, push) => {
+                if (!bulkAuthed) {
+                    bulkAuthed = true;
+                    push(wrapPkt(seq + 1, Buffer.from([0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00])));
+                    return;
+                }
+                if (body[0] === 0x01) return;
+                const frames: Buffer[] = [
+                    wrapPkt(1, Buffer.from([2])),
+                    wrapPkt(2, buildColDef('slot', 0xfd)),
+                    wrapPkt(3, buildColDef('val', 0x08)),
+                    wrapPkt(4, Buffer.from([0xfe, 0, 0, 2, 0]))
+                ];
+                let pktSeq = 5;
+                for (let i = 0; i < 25; i++) {
+                    frames.push(wrapPkt(pktSeq++, Buffer.concat([lenEncStr(`row_${i}`), lenEncStr(String(i * 10))])));
+                }
+                frames.push(wrapPkt(pktSeq, Buffer.from([0xfe, 0, 0, 2, 0])));
+                // Push all 30 MySQL packets inside ONE coalesced TCP chunk
+                push(Buffer.concat(frames));
+            },
+            [hsBulk.pkt]
+        );
+        const bulkConn = await openLightMysqlConnectionOnSocket(mockBulk.socket, {
+            connectionType: 'direct',
+            host: 'mysql.example.com',
+            port: 3306,
+            database: 'vrcx_db',
+            username: 'vrcx_u',
+            password: 'pw123',
+            sslMode: 'disabled',
+            tablePrefix: 'vrcx_'
+        });
+        const bulkRes = await bulkConn.execute('SELECT slot, val FROM `t`', []);
+        expect(bulkRes.rows.length).toBe(25);
+        expect(bulkRes.rows[0]).toEqual({ slot: 'row_0', val: 0 });
+        expect(bulkRes.rows[24]).toEqual({ slot: 'row_24', val: 240 });
+        await bulkConn.close();
+
         // 3. Unsupported auth plugin (MySQL 8 caching_sha2_password) throws LightMysqlUnsupportedAuthError for seamless mysql2 fallback
         const hsSha2 = buildHandshakeV10('caching_sha2_password', false);
         const mock2 = createMockSocket(() => {}, [hsSha2.pkt]);
@@ -4710,5 +4768,226 @@ describe('External MySQL 5.7+ Database Integration (Hybrid New-Writes Mode & Ful
                 tablePrefix: 'vrcx_'
             })
         ).rejects.toBeInstanceOf(LightMysqlUnsupportedAuthError);
+    });
+
+    it('consolidates GET /api/bootstrap into 1 MySQL 5.7 UNION ALL RTT with exact active+legacy+D1 merge and graceful outage fallback', async () => {
+        await ensureSchemaReady(env);
+        const fakeMysql = new FakeMysql57Server();
+        setMysqlConnectionFactoryForTests(async () => fakeMysql.createConnection());
+
+        const headers = { 'Content-Type': 'application/json', Origin: 'http://example.com' };
+        const legacyDb = env.DB_LEGACY!;
+        const uptimeNow = new Date().toISOString();
+
+        // 1. Seed D1 active + D1 legacy rows BEFORE enabling external MySQL
+        await env.DB_CORE.batch([
+            env.DB_CORE.prepare('DELETE FROM memos'),
+            env.DB_CORE.prepare('DELETE FROM notes'),
+            env.DB_CORE.prepare('DELETE FROM favorite_friend'),
+            env.DB_CORE.prepare('DELETE FROM avatar_tags'),
+            env.DB_CORE.prepare('DELETE FROM moderation'),
+            env.DB_CORE.prepare('DELETE FROM user_profile'),
+            env.DB_CORE.prepare('DELETE FROM stats_counters'),
+            env.DB_CORE.prepare('INSERT INTO memos (user_id, edited_at, memo) VALUES (?, ?, ?)').bind(
+                'usr_override',
+                '2026-01-01T00:00:00.000Z',
+                'd1-active-old'
+            ),
+            env.DB_CORE.prepare('INSERT INTO memos (user_id, edited_at, memo) VALUES (?, ?, ?)').bind(
+                'usr_d1_only',
+                '2026-01-02T00:00:00.000Z',
+                'd1-only-memo'
+            ),
+            env.DB_CORE.prepare(
+                'INSERT INTO stats_counters (counter_key, row_count, updated_at) VALUES (?, ?, ?)'
+            ).bind('feed_gps', 120, '2026-11-28T00:00:00.000Z'),
+            env.DB_CORE.prepare(
+                'INSERT INTO stats_counters (counter_key, row_count, updated_at) VALUES (?, ?, ?)'
+            ).bind('cloud_total_uptime_seconds', 900, uptimeNow)
+        ]);
+        await legacyDb.batch([
+            legacyDb.prepare('DELETE FROM memos'),
+            legacyDb.prepare('DELETE FROM favorite_friend'),
+            legacyDb.prepare('DELETE FROM avatar_tags'),
+            legacyDb.prepare('DELETE FROM legacy_configs'),
+            legacyDb.prepare('INSERT INTO memos (user_id, edited_at, memo) VALUES (?, ?, ?)').bind(
+                'usr_legacy_d1',
+                '2025-01-01T00:00:00.000Z',
+                'legacy-d1-memo'
+            ),
+            legacyDb.prepare(
+                'INSERT INTO legacy_configs (config_key, config_value, updated_at) VALUES (?, ?, ?)'
+            ).bind('VRCX_hideUnfriends', 'true', uptimeNow)
+        ]);
+
+        // 2. Enable external MySQL in Mode 1 (`new_writes_only`) and seed MySQL active + legacy tables
+        const saveRes = await exports.default.fetch('http://example.com/api/storage/mysql/config', {
+            method: 'PUT',
+            headers,
+            body: JSON.stringify({
+                enabled: true,
+                mode: 'new_writes_only',
+                connectionType: 'direct',
+                host: 'mysql57.example.com',
+                port: 3306,
+                database: 'vrcx_boot_test',
+                username: 'vrcx_u',
+                password: 'secret-password',
+                sslMode: 'disabled',
+                tablePrefix: 'vrcx_'
+            })
+        });
+        expect(saveRes.status).toBe(200);
+
+        const seedConn = fakeMysql.createConnection();
+        await ensureMysqlSchemaOnConnection(seedConn, {
+            connectionType: 'direct',
+            host: 'mysql57.example.com',
+            port: 3306,
+            database: 'vrcx_boot_test',
+            username: 'vrcx_u',
+            password: 'secret-password',
+            sslMode: 'disabled',
+            tablePrefix: 'vrcx_'
+        });
+        await seedConn.execute(
+            'INSERT INTO `vrcx_memos` (`user_id`, `edited_at`, `memo`) VALUES (?, ?, ?)',
+            ['usr_override', '2026-11-28T01:00:00.000Z', 'mysql-active-wins']
+        );
+        await seedConn.execute(
+            'INSERT INTO `vrcx_legacy_memos` (`user_id`, `edited_at`, `memo`) VALUES (?, ?, ?)',
+            ['usr_override', '2024-01-01T00:00:00.000Z', 'legacy-should-lose']
+        );
+        await seedConn.execute(
+            'INSERT INTO `vrcx_legacy_memos` (`user_id`, `edited_at`, `memo`) VALUES (?, ?, ?)',
+            ['usr_legacy_mysql', '2024-06-01T00:00:00.000Z', 'legacy-mysql-memo']
+        );
+        await seedConn.execute(
+            'INSERT INTO `vrcx_legacy_favorite_friend` (`created_at`, `user_id`, `group_name`) VALUES (?, ?, ?)',
+            ['2024-07-01T00:00:00.000Z', 'usr_fav_leg', 'group_0']
+        );
+        await seedConn.execute(
+            'INSERT INTO `vrcx_avatar_tags` (`avatar_id`, `tag`, `color`) VALUES (?, ?, ?)',
+            ['avtr_01', 'cute', null]
+        );
+        await seedConn.execute(
+            'INSERT INTO `vrcx_moderation` (`user_id`, `updated_at`, `display_name`, `block`, `mute`) VALUES (?, ?, ?, ?, ?)',
+            ['usr_mod_1', '2026-11-28T01:00:00.000Z', 'NoisyUser', 1, 0]
+        );
+        await seedConn.execute(
+            'INSERT INTO `vrcx_stats_counters` (`counter_key`, `row_count`, `updated_at`) VALUES (?, ?, ?)',
+            ['feed_gps', 300, '2026-11-28T01:00:00.000Z']
+        );
+        await seedConn.execute(
+            'INSERT INTO `vrcx_stats_counters` (`counter_key`, `row_count`, `updated_at`) VALUES (?, ?, ?)',
+            ['cloud_total_uptime_seconds', 1500, uptimeNow]
+        );
+        await seedConn.close();
+
+        // 3. Call GET /api/bootstrap and verify: ONE single MySQL UNION ALL SELECT, zero serial table reads
+        fakeMysql.executedSqls = [];
+        const bootRes = await exports.default.fetch('http://example.com/api/bootstrap', { headers });
+        expect(bootRes.status).toBe(200);
+        const bootJson = (await bootRes.json()) as {
+            ok: boolean;
+            data: {
+                configs: Record<string, string>;
+                memos: Array<{ user_id: string; memo: string }>;
+                favoriteFriends: Array<{ id: number; user_id: string; group_name: string }>;
+                avatarTags: Array<{ avatar_id: string; tag: string; color: string | null }>;
+                moderations: Array<{ user_id: string; block: number; mute: number }>;
+                statsCounters: Record<string, number>;
+                totalUptimeSeconds: number;
+                degraded?: string;
+            };
+        };
+        expect(bootJson.ok).toBe(true);
+        expect(bootJson.data.degraded).toBeUndefined();
+
+        const mysqlSelects = fakeMysql.executedSqls.filter((s) => /^SELECT\b/i.test(s));
+        // Exactly 1 top-level UNION ALL query (no 23 serial table SELECTs, no extra uptime SELECT)
+        const topLevelUnionSelects = mysqlSelects.filter((s) => /\bUNION\s+ALL\b/i.test(s));
+        expect(topLevelUnionSelects.length).toBe(1);
+        // Every non-NULL column inside the UNION ALL must use explicit CAST(... AS CHAR CHARACTER SET utf8mb4)
+        expect(topLevelUnionSelects[0]).toContain('AS CHAR CHARACTER SET utf8mb4');
+        // Zero standalone stats_counters SELECTs (reused preloaded uptime row from UNION ALL)
+        expect(mysqlSelects.some((s) => !/\bUNION\s+ALL\b/i.test(s) && /vrcx_stats_counters/i.test(s) && /WHERE/i.test(s))).toBe(false);
+
+        // Precedence & merged content verification
+        const memoByUser = new Map(bootJson.data.memos.map((m) => [m.user_id, m.memo]));
+        expect(memoByUser.get('usr_override')).toBe('mysql-active-wins');
+        expect(memoByUser.get('usr_d1_only')).toBe('d1-only-memo');
+        expect(memoByUser.get('usr_legacy_mysql')).toBe('legacy-mysql-memo');
+        expect(memoByUser.get('usr_legacy_d1')).toBe('legacy-d1-memo');
+
+        // Legacy favorite_friend id is negated numeric, avatar_tags null color preserved, moderation numeric flags preserved
+        const favLeg = bootJson.data.favoriteFriends.find((f) => f.user_id === 'usr_fav_leg');
+        expect(favLeg).toBeDefined();
+        expect(typeof favLeg?.id).toBe('number');
+        expect((favLeg?.id ?? 0) < 0).toBe(true);
+        expect(bootJson.data.avatarTags).toContainEqual({ avatar_id: 'avtr_01', tag: 'cute', color: null });
+        expect(bootJson.data.moderations).toContainEqual(
+            expect.objectContaining({ user_id: 'usr_mod_1', block: 1, mute: 0 })
+        );
+        // Stats counters: feed_gps sums D1 (120) + MySQL (300) = 420; uptime takes max(900, 1500) = 1500
+        expect(bootJson.data.statsCounters.feed_gps).toBe(420);
+        expect(bootJson.data.totalUptimeSeconds).toBeGreaterThanOrEqual(1500);
+        expect(bootJson.data.configs.VRCX_hideUnfriends).toBe('true');
+
+        // 4. Full-migrated & drained mode skips D1 business rows completely (still 1 MySQL UNION ALL RTT)
+        const saveDrainedRes = await exports.default.fetch('http://example.com/api/storage/mysql/config', {
+            method: 'PUT',
+            headers,
+            body: JSON.stringify({
+                enabled: true,
+                mode: 'full_migrate',
+                connectionType: 'direct',
+                host: 'mysql57.example.com',
+                port: 3306,
+                database: 'vrcx_boot_test',
+                username: 'vrcx_u',
+                password: 'secret-password',
+                sslMode: 'disabled',
+                tablePrefix: 'vrcx_'
+            })
+        });
+        expect(saveDrainedRes.status).toBe(200);
+        await saveExternalDbMigrationState(env, {
+            ...defaultExternalDbMigrationState(),
+            status: 'completed',
+            d1Drained: true,
+            schemaVersion: CURRENT_MIGRATION_SCHEMA_VERSION
+        });
+        invalidateExternalDbConfigCache();
+
+        fakeMysql.executedSqls = [];
+        const drainedRes = await exports.default.fetch('http://example.com/api/bootstrap', { headers });
+        expect(drainedRes.status).toBe(200);
+        const drainedJson = (await drainedRes.json()) as {
+            ok: boolean;
+            data: { memos: Array<{ user_id: string; memo: string }>; statsCounters: Record<string, number> };
+        };
+        const drainedMemoUsers = new Set(drainedJson.data.memos.map((m) => m.user_id));
+        expect(drainedMemoUsers.has('usr_override')).toBe(true);
+        expect(drainedMemoUsers.has('usr_legacy_mysql')).toBe(true);
+        // D1-only rows are skipped once d1Drained = true
+        expect(drainedMemoUsers.has('usr_d1_only')).toBe(false);
+        expect(drainedJson.data.statsCounters.feed_gps).toBe(300);
+
+        // 5. Simulated external MySQL outage during GET /api/bootstrap degrades gracefully to HTTP 200 JSON (never 503)
+        await saveExternalDbMigrationState(env, defaultExternalDbMigrationState());
+        invalidateExternalDbConfigCache();
+        fakeMysql.failNextConnect = true;
+        const outageRes = await exports.default.fetch('http://example.com/api/bootstrap', { headers });
+        fakeMysql.failNextConnect = false;
+        expect(outageRes.status).toBe(200);
+        expect(outageRes.headers.get('X-VRCX-Storage-Degraded')).toBe('external_db_unavailable');
+        const outageJson = (await outageRes.json()) as {
+            ok: boolean;
+            data: { degraded?: string; memos: Array<{ user_id: string; memo: string }> };
+        };
+        expect(outageJson.ok).toBe(true);
+        expect(outageJson.data.degraded).toBe('external_db_unavailable');
+        expect(outageJson.data.memos.some((m) => m.user_id === 'usr_d1_only')).toBe(true);
     });
 });

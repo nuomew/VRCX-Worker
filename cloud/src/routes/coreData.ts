@@ -7,6 +7,12 @@ import {
     mutateArchiveChunks,
     parseActiveArchiveVirtualRowId
 } from '../db/compactArchive';
+import {
+    getRawD1Env,
+    qualifyMysqlTableName,
+    type QualifiedMysqlPhysicalTableName
+} from '../db/externalMysql';
+import { getHybridMysqlSession } from '../db/externalMysqlProxy';
 import { getLegacyDb } from '../db/schemaBootstrap';
 import {
     classifyStorageWriteDegradation,
@@ -304,25 +310,360 @@ export function resolveRecentHttpAgents(
     return { httpAgentsOnline, deviceLastSeen };
 }
 
+interface BootstrapBusinessTables {
+    memos: Array<Record<string, unknown>>;
+    worldMemos: Array<Record<string, unknown>>;
+    avatarMemos: Array<Record<string, unknown>>;
+    notes: Array<Record<string, unknown>>;
+    favoriteFriends: Array<Record<string, unknown>>;
+    favoriteWorlds: Array<Record<string, unknown>>;
+    favoriteAvatars: Array<Record<string, unknown>>;
+    favoritePrints: Array<Record<string, unknown>>;
+    avatarTags: Array<Record<string, unknown>>;
+    moderations: Array<Record<string, unknown>>;
+    userProfiles: Array<Record<string, unknown>>;
+}
+
+interface StatsCounterBootstrapRow {
+    counter_key: string;
+    row_count: number;
+    updated_at: string;
+}
+
+function emptyBootstrapBusinessTables(): BootstrapBusinessTables {
+    return {
+        memos: [],
+        worldMemos: [],
+        avatarMemos: [],
+        notes: [],
+        favoriteFriends: [],
+        favoriteWorlds: [],
+        favoriteAvatars: [],
+        favoritePrints: [],
+        avatarTags: [],
+        moderations: [],
+        userProfiles: []
+    };
+}
+
+function castMysqlCol(col: string, alias: string): string {
+    // Explicit `CAST(... AS CHAR CHARACTER SET utf8mb4)` normalizes ascii_bin / utf8mb4_bin /
+    // utf8mb4_unicode_ci / numeric columns into a uniform collation across all UNION ALL branches,
+    // preventing MySQL 5.7 Error 1271 ("Illegal mix of collations for operation 'UNION'").
+    return `CAST(\`${col}\` AS CHAR CHARACTER SET utf8mb4) AS ${alias}`;
+}
+
+/**
+ * Builds a single MySQL 5.7-compatible UNION ALL query covering all 12 active (and optionally 11 legacy)
+ * bootstrap business tables in 1 round-trip instead of 23+ serial queries.
+ */
+function buildBootstrapMysqlUnionSql(tablePrefix: string, includeLegacy: boolean): string {
+    const branches: string[] = [];
+    const pushBranch = (
+        slot: string,
+        physicalTable: QualifiedMysqlPhysicalTableName,
+        cols: [string, string, string, string | null, string | null]
+    ) => {
+        const qTbl = qualifyMysqlTableName(tablePrefix, physicalTable);
+        const c1 = castMysqlCol(cols[0], 'c1');
+        const c2 = castMysqlCol(cols[1], 'c2');
+        const c3 = castMysqlCol(cols[2], 'c3');
+        const c4 = cols[3] ? castMysqlCol(cols[3], 'c4') : 'NULL AS c4';
+        const c5 = cols[4] ? castMysqlCol(cols[4], 'c5') : 'NULL AS c5';
+        branches.push(`SELECT '${slot}' AS src_slot, ${c1}, ${c2}, ${c3}, ${c4}, ${c5} FROM \`${qTbl}\``);
+    };
+
+    const addTableFamily = (prefix: 'a' | 'l', tblPrefix: '' | 'legacy_') => {
+        pushBranch(`${prefix}_memos`, `${tblPrefix}memos`, ['user_id', 'edited_at', 'memo', null, null]);
+        pushBranch(`${prefix}_world_memos`, `${tblPrefix}world_memos`, ['world_id', 'edited_at', 'memo', null, null]);
+        pushBranch(`${prefix}_avatar_memos`, `${tblPrefix}avatar_memos`, ['avatar_id', 'edited_at', 'memo', null, null]);
+        pushBranch(`${prefix}_notes`, `${tblPrefix}notes`, ['user_id', 'display_name', 'note', 'created_at', null]);
+        pushBranch(`${prefix}_fav_friend`, `${tblPrefix}favorite_friend`, ['id', 'created_at', 'user_id', 'group_name', null]);
+        pushBranch(`${prefix}_fav_world`, `${tblPrefix}favorite_world`, ['id', 'created_at', 'world_id', 'group_name', null]);
+        pushBranch(`${prefix}_fav_avatar`, `${tblPrefix}favorite_avatar`, ['id', 'created_at', 'avatar_id', 'group_name', null]);
+        pushBranch(`${prefix}_fav_print`, `${tblPrefix}favorite_print`, ['id', 'print_id', 'created_at', null, null]);
+        pushBranch(`${prefix}_avatar_tags`, `${tblPrefix}avatar_tags`, ['avatar_id', 'tag', 'color', null, null]);
+        pushBranch(`${prefix}_moderation`, `${tblPrefix}moderation`, ['user_id', 'updated_at', 'display_name', 'block', 'mute']);
+        pushBranch(`${prefix}_user_profile`, `${tblPrefix}user_profile`, ['user_id', 'bio', 'bio_links', 'updated_at', null]);
+    };
+
+    addTableFamily('a', '');
+    pushBranch('a_stats_counters', 'stats_counters', ['counter_key', 'row_count', 'updated_at', null, null]);
+    if (includeLegacy) {
+        addTableFamily('l', 'legacy_');
+    }
+    return branches.join(' UNION ALL ');
+}
+
+function unpackBootstrapMysqlRows(rows: Array<Record<string, unknown>>): {
+    active: BootstrapBusinessTables;
+    legacy: BootstrapBusinessTables;
+    statsCounters: StatsCounterBootstrapRow[];
+} {
+    const active = emptyBootstrapBusinessTables();
+    const legacy = emptyBootstrapBusinessTables();
+    const statsCounters: StatsCounterBootstrapRow[] = [];
+
+    for (const r of rows) {
+        const slot = String(r.src_slot ?? '');
+        if (!slot) continue;
+        if (slot === 'a_stats_counters') {
+            statsCounters.push({
+                counter_key: String(r.c1 ?? ''),
+                row_count: Number(r.c2 ?? 0) || 0,
+                updated_at: String(r.c3 ?? '')
+            });
+            continue;
+        }
+        const isLegacy = slot.startsWith('l_');
+        const target = isLegacy ? legacy : active;
+        const kind = slot.slice(2);
+        const asStr = (v: unknown): string => (v == null ? '' : String(v));
+        const asFavId = (v: unknown): number => {
+            const n = Number(v ?? 0) || 0;
+            return isLegacy ? -Math.abs(n) : n;
+        };
+
+        switch (kind) {
+            case 'memos':
+                target.memos.push({ user_id: asStr(r.c1), edited_at: asStr(r.c2), memo: asStr(r.c3) });
+                break;
+            case 'world_memos':
+                target.worldMemos.push({ world_id: asStr(r.c1), edited_at: asStr(r.c2), memo: asStr(r.c3) });
+                break;
+            case 'avatar_memos':
+                target.avatarMemos.push({ avatar_id: asStr(r.c1), edited_at: asStr(r.c2), memo: asStr(r.c3) });
+                break;
+            case 'notes':
+                target.notes.push({
+                    user_id: asStr(r.c1),
+                    display_name: asStr(r.c2),
+                    note: asStr(r.c3),
+                    created_at: asStr(r.c4)
+                });
+                break;
+            case 'fav_friend':
+                target.favoriteFriends.push({
+                    id: asFavId(r.c1),
+                    created_at: asStr(r.c2),
+                    user_id: asStr(r.c3),
+                    group_name: asStr(r.c4)
+                });
+                break;
+            case 'fav_world':
+                target.favoriteWorlds.push({
+                    id: asFavId(r.c1),
+                    created_at: asStr(r.c2),
+                    world_id: asStr(r.c3),
+                    group_name: asStr(r.c4)
+                });
+                break;
+            case 'fav_avatar':
+                target.favoriteAvatars.push({
+                    id: asFavId(r.c1),
+                    created_at: asStr(r.c2),
+                    avatar_id: asStr(r.c3),
+                    group_name: asStr(r.c4)
+                });
+                break;
+            case 'fav_print':
+                target.favoritePrints.push({
+                    id: asFavId(r.c1),
+                    print_id: asStr(r.c2),
+                    created_at: asStr(r.c3)
+                });
+                break;
+            case 'avatar_tags':
+                target.avatarTags.push({
+                    avatar_id: asStr(r.c1),
+                    tag: asStr(r.c2),
+                    color: r.c3 === null || r.c3 === undefined ? null : String(r.c3)
+                });
+                break;
+            case 'moderation':
+                target.moderations.push({
+                    user_id: asStr(r.c1),
+                    updated_at: asStr(r.c2),
+                    display_name: asStr(r.c3),
+                    block: Number(r.c4 ?? 0) || 0,
+                    mute: Number(r.c5 ?? 0) || 0
+                });
+                break;
+            case 'user_profile':
+                target.userProfiles.push({
+                    user_id: asStr(r.c1),
+                    bio: asStr(r.c2),
+                    bio_links: asStr(r.c3),
+                    updated_at: asStr(r.c4)
+                });
+                break;
+            default:
+                break;
+        }
+    }
+
+    return { active, legacy, statsCounters };
+}
+
+function mergeBootstrapTableSets(
+    primary: BootstrapBusinessTables,
+    secondary: BootstrapBusinessTables
+): BootstrapBusinessTables {
+    return {
+        memos: mergePrimaryAndLegacy(primary.memos, secondary.memos, (r) => String(r.user_id ?? '')),
+        worldMemos: mergePrimaryAndLegacy(primary.worldMemos, secondary.worldMemos, (r) => String(r.world_id ?? '')),
+        avatarMemos: mergePrimaryAndLegacy(primary.avatarMemos, secondary.avatarMemos, (r) => String(r.avatar_id ?? '')),
+        notes: mergePrimaryAndLegacy(primary.notes, secondary.notes, (r) => String(r.user_id ?? '')),
+        favoriteFriends: mergePrimaryAndLegacy(
+            primary.favoriteFriends,
+            secondary.favoriteFriends,
+            (r) => `${String(r.user_id ?? '')}|${String(r.group_name ?? '')}`
+        ),
+        favoriteWorlds: mergePrimaryAndLegacy(
+            primary.favoriteWorlds,
+            secondary.favoriteWorlds,
+            (r) => `${String(r.world_id ?? '')}|${String(r.group_name ?? '')}`
+        ),
+        favoriteAvatars: mergePrimaryAndLegacy(
+            primary.favoriteAvatars,
+            secondary.favoriteAvatars,
+            (r) => `${String(r.avatar_id ?? '')}|${String(r.group_name ?? '')}`
+        ),
+        favoritePrints: mergePrimaryAndLegacy(primary.favoritePrints, secondary.favoritePrints, (r) =>
+            String(r.print_id ?? '')
+        ),
+        avatarTags: mergePrimaryAndLegacy(
+            primary.avatarTags,
+            secondary.avatarTags,
+            (r) => `${String(r.avatar_id ?? '')}|${String(r.tag ?? '')}`
+        ),
+        moderations: mergePrimaryAndLegacy(primary.moderations, secondary.moderations, (r) => String(r.user_id ?? '')),
+        userProfiles: mergePrimaryAndLegacy(primary.userProfiles, secondary.userProfiles, (r) => String(r.user_id ?? ''))
+    };
+}
+
+function mergeBootstrapStatsCounters(
+    mysqlRows: StatsCounterBootstrapRow[],
+    d1Rows: StatsCounterBootstrapRow[]
+): Map<string, StatsCounterBootstrapRow> {
+    const merged = new Map<string, StatsCounterBootstrapRow>();
+    for (const row of [...d1Rows, ...mysqlRows]) {
+        const key = String(row.counter_key ?? '');
+        if (!key) continue;
+        const cnt = Number(row.row_count ?? 0) || 0;
+        const upd = String(row.updated_at ?? '');
+        const prev = merged.get(key);
+        if (!prev) {
+            merged.set(key, { counter_key: key, row_count: cnt, updated_at: upd });
+            continue;
+        }
+        // Matches externalMysqlProxy mergeDualBusinessRows: uptime is a monotonic gauge (max); event counters sum.
+        prev.row_count =
+            key === CLOUD_TOTAL_UPTIME_COUNTER_KEY ? Math.max(prev.row_count, cnt) : prev.row_count + cnt;
+        if (upd > prev.updated_at) {
+            prev.updated_at = upd;
+        }
+    }
+    return merged;
+}
+
+async function runBootstrapD1BatchSafe(
+    db: D1Database,
+    sqlList: readonly string[]
+): Promise<Array<Array<Record<string, unknown>>>> {
+    if (sqlList.length === 0) return [];
+    try {
+        const res = await db.batch(sqlList.map((sql) => db.prepare(sql)));
+        return res.map((r) => (r?.results ?? []) as Array<Record<string, unknown>>);
+    } catch {
+        // Fallback for minimal test fixtures that may omit optional legacy tables
+        return Promise.all(
+            sqlList.map((sql) =>
+                db
+                    .prepare(sql)
+                    .all<Record<string, unknown>>()
+                    .then((r) => r.results ?? [])
+                    .catch(() => [] as Array<Record<string, unknown>>)
+            )
+        );
+    }
+}
+
+const BOOTSTRAP_CORE_BUSINESS_SQLS = [
+    'SELECT user_id, edited_at, memo FROM memos',
+    'SELECT world_id, edited_at, memo FROM world_memos',
+    'SELECT avatar_id, edited_at, memo FROM avatar_memos',
+    'SELECT user_id, display_name, note, created_at FROM notes',
+    'SELECT id, created_at, user_id, group_name FROM favorite_friend',
+    'SELECT id, created_at, world_id, group_name FROM favorite_world',
+    'SELECT id, created_at, avatar_id, group_name FROM favorite_avatar',
+    'SELECT id, print_id, created_at FROM favorite_print',
+    'SELECT avatar_id, tag, color FROM avatar_tags',
+    'SELECT user_id, updated_at, display_name, block, mute FROM moderation',
+    'SELECT user_id, bio, bio_links, updated_at FROM user_profile',
+    'SELECT counter_key, row_count, updated_at FROM stats_counters'
+] as const;
+
+const BOOTSTRAP_LEGACY_BUSINESS_SQLS = [
+    'SELECT user_id, edited_at, memo FROM memos',
+    'SELECT world_id, edited_at, memo FROM world_memos',
+    'SELECT avatar_id, edited_at, memo FROM avatar_memos',
+    'SELECT user_id, display_name, note, created_at FROM notes',
+    'SELECT -id AS id, created_at, user_id, group_name FROM favorite_friend',
+    'SELECT -id AS id, created_at, world_id, group_name FROM favorite_world',
+    'SELECT -id AS id, created_at, avatar_id, group_name FROM favorite_avatar',
+    'SELECT -id AS id, print_id, created_at FROM favorite_print',
+    'SELECT avatar_id, tag, color FROM avatar_tags',
+    'SELECT user_id, updated_at, display_name, block, mute FROM moderation',
+    'SELECT user_id, bio, bio_links, updated_at FROM user_profile'
+] as const;
+
+function mapBusinessSlices(slices: Array<Array<Record<string, unknown>>>, offset = 0): BootstrapBusinessTables {
+    return {
+        memos: slices[offset] ?? [],
+        worldMemos: slices[offset + 1] ?? [],
+        avatarMemos: slices[offset + 2] ?? [],
+        notes: slices[offset + 3] ?? [],
+        favoriteFriends: slices[offset + 4] ?? [],
+        favoriteWorlds: slices[offset + 5] ?? [],
+        favoriteAvatars: slices[offset + 6] ?? [],
+        favoritePrints: slices[offset + 7] ?? [],
+        avatarTags: slices[offset + 8] ?? [],
+        moderations: slices[offset + 9] ?? [],
+        userProfiles: slices[offset + 10] ?? []
+    };
+}
+
 /**
  * Monotonically accrues persistent cloud uptime seconds in `stats_counters` (`cloud_total_uptime_seconds`).
  * Uses a single shared `updated_at` watermark so concurrent Web heartbeats and VRCX.Agent periodic sync ticks
  * never double-count the same wall-clock interval, while offline gaps (> maxStepSeconds) only advance the watermark.
  */
-export async function accrueCloudUptime(db: D1Database, nowIso: string, maxStepSeconds: number): Promise<number> {
+export async function accrueCloudUptime(
+    db: D1Database,
+    nowIso: string,
+    maxStepSeconds: number,
+    preloadedExisting?: { row_count: number; updated_at: string } | null
+): Promise<number> {
     const nowMs = Date.parse(nowIso);
     if (!Number.isFinite(nowMs)) return 0;
 
-    const existing = await db
-        .prepare('SELECT row_count, updated_at FROM stats_counters WHERE counter_key = ? LIMIT 1')
-        .bind(CLOUD_TOTAL_UPTIME_COUNTER_KEY)
-        .first<{ row_count: number; updated_at: string }>();
+    const existing =
+        preloadedExisting !== undefined
+            ? preloadedExisting
+            : await db
+                  .prepare('SELECT row_count, updated_at FROM stats_counters WHERE counter_key = ? LIMIT 1')
+                  .bind(CLOUD_TOTAL_UPTIME_COUNTER_KEY)
+                  .first<{ row_count: number; updated_at: string }>();
 
     if (!existing) {
-        await db
+        const insertRes = await db
             .prepare('INSERT OR IGNORE INTO stats_counters (counter_key, row_count, updated_at) VALUES (?, 0, ?)')
             .bind(CLOUD_TOTAL_UPTIME_COUNTER_KEY, nowIso)
             .run();
+        if ((insertRes.meta?.changes ?? 0) > 0) {
+            return 0;
+        }
         const afterInsert = await db
             .prepare('SELECT row_count FROM stats_counters WHERE counter_key = ? LIMIT 1')
             .bind(CLOUD_TOTAL_UPTIME_COUNTER_KEY)
@@ -383,184 +724,303 @@ export async function getCloudSyncIntervalSeconds(env: Env): Promise<number> {
 }
 
 export async function handleCoreDataRoutes(request: Request, env: Env, url: URL): Promise<Response | null> {
-    // 1. Single-request bootstrap: replaces ~400 startup SQLite queries on Web mode
+    // 1. Single-request bootstrap: replaces ~400 startup SQLite queries on Web mode.
+    // When external MySQL is active, consolidates all 23 active + legacy business tables into 1 MySQL
+    // UNION ALL RTT + parallel native D1 batches so Cloudflare Workers Free stays well below 10ms CPU.
     if (url.pathname === '/api/bootstrap' && request.method === 'GET') {
         const hub = env.AGENT_HUB.get(env.AGENT_HUB.idFromName('primary'));
-        const [batchRes, hubRes] = await Promise.all([
-            env.DB_CORE.batch([
-                env.DB_CORE.prepare('SELECT bundle_key, version, payload_json, updated_at FROM config_bundles'),
-                env.DB_CORE.prepare('SELECT user_id, edited_at, memo FROM memos'),
-                env.DB_CORE.prepare('SELECT world_id, edited_at, memo FROM world_memos'),
-                env.DB_CORE.prepare('SELECT avatar_id, edited_at, memo FROM avatar_memos'),
-                env.DB_CORE.prepare('SELECT user_id, display_name, note, created_at FROM notes'),
-                env.DB_CORE.prepare('SELECT id, created_at, user_id, group_name FROM favorite_friend'),
-                env.DB_CORE.prepare('SELECT id, created_at, world_id, group_name FROM favorite_world'),
-                env.DB_CORE.prepare('SELECT id, created_at, avatar_id, group_name FROM favorite_avatar'),
-                env.DB_CORE.prepare('SELECT id, print_id, created_at FROM favorite_print'),
-                env.DB_CORE.prepare('SELECT avatar_id, tag, color FROM avatar_tags'),
-                env.DB_CORE.prepare('SELECT user_id, updated_at, display_name, block, mute FROM moderation'),
-                env.DB_CORE.prepare('SELECT user_id, bio, bio_links, updated_at FROM user_profile'),
-                env.DB_CORE.prepare('SELECT counter_key, row_count FROM stats_counters'),
-                env.DB_CORE.prepare('SELECT device_id, device_name, last_seen_at FROM cloud_devices'),
-                env.DB_CORE.prepare('SELECT device_id, state_json, updated_at FROM cloud_device_states'),
-                env.DB_CORE.prepare(
-                    "SELECT payload_json FROM cloud_bg_sync_state WHERE state_key = 'friends_snapshot' LIMIT 1"
-                )
-            ]),
-            hub
-                .fetch(new Request('https://agent-hub.internal/status'))
-                .then((r) => r.json() as Promise<{ data?: unknown }>)
-        ]);
+        const mysqlSession = getHybridMysqlSession(env.DB_CORE);
+        const rawEnv = getRawD1Env(env);
+        let degradedReason: StorageDegradedReason | null = null;
+        let mysqlBootstrapFailed = false;
+
+        let configBundleRows: Array<{ bundle_key: string; payload_json: string }> = [];
+        let deviceRows: Array<{ device_id: string; device_name: string; last_seen_at: string }> = [];
+        let persistedStateRows: Array<{ device_id: string; state_json: string; updated_at: string }> = [];
+        let snapshotRow: { payload_json?: string } | null = null;
+        let legacyConfigRows: Array<{ config_key?: string; config_value?: string }> = [];
+        let hubRes: { data?: unknown } = {};
+        let extStorageCfg: Awaited<ReturnType<typeof loadExternalStorageConfig>>;
+
+        let business = emptyBootstrapBusinessTables();
+        let statsCounterMap = new Map<string, StatsCounterBootstrapRow>();
+
+        if (mysqlSession) {
+            const rawLegacyDb = getLegacyDb(rawEnv);
+            const readD1Business = !(mysqlSession.mode === 'full_migrate' && mysqlSession.d1Drained);
+            const coreSqls: string[] = [
+                'SELECT bundle_key, version, payload_json, updated_at FROM config_bundles',
+                'SELECT device_id, device_name, last_seen_at FROM cloud_devices',
+                'SELECT device_id, state_json, updated_at FROM cloud_device_states',
+                "SELECT payload_json FROM cloud_bg_sync_state WHERE state_key = 'friends_snapshot' LIMIT 1",
+                ...(readD1Business ? BOOTSTRAP_CORE_BUSINESS_SQLS : [])
+            ];
+            const legacySqls: string[] = rawLegacyDb
+                ? [
+                      'SELECT config_key, config_value FROM legacy_configs LIMIT 500',
+                      ...(readD1Business ? BOOTSTRAP_LEGACY_BUSINESS_SQLS : [])
+                  ]
+                : [];
+            const unionSql = buildBootstrapMysqlUnionSql(mysqlSession.params.tablePrefix, Boolean(rawLegacyDb));
+
+            const [coreSlices, legacySlices, mysqlRes, fetchedHubRes, fetchedExtStorageCfg] = await Promise.all([
+                runBootstrapD1BatchSafe(rawEnv.DB_CORE, coreSqls),
+                rawLegacyDb ? runBootstrapD1BatchSafe(rawLegacyDb, legacySqls) : Promise.resolve([]),
+                mysqlSession.query(unionSql, []).catch((err) => {
+                    mysqlBootstrapFailed = true;
+                    const reason: StorageDegradedReason =
+                        classifyStorageWriteDegradation(err) ?? 'external_db_unavailable';
+                    mysqlSession.markDegraded(reason);
+                    degradedReason = mergeStorageDegradedReason(degradedReason, reason);
+                    return { rows: [] as Array<Record<string, unknown>>, affectedRows: 0, insertId: 0 };
+                }),
+                hub
+                    .fetch(new Request('https://agent-hub.internal/status'))
+                    .then((r) => r.json() as Promise<{ data?: unknown }>),
+                loadExternalStorageConfig(rawEnv)
+            ]);
+
+            hubRes = fetchedHubRes;
+            extStorageCfg = fetchedExtStorageCfg;
+            configBundleRows = (coreSlices[0] ?? []) as Array<{ bundle_key: string; payload_json: string }>;
+            deviceRows = (coreSlices[1] ?? []) as Array<{
+                device_id: string;
+                device_name: string;
+                last_seen_at: string;
+            }>;
+            persistedStateRows = (coreSlices[2] ?? []) as Array<{
+                device_id: string;
+                state_json: string;
+                updated_at: string;
+            }>;
+            snapshotRow = (coreSlices[3]?.[0] ?? null) as { payload_json?: string } | null;
+            legacyConfigRows = (legacySlices[0] ?? []) as Array<{ config_key?: string; config_value?: string }>;
+
+            const unpackedMysql = unpackBootstrapMysqlRows(mysqlRes.rows);
+            const d1Active = readD1Business ? mapBusinessSlices(coreSlices, 4) : emptyBootstrapBusinessTables();
+            const d1StatsRows = readD1Business
+                ? ((coreSlices[15] ?? []) as unknown as StatsCounterBootstrapRow[])
+                : [];
+            const d1Legacy =
+                rawLegacyDb && readD1Business ? mapBusinessSlices(legacySlices, 1) : emptyBootstrapBusinessTables();
+
+            // Precedence matches HybridMysqlD1Database + mergePrimaryAndLegacy:
+            // active MySQL > active D1 > legacy MySQL > legacy D1.
+            const mergedActive = readD1Business
+                ? mergeBootstrapTableSets(unpackedMysql.active, d1Active)
+                : unpackedMysql.active;
+            const mergedLegacy = readD1Business
+                ? mergeBootstrapTableSets(unpackedMysql.legacy, d1Legacy)
+                : unpackedMysql.legacy;
+            business = mergeBootstrapTableSets(mergedActive, mergedLegacy);
+            statsCounterMap = mergeBootstrapStatsCounters(unpackedMysql.statsCounters, d1StatsRows);
+        } else {
+            const [batchRes, fetchedHubRes, fetchedExtStorageCfg] = await Promise.all([
+                env.DB_CORE.batch([
+                    env.DB_CORE.prepare('SELECT bundle_key, version, payload_json, updated_at FROM config_bundles'),
+                    env.DB_CORE.prepare('SELECT user_id, edited_at, memo FROM memos'),
+                    env.DB_CORE.prepare('SELECT world_id, edited_at, memo FROM world_memos'),
+                    env.DB_CORE.prepare('SELECT avatar_id, edited_at, memo FROM avatar_memos'),
+                    env.DB_CORE.prepare('SELECT user_id, display_name, note, created_at FROM notes'),
+                    env.DB_CORE.prepare('SELECT id, created_at, user_id, group_name FROM favorite_friend'),
+                    env.DB_CORE.prepare('SELECT id, created_at, world_id, group_name FROM favorite_world'),
+                    env.DB_CORE.prepare('SELECT id, created_at, avatar_id, group_name FROM favorite_avatar'),
+                    env.DB_CORE.prepare('SELECT id, print_id, created_at FROM favorite_print'),
+                    env.DB_CORE.prepare('SELECT avatar_id, tag, color FROM avatar_tags'),
+                    env.DB_CORE.prepare('SELECT user_id, updated_at, display_name, block, mute FROM moderation'),
+                    env.DB_CORE.prepare('SELECT user_id, bio, bio_links, updated_at FROM user_profile'),
+                    env.DB_CORE.prepare('SELECT counter_key, row_count, updated_at FROM stats_counters'),
+                    env.DB_CORE.prepare('SELECT device_id, device_name, last_seen_at FROM cloud_devices'),
+                    env.DB_CORE.prepare('SELECT device_id, state_json, updated_at FROM cloud_device_states'),
+                    env.DB_CORE.prepare(
+                        "SELECT payload_json FROM cloud_bg_sync_state WHERE state_key = 'friends_snapshot' LIMIT 1"
+                    )
+                ]),
+                hub
+                    .fetch(new Request('https://agent-hub.internal/status'))
+                    .then((r) => r.json() as Promise<{ data?: unknown }>),
+                loadExternalStorageConfig(env)
+            ]);
+
+            hubRes = fetchedHubRes;
+            extStorageCfg = fetchedExtStorageCfg;
+            configBundleRows = (batchRes[0]?.results ?? []) as Array<{ bundle_key: string; payload_json: string }>;
+            deviceRows = (batchRes[13]?.results ?? []) as Array<{
+                device_id: string;
+                device_name: string;
+                last_seen_at: string;
+            }>;
+            persistedStateRows = (batchRes[14]?.results ?? []) as Array<{
+                device_id: string;
+                state_json: string;
+                updated_at: string;
+            }>;
+            snapshotRow = (batchRes[15]?.results?.[0] ?? null) as { payload_json?: string } | null;
+
+            business = {
+                memos: (batchRes[1]?.results ?? []) as Array<Record<string, unknown>>,
+                worldMemos: (batchRes[2]?.results ?? []) as Array<Record<string, unknown>>,
+                avatarMemos: (batchRes[3]?.results ?? []) as Array<Record<string, unknown>>,
+                notes: (batchRes[4]?.results ?? []) as Array<Record<string, unknown>>,
+                favoriteFriends: (batchRes[5]?.results ?? []) as Array<Record<string, unknown>>,
+                favoriteWorlds: (batchRes[6]?.results ?? []) as Array<Record<string, unknown>>,
+                favoriteAvatars: (batchRes[7]?.results ?? []) as Array<Record<string, unknown>>,
+                favoritePrints: (batchRes[8]?.results ?? []) as Array<Record<string, unknown>>,
+                avatarTags: (batchRes[9]?.results ?? []) as Array<Record<string, unknown>>,
+                moderations: (batchRes[10]?.results ?? []) as Array<Record<string, unknown>>,
+                userProfiles: (batchRes[11]?.results ?? []) as Array<Record<string, unknown>>
+            };
+            statsCounterMap = mergeBootstrapStatsCounters(
+                [],
+                (batchRes[12]?.results ?? []) as unknown as StatsCounterBootstrapRow[]
+            );
+
+            // Transparently merge migrated desktop VRCX data stored in the dedicated DB_LEGACY shard
+            // (active cloud DB_CORE rows always take precedence; 0 extra D1 reads when DB_LEGACY is empty).
+            const legacyDb = getLegacyDb(env);
+            const legacyStats = legacyDb ? await getLegacyImportedStats(env) : null;
+            if (legacyDb && legacyStats) {
+                const legacyStmts: Array<{ slot: string; stmt: D1PreparedStatement }> = [];
+                if (legacyStats.memos_notes > 0) {
+                    legacyStmts.push(
+                        { slot: 'memos', stmt: legacyDb.prepare('SELECT user_id, edited_at, memo FROM memos') },
+                        {
+                            slot: 'worldMemos',
+                            stmt: legacyDb.prepare('SELECT world_id, edited_at, memo FROM world_memos')
+                        },
+                        {
+                            slot: 'avatarMemos',
+                            stmt: legacyDb.prepare('SELECT avatar_id, edited_at, memo FROM avatar_memos')
+                        },
+                        {
+                            slot: 'notes',
+                            stmt: legacyDb.prepare('SELECT user_id, display_name, note, created_at FROM notes')
+                        }
+                    );
+                }
+                if (legacyStats.favorites > 0) {
+                    legacyStmts.push(
+                        {
+                            slot: 'favoriteFriends',
+                            stmt: legacyDb.prepare(
+                                'SELECT -id AS id, created_at, user_id, group_name FROM favorite_friend'
+                            )
+                        },
+                        {
+                            slot: 'favoriteWorlds',
+                            stmt: legacyDb.prepare(
+                                'SELECT -id AS id, created_at, world_id, group_name FROM favorite_world'
+                            )
+                        },
+                        {
+                            slot: 'favoriteAvatars',
+                            stmt: legacyDb.prepare(
+                                'SELECT -id AS id, created_at, avatar_id, group_name FROM favorite_avatar'
+                            )
+                        },
+                        {
+                            slot: 'favoritePrints',
+                            stmt: legacyDb.prepare('SELECT -id AS id, print_id, created_at FROM favorite_print')
+                        },
+                        {
+                            slot: 'avatarTags',
+                            stmt: legacyDb.prepare('SELECT avatar_id, tag, color FROM avatar_tags')
+                        }
+                    );
+                }
+                if (legacyStats.moderation_profiles > 0) {
+                    legacyStmts.push(
+                        {
+                            slot: 'moderations',
+                            stmt: legacyDb.prepare(
+                                'SELECT user_id, updated_at, display_name, block, mute FROM moderation'
+                            )
+                        },
+                        {
+                            slot: 'userProfiles',
+                            stmt: legacyDb.prepare('SELECT user_id, bio, bio_links, updated_at FROM user_profile')
+                        }
+                    );
+                }
+                if (legacyStats.settings > 0) {
+                    legacyStmts.push({
+                        slot: 'configs',
+                        stmt: legacyDb.prepare('SELECT config_key, config_value FROM legacy_configs LIMIT 500')
+                    });
+                }
+                if (legacyStmts.length > 0) {
+                    const legacyRes = await legacyDb.batch(legacyStmts.map((s) => s.stmt));
+                    const legacyTables = emptyBootstrapBusinessTables();
+                    for (let i = 0; i < legacyStmts.length; i++) {
+                        const slot = legacyStmts[i]!.slot;
+                        const rows = (legacyRes[i]?.results ?? []) as Array<Record<string, unknown>>;
+                        if (slot === 'configs') {
+                            legacyConfigRows = rows as Array<{ config_key?: string; config_value?: string }>;
+                        } else if (slot in legacyTables) {
+                            (legacyTables as unknown as Record<string, Array<Record<string, unknown>>>)[slot] = rows;
+                        }
+                    }
+                    business = mergeBootstrapTableSets(business, legacyTables);
+                }
+            }
+        }
 
         const bundles: Record<string, Record<string, string>> = {
             vrcx_config: {},
             vrcx_storage: {}
         };
-        for (const row of (batchRes[0]?.results ?? []) as Array<{ bundle_key: string; payload_json: string }>) {
+        for (const row of configBundleRows) {
             bundles[row.bundle_key] = safeJsonParse<Record<string, string>>(row.payload_json, {});
         }
 
         const counters: Record<string, number> = {};
-        for (const row of (batchRes[12]?.results ?? []) as Array<{ counter_key: string; row_count: number }>) {
-            counters[row.counter_key] = row.row_count;
+        for (const [key, row] of statsCounterMap.entries()) {
+            counters[key] = row.row_count;
         }
 
         const vrcxConfigs = bundles.vrcx_config ?? {};
         sanitizeConfigBundleMap(vrcxConfigs);
-
-        // Transparently merge migrated desktop VRCX data stored in the dedicated DB_LEGACY shard
-        // (active cloud DB_CORE rows always take precedence; 0 extra D1 reads when DB_LEGACY is empty).
-        let memos = (batchRes[1]?.results ?? []) as Array<Record<string, unknown>>;
-        let worldMemos = (batchRes[2]?.results ?? []) as Array<Record<string, unknown>>;
-        let avatarMemos = (batchRes[3]?.results ?? []) as Array<Record<string, unknown>>;
-        let notes = (batchRes[4]?.results ?? []) as Array<Record<string, unknown>>;
-        let favoriteFriends = (batchRes[5]?.results ?? []) as Array<Record<string, unknown>>;
-        let favoriteWorlds = (batchRes[6]?.results ?? []) as Array<Record<string, unknown>>;
-        let favoriteAvatars = (batchRes[7]?.results ?? []) as Array<Record<string, unknown>>;
-        let favoritePrints = (batchRes[8]?.results ?? []) as Array<Record<string, unknown>>;
-        let avatarTags = (batchRes[9]?.results ?? []) as Array<Record<string, unknown>>;
-        let moderations = (batchRes[10]?.results ?? []) as Array<Record<string, unknown>>;
-        let userProfiles = (batchRes[11]?.results ?? []) as Array<Record<string, unknown>>;
-
-        const legacyDb = getLegacyDb(env);
-        const legacyStats = legacyDb ? await getLegacyImportedStats(env) : null;
-        if (legacyDb && legacyStats) {
-            const legacyStmts: Array<{ slot: string; stmt: D1PreparedStatement }> = [];
-            if (legacyStats.memos_notes > 0) {
-                legacyStmts.push(
-                    { slot: 'memos', stmt: legacyDb.prepare('SELECT user_id, edited_at, memo FROM memos') },
-                    { slot: 'worldMemos', stmt: legacyDb.prepare('SELECT world_id, edited_at, memo FROM world_memos') },
-                    { slot: 'avatarMemos', stmt: legacyDb.prepare('SELECT avatar_id, edited_at, memo FROM avatar_memos') },
-                    { slot: 'notes', stmt: legacyDb.prepare('SELECT user_id, display_name, note, created_at FROM notes') }
-                );
-            }
-            if (legacyStats.favorites > 0) {
-                legacyStmts.push(
-                    {
-                        slot: 'favoriteFriends',
-                        stmt: legacyDb.prepare('SELECT -id AS id, created_at, user_id, group_name FROM favorite_friend')
-                    },
-                    {
-                        slot: 'favoriteWorlds',
-                        stmt: legacyDb.prepare('SELECT -id AS id, created_at, world_id, group_name FROM favorite_world')
-                    },
-                    {
-                        slot: 'favoriteAvatars',
-                        stmt: legacyDb.prepare('SELECT -id AS id, created_at, avatar_id, group_name FROM favorite_avatar')
-                    },
-                    {
-                        slot: 'favoritePrints',
-                        stmt: legacyDb.prepare('SELECT -id AS id, print_id, created_at FROM favorite_print')
-                    },
-                    { slot: 'avatarTags', stmt: legacyDb.prepare('SELECT avatar_id, tag, color FROM avatar_tags') }
-                );
-            }
-            if (legacyStats.moderation_profiles > 0) {
-                legacyStmts.push(
-                    {
-                        slot: 'moderations',
-                        stmt: legacyDb.prepare('SELECT user_id, updated_at, display_name, block, mute FROM moderation')
-                    },
-                    {
-                        slot: 'userProfiles',
-                        stmt: legacyDb.prepare('SELECT user_id, bio, bio_links, updated_at FROM user_profile')
-                    }
-                );
-            }
-            if (legacyStats.settings > 0) {
-                legacyStmts.push({
-                    slot: 'configs',
-                    stmt: legacyDb.prepare('SELECT config_key, config_value FROM legacy_configs LIMIT 500')
-                });
-            }
-            if (legacyStmts.length > 0) {
-                const legacyRes = await legacyDb.batch(legacyStmts.map((s) => s.stmt));
-                for (let i = 0; i < legacyStmts.length; i++) {
-                    const slot = legacyStmts[i]!.slot;
-                    const rows = (legacyRes[i]?.results ?? []) as Array<Record<string, unknown>>;
-                    if (slot === 'memos') {
-                        memos = mergePrimaryAndLegacy(memos, rows, (r) => String(r.user_id ?? ''));
-                    } else if (slot === 'worldMemos') {
-                        worldMemos = mergePrimaryAndLegacy(worldMemos, rows, (r) => String(r.world_id ?? ''));
-                    } else if (slot === 'avatarMemos') {
-                        avatarMemos = mergePrimaryAndLegacy(avatarMemos, rows, (r) => String(r.avatar_id ?? ''));
-                    } else if (slot === 'notes') {
-                        notes = mergePrimaryAndLegacy(notes, rows, (r) => String(r.user_id ?? ''));
-                    } else if (slot === 'favoriteFriends') {
-                        favoriteFriends = mergePrimaryAndLegacy(
-                            favoriteFriends,
-                            rows,
-                            (r) => `${String(r.user_id ?? '')}|${String(r.group_name ?? '')}`
-                        );
-                    } else if (slot === 'favoriteWorlds') {
-                        favoriteWorlds = mergePrimaryAndLegacy(
-                            favoriteWorlds,
-                            rows,
-                            (r) => `${String(r.world_id ?? '')}|${String(r.group_name ?? '')}`
-                        );
-                    } else if (slot === 'favoriteAvatars') {
-                        favoriteAvatars = mergePrimaryAndLegacy(
-                            favoriteAvatars,
-                            rows,
-                            (r) => `${String(r.avatar_id ?? '')}|${String(r.group_name ?? '')}`
-                        );
-                    } else if (slot === 'favoritePrints') {
-                        favoritePrints = mergePrimaryAndLegacy(favoritePrints, rows, (r) => String(r.print_id ?? ''));
-                    } else if (slot === 'avatarTags') {
-                        avatarTags = mergePrimaryAndLegacy(
-                            avatarTags,
-                            rows,
-                            (r) => `${String(r.avatar_id ?? '')}|${String(r.tag ?? '')}`
-                        );
-                    } else if (slot === 'moderations') {
-                        moderations = mergePrimaryAndLegacy(moderations, rows, (r) => String(r.user_id ?? ''));
-                    } else if (slot === 'userProfiles') {
-                        userProfiles = mergePrimaryAndLegacy(userProfiles, rows, (r) => String(r.user_id ?? ''));
-                    } else if (slot === 'configs') {
-                        for (const r of rows) {
-                            const k = typeof r.config_key === 'string' ? r.config_key : '';
-                            const v = typeof r.config_value === 'string' ? r.config_value : '';
-                            if (k && isSafeLegacyConfigKey(k) && !Object.prototype.hasOwnProperty.call(vrcxConfigs, k)) {
-                                vrcxConfigs[k] = v;
-                            }
-                        }
-                    }
-                }
+        for (const r of legacyConfigRows) {
+            const k = typeof r.config_key === 'string' ? r.config_key : '';
+            const v = typeof r.config_value === 'string' ? r.config_value : '';
+            if (k && isSafeLegacyConfigKey(k) && !Object.prototype.hasOwnProperty.call(vrcxConfigs, k)) {
+                vrcxConfigs[k] = v;
             }
         }
+
+        const {
+            memos,
+            worldMemos,
+            avatarMemos,
+            notes,
+            favoriteFriends,
+            favoriteWorlds,
+            favoriteAvatars,
+            favoritePrints,
+            avatarTags,
+            moderations,
+            userProfiles
+        } = business;
 
         const syncIntervalSeconds = parseCloudSyncIntervalSeconds(vrcxConfigs['cloud:syncIntervalSeconds']);
         const webSyncIntervalSeconds = parseWebSyncIntervalSeconds(vrcxConfigs['cloud:webSyncIntervalSeconds']);
         const nowIso = new Date().toISOString();
         const nowMs = Date.parse(nowIso);
-        let degradedReason: StorageDegradedReason | null = null;
+        const preloadedUptimeRow = statsCounterMap.get(CLOUD_TOTAL_UPTIME_COUNTER_KEY) ?? null;
         let totalUptimeSeconds = Number(counters[CLOUD_TOTAL_UPTIME_COUNTER_KEY] ?? 0) || 0;
-        try {
-            totalUptimeSeconds = await accrueCloudUptime(env.DB_CORE, nowIso, Math.max(syncIntervalSeconds * 3, 360));
-        } catch (err) {
-            const reason = classifyStorageWriteDegradation(err);
-            if (!reason) throw err;
-            degradedReason = mergeStorageDegradedReason(degradedReason, reason);
+        if (!mysqlBootstrapFailed) {
+            try {
+                totalUptimeSeconds = await accrueCloudUptime(
+                    env.DB_CORE,
+                    nowIso,
+                    Math.max(syncIntervalSeconds * 3, 360),
+                    preloadedUptimeRow
+                );
+            } catch (err) {
+                const reason = classifyStorageWriteDegradation(err);
+                if (!reason) throw err;
+                degradedReason = mergeStorageDegradedReason(degradedReason, reason);
+            }
         }
         try {
             await markWebClientActive(env, nowIso, false);
@@ -582,11 +1042,6 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
             deviceStates?: Record<string, { state: Record<string, unknown>; updatedAt: string }>;
         };
         const wsAgentsOnline = Array.isArray(rawHub.agentsOnline) ? rawHub.agentsOnline : [];
-        const deviceRows = (batchRes[13]?.results ?? []) as Array<{
-            device_id: string;
-            device_name: string;
-            last_seen_at: string;
-        }>;
         const { httpAgentsOnline, deviceLastSeen } = resolveRecentHttpAgents(
             deviceRows,
             nowMs,
@@ -594,11 +1049,6 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
         );
         const mergedAgentsOnline = Array.from(new Set([...wsAgentsOnline, ...httpAgentsOnline]));
 
-        const persistedStateRows = (batchRes[14]?.results ?? []) as Array<{
-            device_id: string;
-            state_json: string;
-            updated_at: string;
-        }>;
         const mergedDeviceStates: Record<string, { state: Record<string, unknown>; updatedAt: string }> = {
             ...(rawHub.deviceStates ?? {})
         };
@@ -616,11 +1066,12 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
             }
         }
 
-        const snapshotRow = (batchRes[15]?.results?.[0] ?? null) as { payload_json?: string } | null;
-        const [extStorageCfg, friendPresenceTimes] = await Promise.all([
-            loadExternalStorageConfig(env),
-            buildBootstrapFriendPresenceTimes(env, snapshotRow?.payload_json)
-        ]);
+        const friendPresenceTimes =
+            snapshotRow?.payload_json && !mysqlBootstrapFailed
+                ? await buildBootstrapFriendPresenceTimes(env, snapshotRow.payload_json)
+                : snapshotRow?.payload_json
+                  ? await buildBootstrapFriendPresenceTimes(rawEnv, snapshotRow.payload_json)
+                  : {};
         const b2Enabled = Boolean(
             extStorageCfg.enabled &&
                 extStorageCfg.endpoint &&
