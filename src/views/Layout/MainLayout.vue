@@ -1,6 +1,7 @@
 <template>
     <template v-if="watchState.isLoggedIn">
-        <div class="flex flex-col flex-1 h-full min-h-0 min-w-0 overflow-hidden">
+        <KawaiiLayout v-if="isKawaiiTheme" />
+        <div v-else class="flex flex-col flex-1 h-full min-h-0 min-w-0 overflow-hidden">
             <SidebarProvider
                 :open="sidebarOpen"
                 :width="navWidth"
@@ -182,6 +183,7 @@
     import GroupEventEditDialog from '../../components/dialogs/GroupDialog/GroupEventEditDialog.vue';
     import InventoryBundleDialog from '../../components/dialogs/InventoryBundleDialog.vue';
     import InviteGroupDialog from '../../components/dialogs/InviteGroupDialog.vue';
+    import KawaiiLayout from './KawaiiLayout.vue';
     import LaunchDialog from '../../components/dialogs/LaunchDialog.vue';
     import LaunchOptionsDialog from '../Settings/dialogs/LaunchOptionsDialog.vue';
     import MainDialogContainer from '../../components/dialogs/MainDialogContainer.vue';
@@ -200,8 +202,9 @@
     const { t } = useI18n();
 
     const appearanceSettingsStore = useAppearanceSettingsStore();
-    const { navWidth, isNavCollapsed } = storeToRefs(appearanceSettingsStore);
+    const { navWidth, isNavCollapsed, themeMode } = storeToRefs(appearanceSettingsStore);
 
+    const isKawaiiTheme = computed(() => themeMode.value === 'kawaii');
     const sidebarOpen = computed(() => !isNavCollapsed.value);
 
     const handleSidebarOpenChange = (open) => {
