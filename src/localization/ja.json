@@ -905,6 +905,8 @@
                     "editorial_quick_theme": "テーマ＆アクセント切替",
                     "editorial_nav_more": "その他",
                     "editorial_accent_colors": "アクセントカラー",
+                    "editorial_theme_brightness": "テーマの明るさ",
+                    "editorial_theme_brightness_reset": "クリックで100%に戻す",
                     "editorial_stat_friends": "オンライン",
                     "editorial_stat_game": "VRChat",
                     "editorial_stat_servers": "サーバー",

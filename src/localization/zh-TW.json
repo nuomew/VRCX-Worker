@@ -1059,6 +1059,8 @@
                     "editorial_quick_theme": "切換主題與點綴色",
                     "editorial_nav_more": "更多",
                     "editorial_accent_colors": "主題點綴色",
+                    "editorial_theme_brightness": "主題亮度",
+                    "editorial_theme_brightness_reset": "點擊恢復 100% 亮度",
                     "editorial_stat_friends": "線上好友",
                     "editorial_stat_game": "遊戲狀態",
                     "editorial_stat_servers": "伺服器",

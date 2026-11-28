@@ -1129,6 +1129,8 @@
                     "editorial_quick_theme": "Switch Theme & Accent",
                     "editorial_nav_more": "More",
                     "editorial_accent_colors": "Accent Palette",
+                    "editorial_theme_brightness": "Theme Brightness",
+                    "editorial_theme_brightness_reset": "Click to reset brightness to 100%",
                     "editorial_stat_friends": "Online",
                     "editorial_stat_game": "VRChat",
                     "editorial_stat_servers": "Servers",

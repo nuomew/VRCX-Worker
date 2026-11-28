@@ -148,6 +148,8 @@ describe('Official Anime-Site Dual Themes (Lookbook & Azure Archive) registratio
             'editorial_archive_toggle_panel',
             'editorial_quick_theme',
             'editorial_accent_colors',
+            'editorial_theme_brightness',
+            'editorial_theme_brightness_reset',
             'editorial_nav_more',
             'editorial_stat_friends',
             'editorial_stat_game',
@@ -189,6 +191,11 @@ describe('Official Anime-Site Dual Themes (Lookbook & Azure Archive) registratio
             // Regression guard: top nav rail must never use horizontal overflow-x-auto that slices labels mid-character
             expect(src).not.toMatch(/<nav[\s\S]{0,220}overflow-x-auto/);
         }
+
+        // Lookbook left folio card uses Theme Brightness slider + teleported dimmer instead of redundant color dots
+        expect(lookbookSrc).toContain('editorial_theme_brightness');
+        expect(lookbookSrc).toContain('lb-brightness-dimmer');
+        expect(lookbookSrc).toContain('vrcx-lookbook-brightness');
     });
 
     it('splits priority-plus nav items cleanly on whole-item boundaries with zero mid-character clipping', () => {

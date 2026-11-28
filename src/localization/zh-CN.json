@@ -1129,6 +1129,8 @@
                     "editorial_quick_theme": "切换主题与点缀色",
                     "editorial_nav_more": "更多",
                     "editorial_accent_colors": "主题点缀色",
+                    "editorial_theme_brightness": "主题亮度",
+                    "editorial_theme_brightness_reset": "点击恢复 100% 亮度",
                     "editorial_stat_friends": "在线好友",
                     "editorial_stat_game": "游戏状态",
                     "editorial_stat_servers": "服务器",
