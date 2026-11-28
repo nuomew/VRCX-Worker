@@ -80,14 +80,26 @@ function isFont(name) {
 }
 
 /**
- * @param {import('rolldown').PreRenderedAsset} assetInfo
+ * Generates asset filenames; Web builds append content hashes to non-font assets
+ * (such as theme CSS and i18n JSON) so Cloudflare/browser caches immediately pick up updates.
+ *
+ * @param {boolean} isWeb
  */
-function getAssetFilename({ name }) {
-    const language = getAssetLanguage(name);
-    if (!name || !language) return `assets/${defaultAssetName}`;
+function createAssetFilenameResolver(isWeb) {
+    const hashedSuffix = isWeb ? '-[hash]' : '';
+    /**
+     * @param {import('rolldown').PreRenderedAsset} assetInfo
+     */
+    return function getAssetFilename({ name }) {
+        const language = getAssetLanguage(name);
+        if (!name || !language) {
+            if (name && isFont(name)) return `assets/${defaultAssetName}`;
+            return `assets/[name]${hashedSuffix}[extname]`;
+        }
 
-    if (isFont(name)) return 'assets/fonts/[name][extname]';
-    return 'assets/i18n/[name][extname]';
+        if (isFont(name)) return 'assets/fonts/[name][extname]';
+        return `assets/i18n/[name]${hashedSuffix}[extname]`;
+    };
 }
 
 /**
@@ -254,6 +266,7 @@ export default defineConfig(({ mode }) => {
             assetsInlineLimit(filePath, content) {
                 if (isFont(filePath)) return false;
                 if (filePath.endsWith('.json')) return false;
+                if (filePath.includes('/styles/themes/') || filePath.includes('\\styles\\themes\\')) return false;
                 return content.length <= 40960;
             },
             rolldownOptions: {
@@ -265,7 +278,7 @@ export default defineConfig(({ mode }) => {
                           vr: resolve(import.meta.dirname, './vr.html')
                       },
                 output: {
-                    assetFileNames: getAssetFilename,
+                    assetFileNames: createAssetFilenameResolver(isWeb),
                     manualChunks: getManualChunk,
                     strictExecutionOrder: true
                 }

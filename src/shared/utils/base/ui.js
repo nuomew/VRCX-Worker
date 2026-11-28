@@ -23,9 +23,25 @@ const DEFAULT_THEME_COLOR_KEY = 'default';
 const APP_FONT_LINK_ATTR = 'data-app-font';
 const APP_CJK_FONT_PACK_LINK_ATTR = 'data-app-cjk-font-pack';
 
+const themeStyleUrls = import.meta.glob('../../../styles/themes/*.css', {
+    eager: true,
+    query: '?url',
+    import: 'default'
+});
+
+function resolveThemeStylesheetUrl(fileName) {
+    if (!fileName) {
+        return null;
+    }
+    return (
+        themeStyleUrls[`../../../styles/themes/${fileName}`] ||
+        new URL(`../../../styles/themes/${fileName}`, import.meta.url).href
+    );
+}
+
 const themeColors = THEME_COLORS.map((theme) => ({
     ...theme,
-    href: theme.file ? new URL(`../../../styles/themes/${theme.file}`, import.meta.url).href : null
+    href: resolveThemeStylesheetUrl(theme.file)
 }));
 
 const currentThemeColor = ref(DEFAULT_THEME_COLOR_KEY);
@@ -149,7 +165,7 @@ function applyThemeModeStyle(themeMode) {
         return;
     }
 
-    const themeHref = new URL(`../../../styles/themes/${themeFile}`, import.meta.url).href;
+    const themeHref = resolveThemeStylesheetUrl(themeFile);
 
     if (!styleEl) {
         styleEl = document.createElement('link');
