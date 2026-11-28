@@ -11,6 +11,7 @@ import type { StorageDegradedReason } from './storageResilience';
  */
 export const MYSQL_CHUNK_ID_MIN = 1_000_000;
 export const MYSQL_CHUNK_AUTO_INCREMENT_START = 1_000_001;
+export const CURRENT_MIGRATION_SCHEMA_VERSION = 2;
 
 export const STATE_KEY_EXTERNAL_DB_CONFIG = 'cloud_external_db_config';
 export const STATE_KEY_EXTERNAL_DB_MIGRATION = 'cloud_external_db_migration_state';
@@ -31,7 +32,37 @@ export type ManagedArchiveTableName =
 
 export type ManagedRollupTableName = 'gamelog_user_rollup' | 'gamelog_world_rollup';
 
-export type ManagedMysqlTableName = ManagedArchiveTableName | ManagedRollupTableName | 'vrc_api_cache';
+export type SharedLegacyBusinessTableName =
+    | 'memos'
+    | 'world_memos'
+    | 'avatar_memos'
+    | 'notes'
+    | 'favorite_friend'
+    | 'favorite_world'
+    | 'favorite_avatar'
+    | 'favorite_print'
+    | 'avatar_tags'
+    | 'avatar_history'
+    | 'friend_log_current'
+    | 'moderation'
+    | 'user_profile'
+    | 'entity_users'
+    | 'entity_worlds';
+
+export type ActiveOnlyBusinessTableName =
+    | 'cloud_screenshots'
+    | 'activity_sessions_v2'
+    | 'cloud_rss_snapshot'
+    | 'cloud_chat_messages'
+    | 'stats_counters';
+
+export type ManagedBusinessTableName = SharedLegacyBusinessTableName | ActiveOnlyBusinessTableName;
+
+export type ManagedMysqlTableName =
+    | ManagedArchiveTableName
+    | ManagedRollupTableName
+    | 'vrc_api_cache'
+    | ManagedBusinessTableName;
 
 export type QualifiedMysqlPhysicalTableName =
     | ManagedArchiveTableName
@@ -39,7 +70,9 @@ export type QualifiedMysqlPhysicalTableName =
     | 'gamelog_user_rollup'
     | 'gamelog_world_rollup'
     | 'legacy_gamelog_user_rollup'
-    | 'legacy_gamelog_world_rollup';
+    | 'legacy_gamelog_world_rollup'
+    | ManagedBusinessTableName
+    | `legacy_${SharedLegacyBusinessTableName}`;
 
 export interface ManagedArchiveTableSpec {
     table: ManagedArchiveTableName;
@@ -58,6 +91,292 @@ export interface ManagedRollupTableSpec {
     pkCol: 'user_id' | 'world_id';
 }
 
+export type ManagedBusinessMergeMode =
+    | 'ignore'
+    | 'avatar_history'
+    | 'stats_counters'
+    | 'rss_snapshot'
+    | 'activity_sessions';
+
+export interface ManagedBusinessTableSpec {
+    table: ManagedBusinessTableName;
+    physicalTable: QualifiedMysqlPhysicalTableName;
+    shard: ExternalDbShardKey;
+    columns: readonly string[];
+    keyCols: readonly string[];
+    orderByCol: string;
+    mergeMode: ManagedBusinessMergeMode;
+}
+
+export const SHARED_LEGACY_BUSINESS_TABLES: readonly SharedLegacyBusinessTableName[] = [
+    'memos',
+    'world_memos',
+    'avatar_memos',
+    'notes',
+    'favorite_friend',
+    'favorite_world',
+    'favorite_avatar',
+    'favorite_print',
+    'avatar_tags',
+    'avatar_history',
+    'friend_log_current',
+    'moderation',
+    'user_profile',
+    'entity_users',
+    'entity_worlds'
+] as const;
+
+export const SHARED_LEGACY_BUSINESS_TABLE_SET: ReadonlySet<string> = new Set<string>(SHARED_LEGACY_BUSINESS_TABLES);
+
+const BASE_BUSINESS_TABLE_CONFIG: ReadonlyArray<{
+    table: ManagedBusinessTableName;
+    activeShard: Exclude<ExternalDbShardKey, 'legacy'>;
+    sharedWithLegacy: boolean;
+    columns: readonly string[];
+    keyCols: readonly string[];
+    orderByCol: string;
+    mergeMode: ManagedBusinessMergeMode;
+}> = [
+    {
+        table: 'memos',
+        activeShard: 'core',
+        sharedWithLegacy: true,
+        columns: ['user_id', 'edited_at', 'memo'],
+        keyCols: ['user_id'],
+        orderByCol: 'user_id',
+        mergeMode: 'ignore'
+    },
+    {
+        table: 'world_memos',
+        activeShard: 'core',
+        sharedWithLegacy: true,
+        columns: ['world_id', 'edited_at', 'memo'],
+        keyCols: ['world_id'],
+        orderByCol: 'world_id',
+        mergeMode: 'ignore'
+    },
+    {
+        table: 'avatar_memos',
+        activeShard: 'core',
+        sharedWithLegacy: true,
+        columns: ['avatar_id', 'edited_at', 'memo'],
+        keyCols: ['avatar_id'],
+        orderByCol: 'avatar_id',
+        mergeMode: 'ignore'
+    },
+    {
+        table: 'notes',
+        activeShard: 'core',
+        sharedWithLegacy: true,
+        columns: ['user_id', 'display_name', 'note', 'created_at'],
+        keyCols: ['user_id'],
+        orderByCol: 'user_id',
+        mergeMode: 'ignore'
+    },
+    {
+        table: 'favorite_friend',
+        activeShard: 'core',
+        sharedWithLegacy: true,
+        columns: ['created_at', 'user_id', 'group_name'],
+        keyCols: ['user_id', 'group_name'],
+        orderByCol: 'id',
+        mergeMode: 'ignore'
+    },
+    {
+        table: 'favorite_world',
+        activeShard: 'core',
+        sharedWithLegacy: true,
+        columns: ['created_at', 'world_id', 'group_name'],
+        keyCols: ['world_id', 'group_name'],
+        orderByCol: 'id',
+        mergeMode: 'ignore'
+    },
+    {
+        table: 'favorite_avatar',
+        activeShard: 'core',
+        sharedWithLegacy: true,
+        columns: ['created_at', 'avatar_id', 'group_name'],
+        keyCols: ['avatar_id', 'group_name'],
+        orderByCol: 'id',
+        mergeMode: 'ignore'
+    },
+    {
+        table: 'favorite_print',
+        activeShard: 'core',
+        sharedWithLegacy: true,
+        columns: ['print_id', 'created_at'],
+        keyCols: ['print_id'],
+        orderByCol: 'id',
+        mergeMode: 'ignore'
+    },
+    {
+        table: 'avatar_tags',
+        activeShard: 'core',
+        sharedWithLegacy: true,
+        columns: ['avatar_id', 'tag', 'color'],
+        keyCols: ['avatar_id', 'tag'],
+        orderByCol: 'avatar_id',
+        mergeMode: 'ignore'
+    },
+    {
+        table: 'avatar_history',
+        activeShard: 'core',
+        sharedWithLegacy: true,
+        columns: ['avatar_id', 'created_at', 'time'],
+        keyCols: ['avatar_id'],
+        orderByCol: 'avatar_id',
+        mergeMode: 'avatar_history'
+    },
+    {
+        table: 'friend_log_current',
+        activeShard: 'core',
+        sharedWithLegacy: true,
+        columns: ['user_id', 'display_name', 'trust_level', 'friend_number'],
+        keyCols: ['user_id'],
+        orderByCol: 'user_id',
+        mergeMode: 'ignore'
+    },
+    {
+        table: 'moderation',
+        activeShard: 'core',
+        sharedWithLegacy: true,
+        columns: ['user_id', 'updated_at', 'display_name', 'block', 'mute'],
+        keyCols: ['user_id'],
+        orderByCol: 'user_id',
+        mergeMode: 'ignore'
+    },
+    {
+        table: 'user_profile',
+        activeShard: 'core',
+        sharedWithLegacy: true,
+        columns: ['user_id', 'bio', 'bio_links', 'updated_at'],
+        keyCols: ['user_id'],
+        orderByCol: 'user_id',
+        mergeMode: 'ignore'
+    },
+    {
+        table: 'entity_users',
+        activeShard: 'core',
+        sharedWithLegacy: true,
+        columns: ['user_id', 'display_name', 'aliases_text', 'updated_at'],
+        keyCols: ['user_id'],
+        orderByCol: 'rowid',
+        mergeMode: 'ignore'
+    },
+    {
+        table: 'entity_worlds',
+        activeShard: 'core',
+        sharedWithLegacy: true,
+        columns: ['world_id', 'world_name', 'updated_at'],
+        keyCols: ['world_id'],
+        orderByCol: 'rowid',
+        mergeMode: 'ignore'
+    },
+    {
+        table: 'cloud_screenshots',
+        activeShard: 'core',
+        sharedWithLegacy: false,
+        columns: [
+            'id',
+            'device_id',
+            'taken_at',
+            'local_filename',
+            'world_id',
+            'world_name',
+            'instance_id',
+            'players_json',
+            'metadata_json',
+            'r2_thumb_key',
+            'thumb_bytes',
+            'created_at'
+        ],
+        keyCols: ['id'],
+        orderByCol: 'taken_at',
+        mergeMode: 'ignore'
+    },
+    {
+        table: 'activity_sessions_v2',
+        activeShard: 'feed',
+        sharedWithLegacy: false,
+        columns: ['session_id', 'user_id', 'start_at', 'end_at', 'is_open_tail', 'source_revision'],
+        keyCols: ['session_id'],
+        orderByCol: 'session_id',
+        mergeMode: 'activity_sessions'
+    },
+    {
+        table: 'cloud_rss_snapshot',
+        activeShard: 'cache',
+        sharedWithLegacy: false,
+        columns: ['snapshot_key', 'payload_json', 'synced_at'],
+        keyCols: ['snapshot_key'],
+        orderByCol: 'snapshot_key',
+        mergeMode: 'rss_snapshot'
+    },
+    {
+        table: 'cloud_chat_messages',
+        activeShard: 'chat',
+        sharedWithLegacy: false,
+        columns: [
+            'id',
+            'device_id',
+            'direction',
+            'source_text',
+            'translated_text',
+            'sent_text',
+            'source_lang',
+            'target_lang',
+            'display_mode',
+            'osc_address',
+            'osc_port',
+            'immediate',
+            'play_sfx',
+            'status',
+            'cmd_id',
+            'error_message',
+            'created_at'
+        ],
+        keyCols: ['id'],
+        orderByCol: 'created_at',
+        mergeMode: 'ignore'
+    },
+    {
+        table: 'stats_counters',
+        activeShard: 'core',
+        sharedWithLegacy: false,
+        columns: ['counter_key', 'row_count', 'updated_at'],
+        keyCols: ['counter_key'],
+        orderByCol: 'counter_key',
+        mergeMode: 'stats_counters'
+    }
+];
+
+export const MANAGED_BUSINESS_TABLES: readonly ManagedBusinessTableSpec[] = (() => {
+    const out: ManagedBusinessTableSpec[] = [];
+    for (const cfg of BASE_BUSINESS_TABLE_CONFIG) {
+        out.push({
+            table: cfg.table,
+            physicalTable: cfg.table,
+            shard: cfg.activeShard,
+            columns: cfg.columns,
+            keyCols: cfg.keyCols,
+            orderByCol: cfg.orderByCol,
+            mergeMode: cfg.mergeMode
+        });
+        if (cfg.sharedWithLegacy) {
+            out.push({
+                table: cfg.table,
+                physicalTable: `legacy_${cfg.table}` as QualifiedMysqlPhysicalTableName,
+                shard: 'legacy',
+                columns: cfg.columns,
+                keyCols: cfg.keyCols,
+                orderByCol: cfg.orderByCol,
+                mergeMode: cfg.mergeMode
+            });
+        }
+    }
+    return out;
+})();
+
 export const MANAGED_ARCHIVE_TABLES: readonly ManagedArchiveTableSpec[] = [
     { table: 'core_archive_chunks', shard: 'core', kindColumn: 'core_kind' },
     { table: 'gamelog_archive_chunks', shard: 'gamelog', kindColumn: 'gamelog_kind' },
@@ -67,6 +386,10 @@ export const MANAGED_ARCHIVE_TABLES: readonly ManagedArchiveTableSpec[] = [
     { table: 'legacy_core_chunks', shard: 'legacy', kindColumn: 'core_kind' },
     { table: 'chat_archive_chunks', shard: 'chat', kindColumn: null }
 ] as const;
+
+export const MANAGED_ARCHIVE_TABLE_SET: ReadonlySet<string> = new Set<string>(
+    MANAGED_ARCHIVE_TABLES.map((s) => s.table)
+);
 
 export const MANAGED_ROLLUP_TABLES: readonly ManagedRollupTableSpec[] = [
     { table: 'gamelog_user_rollup', physicalTable: 'gamelog_user_rollup', shard: 'gamelog', pkCol: 'user_id' },
@@ -79,7 +402,8 @@ export const MANAGED_MYSQL_TABLE_SET: ReadonlySet<string> = new Set<string>([
     ...MANAGED_ARCHIVE_TABLES.map((s) => s.table),
     'gamelog_user_rollup',
     'gamelog_world_rollup',
-    'vrc_api_cache'
+    'vrc_api_cache',
+    ...BASE_BUSINESS_TABLE_CONFIG.map((c) => c.table)
 ]);
 
 export interface StoredExternalDbConfig {
@@ -125,12 +449,14 @@ export interface ResolvedMysqlConnectionParams {
 }
 
 export interface ExternalDbMigrationState {
+    schemaVersion: number;
     status: 'idle' | 'running' | 'completed' | 'paused' | 'error';
-    phase: 'idle' | 'compact_single_rows' | 'move_chunks' | 'move_cache' | 'done';
+    phase: 'idle' | 'compact_single_rows' | 'move_chunks' | 'move_business' | 'move_cache' | 'done';
     d1Drained: boolean;
     totalChunksMoved: number;
     totalRowsMoved: number;
     totalRollupMoved: number;
+    totalBusinessRowsMoved: number;
     totalCacheMoved: number;
     totalSingleRowsCompacted: number;
     lastTable: string;
@@ -146,6 +472,7 @@ export interface ExternalDbUsageSummary {
     usedBytes: number;
     totalChunks: number;
     totalLogicalRows: number;
+    businessRows: number;
     cacheRows: number;
     tables: Record<string, { chunks: number; rows: number; bytes: number }>;
     checkedAt: string;
@@ -216,12 +543,14 @@ export function defaultExternalDbConfig(): StoredExternalDbConfig {
 
 export function defaultExternalDbMigrationState(): ExternalDbMigrationState {
     return {
+        schemaVersion: CURRENT_MIGRATION_SCHEMA_VERSION,
         status: 'idle',
         phase: 'idle',
         d1Drained: false,
         totalChunksMoved: 0,
         totalRowsMoved: 0,
         totalRollupMoved: 0,
+        totalBusinessRowsMoved: 0,
         totalCacheMoved: 0,
         totalSingleRowsCompacted: 0,
         lastTable: '',
@@ -401,15 +730,22 @@ export function normalizeExternalDbConnectionType(raw: unknown): ExternalDbConne
     return raw === 'hyperdrive' ? 'hyperdrive' : 'direct';
 }
 
+const LEGACY_PHYSICAL_TABLE_SET: ReadonlySet<string> = new Set<string>([
+    'legacy_gamelog_user_rollup',
+    'legacy_gamelog_world_rollup',
+    ...SHARED_LEGACY_BUSINESS_TABLES.map((t) => `legacy_${t}`)
+]);
+
 export function resolvePhysicalMysqlTable(
     baseTable: ManagedMysqlTableName,
     shard?: ExternalDbShardKey
 ): QualifiedMysqlPhysicalTableName {
-    if (baseTable === 'gamelog_user_rollup') {
-        return shard === 'legacy' ? 'legacy_gamelog_user_rollup' : 'gamelog_user_rollup';
-    }
-    if (baseTable === 'gamelog_world_rollup') {
-        return shard === 'legacy' ? 'legacy_gamelog_world_rollup' : 'gamelog_world_rollup';
+    if (shard === 'legacy') {
+        if (baseTable === 'gamelog_user_rollup') return 'legacy_gamelog_user_rollup';
+        if (baseTable === 'gamelog_world_rollup') return 'legacy_gamelog_world_rollup';
+        if (SHARED_LEGACY_BUSINESS_TABLE_SET.has(baseTable)) {
+            return `legacy_${baseTable as SharedLegacyBusinessTableName}`;
+        }
     }
     return baseTable;
 }
@@ -420,10 +756,9 @@ export function qualifyMysqlTableName(
     shard?: ExternalDbShardKey
 ): string {
     const safePrefix = validateMysqlTablePrefix(tablePrefix).valid ? tablePrefix.trim() : 'vrcx_';
-    const physical =
-        baseTable === 'legacy_gamelog_user_rollup' || baseTable === 'legacy_gamelog_world_rollup'
-            ? baseTable
-            : resolvePhysicalMysqlTable(baseTable, shard);
+    const physical = LEGACY_PHYSICAL_TABLE_SET.has(baseTable)
+        ? baseTable
+        : resolvePhysicalMysqlTable(baseTable as ManagedMysqlTableName, shard);
     return `${safePrefix}${physical}`;
 }
 
@@ -483,7 +818,13 @@ function parseMigrationStateJson(raw: string | undefined): ExternalDbMigrationSt
     if (!raw) return base;
     try {
         const parsed = JSON.parse(raw) as Partial<ExternalDbMigrationState>;
+        const parsedVersion = Number(parsed.schemaVersion ?? 1);
+        const schemaVersion = Number.isFinite(parsedVersion) && parsedVersion >= 1 ? Math.floor(parsedVersion) : 1;
+        // Phase 2 adds 35 newly offloaded business tables: pre-v2 states marked d1Drained must resume dual-reads
+        // and show pending D1 business rows until those tables are also drained.
+        const upgradedBelowV2 = schemaVersion < CURRENT_MIGRATION_SCHEMA_VERSION;
         return {
+            schemaVersion,
             status:
                 parsed.status === 'running' ||
                 parsed.status === 'completed' ||
@@ -494,14 +835,16 @@ function parseMigrationStateJson(raw: string | undefined): ExternalDbMigrationSt
             phase:
                 parsed.phase === 'compact_single_rows' ||
                 parsed.phase === 'move_chunks' ||
+                parsed.phase === 'move_business' ||
                 parsed.phase === 'move_cache' ||
                 parsed.phase === 'done'
                     ? parsed.phase
                     : 'idle',
-            d1Drained: parsed.d1Drained === true,
+            d1Drained: upgradedBelowV2 ? false : parsed.d1Drained === true,
             totalChunksMoved: Math.max(0, Number(parsed.totalChunksMoved ?? 0) || 0),
             totalRowsMoved: Math.max(0, Number(parsed.totalRowsMoved ?? 0) || 0),
             totalRollupMoved: Math.max(0, Number(parsed.totalRollupMoved ?? 0) || 0),
+            totalBusinessRowsMoved: Math.max(0, Number(parsed.totalBusinessRowsMoved ?? 0) || 0),
             totalCacheMoved: Math.max(0, Number(parsed.totalCacheMoved ?? 0) || 0),
             totalSingleRowsCompacted: Math.max(0, Number(parsed.totalSingleRowsCompacted ?? 0) || 0),
             lastTable: typeof parsed.lastTable === 'string' ? parsed.lastTable : '',
@@ -643,55 +986,253 @@ export async function resolveExternalDbConnectionParams(
     };
 }
 
+export interface MysqlSchemaEntry {
+    physicalTable: QualifiedMysqlPhysicalTableName;
+    qualifiedTable: string;
+    sql: string;
+}
+
+function buildBusinessTableDdl(baseTable: ManagedBusinessTableName, qTbl: string): string {
+    switch (baseTable) {
+        case 'memos':
+            return `CREATE TABLE IF NOT EXISTS \`${qTbl}\` (
+                \`user_id\` VARCHAR(128) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                \`edited_at\` VARCHAR(40) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                \`memo\` MEDIUMTEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL,
+                PRIMARY KEY (\`user_id\`)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`;
+        case 'world_memos':
+            return `CREATE TABLE IF NOT EXISTS \`${qTbl}\` (
+                \`world_id\` VARCHAR(128) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                \`edited_at\` VARCHAR(40) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                \`memo\` MEDIUMTEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL,
+                PRIMARY KEY (\`world_id\`)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`;
+        case 'avatar_memos':
+            return `CREATE TABLE IF NOT EXISTS \`${qTbl}\` (
+                \`avatar_id\` VARCHAR(128) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                \`edited_at\` VARCHAR(40) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                \`memo\` MEDIUMTEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL,
+                PRIMARY KEY (\`avatar_id\`)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`;
+        case 'notes':
+            return `CREATE TABLE IF NOT EXISTS \`${qTbl}\` (
+                \`user_id\` VARCHAR(128) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                \`display_name\` VARCHAR(256) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL DEFAULT '',
+                \`note\` MEDIUMTEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL,
+                \`created_at\` VARCHAR(40) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                PRIMARY KEY (\`user_id\`)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`;
+        case 'favorite_friend':
+            return `CREATE TABLE IF NOT EXISTS \`${qTbl}\` (
+                \`id\` BIGINT NOT NULL AUTO_INCREMENT,
+                \`created_at\` VARCHAR(40) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                \`user_id\` VARCHAR(128) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                \`group_name\` VARCHAR(150) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+                PRIMARY KEY (\`id\`),
+                UNIQUE KEY \`uq_user_group\` (\`user_id\`, \`group_name\`)
+            ) ENGINE=InnoDB AUTO_INCREMENT=${MYSQL_CHUNK_AUTO_INCREMENT_START} DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`;
+        case 'favorite_world':
+            return `CREATE TABLE IF NOT EXISTS \`${qTbl}\` (
+                \`id\` BIGINT NOT NULL AUTO_INCREMENT,
+                \`created_at\` VARCHAR(40) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                \`world_id\` VARCHAR(128) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                \`group_name\` VARCHAR(150) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+                PRIMARY KEY (\`id\`),
+                UNIQUE KEY \`uq_world_group\` (\`world_id\`, \`group_name\`)
+            ) ENGINE=InnoDB AUTO_INCREMENT=${MYSQL_CHUNK_AUTO_INCREMENT_START} DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`;
+        case 'favorite_avatar':
+            return `CREATE TABLE IF NOT EXISTS \`${qTbl}\` (
+                \`id\` BIGINT NOT NULL AUTO_INCREMENT,
+                \`created_at\` VARCHAR(40) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                \`avatar_id\` VARCHAR(128) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                \`group_name\` VARCHAR(150) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+                PRIMARY KEY (\`id\`),
+                UNIQUE KEY \`uq_avatar_group\` (\`avatar_id\`, \`group_name\`)
+            ) ENGINE=InnoDB AUTO_INCREMENT=${MYSQL_CHUNK_AUTO_INCREMENT_START} DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`;
+        case 'favorite_print':
+            return `CREATE TABLE IF NOT EXISTS \`${qTbl}\` (
+                \`id\` BIGINT NOT NULL AUTO_INCREMENT,
+                \`print_id\` VARCHAR(128) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                \`created_at\` VARCHAR(40) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                PRIMARY KEY (\`id\`),
+                UNIQUE KEY \`uq_print_id\` (\`print_id\`)
+            ) ENGINE=InnoDB AUTO_INCREMENT=${MYSQL_CHUNK_AUTO_INCREMENT_START} DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`;
+        case 'avatar_tags':
+            return `CREATE TABLE IF NOT EXISTS \`${qTbl}\` (
+                \`avatar_id\` VARCHAR(128) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                \`tag\` VARCHAR(128) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+                \`color\` VARCHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NULL,
+                PRIMARY KEY (\`avatar_id\`, \`tag\`)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`;
+        case 'avatar_history':
+            return `CREATE TABLE IF NOT EXISTS \`${qTbl}\` (
+                \`avatar_id\` VARCHAR(128) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                \`created_at\` VARCHAR(40) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                \`time\` BIGINT NOT NULL DEFAULT 0,
+                PRIMARY KEY (\`avatar_id\`),
+                KEY \`idx_created\` (\`created_at\`)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`;
+        case 'friend_log_current':
+            return `CREATE TABLE IF NOT EXISTS \`${qTbl}\` (
+                \`user_id\` VARCHAR(128) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                \`display_name\` VARCHAR(256) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL DEFAULT '',
+                \`trust_level\` VARCHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL DEFAULT '',
+                \`friend_number\` INT NOT NULL DEFAULT 0,
+                PRIMARY KEY (\`user_id\`)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`;
+        case 'moderation':
+            return `CREATE TABLE IF NOT EXISTS \`${qTbl}\` (
+                \`user_id\` VARCHAR(128) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                \`updated_at\` VARCHAR(40) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                \`display_name\` VARCHAR(256) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL DEFAULT '',
+                \`block\` TINYINT NOT NULL DEFAULT 0,
+                \`mute\` TINYINT NOT NULL DEFAULT 0,
+                PRIMARY KEY (\`user_id\`)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`;
+        case 'user_profile':
+            return `CREATE TABLE IF NOT EXISTS \`${qTbl}\` (
+                \`user_id\` VARCHAR(128) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                \`bio\` MEDIUMTEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL,
+                \`bio_links\` MEDIUMTEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL,
+                \`updated_at\` VARCHAR(40) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                PRIMARY KEY (\`user_id\`)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`;
+        case 'entity_users':
+            return `CREATE TABLE IF NOT EXISTS \`${qTbl}\` (
+                \`id\` BIGINT NOT NULL AUTO_INCREMENT,
+                \`user_id\` VARCHAR(128) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                \`display_name\` VARCHAR(256) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL DEFAULT '',
+                \`aliases_text\` TEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL,
+                \`updated_at\` VARCHAR(40) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                PRIMARY KEY (\`id\`),
+                UNIQUE KEY \`uq_user_id\` (\`user_id\`),
+                KEY \`idx_updated\` (\`updated_at\`)
+            ) ENGINE=InnoDB AUTO_INCREMENT=${MYSQL_CHUNK_AUTO_INCREMENT_START} DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`;
+        case 'entity_worlds':
+            return `CREATE TABLE IF NOT EXISTS \`${qTbl}\` (
+                \`id\` BIGINT NOT NULL AUTO_INCREMENT,
+                \`world_id\` VARCHAR(128) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                \`world_name\` VARCHAR(512) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL DEFAULT '',
+                \`updated_at\` VARCHAR(40) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                PRIMARY KEY (\`id\`),
+                UNIQUE KEY \`uq_world_id\` (\`world_id\`),
+                KEY \`idx_updated\` (\`updated_at\`)
+            ) ENGINE=InnoDB AUTO_INCREMENT=${MYSQL_CHUNK_AUTO_INCREMENT_START} DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`;
+        case 'cloud_screenshots':
+            return `CREATE TABLE IF NOT EXISTS \`${qTbl}\` (
+                \`id\` VARCHAR(128) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                \`device_id\` VARCHAR(128) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                \`taken_at\` VARCHAR(40) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                \`local_filename\` VARCHAR(191) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL,
+                \`world_id\` VARCHAR(128) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT '',
+                \`world_name\` VARCHAR(512) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL DEFAULT '',
+                \`instance_id\` VARCHAR(512) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL DEFAULT '',
+                \`players_json\` MEDIUMTEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL,
+                \`metadata_json\` MEDIUMTEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL,
+                \`r2_thumb_key\` VARCHAR(512) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL DEFAULT '',
+                \`thumb_bytes\` BIGINT NOT NULL DEFAULT 0,
+                \`created_at\` VARCHAR(40) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                PRIMARY KEY (\`id\`),
+                UNIQUE KEY \`uq_filename\` (\`local_filename\`),
+                KEY \`idx_taken\` (\`taken_at\`, \`id\`),
+                KEY \`idx_world_taken\` (\`world_id\`, \`taken_at\`)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`;
+        case 'activity_sessions_v2':
+            return `CREATE TABLE IF NOT EXISTS \`${qTbl}\` (
+                \`session_id\` BIGINT NOT NULL AUTO_INCREMENT,
+                \`user_id\` VARCHAR(128) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                \`start_at\` BIGINT NOT NULL,
+                \`end_at\` BIGINT NOT NULL,
+                \`is_open_tail\` TINYINT NOT NULL DEFAULT 0,
+                \`source_revision\` VARCHAR(128) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL DEFAULT '',
+                PRIMARY KEY (\`session_id\`),
+                KEY \`idx_user_start\` (\`user_id\`, \`start_at\`),
+                KEY \`idx_end_open\` (\`end_at\`, \`is_open_tail\`)
+            ) ENGINE=InnoDB AUTO_INCREMENT=${MYSQL_CHUNK_AUTO_INCREMENT_START} DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`;
+        case 'cloud_rss_snapshot':
+            return `CREATE TABLE IF NOT EXISTS \`${qTbl}\` (
+                \`snapshot_key\` VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                \`payload_json\` MEDIUMTEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL,
+                \`synced_at\` VARCHAR(40) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                PRIMARY KEY (\`snapshot_key\`)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`;
+        case 'cloud_chat_messages':
+            return `CREATE TABLE IF NOT EXISTS \`${qTbl}\` (
+                \`id\` VARCHAR(128) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                \`device_id\` VARCHAR(128) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT '',
+                \`direction\` VARCHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT 'web_to_vrc',
+                \`source_text\` MEDIUMTEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL,
+                \`translated_text\` MEDIUMTEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL,
+                \`sent_text\` MEDIUMTEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL,
+                \`source_lang\` VARCHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT 'auto',
+                \`target_lang\` VARCHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT '',
+                \`display_mode\` VARCHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT 'translated_only',
+                \`osc_address\` VARCHAR(128) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT '/chatbox/input',
+                \`osc_port\` INT NOT NULL DEFAULT 9000,
+                \`immediate\` TINYINT NOT NULL DEFAULT 1,
+                \`play_sfx\` TINYINT NOT NULL DEFAULT 1,
+                \`status\` VARCHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT 'queued',
+                \`cmd_id\` VARCHAR(128) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT '',
+                \`error_message\` TEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL,
+                \`created_at\` VARCHAR(40) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                PRIMARY KEY (\`id\`),
+                KEY \`idx_created\` (\`created_at\`, \`id\`),
+                KEY \`idx_cmd\` (\`cmd_id\`)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`;
+        case 'stats_counters':
+            return `CREATE TABLE IF NOT EXISTS \`${qTbl}\` (
+                \`counter_key\` VARCHAR(128) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                \`row_count\` BIGINT NOT NULL DEFAULT 0,
+                \`updated_at\` VARCHAR(40) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                PRIMARY KEY (\`counter_key\`)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`;
+    }
+}
+
 /**
- * Generates MySQL 5.7+ compatible DDL statements for all 7 compact archive chunk tables and `vrc_api_cache`.
- * - All indexed columns use `CHARACTER SET ascii COLLATE ascii_bin` (1 byte/char, case-sensitive like SQLite,
- *   guaranteed well under MySQL 5.7's 767-byte COMPACT index prefix ceiling).
- * - Text payload columns use `MEDIUMTEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci` (never MySQL 8.0-only
- *   `utf8mb4_0900_ai_ci`), accommodating up to 16 MiB while our chunks remain <= 512 KiB (< 5.7 default 4 MiB packet).
- * - Archive chunk tables start `AUTO_INCREMENT` at 1,000,001 to strictly isolate MySQL chunk IDs from D1 chunk IDs.
+ * Generates MySQL 5.7+ compatible DDL entries for all 47 managed physical tables
+ * (7 archive chunk tables, `vrc_api_cache`, 4 GameLog rollups, and 35 business tables).
+ * Settings and control-plane tables always remain in Cloudflare D1.
  */
-export function buildMysql57SchemaStatements(tablePrefix: string): string[] {
-    const stmts: string[] = [];
+export function buildMysql57SchemaEntries(tablePrefix: string): MysqlSchemaEntry[] {
+    const entries: MysqlSchemaEntry[] = [];
     for (const spec of MANAGED_ARCHIVE_TABLES) {
         const tbl = qualifyMysqlTableName(tablePrefix, spec.table);
-        if (spec.kindColumn) {
-            stmts.push(
-                `CREATE TABLE IF NOT EXISTS \`${tbl}\` (
-                    \`id\` BIGINT NOT NULL AUTO_INCREMENT,
-                    \`chunk_key\` VARCHAR(128) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
-                    \`${spec.kindColumn}\` VARCHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
-                    \`min_created_at\` VARCHAR(40) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
-                    \`max_created_at\` VARCHAR(40) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
-                    \`row_count\` INT NOT NULL DEFAULT 0,
-                    \`payload_json\` MEDIUMTEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL,
-                    PRIMARY KEY (\`id\`),
-                    UNIQUE KEY \`uq_chunk_key\` (\`chunk_key\`),
-                    KEY \`idx_kind_max\` (\`${spec.kindColumn}\`, \`max_created_at\`, \`id\`),
-                    KEY \`idx_kind_min\` (\`${spec.kindColumn}\`, \`min_created_at\`, \`id\`)
-                ) ENGINE=InnoDB AUTO_INCREMENT=${MYSQL_CHUNK_AUTO_INCREMENT_START} DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`
-            );
-        } else {
-            stmts.push(
-                `CREATE TABLE IF NOT EXISTS \`${tbl}\` (
-                    \`id\` BIGINT NOT NULL AUTO_INCREMENT,
-                    \`chunk_key\` VARCHAR(128) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
-                    \`min_created_at\` VARCHAR(40) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
-                    \`max_created_at\` VARCHAR(40) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
-                    \`row_count\` INT NOT NULL DEFAULT 0,
-                    \`payload_json\` MEDIUMTEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL,
-                    PRIMARY KEY (\`id\`),
-                    UNIQUE KEY \`uq_chunk_key\` (\`chunk_key\`),
-                    KEY \`idx_max\` (\`max_created_at\`, \`id\`),
-                    KEY \`idx_min\` (\`min_created_at\`, \`id\`)
-                ) ENGINE=InnoDB AUTO_INCREMENT=${MYSQL_CHUNK_AUTO_INCREMENT_START} DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`
-            );
-        }
+        const sql = spec.kindColumn
+            ? `CREATE TABLE IF NOT EXISTS \`${tbl}\` (
+                \`id\` BIGINT NOT NULL AUTO_INCREMENT,
+                \`chunk_key\` VARCHAR(128) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                \`${spec.kindColumn}\` VARCHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                \`min_created_at\` VARCHAR(40) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                \`max_created_at\` VARCHAR(40) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                \`row_count\` INT NOT NULL DEFAULT 0,
+                \`payload_json\` MEDIUMTEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL,
+                PRIMARY KEY (\`id\`),
+                UNIQUE KEY \`uq_chunk_key\` (\`chunk_key\`),
+                KEY \`idx_kind_max\` (\`${spec.kindColumn}\`, \`max_created_at\`, \`id\`),
+                KEY \`idx_kind_min\` (\`${spec.kindColumn}\`, \`min_created_at\`, \`id\`)
+            ) ENGINE=InnoDB AUTO_INCREMENT=${MYSQL_CHUNK_AUTO_INCREMENT_START} DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`
+            : `CREATE TABLE IF NOT EXISTS \`${tbl}\` (
+                \`id\` BIGINT NOT NULL AUTO_INCREMENT,
+                \`chunk_key\` VARCHAR(128) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                \`min_created_at\` VARCHAR(40) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                \`max_created_at\` VARCHAR(40) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                \`row_count\` INT NOT NULL DEFAULT 0,
+                \`payload_json\` MEDIUMTEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL,
+                PRIMARY KEY (\`id\`),
+                UNIQUE KEY \`uq_chunk_key\` (\`chunk_key\`),
+                KEY \`idx_max\` (\`max_created_at\`, \`id\`),
+                KEY \`idx_min\` (\`min_created_at\`, \`id\`)
+            ) ENGINE=InnoDB AUTO_INCREMENT=${MYSQL_CHUNK_AUTO_INCREMENT_START} DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`;
+        entries.push({ physicalTable: spec.table, qualifiedTable: tbl, sql });
     }
 
     const cacheTbl = qualifyMysqlTableName(tablePrefix, 'vrc_api_cache');
-    stmts.push(
-        `CREATE TABLE IF NOT EXISTS \`${cacheTbl}\` (
+    entries.push({
+        physicalTable: 'vrc_api_cache',
+        qualifiedTable: cacheTbl,
+        sql: `CREATE TABLE IF NOT EXISTS \`${cacheTbl}\` (
             \`cache_key\` VARCHAR(700) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
             \`tier\` VARCHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT 'dynamic',
             \`status\` INT NOT NULL DEFAULT 200,
@@ -702,15 +1243,13 @@ export function buildMysql57SchemaStatements(tablePrefix: string): string[] {
             KEY \`idx_expires\` (\`expires_at\`),
             KEY \`idx_tier\` (\`tier\`)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`
-    );
+    });
 
-    // 4 GameLog rollup tables (active DB_GAMELOG + dedicated DB_LEGACY) so desktop/live imports write 0 rollup rows to D1.
-    // `user_id` uses utf8mb4_bin VARCHAR(191) (764 bytes < MySQL 5.7 767-byte COMPACT index limit, case-sensitive, Emoji-safe).
     for (const rollupSpec of MANAGED_ROLLUP_TABLES) {
         const rTbl = qualifyMysqlTableName(tablePrefix, rollupSpec.physicalTable);
-        if (rollupSpec.table === 'gamelog_user_rollup') {
-            stmts.push(
-                `CREATE TABLE IF NOT EXISTS \`${rTbl}\` (
+        const sql =
+            rollupSpec.table === 'gamelog_user_rollup'
+                ? `CREATE TABLE IF NOT EXISTS \`${rTbl}\` (
                     \`user_id\` VARCHAR(191) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
                     \`display_name\` VARCHAR(256) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL DEFAULT '',
                     \`join_count\` INT NOT NULL DEFAULT 0,
@@ -719,10 +1258,7 @@ export function buildMysql57SchemaStatements(tablePrefix: string): string[] {
                     \`second_last_seen\` VARCHAR(40) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT '',
                     PRIMARY KEY (\`user_id\`)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`
-            );
-        } else {
-            stmts.push(
-                `CREATE TABLE IF NOT EXISTS \`${rTbl}\` (
+                : `CREATE TABLE IF NOT EXISTS \`${rTbl}\` (
                     \`world_id\` VARCHAR(191) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
                     \`world_name\` VARCHAR(512) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL DEFAULT '',
                     \`visit_count\` INT NOT NULL DEFAULT 0,
@@ -731,12 +1267,24 @@ export function buildMysql57SchemaStatements(tablePrefix: string): string[] {
                     PRIMARY KEY (\`world_id\`),
                     KEY \`idx_visits\` (\`visit_count\`, \`total_time\`),
                     KEY \`idx_time\` (\`total_time\`, \`visit_count\`)
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`
-            );
-        }
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`;
+        entries.push({ physicalTable: rollupSpec.physicalTable, qualifiedTable: rTbl, sql });
     }
 
-    return stmts;
+    for (const bSpec of MANAGED_BUSINESS_TABLES) {
+        const bTbl = qualifyMysqlTableName(tablePrefix, bSpec.physicalTable);
+        entries.push({
+            physicalTable: bSpec.physicalTable,
+            qualifiedTable: bTbl,
+            sql: buildBusinessTableDdl(bSpec.table, bTbl)
+        });
+    }
+
+    return entries;
+}
+
+export function buildMysql57SchemaStatements(tablePrefix: string): string[] {
+    return buildMysql57SchemaEntries(tablePrefix).map((e) => e.sql);
 }
 
 function isIpAddressLiteral(host: string): boolean {
@@ -1102,14 +1650,13 @@ export async function ensureMysqlSchemaOnConnection(
     if (!force && schemaReadyKeys.has(cacheKey)) {
         return;
     }
+    const entries = buildMysql57SchemaEntries(params.tablePrefix);
+    let missingEntries = entries;
+
     if (!force) {
-        // Fast 1-RTT existence probe avoids 12 serial `CREATE TABLE IF NOT EXISTS` statements
-        // and prevents MySQL 5.7 Metadata Lock (MDL) contention across concurrent desktop migration workers.
-        const expectedNames = [
-            ...MANAGED_ARCHIVE_TABLES.map((s) => qualifyMysqlTableName(params.tablePrefix, s.table)),
-            qualifyMysqlTableName(params.tablePrefix, 'vrc_api_cache'),
-            ...MANAGED_ROLLUP_TABLES.map((s) => qualifyMysqlTableName(params.tablePrefix, s.physicalTable))
-        ];
+        // Fast 1-RTT existence probe creates ONLY missing tables (e.g. upgrading 12 -> 47 tables)
+        // and prevents MySQL 5.7 Metadata Lock (MDL) contention on hot request paths.
+        const expectedNames = entries.map((e) => e.qualifiedTable);
         try {
             const ph = expectedNames.map(() => '?').join(', ');
             const checkRes = await conn.execute(
@@ -1123,17 +1670,17 @@ export async function ensureMysqlSchemaOnConnection(
                     .map((r) => String(r.table_name ?? '').toLowerCase())
                     .filter(Boolean)
             );
-            if (expectedNames.every((name) => found.has(name.toLowerCase()))) {
+            missingEntries = entries.filter((e) => !found.has(e.qualifiedTable.toLowerCase()));
+            if (missingEntries.length === 0) {
                 schemaReadyKeys.add(cacheKey);
                 return;
             }
         } catch {
-            // Fall through to idempotent CREATE TABLE IF NOT EXISTS if information_schema is restricted
+            missingEntries = entries;
         }
     }
-    const ddl = buildMysql57SchemaStatements(params.tablePrefix);
-    for (const stmt of ddl) {
-        await conn.execute(stmt, []);
+    for (const entry of missingEntries) {
+        await conn.execute(entry.sql, []);
     }
     schemaReadyKeys.add(cacheKey);
 }
@@ -1322,15 +1869,7 @@ export class ExternalMysqlSession {
     }
 }
 
-/**
- * Measures MySQL 5.7+ table storage usage on an already-open connection (avoiding a redundant handshake).
- */
-async function measureExternalMysqlUsageOnConnection(
-    conn: MysqlConnectionLike,
-    params: ResolvedMysqlConnectionParams,
-    knownVersion?: string
-): Promise<ExternalDbUsageSummary> {
-    const checkedAt = new Date().toISOString();
+function buildEmptyUsageTables(): Record<string, { chunks: number; rows: number; bytes: number }> {
     const tables: Record<string, { chunks: number; rows: number; bytes: number }> = {};
     for (const spec of MANAGED_ARCHIVE_TABLES) {
         tables[spec.table] = { chunks: 0, rows: 0, bytes: 0 };
@@ -1339,6 +1878,23 @@ async function measureExternalMysqlUsageOnConnection(
     for (const rSpec of MANAGED_ROLLUP_TABLES) {
         tables[rSpec.physicalTable] = { chunks: 0, rows: 0, bytes: 0 };
     }
+    for (const bSpec of MANAGED_BUSINESS_TABLES) {
+        tables[bSpec.physicalTable] = { chunks: 0, rows: 0, bytes: 0 };
+    }
+    return tables;
+}
+
+/**
+ * Measures MySQL 5.7+ table storage usage on an already-open connection using batched UNION ALL queries
+ * (avoiding 47 serial round-trips).
+ */
+async function measureExternalMysqlUsageOnConnection(
+    conn: MysqlConnectionLike,
+    params: ResolvedMysqlConnectionParams,
+    knownVersion?: string
+): Promise<ExternalDbUsageSummary> {
+    const checkedAt = new Date().toISOString();
+    const tables = buildEmptyUsageTables();
 
     let mysqlVersion = knownVersion ?? '';
     if (!mysqlVersion) {
@@ -1346,11 +1902,8 @@ async function measureExternalMysqlUsageOnConnection(
         mysqlVersion = String(verRes.rows[0]?.version ?? 'unknown');
     }
 
-    const qualifiedNames = [
-        ...MANAGED_ARCHIVE_TABLES.map((s) => qualifyMysqlTableName(params.tablePrefix, s.table)),
-        qualifyMysqlTableName(params.tablePrefix, 'vrc_api_cache'),
-        ...MANAGED_ROLLUP_TABLES.map((s) => qualifyMysqlTableName(params.tablePrefix, s.physicalTable))
-    ];
+    const entries = buildMysql57SchemaEntries(params.tablePrefix);
+    const qualifiedNames = entries.map((e) => e.qualifiedTable);
     const placeholders = qualifiedNames.map(() => '?').join(', ');
     let usedBytes = 0;
     const sizeByQualified = new Map<string, number>();
@@ -1374,40 +1927,59 @@ async function measureExternalMysqlUsageOnConnection(
         // Fallback to 0 bytes if information_schema is restricted on a managed host
     }
 
+    const archiveUnionSql = MANAGED_ARCHIVE_TABLES.map((spec) => {
+        const qTbl = qualifyMysqlTableName(params.tablePrefix, spec.table);
+        return `SELECT '${spec.table}' AS tbl_key, COUNT(*) AS chunk_cnt, COALESCE(SUM(row_count), 0) AS row_cnt FROM \`${qTbl}\``;
+    }).join(' UNION ALL ');
+    const archiveRes = await conn.execute(archiveUnionSql, []);
+
     let totalChunks = 0;
     let totalLogicalRows = 0;
-    for (const spec of MANAGED_ARCHIVE_TABLES) {
-        const tbl = qualifyMysqlTableName(params.tablePrefix, spec.table);
-        const statRes = await conn.execute(
-            `SELECT COUNT(*) AS chunk_cnt, COALESCE(SUM(row_count), 0) AS row_cnt FROM \`${tbl}\``,
-            []
-        );
-        const chunkCnt = Math.max(0, Number(statRes.rows[0]?.chunk_cnt ?? 0) || 0);
-        const rowCnt = Math.max(0, Number(statRes.rows[0]?.row_cnt ?? 0) || 0);
-        const bytes = sizeByQualified.get(tbl.toLowerCase()) ?? 0;
-        tables[spec.table] = { chunks: chunkCnt, rows: rowCnt, bytes };
+    for (const row of archiveRes.rows) {
+        const key = String(row.tbl_key ?? '');
+        if (!key) continue;
+        const qTbl = qualifyMysqlTableName(params.tablePrefix, key as QualifiedMysqlPhysicalTableName);
+        const chunkCnt = Math.max(0, Number(row.chunk_cnt ?? 0) || 0);
+        const rowCnt = Math.max(0, Number(row.row_cnt ?? 0) || 0);
+        tables[key] = {
+            chunks: chunkCnt,
+            rows: rowCnt,
+            bytes: sizeByQualified.get(qTbl.toLowerCase()) ?? 0
+        };
         totalChunks += chunkCnt;
         totalLogicalRows += rowCnt;
     }
 
-    const cacheTbl = qualifyMysqlTableName(params.tablePrefix, 'vrc_api_cache');
-    const cacheStat = await conn.execute(`SELECT COUNT(*) AS cnt FROM \`${cacheTbl}\``, []);
-    const cacheRows = Math.max(0, Number(cacheStat.rows[0]?.cnt ?? 0) || 0);
-    tables.vrc_api_cache = {
-        chunks: cacheRows,
-        rows: cacheRows,
-        bytes: sizeByQualified.get(cacheTbl.toLowerCase()) ?? 0
-    };
+    const flatSpecs: Array<{ key: QualifiedMysqlPhysicalTableName; isCache?: boolean }> = [
+        { key: 'vrc_api_cache', isCache: true },
+        ...MANAGED_ROLLUP_TABLES.map((s) => ({ key: s.physicalTable })),
+        ...MANAGED_BUSINESS_TABLES.map((s) => ({ key: s.physicalTable }))
+    ];
+    const flatUnionSql = flatSpecs
+        .map((s) => {
+            const qTbl = qualifyMysqlTableName(params.tablePrefix, s.key);
+            return `SELECT '${s.key}' AS tbl_key, COUNT(*) AS cnt FROM \`${qTbl}\``;
+        })
+        .join(' UNION ALL ');
+    const flatRes = await conn.execute(flatUnionSql, []);
 
-    for (const rSpec of MANAGED_ROLLUP_TABLES) {
-        const rTbl = qualifyMysqlTableName(params.tablePrefix, rSpec.physicalTable);
-        const rStat = await conn.execute(`SELECT COUNT(*) AS cnt FROM \`${rTbl}\``, []);
-        const rCnt = Math.max(0, Number(rStat.rows[0]?.cnt ?? 0) || 0);
-        tables[rSpec.physicalTable] = {
-            chunks: rCnt,
-            rows: rCnt,
-            bytes: sizeByQualified.get(rTbl.toLowerCase()) ?? 0
+    let cacheRows = 0;
+    let businessRows = 0;
+    for (const row of flatRes.rows) {
+        const key = String(row.tbl_key ?? '');
+        if (!key) continue;
+        const qTbl = qualifyMysqlTableName(params.tablePrefix, key as QualifiedMysqlPhysicalTableName);
+        const cnt = Math.max(0, Number(row.cnt ?? 0) || 0);
+        tables[key] = {
+            chunks: cnt,
+            rows: cnt,
+            bytes: sizeByQualified.get(qTbl.toLowerCase()) ?? 0
         };
+        if (key === 'vrc_api_cache') {
+            cacheRows = cnt;
+        } else {
+            businessRows += cnt;
+        }
     }
 
     return {
@@ -1416,6 +1988,7 @@ async function measureExternalMysqlUsageOnConnection(
         usedBytes,
         totalChunks,
         totalLogicalRows,
+        businessRows,
         cacheRows,
         tables,
         checkedAt
@@ -1423,7 +1996,7 @@ async function measureExternalMysqlUsageOnConnection(
 }
 
 /**
- * Tests connectivity against a MySQL 5.7+ server, initializes all 12 managed tables idempotently,
+ * Tests connectivity against a MySQL 5.7+ server, initializes all 47 managed tables idempotently,
  * and returns server version, round-trip latency, and optional live usage on the SAME TCP connection.
  * Never logs or returns passwords.
  */
@@ -1443,7 +2016,7 @@ export async function testExternalMysqlConnection(
         const verRes = await conn.execute('SELECT VERSION() AS version', []);
         const mysqlVersion = String((verRes.rows[0] as RowDataPacket | undefined)?.version ?? 'unknown');
         await ensureMysqlSchemaOnConnection(conn, params, true);
-        const ddlCount = buildMysql57SchemaStatements(params.tablePrefix).length;
+        const ddlCount = buildMysql57SchemaEntries(params.tablePrefix).length;
         const latencyMs = Math.max(1, Date.now() - startedAt);
         let mysqlUsage: ExternalDbUsageSummary | undefined;
         if (options.includeUsage) {
@@ -1456,8 +2029,9 @@ export async function testExternalMysqlConnection(
                     usedBytes: 0,
                     totalChunks: 0,
                     totalLogicalRows: 0,
+                    businessRows: 0,
                     cacheRows: 0,
-                    tables: {},
+                    tables: buildEmptyUsageTables(),
                     checkedAt: new Date().toISOString(),
                     error: err instanceof Error ? err.message : 'Failed to inspect MySQL table usage'
                 };
@@ -1477,20 +2051,13 @@ export async function testExternalMysqlConnection(
 
 /**
  * Measures real-time MySQL 5.7+ table storage usage (bytes, chunk counts, logical row counts)
- * across all 12 managed tables without leaking credentials.
+ * across all 47 managed tables without leaking credentials.
  */
 export async function measureExternalMysqlUsage(
     params: ResolvedMysqlConnectionParams
 ): Promise<ExternalDbUsageSummary> {
     const checkedAt = new Date().toISOString();
-    const emptyTables: Record<string, { chunks: number; rows: number; bytes: number }> = {};
-    for (const spec of MANAGED_ARCHIVE_TABLES) {
-        emptyTables[spec.table] = { chunks: 0, rows: 0, bytes: 0 };
-    }
-    emptyTables.vrc_api_cache = { chunks: 0, rows: 0, bytes: 0 };
-    for (const rSpec of MANAGED_ROLLUP_TABLES) {
-        emptyTables[rSpec.physicalTable] = { chunks: 0, rows: 0, bytes: 0 };
-    }
+    const emptyTables = buildEmptyUsageTables();
 
     let conn: MysqlConnectionLike | null = null;
     try {
@@ -1504,6 +2071,7 @@ export async function measureExternalMysqlUsage(
             usedBytes: 0,
             totalChunks: 0,
             totalLogicalRows: 0,
+            businessRows: 0,
             cacheRows: 0,
             tables: emptyTables,
             checkedAt,

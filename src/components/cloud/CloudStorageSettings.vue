@@ -177,6 +177,7 @@
                                     <span>{{ t('cloud_hub.storage.mysql_usage_size', { size: formatBytes(mysqlUsage.usedBytes) }) }}</span>
                                     <span>{{ t('cloud_hub.storage.mysql_usage_chunks', { chunks: Number(mysqlUsage.totalChunks || 0).toLocaleString() }) }}</span>
                                     <span>{{ t('cloud_hub.storage.mysql_usage_rows', { rows: Number(mysqlUsage.totalLogicalRows || 0).toLocaleString() }) }}</span>
+                                    <span v-if="(mysqlUsage.businessRows || 0) > 0">{{ t('cloud_hub.storage.mysql_usage_business', { count: Number(mysqlUsage.businessRows || 0).toLocaleString() }) }}</span>
                                     <span>{{ t('cloud_hub.storage.mysql_usage_cache', { count: Number(mysqlUsage.cacheRows || 0).toLocaleString() }) }}</span>
                                 </div>
                             </template>
@@ -368,6 +369,13 @@
                                         })
                                     }}
                                 </span>
+                                <span v-if="(mysqlD1Pending?.totalBusinessRows || 0) > 0">
+                                    {{
+                                        t('cloud_hub.storage.mysql_pending_business', {
+                                            count: Number(mysqlD1Pending?.totalBusinessRows || 0).toLocaleString()
+                                        })
+                                    }}
+                                </span>
                                 <span v-if="(mysqlD1Pending?.totalCacheRows || 0) > 0">
                                     {{
                                         t('cloud_hub.storage.mysql_pending_cache', {
@@ -375,11 +383,21 @@
                                         })
                                     }}
                                 </span>
-                                <span v-if="(mysqlMigrationState?.totalRowsMoved || 0) > 0">
+                                <span
+                                    v-if="
+                                        Number(mysqlMigrationState?.totalRowsMoved || 0) +
+                                            Number(mysqlMigrationState?.totalBusinessRowsMoved || 0) +
+                                            Number(mysqlMigrationState?.totalRollupMoved || 0) >
+                                        0
+                                    ">
                                     {{
                                         t('cloud_hub.storage.mysql_moved_summary', {
                                             chunks: Number(mysqlMigrationState?.totalChunksMoved || 0).toLocaleString(),
-                                            rows: Number(mysqlMigrationState?.totalRowsMoved || 0).toLocaleString()
+                                            rows: (
+                                                Number(mysqlMigrationState?.totalRowsMoved || 0) +
+                                                Number(mysqlMigrationState?.totalBusinessRowsMoved || 0) +
+                                                Number(mysqlMigrationState?.totalRollupMoved || 0)
+                                            ).toLocaleString()
                                         })
                                     }}
                                 </span>
@@ -406,8 +424,10 @@
                                     {{
                                         migratingMysql
                                             ? t('cloud_hub.storage.mysql_migrating_btn')
-                                            : (mysqlMigrationState?.totalChunksMoved || 0) > 0 &&
-                                                mysqlD1PendingTotal > 0
+                                            : Number(mysqlMigrationState?.totalChunksMoved || 0) +
+                                                    Number(mysqlMigrationState?.totalBusinessRowsMoved || 0) +
+                                                    Number(mysqlMigrationState?.totalRollupMoved || 0) >
+                                                    0 && mysqlD1PendingTotal > 0
                                               ? t('cloud_hub.storage.mysql_resume_migrate_btn')
                                               : t('cloud_hub.storage.mysql_start_migrate_btn')
                                     }}
@@ -1170,7 +1190,8 @@
             Number(p.totalChunks || 0) +
             Number(p.totalLegacySingleRows || 0) +
             Number(p.totalCacheRows || 0) +
-            Number(p.totalRollupRows || 0)
+            Number(p.totalRollupRows || 0) +
+            Number(p.totalBusinessRows || 0)
         );
     });
 
@@ -1429,7 +1450,7 @@
             mysqlNotice.value = t('cloud_hub.storage.mysql_test_ok', {
                 version: data?.mysqlVersion || '5.7+',
                 ms: data?.latencyMs ?? 0,
-                tables: data?.tablesReady ?? 12
+                tables: data?.tablesReady ?? 47
             });
             toast.success(mysqlNotice.value);
         } catch (err) {
@@ -1503,6 +1524,7 @@
                     Number(res?.movedRows || 0) +
                     Number(res?.compactedSingleRows || 0) +
                     Number(res?.movedRollupRows || 0) +
+                    Number(res?.movedBusinessRows || 0) +
                     Number(res?.movedCacheRows || 0);
                 if (res?.remaining) mysqlD1Pending.value = res.remaining;
                 if (res?.migration) mysqlMigrationState.value = res.migration;
@@ -1515,6 +1537,7 @@
                 const stateTotalRows =
                     Number(mysqlMigrationState.value?.totalRowsMoved || 0) +
                     Number(mysqlMigrationState.value?.totalRollupMoved || 0) +
+                    Number(mysqlMigrationState.value?.totalBusinessRowsMoved || 0) +
                     Number(mysqlMigrationState.value?.totalCacheMoved || 0);
                 mysqlNotice.value = t('cloud_hub.storage.mysql_migrate_done_toast', {
                     chunks: Number(mysqlMigrationState.value?.totalChunksMoved || batchMovedChunks).toLocaleString(),

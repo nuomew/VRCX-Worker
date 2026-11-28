@@ -51,6 +51,7 @@ interface CleanupTableSpec {
     readonly table: string;
     readonly whereSql: string;
     readonly cutoffKind: 'iso' | 'ms';
+    readonly idCol?: string;
     readonly counterKey?: string;
     readonly legacyCategory?: 'gamelog' | 'feed' | 'notifications' | 'friend_log';
     readonly backup?: boolean;
@@ -167,7 +168,8 @@ const CLEANUP_TABLES: readonly CleanupTableSpec[] = [
         shard: 'feed',
         table: 'activity_sessions_v2',
         whereSql: 'end_at < ? AND is_open_tail = 0',
-        cutoffKind: 'ms'
+        cutoffKind: 'ms',
+        idCol: 'session_id'
     },
     // DB_CORE (historical notifications, friend log history, finished remote commands)
     {
@@ -1320,10 +1322,13 @@ export async function handleDbCleanupRoutes(
         const feedSpecs = CLEANUP_TABLES.filter((t) => t.shard === 'feed');
         const chunkSliceLimit = Math.max(4, Math.min(16, Math.ceil(batchLimit / 200)));
 
-        const buildBackupSelectSql = (s: CleanupTableSpec) =>
-            s.isChunkTable
-                ? `SELECT *, id AS _rid FROM ${s.table} WHERE ${s.whereSql} ORDER BY id ASC LIMIT ?`
-                : `SELECT rowid AS _rid, * FROM ${s.table} WHERE ${s.whereSql} ORDER BY rowid ASC LIMIT ?`;
+        const buildBackupSelectSql = (s: CleanupTableSpec) => {
+            if (s.isChunkTable || s.idCol) {
+                const col = s.idCol ?? 'id';
+                return `SELECT *, ${col} AS _rid FROM ${s.table} WHERE ${s.whereSql} ORDER BY ${col} ASC LIMIT ?`;
+            }
+            return `SELECT rowid AS _rid, * FROM ${s.table} WHERE ${s.whereSql} ORDER BY rowid ASC LIMIT ?`;
+        };
 
         const [coreRowsRes, gamelogRowsRes, feedRowsRes, legacyRowsRes] = await Promise.all([
             env.DB_CORE.batch(
@@ -1595,7 +1600,7 @@ export async function handleDbCleanupRoutes(
             if (!db || list.length === 0) return;
             const res = await db.batch(
                 list.map((item) => {
-                    const idCol = item.spec.isChunkTable ? 'id' : 'rowid';
+                    const idCol = item.spec.idCol ?? (item.spec.isChunkTable ? 'id' : 'rowid');
                     return db
                         .prepare(`DELETE FROM ${item.spec.table} WHERE ${idCol} <= ? AND ${item.spec.whereSql}`)
                         .bind(item.maxRid, getCutoffParam(item.spec, cutoffIso, cutoffMs));

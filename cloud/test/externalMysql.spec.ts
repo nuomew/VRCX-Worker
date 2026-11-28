@@ -4,8 +4,10 @@ import type { Env } from '../src/env';
 import {
     buildMysql57SchemaStatements,
     clearMysqlSchemaReadyCache,
+    CURRENT_MIGRATION_SCHEMA_VERSION,
     defaultExternalDbConfig,
     defaultExternalDbMigrationState,
+    ensureMysqlSchemaOnConnection,
     invalidateExternalDbConfigCache,
     measureExternalMysqlUsage,
     MYSQL_CHUNK_AUTO_INCREMENT_START,
@@ -34,7 +36,15 @@ const exports = rawExports as unknown as { default: Fetcher };
  *   `DELETE`, `SELECT` filtering/sorting/LIMIT, and `information_schema.TABLES` usage stats.
  */
 class FakeMysql57Server {
-    tables = new Map<string, { autoInc: number; rows: Array<Record<string, unknown>> }>();
+    tables = new Map<
+        string,
+        {
+            autoInc: number;
+            autoCol: string | null;
+            uniqueGroups: string[][];
+            rows: Array<Record<string, unknown>>;
+        }
+    >();
     executedSqls: string[] = [];
     failNextConnect = false;
     lowercaseInfoSchemaNames = false;
@@ -49,292 +59,454 @@ class FakeMysql57Server {
         let closed = false;
         const self = this;
 
-        return {
-            async execute(rawSql: string, params: unknown[] = []): Promise<MysqlExecResult> {
-                if (closed) throw new Error('Connection closed');
-                const sql = rawSql.trim();
-                self.onBeforeExecute?.(sql, params);
-                self.executedSqls.push(sql);
+        const execSql = async (rawSql: string, params: unknown[] = []): Promise<MysqlExecResult> => {
+            if (closed) throw new Error('Connection closed');
+            const sql = rawSql.trim();
+            self.onBeforeExecute?.(sql, params);
+            self.executedSqls.push(sql);
 
-                // Strict MySQL 5.7 dialect guardrails
-                if (/utf8mb4_0900_ai_ci/i.test(sql)) {
-                    throw new Error(`MySQL 8.0-only collation rejected on 5.7: ${sql}`);
-                }
-                if (/\bINSERT\s+OR\s+(IGNORE|REPLACE)\b/i.test(sql)) {
-                    throw new Error(`SQLite INSERT OR syntax rejected on MySQL 5.7: ${sql}`);
-                }
-                if (/\bON\s+CONFLICT\b/i.test(sql)) {
-                    throw new Error(`SQLite ON CONFLICT syntax rejected on MySQL 5.7: ${sql}`);
-                }
-                if (/DELETE\s+FROM\s+[`\w]+\s+WHERE\s+cache_key\s+IN\s*\(\s*SELECT/i.test(sql)) {
-                    throw new Error(`MySQL 5.7 Error 1093/1235 self-subquery DELETE rejected: ${sql}`);
-                }
-                if (/\browid\b/i.test(sql)) {
-                    throw new Error(`MySQL 5.7 ER_BAD_FIELD_ERROR Unknown column 'rowid': ${sql}`);
-                }
-                if (/^SELECT\s+[^*,\n]+,\s*\*\s+FROM\b/i.test(sql)) {
-                    throw new Error(`MySQL 5.7 Syntax Error 1064: '*' must come first in SELECT list: ${sql}`);
-                }
-                if (/\bMAX\s*\(\s*0\s*,/i.test(sql)) {
-                    throw new Error(`MySQL 5.7 rejects 2-arg SQLite MAX(0, x); must use GREATEST(0, x): ${sql}`);
-                }
+            // Strict MySQL 5.7 dialect guardrails
+            if (/utf8mb4_0900_ai_ci/i.test(sql)) {
+                throw new Error(`MySQL 8.0-only collation rejected on 5.7: ${sql}`);
+            }
+            if (/\b(?:INSERT|UPDATE)\s+OR\s+(?:IGNORE|REPLACE)\b/i.test(sql)) {
+                throw new Error(`SQLite OR conflict syntax rejected on MySQL 5.7: ${sql}`);
+            }
+            if (/\bCOLLATE\s+NOCASE\b/i.test(sql)) {
+                throw new Error(`SQLite COLLATE NOCASE rejected on MySQL 5.7: ${sql}`);
+            }
+            if (/\bON\s+CONFLICT\b/i.test(sql)) {
+                throw new Error(`SQLite ON CONFLICT syntax rejected on MySQL 5.7: ${sql}`);
+            }
+            if (/ON\s+DUPLICATE\s+KEY\s+UPDATE[\s\S]*\bWHERE\b/i.test(sql)) {
+                throw new Error(`MySQL 5.7 rejects WHERE after ON DUPLICATE KEY UPDATE: ${sql}`);
+            }
+            if (/\bFROM\s*\(\s*SELECT\b/i.test(sql)) {
+                throw new Error(`Unaliased derived subquery rejected on MySQL 5.7: ${sql}`);
+            }
+            if (/DELETE\s+FROM\s+[`\w]+\s+WHERE\s+\w+\s+(?:NOT\s+)?IN\s*\(\s*SELECT/i.test(sql)) {
+                throw new Error(`MySQL 5.7 Error 1093/1235 self-subquery DELETE rejected: ${sql}`);
+            }
+            if (/\browid\b/i.test(sql)) {
+                throw new Error(`MySQL 5.7 ER_BAD_FIELD_ERROR Unknown column 'rowid': ${sql}`);
+            }
+            if (/^SELECT\s+[^*,\n]+,\s*\*\s+FROM\b/i.test(sql)) {
+                throw new Error(`MySQL 5.7 Syntax Error 1064: '*' must come first in SELECT list: ${sql}`);
+            }
+            if (/\bMAX\s*\(\s*0\s*,/i.test(sql)) {
+                throw new Error(`MySQL 5.7 rejects 2-arg SQLite MAX(0, x); must use GREATEST(0, x): ${sql}`);
+            }
 
-                if (/^SELECT\s+VERSION\(\)/i.test(sql)) {
-                    return { rows: [{ version: '5.7.44-log' }], affectedRows: 0, insertId: 0 };
-                }
+            if (/^SELECT\s+VERSION\(\)/i.test(sql)) {
+                return { rows: [{ version: '5.7.44-log' }], affectedRows: 0, insertId: 0 };
+            }
 
-                // CREATE TABLE IF NOT EXISTS `tbl` (...)
-                const createMatch = /^CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\s+`([^`]+)`/i.exec(sql);
-                if (createMatch) {
-                    const name = createMatch[1]!;
-                    if (!self.tables.has(name)) {
-                        const aiMatch = /AUTO_INCREMENT\s*=\s*(\d+)/i.exec(sql);
-                        self.tables.set(name, {
-                            autoInc: aiMatch ? Number(aiMatch[1]) : 1,
-                            rows: []
-                        });
+            if (/\bUNION\s+ALL\b/i.test(sql) && /^SELECT\b/i.test(sql)) {
+                const branches = sql.split(/\bUNION\s+ALL\b/i);
+                const allRows: Array<Record<string, unknown>> = [];
+                for (const branch of branches) {
+                    const sub = await execSql(branch.trim(), []);
+                    allRows.push(...sub.rows);
+                }
+                return { rows: allRows, affectedRows: 0, insertId: 0 };
+            }
+
+            // CREATE TABLE IF NOT EXISTS `tbl` (...)
+            const createMatch = /^CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\s+`([^`]+)`/i.exec(sql);
+            if (createMatch) {
+                const name = createMatch[1]!;
+                if (!self.tables.has(name)) {
+                    const aiMatch = /AUTO_INCREMENT\s*=\s*(\d+)/i.exec(sql);
+                    const autoColMatch = /`(\w+)`\s+BIGINT\s+NOT\s+NULL\s+AUTO_INCREMENT/i.exec(sql);
+                    const autoCol = autoColMatch ? autoColMatch[1]! : null;
+                    const uniqueGroups: string[][] = [];
+                    const pkMatch = /PRIMARY\s+KEY\s*\(([^)]+)\)/i.exec(sql);
+                    if (pkMatch) {
+                        uniqueGroups.push(pkMatch[1]!.split(',').map((c) => c.trim().replace(/^`|`$/g, '')));
                     }
-                    return { rows: [], affectedRows: 0, insertId: 0 };
+                    const ukRe = /UNIQUE\s+KEY\s+`[^`]+`\s*\(([^)]+)\)/gi;
+                    let ukm: RegExpExecArray | null;
+                    while ((ukm = ukRe.exec(sql)) !== null) {
+                        uniqueGroups.push(ukm[1]!.split(',').map((c) => c.trim().replace(/^`|`$/g, '')));
+                    }
+                    self.tables.set(name, {
+                        autoInc: aiMatch ? Number(aiMatch[1]) : 1,
+                        autoCol,
+                        uniqueGroups: uniqueGroups.length > 0 ? uniqueGroups : [['chunk_key']],
+                        rows: []
+                    });
+                }
+                return { rows: [], affectedRows: 0, insertId: 0 };
+            }
+
+            // information_schema.TABLES size lookup
+            if (/FROM\s+information_schema\.TABLES/i.test(sql)) {
+                const targetNames = new Set(params.slice(1).map((x) => String(x).toLowerCase()));
+                const out: Array<Record<string, unknown>> = [];
+                for (const [name, t] of self.tables.entries()) {
+                    if (!targetNames.has(name.toLowerCase())) continue;
+                    const bytes = t.rows.reduce((sum, r) => sum + JSON.stringify(r).length + 64, 16384);
+                    out.push({
+                        table_name: self.lowercaseInfoSchemaNames ? name.toLowerCase() : name,
+                        total_bytes: bytes
+                    });
+                }
+                return { rows: out, affectedRows: 0, insertId: 0 };
+            }
+
+            // INSERT [IGNORE] / REPLACE INTO `tbl` (cols...) VALUES (...)[, (...)] [ON DUPLICATE KEY UPDATE ...]
+            const insertMatch =
+                /^(INSERT\s+(?:IGNORE\s+)?|REPLACE\s+)INTO\s+`([^`]+)`\s*\(([^)]+)\)\s*VALUES\s*([\s\S]+?)(?:\s+ON\s+DUPLICATE\s+KEY\s+UPDATE([\s\S]*))?$/i.exec(
+                    sql
+                );
+            if (insertMatch) {
+                const verbPrefix = insertMatch[1]!.trim().toUpperCase();
+                const isReplace = verbPrefix.startsWith('REPLACE');
+                const isIgnore = verbPrefix.includes('IGNORE');
+                const tblName = insertMatch[2]!;
+                const cols = insertMatch[3]!.split(',').map((c) => c.trim().replace(/^`|`$/g, ''));
+                const valuesSpec = insertMatch[4]!;
+                const upsertClause = insertMatch[5] ?? '';
+                const isUpsert = Boolean(upsertClause);
+                const tbl = self.tables.get(tblName);
+                if (!tbl) throw new Error(`Table '${tblName}' doesn't exist`);
+
+                const isUserRollup = tblName.endsWith('gamelog_user_rollup');
+                const isWorldRollup = tblName.endsWith('gamelog_world_rollup');
+                const tuples = splitBalancedTuples(valuesSpec);
+                const pCursor = { idx: 0 };
+                let totalAffected = 0;
+                let lastInsertId = 0;
+
+                for (const tupleExprs of tuples) {
+                    const row: Record<string, unknown> = {};
+                    cols.forEach((c, cIdx) => {
+                        const rawExpr = (tupleExprs[cIdx] ?? '?').trim();
+                        if (rawExpr === '?') {
+                            row[c] = params[pCursor.idx++];
+                        } else if (/^GREATEST\s*\(\s*0\s*,\s*\?\s*\)$/i.test(rawExpr)) {
+                            row[c] = Math.max(0, Number(params[pCursor.idx++] ?? 0) || 0);
+                        } else if (/^'(?:[^']*)'$/.test(rawExpr)) {
+                            row[c] = rawExpr.slice(1, -1);
+                        } else if (/^-?\d+(?:\.\d+)?$/.test(rawExpr)) {
+                            row[c] = Number(rawExpr);
+                        } else if (/^NULL$/i.test(rawExpr)) {
+                            row[c] = null;
+                        } else {
+                            row[c] = params[pCursor.idx++];
+                        }
+                    });
+
+                    const matchValEq = (col: string, a: unknown, b: unknown): boolean => {
+                        if (col === 'local_filename') {
+                            return String(a ?? '').toLowerCase() === String(b ?? '').toLowerCase();
+                        }
+                        return a === b;
+                    };
+                    const existingIdx = tbl.rows.findIndex((existing) =>
+                        tbl.uniqueGroups.some((grp) => {
+                            if (grp.some((col) => row[col] === undefined)) return false;
+                            return grp.every((col) => matchValEq(col, existing[col], row[col]));
+                        })
+                    );
+
+                    if (existingIdx >= 0) {
+                        if (isReplace) {
+                            tbl.rows[existingIdx] = { ...tbl.rows[existingIdx], ...row };
+                            totalAffected += 2;
+                            continue;
+                        }
+                        if (isUpsert) {
+                            const prev = tbl.rows[existingIdx]!;
+                            if (isWorldRollup) {
+                                const prevLast = String(prev.last_visit ?? '');
+                                const incLast = String(row.last_visit ?? '');
+                                const incName = String(row.world_name ?? '');
+                                const prevName = String(prev.world_name ?? '');
+                                tbl.rows[existingIdx] = {
+                                    ...prev,
+                                    world_name:
+                                        incName && incLast >= prevLast ? incName : prevName || incName,
+                                    visit_count:
+                                        (Number(prev.visit_count ?? 0) || 0) + (Number(row.visit_count ?? 0) || 0),
+                                    total_time:
+                                        (Number(prev.total_time ?? 0) || 0) + (Number(row.total_time ?? 0) || 0),
+                                    last_visit: incLast > prevLast ? incLast : prevLast
+                                };
+                            } else if (
+                                isUserRollup &&
+                                /\bjoin_count\s*=\s*(?:`?\w+`?\.)?join_count\s*\+/i.test(upsertClause)
+                            ) {
+                                const prevLast = String(prev.last_seen ?? '');
+                                const prevSecond = String(prev.second_last_seen ?? '');
+                                const incLast = String(row.last_seen ?? '');
+                                const incSecond = String(row.second_last_seen ?? '');
+                                const incName = String(row.display_name ?? '');
+                                const prevName = String(prev.display_name ?? '');
+                                const nextSecond =
+                                    incLast > prevLast
+                                        ? incSecond > prevLast
+                                            ? incSecond
+                                            : prevLast
+                                        : incLast === prevLast
+                                          ? incSecond > prevSecond
+                                              ? incSecond
+                                              : prevSecond
+                                          : incLast > prevSecond
+                                            ? incLast
+                                            : prevSecond;
+                                const nextLast = incLast > prevLast ? incLast : prevLast;
+                                tbl.rows[existingIdx] = {
+                                    ...prev,
+                                    display_name:
+                                        incName && incLast >= prevLast ? incName : prevName || incName,
+                                    join_count:
+                                        (Number(prev.join_count ?? 0) || 0) + (Number(row.join_count ?? 0) || 0),
+                                    time_spent:
+                                        (Number(prev.time_spent ?? 0) || 0) + (Number(row.time_spent ?? 0) || 0),
+                                    last_seen: nextLast,
+                                    second_last_seen: nextSecond
+                                };
+                            } else {
+                                const next = { ...prev };
+                                const assigns = splitTopLevelComma(upsertClause);
+                                for (const assign of assigns) {
+                                    const eqPos = assign.indexOf('=');
+                                    if (eqPos === -1) continue;
+                                    const lhsCol = assign
+                                        .slice(0, eqPos)
+                                        .trim()
+                                        .replace(/^(?:`[^`]+`\.)?`?(\w+)`?$/i, '$1');
+                                    const rhs = assign.slice(eqPos + 1).trim();
+                                    if (rhs.toUpperCase().startsWith('CASE')) {
+                                        const caseMatch =
+                                            /WHEN\s+VALUES\(`?(\w+)`?\)\s*(>=|>)\s*(?:`[^`]+`\.)?`?(\w+)`?\s+THEN\s+VALUES\(`?(\w+)`?\)\s+ELSE\s+(?:`[^`]+`\.)?`?(\w+)`?/i.exec(
+                                                rhs
+                                            );
+                                        if (caseMatch) {
+                                            const cmpLeft = String(row[caseMatch[1]!] ?? '');
+                                            const cmpRight = String(next[caseMatch[3]!] ?? '');
+                                            const cond = caseMatch[2] === '>=' ? cmpLeft >= cmpRight : cmpLeft > cmpRight;
+                                            next[lhsCol] = cond ? row[caseMatch[4]!] : next[caseMatch[5]!];
+                                        }
+                                    } else if (/GREATEST\s*\(\s*0\s*,\s*(?:`?(\w+)`?\s*\+\s*\?)\s*\)/i.test(rhs)) {
+                                        const delta = Number(params[pCursor.idx++] ?? 0) || 0;
+                                        next[lhsCol] = Math.max(0, (Number(next[lhsCol] ?? 0) || 0) + delta);
+                                    } else if (/GREATEST\s*\(\s*`?(\w+)`?\s*,\s*VALUES\(`?(\w+)`?\)\s*\)/i.test(rhs)) {
+                                        next[lhsCol] = Math.max(
+                                            Number(next[lhsCol] ?? 0) || 0,
+                                            Number(row[lhsCol] ?? 0) || 0
+                                        );
+                                    } else if (/^\s*`?\w+`?\s*\+\s*VALUES\(`?(\w+)`?\)\s*$/i.test(rhs)) {
+                                        const vCol = /\+\s*VALUES\(`?(\w+)`?\)/i.exec(rhs)![1]!;
+                                        next[lhsCol] = (Number(next[lhsCol] ?? 0) || 0) + (Number(row[vCol] ?? 0) || 0);
+                                    } else if (/^\s*VALUES\(`?(\w+)`?\)\s*$/i.test(rhs)) {
+                                        const vCol = /VALUES\(`?(\w+)`?\)/i.exec(rhs)![1]!;
+                                        next[lhsCol] = row[vCol];
+                                    } else if (rhs === '?') {
+                                        next[lhsCol] = params[pCursor.idx++];
+                                    }
+                                }
+                                tbl.rows[existingIdx] = next;
+                            }
+                            totalAffected += 2;
+                            continue;
+                        }
+                        if (isIgnore) continue;
+                        throw new Error(`Duplicate entry in '${tblName}'`);
+                    }
+
+                    if (tbl.autoCol) {
+                        if (typeof row[tbl.autoCol] === 'number' && Number(row[tbl.autoCol]) > 0) {
+                            lastInsertId = Number(row[tbl.autoCol]);
+                            if (lastInsertId >= tbl.autoInc) tbl.autoInc = lastInsertId + 1;
+                        } else {
+                            lastInsertId = tbl.autoInc++;
+                            row[tbl.autoCol] = lastInsertId;
+                        }
+                    }
+                    tbl.rows.push(row);
+                    totalAffected += 1;
+                }
+                return { rows: [], affectedRows: totalAffected, insertId: lastInsertId };
+            }
+
+            // UPDATE [IGNORE] `tbl` SET ... WHERE ...
+            const updateMatch = /^UPDATE\s+(IGNORE\s+)?`([^`]+)`\s+SET\s+([\s\S]+?)\s+WHERE\s+([\s\S]+)$/i.exec(sql);
+            if (updateMatch) {
+                const isUpdateIgnore = Boolean(updateMatch[1]);
+                const tblName = updateMatch[2]!;
+                const setStr = updateMatch[3]!;
+                const whereStr = updateMatch[4]!;
+                const tbl = self.tables.get(tblName);
+                if (!tbl) throw new Error(`Table '${tblName}' doesn't exist`);
+                const setParts = splitTopLevelComma(setStr);
+                let setParamCursor = 0;
+                const setAssigns = setParts.map((part) => {
+                    const eqIdx = part.indexOf('=');
+                    const col = part.slice(0, eqIdx).trim().replace(/^`|`$/g, '');
+                    const rhs = part.slice(eqIdx + 1).trim();
+                    const qCount = (rhs.match(/\?/g) ?? []).length;
+                    const partParams = params.slice(setParamCursor, setParamCursor + qCount);
+                    setParamCursor += qCount;
+                    const isGreatestDelta = /^GREATEST\s*\(\s*0\s*,/i.test(rhs);
+                    const isAddDelta = new RegExp(`^\`?${col}\`?\\s*\\+\\s*\\?$`, 'i').test(rhs);
+                    const isNonEmptyCase = /^CASE\s+WHEN\s+\?\s*!=\s*''\s+THEN\s+\?\s+ELSE\s+`?\w+`?\s+END$/i.test(rhs);
+                    return { col, partParams, isGreatestDelta, isAddDelta, isNonEmptyCase };
+                });
+                const whereParams = params.slice(setParamCursor);
+                let changes = 0;
+                for (let idx = 0; idx < tbl.rows.length; idx++) {
+                    const row = tbl.rows[idx]!;
+                    if (matchWhereClause(row, whereStr, whereParams)) {
+                        const candidate = { ...row };
+                        for (const a of setAssigns) {
+                            if (a.isGreatestDelta) {
+                                candidate[a.col] = Math.max(
+                                    0,
+                                    (Number(row[a.col] ?? 0) || 0) + (Number(a.partParams[0] ?? 0) || 0)
+                                );
+                            } else if (a.isAddDelta) {
+                                candidate[a.col] =
+                                    (Number(row[a.col] ?? 0) || 0) + (Number(a.partParams[0] ?? 0) || 0);
+                            } else if (a.isNonEmptyCase) {
+                                const v = String(a.partParams[0] ?? '');
+                                candidate[a.col] = v !== '' ? a.partParams[1] : row[a.col];
+                            } else {
+                                candidate[a.col] = a.partParams[0];
+                            }
+                        }
+                        const collides = tbl.rows.some((other, otherIdx) => {
+                            if (otherIdx === idx) return false;
+                            return tbl.uniqueGroups.some((grp) => {
+                                if (grp.some((col) => candidate[col] === undefined)) return false;
+                                return grp.every((col) => other[col] === candidate[col]);
+                            });
+                        });
+                        if (collides) {
+                            if (isUpdateIgnore) continue;
+                            throw new Error(`Duplicate entry on UPDATE in '${tblName}'`);
+                        }
+                        tbl.rows[idx] = candidate;
+                        changes++;
+                    }
+                }
+                return { rows: [], affectedRows: changes, insertId: 0 };
+            }
+
+            // DELETE FROM `tbl` [WHERE ...] [ORDER BY ...] [LIMIT ?]
+            const deleteMatch =
+                /^DELETE\s+FROM\s+`([^`]+)`(?:\s+WHERE\s+([\s\S]+?))?(?:\s+ORDER\s+BY\s+([\s\S]+?))?(?:\s+LIMIT\s+(\?|\d+))?$/i.exec(
+                    sql
+                );
+            if (deleteMatch) {
+                const tblName = deleteMatch[1]!;
+                const whereStr = deleteMatch[2];
+                const orderStr = deleteMatch[3];
+                const limitTok = deleteMatch[4];
+                const tbl = self.tables.get(tblName);
+                if (!tbl) throw new Error(`Table '${tblName}' doesn't exist`);
+
+                let limitNum: number | null = null;
+                let whereParams = params;
+                if (limitTok === '?') {
+                    const rawLim = params[params.length - 1];
+                    if (typeof rawLim !== 'number' || !Number.isInteger(rawLim)) {
+                        throw new Error(`MySQL 5.7 LIMIT requires integer, got ${typeof rawLim}`);
+                    }
+                    limitNum = rawLim;
+                    whereParams = params.slice(0, -1);
+                } else if (limitTok) {
+                    limitNum = Number(limitTok);
                 }
 
-                // information_schema.TABLES size lookup
-                if (/FROM\s+information_schema\.TABLES/i.test(sql)) {
-                    const targetNames = new Set(params.slice(1).map((x) => String(x).toLowerCase()));
+                const matching = tbl.rows.filter((r) => !whereStr || matchWhereClause(r, whereStr, whereParams));
+                if (orderStr) sortRows(matching, orderStr);
+                const toRemove = new Set(limitNum !== null ? matching.slice(0, limitNum) : matching);
+                tbl.rows = tbl.rows.filter((r) => !toRemove.has(r));
+                return { rows: [], affectedRows: toRemove.size, insertId: 0 };
+            }
+
+            // SELECT ... FROM `tbl` [WHERE ...] [GROUP BY ...] [ORDER BY ...] [LIMIT ...]
+            const selectMatch =
+                /^SELECT\s+([\s\S]+?)\s+FROM\s+`([^`]+)`(?:\s+WHERE\s+([\s\S]+?))?(?:\s+GROUP\s+BY\s+([^\s]+))?(?:\s+ORDER\s+BY\s+([\s\S]+?))?(?:\s+LIMIT\s+(\?|\d+))?$/i.exec(
+                    sql
+                );
+            if (selectMatch) {
+                const selectExpr = selectMatch[1]!.trim();
+                const tblName = selectMatch[2]!;
+                const whereStr = selectMatch[3];
+                const groupCol = selectMatch[4]?.replace(/^`|`$/g, '');
+                const orderStr = selectMatch[5];
+                const limitTok = selectMatch[6];
+                const tbl = self.tables.get(tblName);
+                if (!tbl) throw new Error(`Table '${tblName}' doesn't exist`);
+
+                let limitNum: number | null = null;
+                let whereParams = params;
+                if (limitTok === '?') {
+                    const rawLim = params[params.length - 1];
+                    if (typeof rawLim !== 'number' || !Number.isInteger(rawLim)) {
+                        throw new Error(`MySQL 5.7 LIMIT requires integer, got ${typeof rawLim}`);
+                    }
+                    limitNum = rawLim;
+                    whereParams = params.slice(0, -1);
+                } else if (limitTok) {
+                    limitNum = Number(limitTok);
+                }
+
+                const filtered = tbl.rows.filter((r) => !whereStr || matchWhereClause(r, whereStr, whereParams));
+
+                // GROUP BY aggregate
+                if (groupCol) {
+                    const groups = new Map<string, Array<Record<string, unknown>>>();
+                    for (const r of filtered) {
+                        const k = String(r[groupCol] ?? '');
+                        const arr = groups.get(k) ?? [];
+                        arr.push(r);
+                        groups.set(k, arr);
+                    }
+                    let groupOutKey = groupCol;
+                    const aliasRe = new RegExp(`^` + '`?' + groupCol + '`?' + `\\s+AS\\s+` + '`?(\\w+)`?$', 'i');
+                    for (const p of splitTopLevelComma(selectExpr)) {
+                        const am = aliasRe.exec(p.trim());
+                        if (am) {
+                            groupOutKey = am[1]!;
+                            break;
+                        }
+                    }
                     const out: Array<Record<string, unknown>> = [];
-                    for (const [name, t] of self.tables.entries()) {
-                        if (!targetNames.has(name.toLowerCase())) continue;
-                        const bytes = t.rows.reduce((sum, r) => sum + JSON.stringify(r).length + 64, 16384);
-                        out.push({
-                            table_name: self.lowercaseInfoSchemaNames ? name.toLowerCase() : name,
-                            total_bytes: bytes
-                        });
+                    for (const [k, gRows] of groups.entries()) {
+                        const rec: Record<string, unknown> = { [groupOutKey]: k };
+                        applyAggregates(selectExpr, gRows, rec);
+                        out.push(rec);
                     }
                     return { rows: out, affectedRows: 0, insertId: 0 };
                 }
 
-                // INSERT [IGNORE] / REPLACE INTO `tbl` (cols...) VALUES (...)[, (...)] [ON DUPLICATE KEY UPDATE ...]
-                const insertMatch =
-                    /^(INSERT\s+(?:IGNORE\s+)?|REPLACE\s+)INTO\s+`([^`]+)`\s*\(([^)]+)\)\s*VALUES\s*([\s\S]+?)(?:\s+ON\s+DUPLICATE\s+KEY\s+UPDATE([\s\S]*))?$/i.exec(
-                        sql
-                    );
-                if (insertMatch) {
-                    const verbPrefix = insertMatch[1]!.trim().toUpperCase();
-                    const isReplace = verbPrefix.startsWith('REPLACE');
-                    const isIgnore = verbPrefix.includes('IGNORE');
-                    const tblName = insertMatch[2]!;
-                    const cols = insertMatch[3]!.split(',').map((c) => c.trim().replace(/^`|`$/g, ''));
-                    const valuesSpec = insertMatch[4]!;
-                    const upsertClause = insertMatch[5] ?? '';
-                    const isUpsert = Boolean(upsertClause);
-                    const tbl = self.tables.get(tblName);
-                    if (!tbl) throw new Error(`Table '${tblName}' doesn't exist`);
-
-                    const tupleMatches = valuesSpec.match(/\([^)]+\)/g) ?? [];
-                    const rowCount = Math.max(1, tupleMatches.length);
-                    const isCache = tblName.endsWith('vrc_api_cache');
-                    const isUserRollup = tblName.endsWith('gamelog_user_rollup');
-                    const isWorldRollup = tblName.endsWith('gamelog_world_rollup');
-                    const uniqCol = isCache
-                        ? 'cache_key'
-                        : isUserRollup
-                          ? 'user_id'
-                          : isWorldRollup
-                            ? 'world_id'
-                            : 'chunk_key';
-                    const hasAutoId = !isCache && !isUserRollup && !isWorldRollup;
-
-                    let totalAffected = 0;
-                    let lastInsertId = 0;
-                    for (let rIdx = 0; rIdx < rowCount; rIdx++) {
-                        const row: Record<string, unknown> = {};
-                        cols.forEach((c, cIdx) => {
-                            row[c] = params[rIdx * cols.length + cIdx];
-                        });
-                        const existingIdx = tbl.rows.findIndex((r) => r[uniqCol] === row[uniqCol]);
-                        if (existingIdx >= 0) {
-                            if (isReplace) {
-                                tbl.rows[existingIdx] = { ...row };
-                                totalAffected += 2;
-                                continue;
-                            }
-                            if (isUpsert) {
-                                const prev = tbl.rows[existingIdx]!;
-                                if (isWorldRollup) {
-                                    const prevLast = String(prev.last_visit ?? '');
-                                    const incLast = String(row.last_visit ?? '');
-                                    const incName = String(row.world_name ?? '');
-                                    const prevName = String(prev.world_name ?? '');
-                                    tbl.rows[existingIdx] = {
-                                        ...prev,
-                                        world_name:
-                                            incName && incLast >= prevLast
-                                                ? incName
-                                                : prevName || incName,
-                                        visit_count:
-                                            (Number(prev.visit_count ?? 0) || 0) + (Number(row.visit_count ?? 0) || 0),
-                                        total_time:
-                                            (Number(prev.total_time ?? 0) || 0) + (Number(row.total_time ?? 0) || 0),
-                                        last_visit: incLast > prevLast ? incLast : prevLast
-                                    };
-                                } else {
-                                    tbl.rows[existingIdx] = { ...prev, ...row };
-                                }
-                                totalAffected += 2;
-                                continue;
-                            }
-                            if (isIgnore) continue;
-                            throw new Error(`Duplicate entry for key '${uniqCol}'`);
-                        }
-                        if (hasAutoId) {
-                            lastInsertId = tbl.autoInc++;
-                            row.id = lastInsertId;
-                        }
-                        tbl.rows.push(row);
-                        totalAffected += 1;
+                // Scalar aggregate without GROUP BY (preserve literal string projections like `'vrc_api_cache' AS tbl_key`)
+                if (/\b(COUNT|SUM|MIN|MAX)\s*\(/i.test(selectExpr)) {
+                    const rec: Record<string, unknown> = {};
+                    for (const part of splitTopLevelComma(selectExpr)) {
+                        const litMatch = /^'([^']*)'\s+AS\s+`?(\w+)`?\s*$/i.exec(part);
+                        if (litMatch) rec[litMatch[2]!] = litMatch[1]!;
                     }
-                    return { rows: [], affectedRows: totalAffected, insertId: lastInsertId };
+                    applyAggregates(selectExpr, filtered, rec);
+                    return { rows: [rec], affectedRows: 0, insertId: 0 };
                 }
 
-                // UPDATE `tbl` SET ... WHERE ...
-                const updateMatch = /^UPDATE\s+`([^`]+)`\s+SET\s+([\s\S]+?)\s+WHERE\s+([\s\S]+)$/i.exec(sql);
-                if (updateMatch) {
-                    const tblName = updateMatch[1]!;
-                    const setStr = updateMatch[2]!;
-                    const whereStr = updateMatch[3]!;
-                    const tbl = self.tables.get(tblName);
-                    if (!tbl) throw new Error(`Table '${tblName}' doesn't exist`);
-                    const setParts = splitTopLevelComma(setStr);
-                    const setAssigns = setParts.map((part) => {
-                        const eqIdx = part.indexOf('=');
-                        const col = part.slice(0, eqIdx).trim().replace(/^`|`$/g, '');
-                        const rhs = part.slice(eqIdx + 1).trim();
-                        const isGreatestDelta = /^GREATEST\s*\(\s*0\s*,/i.test(rhs);
-                        return { col, isGreatestDelta };
-                    });
-                    const setParams = params.slice(0, setAssigns.length);
-                    const whereParams = params.slice(setAssigns.length);
-                    let changes = 0;
-                    for (const row of tbl.rows) {
-                        if (matchWhereClause(row, whereStr, whereParams)) {
-                            setAssigns.forEach((a, i) => {
-                                if (a.isGreatestDelta) {
-                                    row[a.col] = Math.max(0, (Number(row[a.col] ?? 0) || 0) + (Number(setParams[i] ?? 0) || 0));
-                                } else {
-                                    row[a.col] = setParams[i];
-                                }
-                            });
-                            changes++;
-                        }
-                    }
-                    return { rows: [], affectedRows: changes, insertId: 0 };
-                }
+                const list = filtered.map((r) => ({ ...r }));
+                if (orderStr) sortRows(list, orderStr);
+                const sliced = limitNum !== null ? list.slice(0, limitNum) : list;
+                const projected = projectColumns(selectExpr, sliced);
+                return { rows: projected, affectedRows: 0, insertId: 0 };
+            }
 
-                // DELETE FROM `tbl` [WHERE ...] [ORDER BY ...] [LIMIT ?]
-                const deleteMatch =
-                    /^DELETE\s+FROM\s+`([^`]+)`(?:\s+WHERE\s+([\s\S]+?))?(?:\s+ORDER\s+BY\s+([\s\S]+?))?(?:\s+LIMIT\s+(\?|\d+))?$/i.exec(
-                        sql
-                    );
-                if (deleteMatch) {
-                    const tblName = deleteMatch[1]!;
-                    const whereStr = deleteMatch[2];
-                    const orderStr = deleteMatch[3];
-                    const limitTok = deleteMatch[4];
-                    const tbl = self.tables.get(tblName);
-                    if (!tbl) throw new Error(`Table '${tblName}' doesn't exist`);
+            throw new Error(`FakeMysql57Server unsupported SQL: ${sql}`);
+        };
 
-                    let limitNum: number | null = null;
-                    let whereParams = params;
-                    if (limitTok === '?') {
-                        const rawLim = params[params.length - 1];
-                        if (typeof rawLim !== 'number' || !Number.isInteger(rawLim)) {
-                            throw new Error(`MySQL 5.7 LIMIT requires integer, got ${typeof rawLim}`);
-                        }
-                        limitNum = rawLim;
-                        whereParams = params.slice(0, -1);
-                    } else if (limitTok) {
-                        limitNum = Number(limitTok);
-                    }
-
-                    const matching = tbl.rows.filter((r) => !whereStr || matchWhereClause(r, whereStr, whereParams));
-                    if (orderStr) sortRows(matching, orderStr);
-                    const toRemove = new Set(limitNum !== null ? matching.slice(0, limitNum) : matching);
-                    tbl.rows = tbl.rows.filter((r) => !toRemove.has(r));
-                    return { rows: [], affectedRows: toRemove.size, insertId: 0 };
-                }
-
-                // SELECT ... FROM `tbl` [WHERE ...] [GROUP BY ...] [ORDER BY ...] [LIMIT ...]
-                const selectMatch =
-                    /^SELECT\s+([\s\S]+?)\s+FROM\s+`([^`]+)`(?:\s+WHERE\s+([\s\S]+?))?(?:\s+GROUP\s+BY\s+([^\s]+))?(?:\s+ORDER\s+BY\s+([\s\S]+?))?(?:\s+LIMIT\s+(\?|\d+))?$/i.exec(
-                        sql
-                    );
-                if (selectMatch) {
-                    const selectExpr = selectMatch[1]!.trim();
-                    const tblName = selectMatch[2]!;
-                    const whereStr = selectMatch[3];
-                    const groupCol = selectMatch[4]?.replace(/^`|`$/g, '');
-                    const orderStr = selectMatch[5];
-                    const limitTok = selectMatch[6];
-                    const tbl = self.tables.get(tblName);
-                    if (!tbl) throw new Error(`Table '${tblName}' doesn't exist`);
-
-                    let limitNum: number | null = null;
-                    let whereParams = params;
-                    if (limitTok === '?') {
-                        const rawLim = params[params.length - 1];
-                        if (typeof rawLim !== 'number' || !Number.isInteger(rawLim)) {
-                            throw new Error(`MySQL 5.7 LIMIT requires integer, got ${typeof rawLim}`);
-                        }
-                        limitNum = rawLim;
-                        whereParams = params.slice(0, -1);
-                    } else if (limitTok) {
-                        limitNum = Number(limitTok);
-                    }
-
-                    const filtered = tbl.rows.filter((r) => !whereStr || matchWhereClause(r, whereStr, whereParams));
-
-                    // GROUP BY aggregate
-                    if (groupCol) {
-                        const groups = new Map<string, Array<Record<string, unknown>>>();
-                        for (const r of filtered) {
-                            const k = String(r[groupCol] ?? '');
-                            const arr = groups.get(k) ?? [];
-                            arr.push(r);
-                            groups.set(k, arr);
-                        }
-                        let groupOutKey = groupCol;
-                        const aliasRe = new RegExp(`^` + '`?' + groupCol + '`?' + `\\s+AS\\s+` + '`?(\\w+)`?$', 'i');
-                        for (const p of splitTopLevelComma(selectExpr)) {
-                            const am = aliasRe.exec(p.trim());
-                            if (am) {
-                                groupOutKey = am[1]!;
-                                break;
-                            }
-                        }
-                        const out: Array<Record<string, unknown>> = [];
-                        for (const [k, gRows] of groups.entries()) {
-                            const rec: Record<string, unknown> = { [groupOutKey]: k };
-                            applyAggregates(selectExpr, gRows, rec);
-                            out.push(rec);
-                        }
-                        return { rows: out, affectedRows: 0, insertId: 0 };
-                    }
-
-                    // Scalar aggregate without GROUP BY
-                    if (/\b(COUNT|SUM|MIN|MAX)\s*\(/i.test(selectExpr)) {
-                        const rec: Record<string, unknown> = {};
-                        applyAggregates(selectExpr, filtered, rec);
-                        return { rows: [rec], affectedRows: 0, insertId: 0 };
-                    }
-
-                    const list = filtered.map((r) => ({ ...r }));
-                    if (orderStr) sortRows(list, orderStr);
-                    const sliced = limitNum !== null ? list.slice(0, limitNum) : list;
-                    const projected = projectColumns(selectExpr, sliced);
-                    return { rows: projected, affectedRows: 0, insertId: 0 };
-                }
-
-                throw new Error(`FakeMysql57Server unsupported SQL: ${sql}`);
-            },
+        return {
+            execute: execSql,
             async close(): Promise<void> {
                 if (!closed) {
                     closed = true;
@@ -345,66 +517,199 @@ class FakeMysql57Server {
     }
 }
 
-function matchWhereClause(row: Record<string, unknown>, whereStr: string, params: unknown[]): boolean {
-    let pIdx = 0;
-    const clauses = whereStr
-        .split(/\s+AND\s+/i)
-        .map((s) => s.trim())
-        .filter(Boolean);
+function splitBalancedTuples(valuesSpec: string): string[][] {
+    const tuples: string[][] = [];
+    let i = 0;
+    while (i < valuesSpec.length) {
+        if (valuesSpec[i] !== '(') {
+            i++;
+            continue;
+        }
+        let depth = 1;
+        const start = i + 1;
+        i++;
+        let inQuote = false;
+        while (i < valuesSpec.length && depth > 0) {
+            const ch = valuesSpec[i]!;
+            if (ch === "'" && valuesSpec[i - 1] !== '\\') {
+                inQuote = !inQuote;
+            } else if (!inQuote) {
+                if (ch === '(') depth++;
+                else if (ch === ')') depth--;
+            }
+            i++;
+        }
+        const inner = valuesSpec.slice(start, i - 1);
+        tuples.push(splitTopLevelComma(inner));
+    }
+    return tuples;
+}
 
-    for (const rawClause of clauses) {
-        const clause = rawClause.replace(/^\(([\s\S]*)\)$/, '$1').trim();
-        let m: RegExpMatchArray | null;
-
-        // `col` IN (?, ?, ...)
-        if ((m = /^`?(\w+)`?\s+IN\s*\(([^)]+)\)$/i.exec(clause))) {
-            const col = m[1]!;
-            const items = m[2]!.split(',').map((t) => {
-                const trimmed = t.trim();
-                if (trimmed === '?') return params[pIdx++];
-                return trimmed.replace(/^'|'$/g, '');
-            });
-            if (!items.includes(row[col])) return false;
+function splitAtTopLevelKeyword(expr: string, keyword: 'OR' | 'AND'): string[] {
+    const parts: string[] = [];
+    let depth = 0;
+    let inQuote = false;
+    let start = 0;
+    const kwLen = keyword.length;
+    for (let i = 0; i < expr.length; i++) {
+        const ch = expr[i]!;
+        if (ch === "'") {
+            inQuote = !inQuote;
             continue;
         }
-        // `col` NOT LIKE 'gz:%'
-        if ((m = /^`?(\w+)`?\s+NOT\s+LIKE\s+'([^']*)'$/i.exec(clause))) {
-            const val = String(row[m[1]!] ?? '');
-            const prefix = m[2]!.replace(/%$/, '');
-            if (val.startsWith(prefix)) return false;
+        if (inQuote) continue;
+        if (ch === '(') {
+            depth++;
             continue;
         }
-        // LENGTH(col) >= ?
-        if ((m = /^LENGTH\(`?(\w+)`?\)\s*>=\s*\?$/i.exec(clause))) {
-            const target = Number(params[pIdx++]);
-            if (String(row[m[1]!] ?? '').length < target) return false;
+        if (ch === ')') {
+            depth = Math.max(0, depth - 1);
             continue;
         }
-        // `col` op ? or 'literal' or number
-        if ((m = /^`?(\w+)`?\s*(=|!=|<>|<=|>=|<|>)\s*(\?|'[^']*'|\d+)$/i.exec(clause))) {
-            const col = m[1]!;
-            const op = m[2]!;
-            const rhsRaw = m[3]!;
-            const rhs = rhsRaw === '?' ? params[pIdx++] : rhsRaw.startsWith("'") ? rhsRaw.slice(1, -1) : Number(rhsRaw);
-            const lhs = row[col];
-            const cmp =
-                typeof lhs === 'number' && typeof rhs === 'number'
-                    ? lhs - rhs
-                    : String(lhs ?? '') < String(rhs ?? '')
-                      ? -1
-                      : String(lhs ?? '') > String(rhs ?? '')
-                        ? 1
-                        : 0;
-            if (op === '=' && cmp !== 0) return false;
-            if ((op === '!=' || op === '<>') && cmp === 0) return false;
-            if (op === '<' && !(cmp < 0)) return false;
-            if (op === '<=' && !(cmp <= 0)) return false;
-            if (op === '>' && !(cmp > 0)) return false;
-            if (op === '>=' && !(cmp >= 0)) return false;
-            continue;
+        if (
+            depth === 0 &&
+            i > 0 &&
+            i + kwLen < expr.length &&
+            /\s/.test(expr[i - 1]!) &&
+            /\s/.test(expr[i + kwLen]!) &&
+            expr.slice(i, i + kwLen).toUpperCase() === keyword
+        ) {
+            parts.push(expr.slice(start, i).trim());
+            start = i + kwLen;
+            i += kwLen - 1;
         }
     }
+    parts.push(expr.slice(start).trim());
+    return parts.filter(Boolean);
+}
+
+function stripOuterParens(expr: string): string {
+    let s = expr.trim();
+    while (s.startsWith('(') && s.endsWith(')')) {
+        let depth = 0;
+        let inQuote = false;
+        let wrapsAll = true;
+        for (let i = 0; i < s.length; i++) {
+            const ch = s[i]!;
+            if (ch === "'") inQuote = !inQuote;
+            else if (!inQuote) {
+                if (ch === '(') depth++;
+                else if (ch === ')') {
+                    depth--;
+                    if (depth === 0 && i < s.length - 1) {
+                        wrapsAll = false;
+                        break;
+                    }
+                }
+            }
+        }
+        if (!wrapsAll) break;
+        s = s.slice(1, -1).trim();
+    }
+    return s;
+}
+
+function evalWhereExpr(row: Record<string, unknown>, rawExpr: string, cursor: { idx: number }, params: unknown[]): boolean {
+    const expr = stripOuterParens(rawExpr);
+    if (!expr) return true;
+
+    const orParts = splitAtTopLevelKeyword(expr, 'OR');
+    if (orParts.length > 1) {
+        let anyTrue = false;
+        for (const p of orParts) {
+            if (evalWhereExpr(row, p, cursor, params)) anyTrue = true;
+        }
+        return anyTrue;
+    }
+
+    const andParts = splitAtTopLevelKeyword(expr, 'AND');
+    if (andParts.length > 1) {
+        let allTrue = true;
+        for (const p of andParts) {
+            if (!evalWhereExpr(row, p, cursor, params)) allTrue = false;
+        }
+        return allTrue;
+    }
+
+    let m: RegExpMatchArray | null;
+
+    if ((m = /^(?:LOWER\()?`?(\w+)`?\)?\s+IN\s*\(([^)]+)\)$/i.exec(expr))) {
+        const isLower = /^LOWER\(/i.test(expr);
+        const col = m[1]!;
+        const items = m[2]!.split(',').map((t) => {
+            const trimmed = t.trim();
+            if (trimmed === '?') return params[cursor.idx++];
+            return trimmed.replace(/^'|'$/g, '');
+        });
+        const lhsRaw = row[col];
+        const lhs = isLower || col === 'local_filename' ? String(lhsRaw ?? '').toLowerCase() : lhsRaw;
+        return items.some((it) => (isLower || col === 'local_filename' ? String(it ?? '').toLowerCase() === lhs : it === lhs));
+    }
+
+    if ((m = /^`?(\w+)`?\s+NOT\s+LIKE\s+'([^']*)'$/i.exec(expr))) {
+        const val = String(row[m[1]!] ?? '');
+        const prefix = m[2]!.replace(/%$/, '');
+        return !val.startsWith(prefix);
+    }
+
+    if ((m = /^(?:LOWER\()?`?(\w+)`?\)?\s+LIKE\s+\?(?:\s+ESCAPE\s+'(.)')?$/i.exec(expr))) {
+        const isLower = /^LOWER\(/i.test(expr);
+        const col = m[1]!;
+        const pattern = String(params[cursor.idx++] ?? '');
+        const esc = m[2] ?? '!';
+        let regexStr = '^';
+        for (let i = 0; i < pattern.length; i++) {
+            const c = pattern[i]!;
+            if (c === esc && i + 1 < pattern.length) {
+                const next = pattern[++i]!;
+                regexStr += next.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            } else if (c === '%') {
+                regexStr += '.*';
+            } else if (c === '_') {
+                regexStr += '.';
+            } else {
+                regexStr += c.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            }
+        }
+        regexStr += '$';
+        const val = isLower ? String(row[col] ?? '').toLowerCase() : String(row[col] ?? '');
+        return new RegExp(regexStr, 'is').test(val);
+    }
+
+    if ((m = /^LENGTH\(`?(\w+)`?\)\s*>=\s*\?$/i.exec(expr))) {
+        const target = Number(params[cursor.idx++]);
+        return String(row[m[1]!] ?? '').length >= target;
+    }
+
+    if ((m = /^`?(\w+)`?\s*(=|!=|<>|<=|>=|<|>)\s*(\?|'[^']*'|\d+)$/i.exec(expr))) {
+        const col = m[1]!;
+        const op = m[2]!;
+        const rhsRaw = m[3]!;
+        const rhs = rhsRaw === '?' ? params[cursor.idx++] : rhsRaw.startsWith("'") ? rhsRaw.slice(1, -1) : Number(rhsRaw);
+        const rawLhs = row[col];
+        const lhs = col === 'local_filename' ? String(rawLhs ?? '').toLowerCase() : rawLhs;
+        const normRhs = col === 'local_filename' ? String(rhs ?? '').toLowerCase() : rhs;
+        const cmp =
+            typeof lhs === 'number' && typeof normRhs === 'number'
+                ? lhs - normRhs
+                : String(lhs ?? '') < String(normRhs ?? '')
+                  ? -1
+                  : String(lhs ?? '') > String(normRhs ?? '')
+                    ? 1
+                    : 0;
+        if (op === '=') return cmp === 0;
+        if (op === '!=' || op === '<>') return cmp !== 0;
+        if (op === '<') return cmp < 0;
+        if (op === '<=') return cmp <= 0;
+        if (op === '>') return cmp > 0;
+        if (op === '>=') return cmp >= 0;
+    }
+
     return true;
+}
+
+function matchWhereClause(row: Record<string, unknown>, whereStr: string, params: unknown[]): boolean {
+    return evalWhereExpr(row, whereStr, { idx: 0 }, params);
 }
 
 function sortRows(rows: Array<Record<string, unknown>>, orderStr: string): void {
@@ -542,13 +847,14 @@ describe('External MySQL 5.7+ Database Integration (Hybrid New-Writes Mode & Ful
         expect(validateMysqlTablePrefix('bad`prefix').valid).toBe(false);
         expect(validateMysqlTablePrefix('123invalid').valid).toBe(false);
 
-        // MySQL 5.7 DDL safety checks (7 archive chunks + 1 cache + 4 gamelog rollups = 12 tables)
+        // MySQL 5.7 DDL safety checks (7 archive chunks + 1 cache + 4 gamelog rollups + 35 business tables = 47 tables)
         const ddls = buildMysql57SchemaStatements('vrcx_');
-        expect(ddls.length).toBe(12);
+        expect(ddls.length).toBe(47);
         for (const ddl of ddls) {
             expect(ddl).not.toMatch(/utf8mb4_0900_ai_ci/i);
             expect(ddl).toMatch(/ENGINE=InnoDB/i);
-            expect(ddl).toMatch(/COLLATE (?:ascii_bin|utf8mb4_bin)/i);
+            expect(ddl).toMatch(/COLLATE (?:ascii_bin|utf8mb4_bin|utf8mb4_unicode_ci)/i);
+            expect(ddl).not.toMatch(/\b(?:MEDIUM)?TEXT\b[^\n]*\bDEFAULT\b/i);
         }
         for (const archiveDdl of ddls.slice(0, 7)) {
             expect(archiveDdl).toContain(`AUTO_INCREMENT=${MYSQL_CHUNK_AUTO_INCREMENT_START}`);
@@ -691,7 +997,7 @@ describe('External MySQL 5.7+ Database Integration (Hybrid New-Writes Mode & Ful
             };
             expect(testJson.ok).toBe(true);
             expect(testJson.data.mysqlVersion).toBe('5.7.44-log');
-            expect(testJson.data.tablesReady).toBe(12);
+            expect(testJson.data.tablesReady).toBe(47);
 
             // 2. Enable Mode 1: keep existing data in D1, route ALL new writes to MySQL 5.7
             const saveMode1Res = await exports.default.fetch('http://example.com/api/storage/mysql/config', {
@@ -1962,7 +2268,7 @@ describe('External MySQL 5.7+ Database Integration (Hybrid New-Writes Mode & Ful
                 data: { mysqlVersion: string; tablesReady: number; mysqlUsage?: { connected: boolean } };
             };
             expect(okJson.ok).toBe(true);
-            expect(okJson.data.tablesReady).toBe(12);
+            expect(okJson.data.tablesReady).toBe(47);
             expect(okJson.data.mysqlUsage?.connected).toBe(true);
             expect(openedConnections).toBe(1);
 
@@ -2532,6 +2838,1009 @@ describe('External MySQL 5.7+ Database Integration (Hybrid New-Writes Mode & Ful
             await saveExternalDbMigrationState(env, defaultExternalDbMigrationState());
             invalidateExternalDbConfigCache();
             clearMysqlSchemaReadyCache();
+        }
+    });
+
+    it('handles 1000-row high-cardinality gamelog_join_leave and ~480 KiB high-entropy feed_bio batches with zero tail-chunk gunzip/CAS, zero rollup pre-SELECTs, exact out-of-order second_last_seen, and concurrency safety', async () => {
+        await ensureSchemaReady(env);
+        const legacyDb = env.DB_LEGACY!;
+        const fakeMysql = new FakeMysql57Server();
+        setMysqlConnectionFactoryForTests(async () => fakeMysql.createConnection());
+        const headers = { 'Content-Type': 'application/json', Origin: 'http://example.com' };
+
+        const keyRes = await exports.default.fetch('http://example.com/api/agent/sync-key', {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({ deviceName: 'Desktop-1102-Perf-Test' })
+        });
+        expect(keyRes.status).toBe(200);
+        const keyJson = (await keyRes.json()) as { data: { deviceId: string; syncKey: string } };
+        const agentHeaders = {
+            'Content-Type': 'application/json',
+            'X-Sync-Key': keyJson.data.syncKey
+        };
+
+        try {
+            expect(
+                (
+                    await exports.default.fetch('http://example.com/api/storage/mysql/config', {
+                        method: 'PUT',
+                        headers,
+                        body: JSON.stringify({
+                            enabled: true,
+                            mode: 'new_writes_only',
+                            connectionType: 'direct',
+                            host: 'db.example.com',
+                            port: 3306,
+                            database: 'vrcx_db',
+                            username: 'vrcx',
+                            password: 'secret',
+                            sslMode: 'disabled',
+                            tablePrefix: 'vrcx_'
+                        })
+                    })
+                ).status
+            ).toBe(200);
+            expect(
+                (
+                    await exports.default.fetch('http://example.com/api/storage/mysql/test', {
+                        method: 'POST',
+                        headers,
+                        body: JSON.stringify({ useSaved: true })
+                    })
+                ).status
+            ).toBe(200);
+
+            const jobId = 'mig_1102_perf_test';
+            await legacyDb
+                .prepare(
+                    `INSERT INTO legacy_migration_state (state_key, payload_json, updated_at)
+                     VALUES ('job', ?, ?)
+                     ON CONFLICT(state_key) DO UPDATE SET payload_json = excluded.payload_json, updated_at = excluded.updated_at`
+                )
+                .bind(
+                    JSON.stringify({
+                        jobId,
+                        deviceId: keyJson.data.deviceId,
+                        accountPrefix: 'usrperf',
+                        categories: ['gamelog', 'feed'],
+                        concurrency: 4,
+                        status: 'running',
+                        startedAt: '2026-11-28T00:00:00.000Z',
+                        updatedAt: '2026-11-28T00:00:00.000Z',
+                        finishedAt: '',
+                        currentCategory: 'gamelog',
+                        completedCategories: [],
+                        totalEstimatedRows: 3000,
+                        processedRows: 0,
+                        insertedRows: 0,
+                        skippedRows: 0,
+                        estimatedBytes: 2_000_000,
+                        errorMessage: ''
+                    }),
+                    '2026-11-28T00:00:00.000Z'
+                )
+                .run();
+
+            // 1. 1,000 gamelog_join_leave rows across 600 unique users (matches typical public VRChat rooms)
+            const jlItems = Array.from({ length: 1000 }, (_, i) => {
+                const uIdx = i % 600;
+                const day = String((i % 20) + 10).padStart(2, '0');
+                const hh = String(i % 24).padStart(2, '0');
+                const mm = String(i % 60).padStart(2, '0');
+                const ss = String(Math.floor(i / 600) * 30).padStart(2, '0');
+                return {
+                    type: i % 2 === 0 ? 'OnPlayerJoined' : 'OnPlayerLeft',
+                    created_at: `2025-11-${day}T${hh}:${mm}:${ss}.000Z`,
+                    displayName: `PerfUser_${uIdx}_こんにちは🌸`,
+                    location: `wrld_perf_${i % 25}:${1000 + i}~region(jp)`,
+                    userId: `usr_perf_${String(uIdx).padStart(6, '0')}`,
+                    time: 1000
+                };
+            });
+
+            fakeMysql.executedSqls = [];
+            const jlRes = await exports.default.fetch('http://example.com/api/agent/migration/batch', {
+                method: 'POST',
+                headers: agentHeaders,
+                body: JSON.stringify({
+                    jobId,
+                    category: 'gamelog',
+                    items: jlItems,
+                    categoryDone: false,
+                    allDone: false
+                })
+            });
+            expect(jlRes.status).toBe(200);
+            const jlJson = (await jlRes.json()) as { ok: boolean; data: { inserted: number } };
+            expect(jlJson.ok).toBe(true);
+            expect(jlJson.data.inserted).toBe(1000);
+
+            // Verify fast-path invariants:
+            // - 0 tail-chunk SELECTs (no gunzip/JSON.parse/CAS contention on large batches)
+            // - 0 gamelog_user_rollup pre-SELECTs (pure atomic SQL UPSERT)
+            // - 4 multi-value rollup INSERTs for 600 unique users (150 rows/stmt instead of 40x15 + 10 SELECTs)
+            const chunkSelects = fakeMysql.executedSqls.filter((s) =>
+                /^SELECT\b[\s\S]*FROM\s+`vrcx_legacy_gamelog_chunks`/i.test(s)
+            );
+            const rollupSelects = fakeMysql.executedSqls.filter((s) =>
+                /^SELECT\b[\s\S]*FROM\s+`vrcx_legacy_gamelog_user_rollup`/i.test(s)
+            );
+            const rollupInserts = fakeMysql.executedSqls.filter((s) =>
+                /^INSERT\s+INTO\s+`vrcx_legacy_gamelog_user_rollup`/i.test(s)
+            );
+            expect(chunkSelects.length).toBe(0);
+            expect(rollupSelects.length).toBe(0);
+            expect(rollupInserts.length).toBe(4);
+
+            // 2. Idempotent replay of the exact same 1,000-row batch MUST insert 0 rows and NOT double rollup counts
+            const u0Before = fakeMysql.tables
+                .get('vrcx_legacy_gamelog_user_rollup')
+                ?.rows.find((r) => r.user_id === 'usr_perf_000000');
+            expect(u0Before?.join_count).toBe(2);
+            expect(u0Before?.time_spent).toBe(2000);
+
+            const replayRes = await exports.default.fetch('http://example.com/api/agent/migration/batch', {
+                method: 'POST',
+                headers: agentHeaders,
+                body: JSON.stringify({
+                    jobId,
+                    category: 'gamelog',
+                    items: jlItems,
+                    categoryDone: false,
+                    allDone: false
+                })
+            });
+            expect(replayRes.status).toBe(200);
+            const replayJson = (await replayRes.json()) as { data: { inserted: number; skipped: number } };
+            expect(replayJson.data.inserted).toBe(0);
+            expect(replayJson.data.skipped).toBe(1000);
+            const u0AfterReplay = fakeMysql.tables
+                .get('vrcx_legacy_gamelog_user_rollup')
+                ?.rows.find((r) => r.user_id === 'usr_perf_000000');
+            expect(u0AfterReplay?.join_count).toBe(2);
+            expect(u0AfterReplay?.time_spent).toBe(2000);
+
+            // 3. Out-of-order historical batches (newer then middle timestamp) MUST maintain exact last_seen & second_last_seen
+            const newerBranchRes = await exports.default.fetch('http://example.com/api/agent/migration/batch', {
+                method: 'POST',
+                headers: agentHeaders,
+                body: JSON.stringify({
+                    jobId,
+                    category: 'gamelog',
+                    items: [
+                        {
+                            type: 'OnPlayerJoined',
+                            created_at: '2025-11-18T12:00:00.000Z',
+                            displayName: 'NewestValidName',
+                            location: 'wrld_perf_newer:777',
+                            userId: 'usr_perf_000000',
+                            time: 500
+                        }
+                    ],
+                    categoryDone: false,
+                    allDone: false
+                })
+            });
+            expect(newerBranchRes.status).toBe(200);
+            const olderBranchRes = await exports.default.fetch('http://example.com/api/agent/migration/batch', {
+                method: 'POST',
+                headers: agentHeaders,
+                body: JSON.stringify({
+                    jobId,
+                    category: 'gamelog',
+                    items: [
+                        {
+                            type: 'OnPlayerJoined',
+                            created_at: '2025-11-15T08:00:00.000Z',
+                            displayName: 'OlderNameShouldNotOverwrite',
+                            location: 'wrld_perf_mid:888',
+                            userId: 'usr_perf_000000',
+                            time: 250
+                        }
+                    ],
+                    categoryDone: false,
+                    allDone: false
+                })
+            });
+            expect(olderBranchRes.status).toBe(200);
+            const u0Final = fakeMysql.tables
+                .get('vrcx_legacy_gamelog_user_rollup')
+                ?.rows.find((r) => r.user_id === 'usr_perf_000000');
+            expect(u0Final?.join_count).toBe(4);
+            expect(u0Final?.time_spent).toBe(2750);
+            expect(u0Final?.last_seen).toBe('2025-11-18T12:00:00.000Z');
+            expect(u0Final?.second_last_seen).toBe('2025-11-15T08:00:00.000Z');
+            expect(u0Final?.display_name).toBe('NewestValidName');
+
+            // 4. ~480 KiB high-entropy feed_bio batch (with NUL + lone surrogate + valid Emoji) stored gzipped <= 256 KiB raw
+            const vocab = ['VRChat', 'world', 'avatar', 'music', '東京', '渋谷', '桜', 'ねこ', 'shader', 'party', 'night', 'dream'];
+            const makeBio = (seed: number) => {
+                let s = '';
+                let x = (seed * 2654435761) >>> 0;
+                for (let k = 0; k < 70; k++) {
+                    x = (Math.imul(x, 1664525) + 1013904223) >>> 0;
+                    s += `${vocab[x % vocab.length]} `;
+                }
+                return `${s.trim()}_#${seed}`;
+            };
+            const bigBioItems = Array.from({ length: 400 }, (_, i) => ({
+                type: 'Bio',
+                created_at: `2025-10-${String((i % 28) + 1).padStart(2, '0')}T12:${String(i % 60).padStart(2, '0')}:00.000Z`,
+                userId: `usr_bio_${String(i).padStart(6, '0')}`,
+                displayName: i === 0 ? 'Dirty\0Name🌸\uD83D_ok' : `BioFriend_${i}`,
+                bio: makeBio(i + 1),
+                previousBio: makeBio(i + 10000),
+                bioLinks: '["https://vrchat.com"]',
+                previousBioLinks: '[]'
+            }));
+            fakeMysql.executedSqls = [];
+            const bioRes = await exports.default.fetch('http://example.com/api/agent/migration/batch', {
+                method: 'POST',
+                headers: agentHeaders,
+                body: JSON.stringify({
+                    jobId,
+                    category: 'feed',
+                    items: bigBioItems,
+                    categoryDone: false,
+                    allDone: false
+                })
+            });
+            expect(bioRes.status).toBe(200);
+            const bioJson = (await bioRes.json()) as { data: { inserted: number } };
+            expect(bioJson.data.inserted).toBe(400);
+            const feedChunks = fakeMysql.tables.get('vrcx_legacy_feed_chunks')?.rows ?? [];
+            expect(feedChunks.length).toBeGreaterThanOrEqual(2);
+            expect(feedChunks.length).toBeLessThanOrEqual(3);
+            for (const c of feedChunks) {
+                expect(String(c.payload_json ?? '').startsWith('gz:')).toBe(true);
+            }
+            const bioChunkSelects = fakeMysql.executedSqls.filter((s) =>
+                /^SELECT\b[\s\S]*FROM\s+`vrcx_legacy_feed_chunks`/i.test(s)
+            );
+            expect(bioChunkSelects.length).toBe(0);
+
+            // Verify sanitized dirty string survived gzip round-trip cleanly with valid Emoji preserved
+            const { parseCompactChunkTuples } = await import('../src/db/compactArchive');
+            const firstBioTuple = parseCompactChunkTuples(String(feedChunks[0]?.payload_json ?? ''))[0];
+            expect(firstBioTuple?.[2]).toBe('DirtyName🌸_ok');
+
+            // 5. Four concurrent 300-row batches on the same table succeed with zero CAS retries/errors
+            const concurrentRes = await Promise.all(
+                [0, 1, 2, 3].map((workerIdx) =>
+                    exports.default.fetch('http://example.com/api/agent/migration/batch', {
+                        method: 'POST',
+                        headers: agentHeaders,
+                        body: JSON.stringify({
+                            jobId,
+                            category: 'feed',
+                            items: Array.from({ length: 300 }, (_, rowIdx) => ({
+                                type: 'GPS',
+                                created_at: `2025-09-${String((rowIdx % 28) + 1).padStart(2, '0')}T0${workerIdx}:${String(rowIdx % 60).padStart(2, '0')}:00.000Z`,
+                                userId: `usr_conc_${workerIdx}_${rowIdx}`,
+                                displayName: `ConcUser_${workerIdx}_${rowIdx}`,
+                                location: `wrld_conc_${workerIdx}:${rowIdx}`,
+                                worldName: `Concurrent World ${workerIdx}`,
+                                previousLocation: '',
+                                time: 60,
+                                groupName: ''
+                            })),
+                            categoryDone: false,
+                            allDone: false
+                        })
+                    })
+                )
+            );
+            for (const r of concurrentRes) {
+                expect(r.status).toBe(200);
+                const j = (await r.json()) as { ok: boolean; data: { inserted: number } };
+                expect(j.ok).toBe(true);
+                expect(j.data.inserted).toBe(300);
+            }
+            const gpsChunks = (fakeMysql.tables.get('vrcx_legacy_feed_chunks')?.rows ?? []).filter(
+                (r) => r.feed_kind === 'gps'
+            );
+            const totalGpsRows = gpsChunks.reduce((sum, c) => sum + Number(c.row_count ?? 0), 0);
+            expect(totalGpsRows).toBe(1200);
+        } finally {
+            setMysqlConnectionFactoryForTests(null);
+            await legacyDb.prepare("DELETE FROM legacy_migration_state WHERE state_key IN ('job', 'imported_stats')").run().catch(() => {});
+            await env.DB_CORE.prepare('DELETE FROM cloud_devices WHERE device_id = ?')
+                .bind(keyJson.data.deviceId)
+                .run()
+                .catch(() => {});
+            await saveExternalDbConfig(env, defaultExternalDbConfig());
+            await saveExternalDbMigrationState(env, defaultExternalDbMigrationState());
+            invalidateExternalDbConfigCache();
+            clearMysqlSchemaReadyCache();
+        }
+    });
+
+    it('Phase 2 Test A: validates 47 MySQL 5.7 DDLs, upgrades incrementally (creating only 35 missing tables), and measures usage via UNION ALL', async () => {
+        await ensureSchemaReady(env);
+        const fakeMysql = new FakeMysql57Server();
+        const params: ResolvedMysqlConnectionParams = {
+            connectionType: 'direct',
+            host: 'mysql57.example.com',
+            port: 3306,
+            database: 'vrcx_prod',
+            username: 'vrcx_user',
+            password: 'secret',
+            sslMode: 'disabled',
+            tablePrefix: 'vrcx_'
+        };
+
+        const ddls = buildMysql57SchemaStatements('vrcx_');
+        expect(ddls.length).toBe(47);
+        for (const ddl of ddls) {
+            expect(ddl).not.toMatch(/utf8mb4_0900_ai_ci/i);
+            expect(ddl).not.toMatch(/\b(?:MEDIUM)?TEXT\b[^\n]*\bDEFAULT\b/i);
+            if (/AUTO_INCREMENT/i.test(ddl)) {
+                expect(ddl).toContain(`AUTO_INCREMENT=${MYSQL_CHUNK_AUTO_INCREMENT_START}`);
+            }
+        }
+
+        // Seed only the legacy 12 tables first so ensureMysqlSchemaOnConnection upgrades 12 -> 47 incrementally
+        const conn1 = fakeMysql.createConnection();
+        try {
+            for (const stmt of ddls.slice(0, 12)) {
+                await conn1.execute(stmt, []);
+            }
+            expect(fakeMysql.tables.size).toBe(12);
+            fakeMysql.executedSqls = [];
+            await ensureMysqlSchemaOnConnection(conn1, params, false);
+            const createdCount = fakeMysql.executedSqls.filter((s) => /^CREATE\s+TABLE/i.test(s)).length;
+            expect(createdCount).toBe(35);
+            expect(fakeMysql.tables.size).toBe(47);
+        } finally {
+            await conn1.close();
+        }
+
+        // Verify batched UNION ALL usage probe counts newly offloaded business rows
+        setMysqlConnectionFactoryForTests(async () => fakeMysql.createConnection());
+        try {
+            fakeMysql.tables.get('vrcx_memos')!.rows.push({
+                user_id: 'usr_u1',
+                edited_at: '2026-01-01T00:00:00.000Z',
+                memo: 'hello'
+            });
+            fakeMysql.executedSqls = [];
+            const usage = await measureExternalMysqlUsage(params);
+            expect(usage.connected).toBe(true);
+            expect(usage.businessRows).toBeGreaterThanOrEqual(1);
+            expect(usage.tables.memos?.rows).toBe(1);
+            const unionQueries = fakeMysql.executedSqls.filter((s) => /\bUNION\s+ALL\b/i.test(s));
+            expect(unionQueries.length).toBe(2);
+            const singleSelectCounts = fakeMysql.executedSqls.filter(
+                (s) => /^SELECT\s+COUNT\(\*\)/i.test(s) && !/\bUNION\s+ALL\b/i.test(s)
+            );
+            expect(singleSelectCounts.length).toBe(0);
+        } finally {
+            setMysqlConnectionFactoryForTests(null);
+            clearMysqlSchemaReadyCache();
+        }
+    });
+
+    it('Phase 2 Test B: writes all 20 business tables to MySQL 5.7 with zero new D1 business rows while keeping settings and control-plane strictly in D1', async () => {
+        await ensureSchemaReady(env);
+        const fakeMysql = new FakeMysql57Server();
+        setMysqlConnectionFactoryForTests(async () => fakeMysql.createConnection());
+        const headers = { 'Content-Type': 'application/json', Origin: 'http://example.com' };
+        const chatDb = env.DB_CHAT ?? env.DB_CORE;
+        const cacheDb = env.DB_CACHE ?? env.DB_CORE;
+
+        try {
+            expect(
+                (
+                    await exports.default.fetch('http://example.com/api/storage/mysql/config', {
+                        method: 'PUT',
+                        headers,
+                        body: JSON.stringify({
+                            enabled: true,
+                            mode: 'new_writes_only',
+                            connectionType: 'direct',
+                            host: 'mysql57.example.com',
+                            port: 3306,
+                            database: 'vrcx_prod',
+                            username: 'vrcx_user',
+                            password: 'Phase2Password123',
+                            sslMode: 'disabled',
+                            tablePrefix: 'vrcx_'
+                        })
+                    })
+                ).status
+            ).toBe(200);
+
+            // Business writes via HTTP API
+            expect(
+                (
+                    await exports.default.fetch('http://example.com/api/memos', {
+                        method: 'PUT',
+                        headers,
+                        body: JSON.stringify({ kind: 'user', id: 'usr_p2_b', memo: 'MySQL Memo' })
+                    })
+                ).status
+            ).toBe(200);
+            expect(
+                (
+                    await exports.default.fetch('http://example.com/api/memos', {
+                        method: 'PUT',
+                        headers,
+                        body: JSON.stringify({ kind: 'world', id: 'wrld_p2_b', memo: 'World Memo' })
+                    })
+                ).status
+            ).toBe(200);
+            expect(
+                (
+                    await exports.default.fetch('http://example.com/api/memos', {
+                        method: 'PUT',
+                        headers,
+                        body: JSON.stringify({ kind: 'avatar', id: 'avtr_p2_b', memo: 'Avatar Memo' })
+                    })
+                ).status
+            ).toBe(200);
+            expect(
+                (
+                    await exports.default.fetch('http://example.com/api/notes', {
+                        method: 'PUT',
+                        headers,
+                        body: JSON.stringify({ userId: 'usr_p2_b', displayName: 'Phase2User', note: 'SecretNote' })
+                    })
+                ).status
+            ).toBe(200);
+            expect(
+                (
+                    await exports.default.fetch('http://example.com/api/favorites', {
+                        method: 'POST',
+                        headers,
+                        body: JSON.stringify({ kind: 'friend', targetId: 'usr_p2_b', groupName: 'group1' })
+                    })
+                ).status
+            ).toBe(200);
+            expect(
+                (
+                    await exports.default.fetch('http://example.com/api/favorites', {
+                        method: 'POST',
+                        headers,
+                        body: JSON.stringify({ kind: 'friend', targetId: 'usr_p2_b', groupName: 'group2' })
+                    })
+                ).status
+            ).toBe(200);
+            // Triggers `UPDATE OR IGNORE` -> `UPDATE IGNORE` deduplicating colliding `(user_id, group_name)`
+            expect(
+                (
+                    await exports.default.fetch('http://example.com/api/favorites', {
+                        method: 'PATCH',
+                        headers,
+                        body: JSON.stringify({ kind: 'friend', oldGroupName: 'group1', newGroupName: 'group2' })
+                    })
+                ).status
+            ).toBe(200);
+            expect((fakeMysql.tables.get('vrcx_favorite_friend')?.rows ?? []).length).toBe(1);
+
+            expect(
+                (
+                    await exports.default.fetch('http://example.com/api/avatar-tags', {
+                        method: 'POST',
+                        headers,
+                        body: JSON.stringify({ avatarId: 'avtr_p2_b', tag: 'anime', color: '#ff00aa' })
+                    })
+                ).status
+            ).toBe(200);
+            expect(
+                (
+                    await exports.default.fetch('http://example.com/api/avatar-history', {
+                        method: 'POST',
+                        headers,
+                        body: JSON.stringify({ avatarId: 'avtr_p2_b', addTime: 100 })
+                    })
+                ).status
+            ).toBe(200);
+            expect(
+                (
+                    await exports.default.fetch('http://example.com/api/avatar-history', {
+                        method: 'POST',
+                        headers,
+                        body: JSON.stringify({ avatarId: 'avtr_p2_b', addTime: 50 })
+                    })
+                ).status
+            ).toBe(200);
+            expect(fakeMysql.tables.get('vrcx_avatar_history')?.rows.find((r) => r.avatar_id === 'avtr_p2_b')?.time).toBe(
+                150
+            );
+
+            expect(
+                (
+                    await exports.default.fetch('http://example.com/api/moderation', {
+                        method: 'PUT',
+                        headers,
+                        body: JSON.stringify({ userId: 'usr_p2_mod', displayName: 'ModTarget', block: true, mute: false })
+                    })
+                ).status
+            ).toBe(200);
+            expect(
+                (
+                    await exports.default.fetch('http://example.com/api/user-profiles', {
+                        method: 'PUT',
+                        headers,
+                        body: JSON.stringify({
+                            entries: [{ userId: 'usr_p2_b', bio: 'Phase 2 Bio', bioLinks: ['https://example.org'] }]
+                        })
+                    })
+                ).status
+            ).toBe(200);
+            expect(
+                (
+                    await exports.default.fetch('http://example.com/api/friend-log/current', {
+                        method: 'POST',
+                        headers,
+                        body: JSON.stringify({
+                            entries: [
+                                {
+                                    user_id: 'usr_p2_b',
+                                    display_name: 'Phase2User',
+                                    trust_level: 'Trusted User',
+                                    friend_number: 77
+                                }
+                            ]
+                        })
+                    })
+                ).status
+            ).toBe(200);
+            expect(
+                (
+                    await exports.default.fetch('http://example.com/api/activity/sessions', {
+                        method: 'POST',
+                        headers,
+                        body: JSON.stringify({
+                            userId: 'usr_p2_b',
+                            replace: true,
+                            sessions: [
+                                { start: 1000, end: 2000, isOpenTail: false },
+                                { start: 3000, end: 4000, isOpenTail: true }
+                            ]
+                        })
+                    })
+                ).status
+            ).toBe(200);
+            const sessRes = await exports.default.fetch('http://example.com/api/activity/sessions?userId=usr_p2_b');
+            expect(sessRes.status).toBe(200);
+            const sessJson = (await sessRes.json()) as { data: Array<{ start_at: number }> };
+            expect(sessJson.data.map((s) => s.start_at)).toEqual([1000, 3000]);
+
+            // Chat message -> MySQL (chat_archive_chunks + hot cloud_chat_messages); Chat config -> D1; Config bundle -> D1; Uptime counter -> MySQL
+            expect(
+                (
+                    await exports.default.fetch('http://example.com/api/chat/config', {
+                        method: 'PUT',
+                        headers,
+                        body: JSON.stringify({ translateEnabled: false, oscEnabled: false })
+                    })
+                ).status
+            ).toBe(200);
+            expect(
+                (
+                    await exports.default.fetch('http://example.com/api/chat/send', {
+                        method: 'POST',
+                        headers,
+                        body: JSON.stringify({ sourceText: 'Phase2 Chat Line', sentText: 'Phase2 Chat Line' })
+                    })
+                ).status
+            ).toBe(200);
+            expect(
+                (
+                    await exports.default.fetch('http://example.com/api/config/bundle', {
+                        method: 'PUT',
+                        headers,
+                        body: JSON.stringify({ bundleKey: 'vrcx_config', patch: { p2Setting: 'stayInD1' } })
+                    })
+                ).status
+            ).toBe(200);
+            expect(
+                (
+                    await exports.default.fetch('http://example.com/api/stats/uptime', {
+                        method: 'POST',
+                        headers
+                    })
+                ).status
+            ).toBe(200);
+
+            // cloud_screenshots COLLATE NOCASE + cloud_rss_snapshot CASE WHEN + cloud_chat_messages CASE UPDATE via hybrid env
+            const { runWithExternalMysqlEnv } = await import('../src/db/externalMysqlProxy');
+            const { writeRssSnapshot, readRssSnapshot } = await import('../src/cache/vrcCache');
+            const { getChatDb } = await import('../src/db/schemaBootstrap');
+            await runWithExternalMysqlEnv(env, async (activeEnv) => {
+                const activeChatDb = getChatDb(activeEnv);
+                await activeChatDb
+                    .prepare(
+                        `INSERT INTO cloud_chat_messages
+                         (id, device_id, direction, source_text, translated_text, sent_text, created_at)
+                         VALUES ('hot_msg_p2', 'dev_1', 'web_to_vrc', 'hello', '', 'hello', '2026-06-01T00:00:00.000Z')`
+                    )
+                    .run();
+                await activeEnv.DB_CORE.prepare(
+                    `INSERT OR IGNORE INTO cloud_screenshots
+                     (id, device_id, taken_at, local_filename, world_id, world_name, instance_id, players_json, metadata_json, r2_thumb_key, thumb_bytes, created_at)
+                     VALUES ('shot_p2', 'dev_1', '2026-06-01T00:00:00.000Z', 'VRChat_Shot.png', 'wrld_p2_b', 'WorldB', '', '[]', '{}', '', 0, '2026-06-01T00:00:00.000Z')`
+                ).run();
+                const hit = await activeEnv.DB_CORE.prepare(
+                    'SELECT id FROM cloud_screenshots WHERE id = ? OR local_filename = ? COLLATE NOCASE LIMIT 1'
+                )
+                    .bind('none', 'vrchat_shot.png')
+                    .first<{ id: string }>();
+                expect(hit?.id).toBe('shot_p2');
+
+                await writeRssSnapshot(activeEnv, {
+                    syncedAt: '2026-06-02T00:00:00.000Z',
+                    onlineCount: 5,
+                    feedInserted: 1,
+                    notificationsInserted: 0,
+                    bioChecked: 0,
+                    friendLogInserted: 0,
+                    onlineFriendsTruncated: false,
+                    onlineFriends: []
+                });
+                // Older timestamp MUST NOT overwrite newer snapshot
+                await writeRssSnapshot(activeEnv, {
+                    syncedAt: '2026-06-01T00:00:00.000Z',
+                    onlineCount: 1,
+                    feedInserted: 0,
+                    notificationsInserted: 0,
+                    bioChecked: 0,
+                    friendLogInserted: 0,
+                    onlineFriendsTruncated: false,
+                    onlineFriends: []
+                });
+                const snap = await readRssSnapshot(activeEnv);
+                expect(snap?.syncedAt).toBe('2026-06-02T00:00:00.000Z');
+                expect(snap?.onlineCount).toBe(5);
+            });
+
+            // Exercises PATCH /api/chat/messages/:id (`target_lang = CASE WHEN ? != '' ...`) on MySQL `cloud_chat_messages`
+            expect(
+                (
+                    await exports.default.fetch('http://example.com/api/chat/messages/hot_msg_p2', {
+                        method: 'PATCH',
+                        headers,
+                        body: JSON.stringify({ translatedText: 'こんにちは', targetLang: 'ja' })
+                    })
+                ).status
+            ).toBe(200);
+            expect(
+                fakeMysql.tables.get('vrcx_cloud_chat_messages')?.rows.find((r) => r.id === 'hot_msg_p2')?.translated_text
+            ).toBe('こんにちは');
+
+            // Assert zero new business rows in raw D1, while config_bundles & cloud_chat_config remain in D1
+            expect((await env.DB_CORE.prepare("SELECT COUNT(*) AS cnt FROM memos WHERE user_id = 'usr_p2_b'").first<{ cnt: number }>())?.cnt).toBe(0);
+            expect((await env.DB_CORE.prepare("SELECT COUNT(*) AS cnt FROM notes WHERE user_id = 'usr_p2_b'").first<{ cnt: number }>())?.cnt).toBe(0);
+            expect((await env.DB_CORE.prepare("SELECT COUNT(*) AS cnt FROM cloud_screenshots WHERE id = 'shot_p2'").first<{ cnt: number }>())?.cnt).toBe(0);
+            expect((await env.DB_FEED.prepare("SELECT COUNT(*) AS cnt FROM activity_sessions_v2 WHERE user_id = 'usr_p2_b'").first<{ cnt: number }>())?.cnt).toBe(0);
+            expect((await cacheDb.prepare('SELECT COUNT(*) AS cnt FROM cloud_rss_snapshot').first<{ cnt: number }>())?.cnt).toBe(0);
+            expect((await chatDb.prepare('SELECT COUNT(*) AS cnt FROM cloud_chat_messages').first<{ cnt: number }>())?.cnt).toBe(0);
+            expect((await env.DB_CORE.prepare("SELECT COUNT(*) AS cnt FROM stats_counters WHERE counter_key = 'cloud_total_uptime_seconds'").first<{ cnt: number }>())?.cnt).toBe(0);
+
+            expect((fakeMysql.tables.get('vrcx_chat_archive_chunks')?.rows ?? []).length).toBeGreaterThanOrEqual(1);
+            expect((fakeMysql.tables.get('vrcx_cloud_chat_messages')?.rows ?? []).length).toBeGreaterThanOrEqual(1);
+            expect((fakeMysql.tables.get('vrcx_stats_counters')?.rows ?? []).length).toBeGreaterThanOrEqual(1);
+            const d1Cfg = await env.DB_CORE.prepare(
+                "SELECT payload_json FROM config_bundles WHERE bundle_key = 'vrcx_config'"
+            ).first<{ payload_json: string }>();
+            expect(d1Cfg?.payload_json).toContain('stayInD1');
+            const d1ChatCfg = await chatDb
+                .prepare("SELECT payload_json FROM cloud_chat_config WHERE config_key = 'default'")
+                .first<{ payload_json: string }>();
+            expect(d1ChatCfg?.payload_json).toBeTruthy();
+        } finally {
+            setMysqlConnectionFactoryForTests(null);
+            await saveExternalDbConfig(env, defaultExternalDbConfig());
+            await saveExternalDbMigrationState(env, defaultExternalDbMigrationState());
+            invalidateExternalDbConfigCache();
+            clearMysqlSchemaReadyCache();
+            await env.DB_CORE.prepare("DELETE FROM config_bundles WHERE bundle_key = 'vrcx_config'").run().catch(() => {});
+            await chatDb.prepare("DELETE FROM cloud_chat_config WHERE config_key = 'default'").run().catch(() => {});
+        }
+    });
+
+    it('Phase 2 Test C: Mode 1 hybrid dual-reads merge memos, avatar_history, stats_counters, entity search LIKE ESCAPE !, and export without rowid', async () => {
+        await ensureSchemaReady(env);
+        const fakeMysql = new FakeMysql57Server();
+        setMysqlConnectionFactoryForTests(async () => fakeMysql.createConnection());
+        const headers = { 'Content-Type': 'application/json', Origin: 'http://example.com' };
+
+        try {
+            // Seed existing D1 business data before enabling MySQL
+            await env.DB_CORE.batch([
+                env.DB_CORE.prepare("INSERT OR REPLACE INTO memos (user_id, edited_at, memo) VALUES ('usr_d1_only', '2025-01-01T00:00:00.000Z', 'FromD1')"),
+                env.DB_CORE.prepare("INSERT OR REPLACE INTO memos (user_id, edited_at, memo) VALUES ('usr_both_memo', '2025-01-01T00:00:00.000Z', 'OldD1')"),
+                env.DB_CORE.prepare("INSERT OR REPLACE INTO avatar_history (avatar_id, created_at, time) VALUES ('avtr_both_c', '2025-02-01T00:00:00.000Z', 100)"),
+                env.DB_CORE.prepare("INSERT OR REPLACE INTO stats_counters (counter_key, row_count, updated_at) VALUES ('cloud_total_uptime_seconds', 300, '2025-01-01T00:00:00.000Z')"),
+                env.DB_CORE.prepare("INSERT OR REPLACE INTO stats_counters (counter_key, row_count, updated_at) VALUES ('feed_gps', 10, '2025-01-01T00:00:00.000Z')"),
+                env.DB_CORE.prepare("INSERT OR IGNORE INTO entity_users (user_id, display_name, aliases_text, updated_at) VALUES ('usr_bob_d1', 'BobD1', '', '2025-01-01T00:00:00.000Z')")
+            ]);
+
+            // Enable Compatibility Mode & initialize MySQL
+            expect(
+                (
+                    await exports.default.fetch('http://example.com/api/storage/mysql/config', {
+                        method: 'PUT',
+                        headers,
+                        body: JSON.stringify({
+                            enabled: true,
+                            mode: 'new_writes_only',
+                            connectionType: 'direct',
+                            host: 'mysql57.example.com',
+                            port: 3306,
+                            database: 'vrcx_prod',
+                            username: 'vrcx_user',
+                            password: 'Mode1DualReadPassword',
+                            sslMode: 'disabled',
+                            tablePrefix: 'vrcx_'
+                        })
+                    })
+                ).status
+            ).toBe(200);
+
+            // Override overlapping memo & add MySQL avatar_history + entity_users with special LIKE chars (`100%`)
+            expect(
+                (
+                    await exports.default.fetch('http://example.com/api/memos', {
+                        method: 'PUT',
+                        headers,
+                        body: JSON.stringify({ kind: 'user', id: 'usr_both_memo', memo: 'NewMySQL' })
+                    })
+                ).status
+            ).toBe(200);
+            expect(
+                (
+                    await exports.default.fetch('http://example.com/api/avatar-history', {
+                        method: 'POST',
+                        headers,
+                        body: JSON.stringify({ avatarId: 'avtr_both_c', addTime: 50 })
+                    })
+                ).status
+            ).toBe(200);
+
+            const { runWithExternalMysqlEnv } = await import('../src/db/externalMysqlProxy');
+            const { incrementCounter, upsertEntityUsersBatch, upsertEntityWorldsBatch } = await import(
+                '../src/routes/coreData'
+            );
+            const { searchGameLogByEntity } = await import('../src/search/entityFts');
+
+            await runWithExternalMysqlEnv(env, async (activeEnv) => {
+                await incrementCounter(activeEnv.DB_CORE, 'feed_gps', 4);
+                await activeEnv.DB_CORE.prepare(
+                    "INSERT INTO stats_counters (counter_key, row_count, updated_at) VALUES ('cloud_total_uptime_seconds', 500, '2026-01-01T00:00:00.000Z')"
+                ).run();
+                await upsertEntityUsersBatch(activeEnv.DB_CORE, new Map([['usr_pct_mysql', 'Alice [100%] _Special!']]));
+                await upsertEntityWorldsBatch(activeEnv.DB_CORE, new Map([['wrld_pct_mysql', 'World 100% Fun']]));
+
+                // Verify entityFts works via MySQL LIKE ESCAPE '!' (zero FTS5 / rowid errors)
+                const searchRes = await searchGameLogByEntity(activeEnv, '100%');
+                expect(searchRes.matchedUserIds).toContain('usr_pct_mysql');
+                expect(searchRes.matchedWorldIds).toContain('wrld_pct_mysql');
+            });
+
+            // 1. /api/bootstrap merges memos & statsCounters (uptime takes max 500, feed_gps sums 10+4=14)
+            const bootRes = await exports.default.fetch('http://example.com/api/bootstrap');
+            expect(bootRes.status).toBe(200);
+            const bootJson = (await bootRes.json()) as {
+                data: {
+                    totalUptimeSeconds: number;
+                    memos: Array<{ user_id: string; memo: string }>;
+                    statsCounters: Record<string, number>;
+                };
+            };
+            expect(bootJson.data.memos.find((m) => m.user_id === 'usr_d1_only')?.memo).toBe('FromD1');
+            expect(bootJson.data.memos.find((m) => m.user_id === 'usr_both_memo')?.memo).toBe('NewMySQL');
+            expect(bootJson.data.statsCounters.cloud_total_uptime_seconds).toBe(500);
+            expect(bootJson.data.statsCounters.feed_gps).toBe(14);
+
+            // 2. /api/avatar-history sums D1 (100) + MySQL (50) => 150
+            const avHistRes = await exports.default.fetch('http://example.com/api/avatar-history');
+            expect(avHistRes.status).toBe(200);
+            const avHistJson = (await avHistRes.json()) as { data: Array<{ avatar_id: string; time: number }> };
+            expect(avHistJson.data.find((a) => a.avatar_id === 'avtr_both_c')?.time).toBe(150);
+
+            // 3. /api/feed/search bypasses FTS5/rowid cleanly when MySQL is active
+            const feedSearchRes = await exports.default.fetch('http://example.com/api/feed/search?q=100%25&types=GPS');
+            expect(feedSearchRes.status).toBe(200);
+
+            // 4. /api/migration/export for active memos works without SQLite `rowid` and includes D1 + MySQL rows
+            const expRes = await exports.default.fetch(
+                'http://example.com/api/migration/export?table=memos&source=active&afterRowId=0&limit=100'
+            );
+            expect(expRes.status).toBe(200);
+            const expJson = (await expRes.json()) as { data: { rows: Array<{ user_id: string; memo: string }> } };
+            expect(expJson.data.rows.find((r) => r.user_id === 'usr_d1_only')?.memo).toBe('FromD1');
+            expect(expJson.data.rows.find((r) => r.user_id === 'usr_both_memo')?.memo).toBe('NewMySQL');
+        } finally {
+            setMysqlConnectionFactoryForTests(null);
+            await saveExternalDbConfig(env, defaultExternalDbConfig());
+            await saveExternalDbMigrationState(env, defaultExternalDbMigrationState());
+            invalidateExternalDbConfigCache();
+            clearMysqlSchemaReadyCache();
+            await env.DB_CORE.batch([
+                env.DB_CORE.prepare("DELETE FROM memos WHERE user_id IN ('usr_d1_only', 'usr_both_memo')"),
+                env.DB_CORE.prepare("DELETE FROM avatar_history WHERE avatar_id = 'avtr_both_c'"),
+                env.DB_CORE.prepare(
+                    "DELETE FROM stats_counters WHERE counter_key IN ('cloud_total_uptime_seconds', 'feed_gps')"
+                ),
+                env.DB_CORE.prepare("DELETE FROM entity_users WHERE user_id = 'usr_bob_d1'")
+            ]);
+        }
+    });
+
+    it('Phase 2 Test D: Mode 2 schemaVersion=2 upgrade guard detects D1 business rows, drains all 35 business tables safely while preserving settings, and cleans up activity_sessions_v2', async () => {
+        await ensureSchemaReady(env);
+        const fakeMysql = new FakeMysql57Server();
+        setMysqlConnectionFactoryForTests(async () => fakeMysql.createConnection());
+        const headers = { 'Content-Type': 'application/json', Origin: 'http://example.com' };
+        const legacyDb = env.DB_LEGACY!;
+        const chatDb = env.DB_CHAT ?? env.DB_CORE;
+        const cacheDb = env.DB_CACHE ?? env.DB_CORE;
+        const createdBackupKeys: string[] = [];
+
+        try {
+            // Seed raw D1 business tables across Core, Feed, Cache, Chat & Legacy + a settings row that MUST stay in D1
+            await env.DB_CORE.batch([
+                env.DB_CORE.prepare(
+                    "INSERT OR REPLACE INTO config_bundles (bundle_key, version, payload_json, updated_at) VALUES ('vrcx_config', 1, '{\"theme\":\"dark\"}', '2026-01-01T00:00:00.000Z')"
+                ),
+                env.DB_CORE.prepare("INSERT OR REPLACE INTO memos (user_id, edited_at, memo) VALUES ('usr_m_d1', '2025-05-01T00:00:00.000Z', 'D1Memo')"),
+                env.DB_CORE.prepare("INSERT OR REPLACE INTO notes (user_id, display_name, note, created_at) VALUES ('usr_n_d1', 'D1Note', 'Body', '2025-05-01T00:00:00.000Z')"),
+                env.DB_CORE.prepare("INSERT OR IGNORE INTO favorite_friend (created_at, user_id, group_name) VALUES ('2025-05-01T00:00:00.000Z', 'usr_ff_d1', 'grp1')"),
+                env.DB_CORE.prepare("INSERT OR REPLACE INTO avatar_history (avatar_id, created_at, time) VALUES ('avtr_m_d1', '2025-05-01T00:00:00.000Z', 90)"),
+                env.DB_CORE.prepare("INSERT OR REPLACE INTO stats_counters (counter_key, row_count, updated_at) VALUES ('cloud_total_uptime_seconds', 420, '2025-05-01T00:00:00.000Z')"),
+                env.DB_CORE.prepare(
+                    `INSERT OR REPLACE INTO cloud_screenshots (id, device_id, taken_at, local_filename, world_id, world_name, instance_id, players_json, metadata_json, r2_thumb_key, thumb_bytes, created_at)
+                     VALUES ('shot_d1_m', 'dev1', '2025-05-01T00:00:00.000Z', 'd1_shot.png', 'wrld_1', 'W1', '', '[]', '{}', '', 0, '2025-05-01T00:00:00.000Z')`
+                ),
+                env.DB_CORE.prepare("INSERT OR IGNORE INTO entity_users (user_id, display_name, aliases_text, updated_at) VALUES ('usr_e_d1', 'EntD1', '', '2025-05-01T00:00:00.000Z')")
+            ]);
+            await env.DB_FEED.prepare(
+                `INSERT INTO activity_sessions_v2 (user_id, start_at, end_at, is_open_tail, source_revision)
+                 VALUES ('usr_act_d1', ?, ?, 0, 'rev1')`
+            )
+                .bind(Date.parse('2024-01-01T01:00:00.000Z'), Date.parse('2024-01-01T02:00:00.000Z'))
+                .run();
+            await cacheDb
+                .prepare("INSERT OR REPLACE INTO cloud_rss_snapshot (snapshot_key, payload_json, synced_at) VALUES ('primary', '{\"syncedAt\":\"2025-05-01T00:00:00.000Z\"}', '2025-05-01T00:00:00.000Z')")
+                .run();
+            await chatDb
+                .prepare("INSERT OR REPLACE INTO cloud_chat_messages (id, device_id, direction, source_text, translated_text, sent_text, created_at) VALUES ('chat_d1_m', 'dev1', 'web_to_vrc', 'hi', '', 'hi', '2025-05-01T00:00:00.000Z')")
+                .run();
+            await legacyDb.batch([
+                legacyDb.prepare("INSERT OR REPLACE INTO memos (user_id, edited_at, memo) VALUES ('usr_leg_m', '2024-01-01T00:00:00.000Z', 'LegacyMemo')"),
+                legacyDb.prepare("INSERT OR IGNORE INTO entity_users (user_id, display_name, aliases_text, updated_at) VALUES ('usr_leg_e', 'LegacyEnt', '', '2024-01-01T00:00:00.000Z')")
+            ]);
+
+            // Save Mode 2 config AND simulate a pre-v2 migration state that previously thought d1Drained=true
+            await saveExternalDbConfig(env, {
+                ...defaultExternalDbConfig(),
+                enabled: true,
+                mode: 'full_migrate',
+                connectionType: 'direct',
+                host: 'mysql57.example.com',
+                port: 3306,
+                database: 'vrcx_prod',
+                username: 'vrcx_user',
+                passwordEnc: '',
+                sslMode: 'disabled',
+                tablePrefix: 'vrcx_'
+            });
+            await env.DB_CORE.prepare(
+                `INSERT INTO config_bundles (bundle_key, version, payload_json, updated_at)
+                 VALUES ('cloud_external_db_migration_state', 1, ?, ?)
+                 ON CONFLICT(bundle_key) DO UPDATE SET payload_json = excluded.payload_json, updated_at = excluded.updated_at`
+            )
+                .bind(
+                    JSON.stringify({ status: 'completed', phase: 'done', d1Drained: true, totalChunksMoved: 1 }),
+                    '2025-06-01T00:00:00.000Z'
+                )
+                .run();
+            invalidateExternalDbConfigCache();
+
+            // 1. Upgrade guard MUST force d1Drained=false & show totalBusinessRows > 0
+            const statusRes = await exports.default.fetch('http://example.com/api/storage/mysql/status');
+            expect(statusRes.status).toBe(200);
+            const statusJson = (await statusRes.json()) as {
+                data: {
+                    migration: { d1Drained: boolean; schemaVersion: number };
+                    d1Pending: { totalBusinessRows: number };
+                };
+            };
+            expect(statusJson.data.migration.schemaVersion).toBe(1);
+            expect(statusJson.data.migration.d1Drained).toBe(false);
+            expect(statusJson.data.d1Pending.totalBusinessRows).toBeGreaterThanOrEqual(12);
+
+            // 2. Drain everything via Mode 2 migrate batches
+            let migDone = false;
+            let finalMig: { d1Drained?: boolean; schemaVersion?: number; totalBusinessRowsMoved?: number } = {};
+            for (let i = 0; i < 10; i++) {
+                const migRes = await exports.default.fetch('http://example.com/api/storage/mysql/migrate', {
+                    method: 'POST',
+                    headers,
+                    body: JSON.stringify({ maxChunks: 4, maxBusinessRows: 20 })
+                });
+                expect(migRes.status).toBe(200);
+                const mj = (await migRes.json()) as {
+                    data: {
+                        done: boolean;
+                        remaining: { totalBusinessRows: number };
+                        migration: { d1Drained: boolean; schemaVersion: number; totalBusinessRowsMoved: number };
+                    };
+                };
+                if (mj.data.done) {
+                    migDone = true;
+                    expect(mj.data.remaining.totalBusinessRows).toBe(0);
+                    finalMig = mj.data.migration;
+                    break;
+                }
+            }
+            expect(migDone).toBe(true);
+            expect(finalMig.d1Drained).toBe(true);
+            expect(finalMig.schemaVersion).toBe(CURRENT_MIGRATION_SCHEMA_VERSION);
+            expect(finalMig.totalBusinessRowsMoved).toBeGreaterThanOrEqual(12);
+
+            // Verify raw D1 business tables are empty while config_bundles remains intact
+            expect((await env.DB_CORE.prepare('SELECT COUNT(*) AS cnt FROM memos').first<{ cnt: number }>())?.cnt).toBe(0);
+            expect((await env.DB_FEED.prepare('SELECT COUNT(*) AS cnt FROM activity_sessions_v2').first<{ cnt: number }>())?.cnt).toBe(0);
+            expect((await legacyDb.prepare('SELECT COUNT(*) AS cnt FROM memos').first<{ cnt: number }>())?.cnt).toBe(0);
+            expect(
+                (
+                    await env.DB_CORE.prepare(
+                        "SELECT payload_json FROM config_bundles WHERE bundle_key = 'vrcx_config'"
+                    ).first<{ payload_json: string }>()
+                )?.payload_json
+            ).toContain('dark');
+
+            // Verify MySQL holds active + legacy business data
+            expect((fakeMysql.tables.get('vrcx_memos')?.rows ?? []).some((r) => r.user_id === 'usr_m_d1')).toBe(true);
+            expect((fakeMysql.tables.get('vrcx_legacy_memos')?.rows ?? []).some((r) => r.user_id === 'usr_leg_m')).toBe(true);
+            expect((fakeMysql.tables.get('vrcx_activity_sessions_v2')?.rows ?? []).length).toBe(1);
+
+            // 3. Verify backup_and_delete cleanup handles MySQL activity_sessions_v2 via `session_id` without `rowid` error
+            const glRes = await exports.default.fetch('http://example.com/api/gamelog', {
+                method: 'POST',
+                headers,
+                body: JSON.stringify({
+                    items: [
+                        {
+                            type: 'Location',
+                            created_at: '2024-01-01T00:00:00.000Z',
+                            location: 'wrld_act_clean:1',
+                            worldId: 'wrld_act_clean',
+                            worldName: 'Clean World',
+                            time: 60
+                        }
+                    ]
+                })
+            });
+            expect(glRes.status).toBe(200);
+            const cleanRes = await exports.default.fetch('http://example.com/api/admin/cleanup', {
+                method: 'POST',
+                headers,
+                body: JSON.stringify({ months: 1, mode: 'backup_and_delete', includeLegacy: false })
+            });
+            expect(cleanRes.status).toBe(200);
+            const cleanJson = (await cleanRes.json()) as { data: { deletedRows: number; backupKey: string } };
+            expect(cleanJson.data.deletedRows).toBeGreaterThanOrEqual(2);
+            if (cleanJson.data.backupKey) createdBackupKeys.push(cleanJson.data.backupKey);
+            expect((fakeMysql.tables.get('vrcx_activity_sessions_v2')?.rows ?? []).length).toBe(0);
+        } finally {
+            setMysqlConnectionFactoryForTests(null);
+            for (const key of createdBackupKeys) {
+                await env.R2_MEDIA?.delete(key).catch(() => {});
+            }
+            await saveExternalDbConfig(env, defaultExternalDbConfig());
+            await saveExternalDbMigrationState(env, defaultExternalDbMigrationState());
+            invalidateExternalDbConfigCache();
+            clearMysqlSchemaReadyCache();
+            await env.DB_CORE.prepare("DELETE FROM config_bundles WHERE bundle_key = 'vrcx_config'").run().catch(() => {});
+            await env.DB_GAMELOG.batch([
+                env.DB_GAMELOG.prepare("DELETE FROM gamelog_world_rollup WHERE world_id = 'wrld_act_clean'"),
+                env.DB_GAMELOG.prepare('DELETE FROM gamelog_archive_chunks')
+            ]).catch(() => {});
         }
     });
 });

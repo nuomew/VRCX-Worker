@@ -730,9 +730,14 @@ export function buildWriteRssSnapshotStatement(env: Env, snapshot: RssSnapshotPa
             `INSERT INTO cloud_rss_snapshot (snapshot_key, payload_json, synced_at)
              VALUES (?, ?, ?)
              ON CONFLICT(snapshot_key) DO UPDATE SET
-                payload_json = excluded.payload_json,
-                synced_at = excluded.synced_at
-             WHERE excluded.synced_at >= cloud_rss_snapshot.synced_at`
+                payload_json = CASE
+                    WHEN excluded.synced_at >= cloud_rss_snapshot.synced_at THEN excluded.payload_json
+                    ELSE cloud_rss_snapshot.payload_json
+                END,
+                synced_at = CASE
+                    WHEN excluded.synced_at >= cloud_rss_snapshot.synced_at THEN excluded.synced_at
+                    ELSE cloud_rss_snapshot.synced_at
+                END`
         )
         .bind(RSS_SNAPSHOT_PRIMARY_KEY, serializeBoundedRssSnapshot(snapshot), snapshot.syncedAt);
 }
@@ -748,9 +753,14 @@ export async function buildWriteRssSnapshotStatementAsync(
             `INSERT INTO cloud_rss_snapshot (snapshot_key, payload_json, synced_at)
              VALUES (?, ?, ?)
              ON CONFLICT(snapshot_key) DO UPDATE SET
-                payload_json = excluded.payload_json,
-                synced_at = excluded.synced_at
-             WHERE excluded.synced_at >= cloud_rss_snapshot.synced_at`
+                payload_json = CASE
+                    WHEN excluded.synced_at >= cloud_rss_snapshot.synced_at THEN excluded.payload_json
+                    ELSE cloud_rss_snapshot.payload_json
+                END,
+                synced_at = CASE
+                    WHEN excluded.synced_at >= cloud_rss_snapshot.synced_at THEN excluded.synced_at
+                    ELSE cloud_rss_snapshot.synced_at
+                END`
         )
         .bind(RSS_SNAPSHOT_PRIMARY_KEY, serialized, snapshot.syncedAt);
 }

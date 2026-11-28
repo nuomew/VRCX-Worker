@@ -14,10 +14,16 @@ import {
     mutateArchiveChunks,
     parseActiveArchiveVirtualRowId
 } from '../db/compactArchive';
+import { isExternalMysqlActiveOnEnv } from '../db/externalMysqlProxy';
 import { getLegacyDb } from '../db/schemaBootstrap';
 import { classifyStorageWriteDegradation, withStorageDegradedHeader } from '../db/storageResilience';
 import type { Env } from '../env';
-import { buildSafeTrigramMatch, escapeSqlLikePattern, searchGameLogByEntity } from '../search/entityFts';
+import {
+    buildSafeTrigramMatch,
+    escapeSqlLikePattern,
+    escapeSqlLikePatternBang,
+    searchGameLogByEntity
+} from '../search/entityFts';
 import {
     clampQueryLimit,
     getAgentOnlineWindowMs,
@@ -4097,6 +4103,28 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
             }
         } else if (isGroupQuery) {
             // Handled via bounded recent-window scan on feed_gps & feed_online_offline location/group_name
+        } else if (isExternalMysqlActiveOnEnv(env)) {
+            const likePattern = `%${escapeSqlLikePatternBang(q.toLowerCase())}%`;
+            const [uRes, wRes] = await env.DB_CORE.batch([
+                env.DB_CORE.prepare(
+                    `SELECT user_id FROM entity_users
+                     WHERE LOWER(display_name) LIKE ? ESCAPE '!' OR LOWER(aliases_text) LIKE ? ESCAPE '!'
+                     ORDER BY updated_at DESC LIMIT 30`
+                ).bind(likePattern, likePattern),
+                wantGps
+                    ? env.DB_CORE.prepare(
+                          `SELECT world_id FROM entity_worlds
+                           WHERE LOWER(world_name) LIKE ? ESCAPE '!'
+                           ORDER BY updated_at DESC LIMIT 20`
+                      ).bind(likePattern)
+                    : env.DB_CORE.prepare('SELECT 1 WHERE 0')
+            ]);
+            userIds = ((uRes?.results ?? []) as Array<{ user_id?: string }>)
+                .map((r) => String(r.user_id ?? ''))
+                .filter(Boolean);
+            worldIds = ((wRes?.results ?? []) as Array<{ world_id?: string }>)
+                .map((r) => String(r.world_id ?? ''))
+                .filter(Boolean);
         } else if (Array.from(q).length >= 3) {
             const matchExpr = buildSafeTrigramMatch(q);
             const [uRes, wRes] = await env.DB_CORE.batch([
@@ -4998,21 +5026,19 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
         if (request.method === 'GET') {
             const userId = url.searchParams.get('userId') ?? '';
             const limit = clampQueryLimit(url.searchParams.get('limit'), 500, 2000);
-            // Select the latest N sessions then order ascending so newer sessions are never truncated off.
+            // Select the latest N sessions descending then reverse in JS so newer sessions are never truncated off
+            // while remaining 100% compatible with both SQLite and MySQL 5.7 (no unaliased derived table subquery).
             const res = await env.DB_FEED.prepare(
                 `SELECT session_id, user_id, start_at, end_at, is_open_tail, source_revision
-                 FROM (
-                     SELECT session_id, user_id, start_at, end_at, is_open_tail, source_revision
-                     FROM activity_sessions_v2
-                     WHERE user_id = ?
-                     ORDER BY start_at DESC
-                     LIMIT ?
-                 )
-                 ORDER BY start_at ASC`
+                 FROM activity_sessions_v2
+                 WHERE user_id = ?
+                 ORDER BY start_at DESC
+                 LIMIT ?`
             )
                 .bind(userId, limit)
                 .all();
-            return Response.json({ ok: true, data: res.results ?? [] });
+            const rows = (res.results ?? []).slice().reverse();
+            return Response.json({ ok: true, data: rows });
         }
         if (request.method === 'POST') {
             let body: {

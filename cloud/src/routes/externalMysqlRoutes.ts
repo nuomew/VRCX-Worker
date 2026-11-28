@@ -2,6 +2,7 @@ import { encodeCompactChunkPayload, runAllDatabasesCompaction } from '../db/comp
 import {
     attachRawD1Env,
     clearMysqlSchemaReadyCache,
+    CURRENT_MIGRATION_SCHEMA_VERSION,
     defaultExternalDbMigrationState,
     encryptMysqlPassword,
     ensureMysqlSchemaOnConnection,
@@ -9,6 +10,7 @@ import {
     getRawD1Env,
     loadExternalDbConfigAndMigration,
     MANAGED_ARCHIVE_TABLES,
+    MANAGED_BUSINESS_TABLES,
     MANAGED_ROLLUP_TABLES,
     measureExternalMysqlUsage,
     normalizeExternalDbConnectionType,
@@ -27,7 +29,10 @@ import {
     validateMysqlTablePrefix,
     validateMysqlUsername,
     type ExternalDbMigrationState,
-    type ManagedArchiveTableSpec,
+    type ExternalDbShardKey,
+    type ManagedBusinessTableSpec,
+    type ManagedMysqlTableName,
+    type MysqlConnectionLike,
     type ResolvedMysqlConnectionParams,
     type StoredExternalDbConfig
 } from '../db/externalMysql';
@@ -39,7 +44,7 @@ function isPlainObject(val: unknown): val is Record<string, unknown> {
     return Boolean(val) && typeof val === 'object' && !Array.isArray(val);
 }
 
-function getRawShardDb(rawEnv: Env, shard: ManagedArchiveTableSpec['shard']): D1Database | null {
+function getRawShardDb(rawEnv: Env, shard: ExternalDbShardKey): D1Database | null {
     switch (shard) {
         case 'core':
             return rawEnv.DB_CORE;
@@ -51,6 +56,8 @@ function getRawShardDb(rawEnv: Env, shard: ManagedArchiveTableSpec['shard']): D1
             return rawEnv.DB_LEGACY ? getLegacyDb(rawEnv) : null;
         case 'chat':
             return getChatDb(rawEnv);
+        case 'cache':
+            return getCacheDb(rawEnv);
     }
 }
 
@@ -59,6 +66,7 @@ export interface D1PendingMigrationSummary {
     totalChunkRows: number;
     totalCacheRows: number;
     totalRollupRows: number;
+    totalBusinessRows: number;
     totalLegacySingleRows: number;
     tables: Record<string, { chunks: number; rows: number }>;
 }
@@ -169,6 +177,7 @@ export async function measureD1PendingMigration(env: Env): Promise<D1PendingMigr
     let totalCacheRows = 0;
     let totalLegacySingleRows = 0;
     let totalRollupRows = 0;
+    let totalBusinessRows = 0;
 
     const byDb = new Map<D1Database, ShardCountQuery[]>();
     const enqueue = (db: D1Database | null, query: ShardCountQuery) => {
@@ -230,6 +239,19 @@ export async function measureD1PendingMigration(env: Env): Promise<D1PendingMigr
         });
     }
 
+    for (const bSpec of MANAGED_BUSINESS_TABLES) {
+        tables[bSpec.physicalTable] = { chunks: 0, rows: 0 };
+        const db = getRawShardDb(rawEnv, bSpec.shard);
+        enqueue(db, {
+            sql: `SELECT COUNT(*) AS cnt FROM ${bSpec.table}`,
+            onRow: (row) => {
+                const cnt = Math.max(0, Number(row?.cnt ?? 0) || 0);
+                tables[bSpec.physicalTable] = { chunks: cnt, rows: cnt };
+                totalBusinessRows += cnt;
+            }
+        });
+    }
+
     await Promise.all(Array.from(byDb.entries()).map(([db, queries]) => executeShardCountBatch(db, queries)));
 
     return {
@@ -237,9 +259,409 @@ export async function measureD1PendingMigration(env: Env): Promise<D1PendingMigr
         totalChunkRows,
         totalCacheRows,
         totalRollupRows,
+        totalBusinessRows,
         totalLegacySingleRows,
         tables
     };
+}
+
+function clipMysqlStr(val: unknown, maxLen: number): string {
+    const clean = String(val ?? '').replaceAll('\u0000', '');
+    if (clean.length <= maxLen) return clean;
+    let end = maxLen;
+    if (end > 0) {
+        const code = clean.charCodeAt(end - 1);
+        if (code >= 0xd800 && code <= 0xdbff) {
+            end--;
+        }
+    }
+    return clean.slice(0, end);
+}
+
+function normalizeBusinessRowForMysql(
+    table: ManagedBusinessTableSpec['table'],
+    raw: Record<string, unknown>
+): { mysqlRow: unknown[]; mysqlKeyValues: unknown[]; rawKeyValues: unknown[] } {
+    switch (table) {
+        case 'memos': {
+            const uid = clipMysqlStr(raw.user_id, 128);
+            return {
+                mysqlRow: [uid, clipMysqlStr(raw.edited_at, 40), String(raw.memo ?? '').replaceAll('\u0000', '')],
+                mysqlKeyValues: [uid],
+                rawKeyValues: [raw.user_id]
+            };
+        }
+        case 'world_memos': {
+            const wid = clipMysqlStr(raw.world_id, 128);
+            return {
+                mysqlRow: [wid, clipMysqlStr(raw.edited_at, 40), String(raw.memo ?? '').replaceAll('\u0000', '')],
+                mysqlKeyValues: [wid],
+                rawKeyValues: [raw.world_id]
+            };
+        }
+        case 'avatar_memos': {
+            const aid = clipMysqlStr(raw.avatar_id, 128);
+            return {
+                mysqlRow: [aid, clipMysqlStr(raw.edited_at, 40), String(raw.memo ?? '').replaceAll('\u0000', '')],
+                mysqlKeyValues: [aid],
+                rawKeyValues: [raw.avatar_id]
+            };
+        }
+        case 'notes': {
+            const uid = clipMysqlStr(raw.user_id, 128);
+            return {
+                mysqlRow: [
+                    uid,
+                    clipMysqlStr(raw.display_name, 256),
+                    String(raw.note ?? '').replaceAll('\u0000', ''),
+                    clipMysqlStr(raw.created_at, 40)
+                ],
+                mysqlKeyValues: [uid],
+                rawKeyValues: [raw.user_id]
+            };
+        }
+        case 'favorite_friend': {
+            const uid = clipMysqlStr(raw.user_id, 128);
+            const grp = clipMysqlStr(raw.group_name, 150);
+            return {
+                mysqlRow: [clipMysqlStr(raw.created_at, 40), uid, grp],
+                mysqlKeyValues: [uid, grp],
+                rawKeyValues: [raw.user_id, raw.group_name]
+            };
+        }
+        case 'favorite_world': {
+            const wid = clipMysqlStr(raw.world_id, 128);
+            const grp = clipMysqlStr(raw.group_name, 150);
+            return {
+                mysqlRow: [clipMysqlStr(raw.created_at, 40), wid, grp],
+                mysqlKeyValues: [wid, grp],
+                rawKeyValues: [raw.world_id, raw.group_name]
+            };
+        }
+        case 'favorite_avatar': {
+            const aid = clipMysqlStr(raw.avatar_id, 128);
+            const grp = clipMysqlStr(raw.group_name, 150);
+            return {
+                mysqlRow: [clipMysqlStr(raw.created_at, 40), aid, grp],
+                mysqlKeyValues: [aid, grp],
+                rawKeyValues: [raw.avatar_id, raw.group_name]
+            };
+        }
+        case 'favorite_print': {
+            const pid = clipMysqlStr(raw.print_id, 128);
+            return {
+                mysqlRow: [pid, clipMysqlStr(raw.created_at, 40)],
+                mysqlKeyValues: [pid],
+                rawKeyValues: [raw.print_id]
+            };
+        }
+        case 'avatar_tags': {
+            const aid = clipMysqlStr(raw.avatar_id, 128);
+            const tag = clipMysqlStr(raw.tag, 128);
+            return {
+                mysqlRow: [aid, tag, raw.color == null ? null : clipMysqlStr(raw.color, 64)],
+                mysqlKeyValues: [aid, tag],
+                rawKeyValues: [raw.avatar_id, raw.tag]
+            };
+        }
+        case 'avatar_history': {
+            const aid = clipMysqlStr(raw.avatar_id, 128);
+            return {
+                mysqlRow: [aid, clipMysqlStr(raw.created_at, 40), Math.max(0, Math.floor(Number(raw.time ?? 0) || 0))],
+                mysqlKeyValues: [aid],
+                rawKeyValues: [raw.avatar_id]
+            };
+        }
+        case 'friend_log_current': {
+            const uid = clipMysqlStr(raw.user_id, 128);
+            return {
+                mysqlRow: [
+                    uid,
+                    clipMysqlStr(raw.display_name, 256),
+                    clipMysqlStr(raw.trust_level, 64),
+                    Math.max(0, Math.floor(Number(raw.friend_number ?? 0) || 0))
+                ],
+                mysqlKeyValues: [uid],
+                rawKeyValues: [raw.user_id]
+            };
+        }
+        case 'moderation': {
+            const uid = clipMysqlStr(raw.user_id, 128);
+            return {
+                mysqlRow: [
+                    uid,
+                    clipMysqlStr(raw.updated_at, 40),
+                    clipMysqlStr(raw.display_name, 256),
+                    Number(raw.block ?? 0) ? 1 : 0,
+                    Number(raw.mute ?? 0) ? 1 : 0
+                ],
+                mysqlKeyValues: [uid],
+                rawKeyValues: [raw.user_id]
+            };
+        }
+        case 'user_profile': {
+            const uid = clipMysqlStr(raw.user_id, 128);
+            return {
+                mysqlRow: [
+                    uid,
+                    String(raw.bio ?? '').replaceAll('\u0000', ''),
+                    String(raw.bio_links ?? '[]').replaceAll('\u0000', ''),
+                    clipMysqlStr(raw.updated_at, 40)
+                ],
+                mysqlKeyValues: [uid],
+                rawKeyValues: [raw.user_id]
+            };
+        }
+        case 'entity_users': {
+            const uid = clipMysqlStr(raw.user_id, 128);
+            return {
+                mysqlRow: [
+                    uid,
+                    clipMysqlStr(raw.display_name, 256),
+                    String(raw.aliases_text ?? '').replaceAll('\u0000', ''),
+                    clipMysqlStr(raw.updated_at, 40)
+                ],
+                mysqlKeyValues: [uid],
+                rawKeyValues: [raw.user_id]
+            };
+        }
+        case 'entity_worlds': {
+            const wid = clipMysqlStr(raw.world_id, 128);
+            return {
+                mysqlRow: [wid, clipMysqlStr(raw.world_name, 512), clipMysqlStr(raw.updated_at, 40)],
+                mysqlKeyValues: [wid],
+                rawKeyValues: [raw.world_id]
+            };
+        }
+        case 'cloud_screenshots': {
+            const sid = clipMysqlStr(raw.id, 128);
+            const filename = clipMysqlStr(raw.local_filename, 191);
+            return {
+                mysqlRow: [
+                    sid,
+                    clipMysqlStr(raw.device_id, 128),
+                    clipMysqlStr(raw.taken_at, 40),
+                    filename,
+                    clipMysqlStr(raw.world_id, 128),
+                    clipMysqlStr(raw.world_name, 512),
+                    clipMysqlStr(raw.instance_id, 512),
+                    String(raw.players_json ?? '[]').replaceAll('\u0000', ''),
+                    String(raw.metadata_json ?? '{}').replaceAll('\u0000', ''),
+                    clipMysqlStr(raw.r2_thumb_key, 512),
+                    Math.max(0, Math.floor(Number(raw.thumb_bytes ?? 0) || 0)),
+                    clipMysqlStr(raw.created_at, 40)
+                ],
+                mysqlKeyValues: [sid, filename.toLowerCase()],
+                rawKeyValues: [raw.id]
+            };
+        }
+        case 'activity_sessions_v2': {
+            const sid = Math.max(1, Math.floor(Number(raw.session_id ?? 0) || 0));
+            return {
+                mysqlRow: [
+                    sid,
+                    clipMysqlStr(raw.user_id, 128),
+                    Math.floor(Number(raw.start_at ?? 0) || 0),
+                    Math.floor(Number(raw.end_at ?? 0) || 0),
+                    Number(raw.is_open_tail ?? 0) ? 1 : 0,
+                    clipMysqlStr(raw.source_revision, 128)
+                ],
+                mysqlKeyValues: [sid],
+                rawKeyValues: [raw.session_id]
+            };
+        }
+        case 'cloud_rss_snapshot': {
+            const skey = clipMysqlStr(raw.snapshot_key, 64);
+            return {
+                mysqlRow: [
+                    skey,
+                    String(raw.payload_json ?? '{}').replaceAll('\u0000', ''),
+                    clipMysqlStr(raw.synced_at, 40)
+                ],
+                mysqlKeyValues: [skey],
+                rawKeyValues: [raw.snapshot_key]
+            };
+        }
+        case 'cloud_chat_messages': {
+            const mid = clipMysqlStr(raw.id, 128);
+            return {
+                mysqlRow: [
+                    mid,
+                    clipMysqlStr(raw.device_id, 128),
+                    clipMysqlStr(raw.direction, 32),
+                    String(raw.source_text ?? '').replaceAll('\u0000', ''),
+                    String(raw.translated_text ?? '').replaceAll('\u0000', ''),
+                    String(raw.sent_text ?? '').replaceAll('\u0000', ''),
+                    clipMysqlStr(raw.source_lang, 32),
+                    clipMysqlStr(raw.target_lang, 32),
+                    clipMysqlStr(raw.display_mode, 32),
+                    clipMysqlStr(raw.osc_address, 128),
+                    Math.floor(Number(raw.osc_port ?? 9000) || 9000),
+                    Number(raw.immediate ?? 1) ? 1 : 0,
+                    Number(raw.play_sfx ?? 1) ? 1 : 0,
+                    clipMysqlStr(raw.status, 32),
+                    clipMysqlStr(raw.cmd_id, 128),
+                    String(raw.error_message ?? '').replaceAll('\u0000', ''),
+                    clipMysqlStr(raw.created_at, 40)
+                ],
+                mysqlKeyValues: [mid],
+                rawKeyValues: [raw.id]
+            };
+        }
+        case 'stats_counters': {
+            const ckey = clipMysqlStr(raw.counter_key, 128);
+            return {
+                mysqlRow: [
+                    ckey,
+                    Math.max(0, Math.floor(Number(raw.row_count ?? 0) || 0)),
+                    clipMysqlStr(raw.updated_at, 40)
+                ],
+                mysqlKeyValues: [ckey],
+                rawKeyValues: [raw.counter_key]
+            };
+        }
+    }
+}
+
+async function migrateSingleBusinessTableSlice(
+    conn: MysqlConnectionLike,
+    d1: D1Database,
+    bSpec: ManagedBusinessTableSpec,
+    qTbl: string,
+    slice: Array<Record<string, unknown>>
+): Promise<number> {
+    if (slice.length === 0) return 0;
+
+    const prepared = slice.map((raw) => normalizeBusinessRowForMysql(bSpec.table, raw));
+    const colsSql = bSpec.columns.map((c) => `\`${c}\``).join(', ');
+    const rowPh = `(${bSpec.columns.map(() => '?').join(', ')})`;
+
+    if (bSpec.mergeMode === 'avatar_history') {
+        const merged = new Map<string, { aid: string; createdAt: string; time: number }>();
+        for (const item of prepared) {
+            const [aid, createdAt, time] = item.mysqlRow as [string, string, number];
+            const prev = merged.get(aid);
+            if (!prev) {
+                merged.set(aid, { aid, createdAt, time });
+            } else {
+                prev.time += time;
+                if (createdAt > prev.createdAt) prev.createdAt = createdAt;
+            }
+        }
+        const entries = Array.from(merged.values());
+        const ph = entries.map(() => '(?, ?, ?)').join(', ');
+        const binds: unknown[] = [];
+        for (const e of entries) binds.push(e.aid, e.createdAt, e.time);
+        await conn.execute(
+            `INSERT INTO \`${qTbl}\` (${colsSql})
+             VALUES ${ph}
+             ON DUPLICATE KEY UPDATE
+                \`created_at\` = CASE WHEN VALUES(\`created_at\`) > \`created_at\` THEN VALUES(\`created_at\`) ELSE \`created_at\` END,
+                \`time\` = \`time\` + VALUES(\`time\`)`,
+            binds
+        );
+    } else if (bSpec.mergeMode === 'stats_counters') {
+        const uptimeRows = prepared.filter((p) => p.mysqlRow[0] === 'cloud_total_uptime_seconds');
+        const otherRows = prepared.filter((p) => p.mysqlRow[0] !== 'cloud_total_uptime_seconds');
+        if (uptimeRows.length > 0) {
+            const ph = uptimeRows.map(() => '(?, ?, ?)').join(', ');
+            const binds: unknown[] = [];
+            for (const u of uptimeRows) binds.push(...u.mysqlRow);
+            await conn.execute(
+                `INSERT INTO \`${qTbl}\` (${colsSql})
+                 VALUES ${ph}
+                 ON DUPLICATE KEY UPDATE
+                    \`updated_at\` = CASE WHEN VALUES(\`updated_at\`) > \`updated_at\` THEN VALUES(\`updated_at\`) ELSE \`updated_at\` END,
+                    \`row_count\` = GREATEST(\`row_count\`, VALUES(\`row_count\`))`,
+                binds
+            );
+        }
+        if (otherRows.length > 0) {
+            const ph = otherRows.map(() => '(?, ?, ?)').join(', ');
+            const binds: unknown[] = [];
+            for (const o of otherRows) binds.push(...o.mysqlRow);
+            await conn.execute(
+                `INSERT INTO \`${qTbl}\` (${colsSql})
+                 VALUES ${ph}
+                 ON DUPLICATE KEY UPDATE
+                    \`updated_at\` = CASE WHEN VALUES(\`updated_at\`) > \`updated_at\` THEN VALUES(\`updated_at\`) ELSE \`updated_at\` END,
+                    \`row_count\` = \`row_count\` + VALUES(\`row_count\`)`,
+                binds
+            );
+        }
+    } else if (bSpec.mergeMode === 'rss_snapshot') {
+        const ph = prepared.map(() => rowPh).join(', ');
+        const binds: unknown[] = [];
+        for (const item of prepared) binds.push(...item.mysqlRow);
+        // `payload_json` MUST be assigned BEFORE `synced_at` so MySQL 5.7 reads the old `synced_at`.
+        await conn.execute(
+            `INSERT INTO \`${qTbl}\` (${colsSql})
+             VALUES ${ph}
+             ON DUPLICATE KEY UPDATE
+                \`payload_json\` = CASE WHEN VALUES(\`synced_at\`) > \`synced_at\` THEN VALUES(\`payload_json\`) ELSE \`payload_json\` END,
+                \`synced_at\` = CASE WHEN VALUES(\`synced_at\`) > \`synced_at\` THEN VALUES(\`synced_at\`) ELSE \`synced_at\` END`,
+            binds
+        );
+    } else {
+        const ph = prepared.map(() => rowPh).join(', ');
+        const binds: unknown[] = [];
+        for (const item of prepared) binds.push(...item.mysqlRow);
+        await conn.execute(`INSERT IGNORE INTO \`${qTbl}\` (${colsSql}) VALUES ${ph}`, binds);
+    }
+
+    // Verify durable presence in MySQL BEFORE deleting any row from raw D1
+    let verifiedIndices: number[] = [];
+    if (bSpec.table === 'cloud_screenshots') {
+        const ids = prepared.map((p) => String(p.mysqlKeyValues[0] ?? ''));
+        const fns = prepared.map((p) => String(p.mysqlKeyValues[1] ?? ''));
+        const idPh = ids.map(() => '?').join(', ');
+        const fnPh = fns.map(() => '?').join(', ');
+        const verRes = await conn.execute(
+            `SELECT \`id\`, \`local_filename\` FROM \`${qTbl}\` WHERE \`id\` IN (${idPh}) OR LOWER(\`local_filename\`) IN (${fnPh})`,
+            [...ids, ...fns]
+        );
+        const okIds = new Set(verRes.rows.map((r) => String(r.id ?? '')));
+        const okFns = new Set(verRes.rows.map((r) => String(r.local_filename ?? '').toLowerCase()).filter(Boolean));
+        verifiedIndices = prepared
+            .map((p, idx) =>
+                okIds.has(String(p.mysqlKeyValues[0] ?? '')) || okFns.has(String(p.mysqlKeyValues[1] ?? '')) ? idx : -1
+            )
+            .filter((idx) => idx >= 0);
+    } else if (bSpec.keyCols.length === 2) {
+        const k0 = bSpec.keyCols[0]!;
+        const k1 = bSpec.keyCols[1]!;
+        const k0Vals = Array.from(new Set(prepared.map((p) => String(p.mysqlKeyValues[0] ?? ''))));
+        const ph0 = k0Vals.map(() => '?').join(', ');
+        const verRes = await conn.execute(
+            `SELECT \`${k0}\`, \`${k1}\` FROM \`${qTbl}\` WHERE \`${k0}\` IN (${ph0})`,
+            k0Vals
+        );
+        const okPairs = new Set(verRes.rows.map((r) => `${String(r[k0] ?? '')}\0${String(r[k1] ?? '')}`));
+        verifiedIndices = prepared
+            .map((p, idx) =>
+                okPairs.has(`${String(p.mysqlKeyValues[0] ?? '')}\0${String(p.mysqlKeyValues[1] ?? '')}`) ? idx : -1
+            )
+            .filter((idx) => idx >= 0);
+    } else {
+        const k0 = bSpec.keyCols[0]!;
+        const k0Vals = prepared.map((p) => p.mysqlKeyValues[0]);
+        const ph0 = k0Vals.map(() => '?').join(', ');
+        const verRes = await conn.execute(`SELECT \`${k0}\` FROM \`${qTbl}\` WHERE \`${k0}\` IN (${ph0})`, k0Vals);
+        const okSet = new Set(verRes.rows.map((r) => String(r[k0] ?? '')));
+        verifiedIndices = prepared
+            .map((p, idx) => (okSet.has(String(p.mysqlKeyValues[0] ?? '')) ? idx : -1))
+            .filter((idx) => idx >= 0);
+    }
+
+    if (verifiedIndices.length > 0) {
+        const delWhere = bSpec.keyCols.map((c) => `${c} = ?`).join(' AND ');
+        await d1.batch(
+            verifiedIndices.map((idx) =>
+                d1.prepare(`DELETE FROM ${bSpec.table} WHERE ${delWhere}`).bind(...prepared[idx]!.rawKeyValues)
+            )
+        );
+    }
+    return verifiedIndices.length;
 }
 
 export interface MysqlMigrationBatchReport {
@@ -249,6 +671,7 @@ export interface MysqlMigrationBatchReport {
     movedChunks: number;
     movedRows: number;
     movedRollupRows: number;
+    movedBusinessRows: number;
     movedCacheRows: number;
     remaining: D1PendingMigrationSummary;
     migration: ExternalDbMigrationState;
@@ -256,15 +679,17 @@ export interface MysqlMigrationBatchReport {
 
 /**
  * Executes one bounded, resumable batch of Mode 2 (Full Migration: D1 -> MySQL 5.7+):
- * 1. Compacts any remaining uncompacted legacy single-row tables from D1 directly into MySQL chunks.
+ * 1. Compacts any remaining uncompacted legacy single-row history tables from D1 directly into MySQL chunks.
  * 2. Copies up to `maxChunks` D1 archive chunks into MySQL via `INSERT IGNORE`, verifies every `chunk_key`
  *    is durably present in MySQL, and ONLY THEN deletes those exact chunk IDs from D1.
+ * 2.5. Migrates all 4 D1 GameLog rollup tables additively.
+ * 2.8. Migrates all 35 newly offloaded D1 business tables (verifying each slice before D1 deletion).
  * 3. Moves unexpired `vrc_api_cache` entries to MySQL and clears D1 cache.
- * 4. Marks `d1Drained = true` once D1 has zero remaining migratable chunks/cache.
+ * 4. Marks `d1Drained = true` & `schemaVersion = 2` once D1 has zero remaining business/archive/rollup/cache rows.
  */
 export async function runExternalMysqlMigrationBatch(
     env: Env,
-    options: { maxChunks?: number; maxCacheRows?: number; resetProgress?: boolean } = {}
+    options: { maxChunks?: number; maxCacheRows?: number; maxBusinessRows?: number; resetProgress?: boolean } = {}
 ): Promise<MysqlMigrationBatchReport> {
     const rawEnv = getRawD1Env(env);
     const { config, migration: loadedMigration } = await loadExternalDbConfigAndMigration(rawEnv, {
@@ -283,12 +708,14 @@ export async function runExternalMysqlMigrationBatch(
 
     const maxChunks = Math.min(Math.max(Math.floor(Number(options.maxChunks ?? 8)), 1), 30);
     const maxCacheRows = Math.min(Math.max(Math.floor(Number(options.maxCacheRows ?? 80)), 10), 200);
+    const maxBusinessRows = Math.min(Math.max(Math.floor(Number(options.maxBusinessRows ?? 150)), 20), 400);
     const nowIso = new Date().toISOString();
 
     const state: ExternalDbMigrationState = options.resetProgress
         ? { ...defaultExternalDbMigrationState(), status: 'running', startedAt: nowIso }
         : {
               ...loadedMigration,
+              schemaVersion: CURRENT_MIGRATION_SCHEMA_VERSION,
               status: 'running',
               startedAt: loadedMigration.startedAt || nowIso,
               lastError: ''
@@ -298,6 +725,7 @@ export async function runExternalMysqlMigrationBatch(
     let movedChunks = 0;
     let movedRows = 0;
     let movedRollupRows = 0;
+    let movedBusinessRows = 0;
     let movedCacheRows = 0;
 
     // Step 1: Compact any remaining legacy single-row history rows straight into MySQL via hybrid env
@@ -731,8 +1159,39 @@ export async function runExternalMysqlMigrationBatch(
             }
         }
 
-        // Step 3: When all archive chunks & rollups are moved, migrate remaining unexpired `vrc_api_cache` & drain D1 cache
+        // Step 2.8: When archive chunks & rollups are moved, migrate all 35 D1 business tables into MySQL 5.7
+        // (verifying durable presence per 25-row slice before deleting from D1; settings & control-plane stay in D1).
         if (movedChunks === 0 && movedRollupRows === 0 && chunkBudget > 0) {
+            let businessBudget = maxBusinessRows;
+            for (const bSpec of MANAGED_BUSINESS_TABLES) {
+                if (businessBudget <= 0) break;
+                const d1 = getRawShardDb(rawEnv, bSpec.shard);
+                if (!d1) continue;
+                const selectCols = bSpec.columns.join(', ');
+                const res = await d1
+                    .prepare(`SELECT ${selectCols} FROM ${bSpec.table} ORDER BY ${bSpec.orderByCol} ASC LIMIT ?`)
+                    .bind(Math.min(businessBudget, 100))
+                    .all<Record<string, unknown>>()
+                    .catch(() => ({ results: [] as Array<Record<string, unknown>> }));
+                const rows = res.results ?? [];
+                if (rows.length === 0) continue;
+
+                state.phase = 'move_business';
+                state.lastTable = bSpec.physicalTable;
+                const qTbl = qualifyMysqlTableName(connParams.tablePrefix, bSpec.physicalTable);
+
+                for (let i = 0; i < rows.length; i += 25) {
+                    const slice = rows.slice(i, i + 25);
+                    const movedInSlice = await migrateSingleBusinessTableSlice(conn, d1, bSpec, qTbl, slice);
+                    movedBusinessRows += movedInSlice;
+                    businessBudget -= movedInSlice;
+                }
+            }
+        }
+
+        // Step 3: When all archive chunks, rollups, and business tables are moved, migrate remaining unexpired
+        // `vrc_api_cache` & drain D1 cache.
+        if (movedChunks === 0 && movedRollupRows === 0 && movedBusinessRows === 0 && chunkBudget > 0) {
             const cacheDb = getCacheDb(rawEnv);
             const nowMs = Date.now();
             // Purge already-expired rows from D1 cache first
@@ -794,9 +1253,11 @@ export async function runExternalMysqlMigrationBatch(
         }
     } catch (err) {
         // Persist counters for slices already durably written to MySQL and deleted from D1 before the error
+        state.schemaVersion = CURRENT_MIGRATION_SCHEMA_VERSION;
         state.totalChunksMoved += movedChunks;
         state.totalRowsMoved += movedRows;
         state.totalRollupMoved += movedRollupRows;
+        state.totalBusinessRowsMoved += movedBusinessRows;
         state.totalCacheMoved += movedCacheRows;
         state.status = 'error';
         state.lastError = err instanceof Error ? err.message : 'Migration batch failed';
@@ -806,24 +1267,34 @@ export async function runExternalMysqlMigrationBatch(
         await conn.close();
     }
 
+    state.schemaVersion = CURRENT_MIGRATION_SCHEMA_VERSION;
     state.totalChunksMoved += movedChunks;
     state.totalRowsMoved += movedRows;
     state.totalRollupMoved += movedRollupRows;
+    state.totalBusinessRowsMoved += movedBusinessRows;
     state.totalCacheMoved += movedCacheRows;
 
     const remaining = await measureD1PendingMigration(rawEnv);
     const done =
         remaining.totalChunks === 0 &&
         remaining.totalRollupRows === 0 &&
+        remaining.totalBusinessRows === 0 &&
         remaining.totalCacheRows === 0 &&
         (remaining.totalLegacySingleRows === 0 ||
-            (compactedSingleRows === 0 && movedChunks === 0 && movedRollupRows === 0 && movedCacheRows === 0));
+            (compactedSingleRows === 0 &&
+                movedChunks === 0 &&
+                movedRollupRows === 0 &&
+                movedBusinessRows === 0 &&
+                movedCacheRows === 0));
 
     if (done) {
         state.status = 'completed';
         state.phase = 'done';
         state.d1Drained =
-            remaining.totalChunks === 0 && remaining.totalRollupRows === 0 && remaining.totalCacheRows === 0;
+            remaining.totalChunks === 0 &&
+            remaining.totalRollupRows === 0 &&
+            remaining.totalBusinessRows === 0 &&
+            remaining.totalCacheRows === 0;
         state.completedAt = new Date().toISOString();
     } else {
         state.status = 'running';
@@ -839,6 +1310,7 @@ export async function runExternalMysqlMigrationBatch(
         movedChunks,
         movedRows,
         movedRollupRows,
+        movedBusinessRows,
         movedCacheRows,
         remaining,
         migration: state
@@ -1201,12 +1673,14 @@ export async function handleExternalMysqlRoutes(request: Request, env: Env, url:
         const body = isPlainObject(rawBody) ? rawBody : {};
         const maxChunks = Number(body.maxChunks ?? 8);
         const maxCacheRows = Number(body.maxCacheRows ?? 80);
+        const maxBusinessRows = Number(body.maxBusinessRows ?? 150);
         const resetProgress = body.resetProgress === true;
 
         try {
             const report = await runExternalMysqlMigrationBatch(rawEnv, {
                 maxChunks,
                 maxCacheRows,
+                maxBusinessRows,
                 resetProgress
             });
             return Response.json({ ok: true, data: report }, { headers: { 'Cache-Control': 'no-store' } });

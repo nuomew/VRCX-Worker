@@ -22,14 +22,17 @@ import {
     feedTupleDedupKey,
     GAMELOG_TABLE_TO_CHUNK_KIND,
     type GameLogChunkKind,
-    gamelogTupleDedupKey
+    gamelogTupleDedupKey,
+    sanitizeMysqlSafeText
 } from '../db/compactArchive';
+import { MANAGED_MYSQL_TABLE_SET } from '../db/externalMysql';
 import { isExternalMysqlActiveOnEnv } from '../db/externalMysqlProxy';
 import { getLegacyDb } from '../db/schemaBootstrap';
 import type { Env } from '../env';
 import {
     dispatchAgentCommandInternal,
     PayloadTooLargeError,
+    readRequestBytesBounded,
     readRequestTextBounded
 } from './agentRoutes';
 import {
@@ -46,10 +49,14 @@ export const LEGACY_DB_FREE_LIMIT_BYTES = 500 * 1024 * 1024;
 export const LEGACY_DB_SOFT_STOP_BYTES = 480 * 1024 * 1024;
 const LEGACY_DB_HARD_CEILING_BYTES = 496 * 1024 * 1024;
 const MYSQL_OFFLOADED_LEGACY_CATEGORIES: ReadonlySet<string> = new Set([
-    'gamelog',
-    'feed',
+    'memos_notes',
+    'favorites',
+    'avatar_history',
+    'friend_log',
     'notifications',
-    'friend_log'
+    'moderation_profiles',
+    'gamelog',
+    'feed'
 ]);
 const MAX_INVENTORY_BODY_BYTES = 128 * 1024;
 const MAX_BATCH_BODY_BYTES = 4 * 1024 * 1024;
@@ -517,6 +524,51 @@ async function handleCloudExportQuery(env: Env, url: URL): Promise<Response> {
         return readArchiveChunkExportResponse(afterRowId - COMPACT_EXPORT_CHUNK_OFFSET);
     }
 
+    if (isExternalMysqlActiveOnEnv(env) && MANAGED_MYSQL_TABLE_SET.has(tableName)) {
+        const exportSortKeys: Record<string, string[]> = {
+            memos: ['user_id'],
+            world_memos: ['world_id'],
+            avatar_memos: ['avatar_id'],
+            notes: ['user_id'],
+            favorite_friend: ['user_id', 'group_name'],
+            favorite_world: ['world_id', 'group_name'],
+            favorite_avatar: ['avatar_id', 'group_name'],
+            favorite_print: ['print_id'],
+            avatar_tags: ['avatar_id', 'tag'],
+            avatar_history: ['avatar_id'],
+            friend_log_current: ['user_id'],
+            moderation: ['user_id'],
+            user_profile: ['user_id']
+        };
+        const sortCols = exportSortKeys[tableName] ?? ['id'];
+        const res = await targetDb.prepare(`SELECT * FROM ${tableName}`).all<Record<string, unknown>>();
+        const sorted = (res.results ?? []).slice().sort((a, b) => {
+            for (const col of sortCols) {
+                const sa = String(a[col] ?? '');
+                const sb = String(b[col] ?? '');
+                if (sa < sb) return -1;
+                if (sa > sb) return 1;
+            }
+            return 0;
+        });
+        const page = sorted.slice(afterRowId, afterRowId + limit);
+        const nextAfterRowId = afterRowId + page.length;
+        const hasMore = sorted.length > nextAfterRowId;
+        return Response.json(
+            {
+                ok: true,
+                data: {
+                    table: tableName,
+                    source,
+                    rows: page,
+                    nextAfterRowId,
+                    hasMore
+                }
+            },
+            { headers: { 'Cache-Control': 'no-store' } }
+        );
+    }
+
     const res = await targetDb
         .prepare(`SELECT rowid AS _cursor_id, * FROM ${tableName} WHERE rowid > ? ORDER BY rowid ASC LIMIT ?`)
         .bind(afterRowId, limit + 1)
@@ -910,35 +962,11 @@ function isPlainObject(val: unknown): val is Record<string, unknown> {
     return Boolean(val) && typeof val === 'object' && !Array.isArray(val);
 }
 
+const utf8Decoder = new TextDecoder();
+
 function asStr(val: unknown, maxLen = 16_384): string {
     if (typeof val !== 'string') return '';
-    let cut = val.length > maxLen ? maxLen : val.length;
-    if (cut > 0 && cut < val.length) {
-        const lastCode = val.charCodeAt(cut - 1);
-        if (lastCode >= 0xd800 && lastCode <= 0xdbff) {
-            cut--;
-        }
-    }
-    let out = '';
-    for (let i = 0; i < cut; i++) {
-        const c = val.charCodeAt(i);
-        if (c === 0) continue;
-        if (c >= 0xd800 && c <= 0xdbff) {
-            if (i + 1 < cut) {
-                const next = val.charCodeAt(i + 1);
-                if (next >= 0xdc00 && next <= 0xdfff) {
-                    out += val[i]! + val[i + 1]!;
-                    i++;
-                }
-            }
-            continue;
-        }
-        if (c >= 0xdc00 && c <= 0xdfff) {
-            continue;
-        }
-        out += val[i]!;
-    }
-    return out;
+    return sanitizeMysqlSafeText(val, maxLen);
 }
 
 /**
@@ -1077,9 +1105,10 @@ function sanitizeCategoryInventoryList(raw: unknown): LegacyCategoryInventory[] 
     return out;
 }
 
-// Smaller raw chunk ceiling when offloading to public external MySQL 5.7+ so each gzip-compressed
-// SQL packet stays ~8-25 KiB (well below strict shared-host max_allowed_packet and resilient across public TCP links).
-const EXTERNAL_MYSQL_CHUNK_MAX_BYTES = 128 * 1024;
+// 256 KiB raw chunk ceiling when offloading to external MySQL 5.7+ keeps each gzip-compressed
+// SQL packet ~20-65 KiB (1/60 of MySQL 5.7's 4 MiB default max_allowed_packet) while halving
+// per-batch zlib/SHA-256 calls and MySQL round-trips vs 128 KiB to prevent Workers Free 1102 CPU timeouts.
+const EXTERNAL_MYSQL_CHUNK_MAX_BYTES = 256 * 1024;
 
 async function ingestLegacyCategoryBatch(
     legacyDb: D1Database,
@@ -1511,7 +1540,8 @@ async function ingestLegacyCategoryBatch(
             fallbackIso: nowIso,
             maxRows: COMPACT_CHUNK_MAX_ROWS,
             maxJsonBytes: effectiveChunkMaxBytes,
-            negateRowIds: true
+            negateRowIds: true,
+            bulkMigration: true
         });
         inserted += res.inserted;
         if (res.sizeAfter > legacyDbBytes) legacyDbBytes = res.sizeAfter;
@@ -1537,7 +1567,8 @@ async function ingestLegacyCategoryBatch(
             fallbackIso: nowIso,
             maxRows: COMPACT_CHUNK_MAX_ROWS,
             maxJsonBytes: effectiveChunkMaxBytes,
-            negateRowIds: true
+            negateRowIds: true,
+            bulkMigration: true
         });
         inserted += res.inserted;
         if (res.sizeAfter > legacyDbBytes) legacyDbBytes = res.sizeAfter;
@@ -1552,7 +1583,8 @@ async function ingestLegacyCategoryBatch(
                         world_name: t[3],
                         time: t[4],
                         group_name: t[5]
-                    }))
+                    })),
+                    { externalMysqlActive: options.externalMysqlActive }
                 );
             } else if (bucket.kind === 'join_leave') {
                 await applyUserRollupForPackedJoinLeave(
@@ -1565,7 +1597,8 @@ async function ingestLegacyCategoryBatch(
                         user_id: t[4],
                         time: t[5]
                     })),
-                    res.recentExistingTuples
+                    res.recentExistingTuples,
+                    { externalMysqlActive: options.externalMysqlActive }
                 );
             }
         }
@@ -1588,7 +1621,8 @@ async function ingestLegacyCategoryBatch(
             fallbackIso: nowIso,
             maxRows: COMPACT_CHUNK_MAX_ROWS,
             maxJsonBytes: effectiveChunkMaxBytes,
-            negateRowIds: true
+            negateRowIds: true,
+            bulkMigration: true
         });
         inserted += res.inserted;
         if (res.sizeAfter > legacyDbBytes) legacyDbBytes = res.sizeAfter;
@@ -1735,9 +1769,9 @@ export async function handleLegacyMigrationAgentRoutes(
                 { status: 401 }
             );
         }
-        let rawText: string;
+        let rawBytes: Uint8Array;
         try {
-            rawText = await readRequestTextBounded(
+            rawBytes = await readRequestBytesBounded(
                 request,
                 MAX_BATCH_BODY_BYTES,
                 'Migration batch exceeds 4 MiB limit'
@@ -1751,7 +1785,8 @@ export async function handleLegacyMigrationAgentRoutes(
             }
             throw err;
         }
-        const auth = await verifyAgentBodyHmac(request, env, preAuth, rawText);
+        // Pass raw UTF-8 bytes directly to HMAC SHA-256 verification to avoid re-encoding up to 512 KiB strings.
+        const auth = await verifyAgentBodyHmac(request, env, preAuth, rawBytes);
         if (!auth.authenticated || !auth.deviceId) {
             return Response.json(
                 { ok: false, error: { code: 'UNAUTHORIZED_AGENT', message: auth.reason ?? 'Unauthorized agent' } },
@@ -1761,6 +1796,7 @@ export async function handleLegacyMigrationAgentRoutes(
 
         let body: Record<string, unknown>;
         try {
+            const rawText = rawBytes.byteLength > 0 ? utf8Decoder.decode(rawBytes) : '';
             const parsed = rawText ? (JSON.parse(rawText) as unknown) : {};
             if (!isPlainObject(parsed)) {
                 return Response.json(

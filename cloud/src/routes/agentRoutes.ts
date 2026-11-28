@@ -81,7 +81,7 @@ const MAX_CMD_RESULT_JSON_CHARS = 32_768;
 
 export class PayloadTooLargeError extends Error {}
 
-async function readRequestBytesBounded(request: Request, maxBytes: number, message: string): Promise<Uint8Array> {
+export async function readRequestBytesBounded(request: Request, maxBytes: number, message: string): Promise<Uint8Array> {
     const declaredLen = Number(request.headers.get('Content-Length') ?? '0');
     if (Number.isFinite(declaredLen) && declaredLen > maxBytes) {
         await request.body?.cancel().catch(() => {});

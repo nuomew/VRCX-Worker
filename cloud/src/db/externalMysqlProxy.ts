@@ -4,6 +4,7 @@ import {
     ExternalMysqlSession,
     getRawD1Env,
     loadExternalDbConfigAndMigration,
+    MANAGED_ARCHIVE_TABLE_SET,
     MANAGED_MYSQL_TABLE_SET,
     MYSQL_CHUNK_ID_MIN,
     qualifyMysqlTableName,
@@ -14,6 +15,16 @@ import {
 import { classifyStorageWriteDegradation, withStorageDegradedHeader } from './storageResilience';
 
 const WRITE_TARGET_ONLY_HINT = '/* vrcx:write-target */';
+const MANAGED_TABLE_REGEX_CACHE = new Map<ManagedMysqlTableName, RegExp>();
+
+function getManagedTableRegex(table: ManagedMysqlTableName): RegExp {
+    let re = MANAGED_TABLE_REGEX_CACHE.get(table);
+    if (!re) {
+        re = new RegExp(`\\b${table}\\b`, 'gi');
+        MANAGED_TABLE_REGEX_CACHE.set(table, re);
+    }
+    return re;
+}
 
 interface DetectedManagedSql {
     verb: 'SELECT' | 'INSERT' | 'UPDATE' | 'DELETE';
@@ -181,19 +192,16 @@ export function rewriteManagedSqlForMysql(
         };
     }
 
-    // Rewrite SQLite conflict clauses into MySQL 5.7 equivalents
+    // Rewrite SQLite conflict & case-collation clauses into MySQL 5.7 equivalents
     sql = sql.replace(/\bINSERT\s+OR\s+IGNORE\s+INTO\b/gi, 'INSERT IGNORE INTO');
     sql = sql.replace(/\bINSERT\s+OR\s+REPLACE\s+INTO\b/gi, 'REPLACE INTO');
+    sql = sql.replace(/\bUPDATE\s+OR\s+IGNORE\b/gi, 'UPDATE IGNORE');
+    sql = sql.replace(/\bCOLLATE\s+NOCASE\b/gi, '');
 
     // SQLite 2-arg scalar `MAX(0, expr)` is `GREATEST(0, expr)` in MySQL 5.7 (MySQL MAX() is aggregate-only).
-    if (table === 'gamelog_world_rollup' || table === 'gamelog_user_rollup') {
-        sql = sql.replace(/\bMAX\s*\(\s*0\s*,/gi, 'GREATEST(0,');
-    }
+    sql = sql.replace(/\bMAX\s*\(\s*0\s*,/gi, 'GREATEST(0,');
 
-    if (
-        (table === 'vrc_api_cache' || table === 'gamelog_world_rollup' || table === 'gamelog_user_rollup') &&
-        /\bON\s+CONFLICT\s*\([^)]+\)\s*DO\s+UPDATE\s+SET\b/i.test(sql)
-    ) {
+    if (/\bON\s+CONFLICT\s*\([^)]+\)\s*DO\s+UPDATE\s+SET\b/i.test(sql)) {
         sql = sql.replace(
             /\bON\s+CONFLICT\s*\([^)]+\)\s*DO\s+UPDATE\s+SET\b([\s\S]*)$/i,
             (_full, setClause: string) => {
@@ -204,12 +212,16 @@ export function rewriteManagedSqlForMysql(
     }
 
     // Qualify the managed table name safely (avoid replacing occurrences inside single-quoted literals)
-    const tableRe = new RegExp(`\\b${table}\\b`, 'gi');
-    const parts = sql.split(/('(?:''|[^'])*')/g);
-    for (let i = 0; i < parts.length; i += 2) {
-        parts[i] = parts[i]!.replace(tableRe, `\`${qTable}\``);
+    const tableRe = getManagedTableRegex(table);
+    if (!sql.includes("'")) {
+        sql = sql.replace(tableRe, `\`${qTable}\``);
+    } else {
+        const parts = sql.split(/('(?:''|[^'])*')/g);
+        for (let i = 0; i < parts.length; i += 2) {
+            parts[i] = parts[i]!.replace(tableRe, `\`${qTable}\``);
+        }
+        sql = parts.join('');
     }
-    sql = parts.join('');
 
     return {
         sql,
@@ -377,7 +389,219 @@ function detectScalarAggregates(sql: string): { isAggregate: boolean; groupByCol
     return { isAggregate: specs.length > 0, groupByCol, specs };
 }
 
+function extractBusinessRowDedupKey(table: ManagedMysqlTableName, row: Record<string, unknown>): string {
+    if (typeof row.chunk_key === 'string' && row.chunk_key) {
+        return `ck:${row.chunk_key}`;
+    }
+    if (typeof row.cache_key === 'string' && row.cache_key) {
+        return `k:${row.cache_key}`;
+    }
+    switch (table) {
+        case 'memos':
+        case 'notes':
+        case 'friend_log_current':
+        case 'moderation':
+        case 'user_profile':
+        case 'entity_users':
+            return typeof row.user_id === 'string' && row.user_id ? `u:${row.user_id}` : '';
+        case 'world_memos':
+        case 'entity_worlds':
+            return typeof row.world_id === 'string' && row.world_id ? `w:${row.world_id}` : '';
+        case 'avatar_memos':
+        case 'avatar_history':
+            return typeof row.avatar_id === 'string' && row.avatar_id ? `a:${row.avatar_id}` : '';
+        case 'favorite_friend':
+            return row.user_id !== undefined && row.group_name !== undefined
+                ? `ff:${String(row.user_id)}\0${String(row.group_name)}`
+                : '';
+        case 'favorite_world':
+            return row.world_id !== undefined && row.group_name !== undefined
+                ? `fw:${String(row.world_id)}\0${String(row.group_name)}`
+                : '';
+        case 'favorite_avatar':
+            return row.avatar_id !== undefined && row.group_name !== undefined
+                ? `fa:${String(row.avatar_id)}\0${String(row.group_name)}`
+                : '';
+        case 'favorite_print':
+            return typeof row.print_id === 'string' && row.print_id ? `fp:${row.print_id}` : '';
+        case 'avatar_tags':
+            return row.avatar_id !== undefined && row.tag !== undefined
+                ? `at:${String(row.avatar_id)}\0${String(row.tag)}`
+                : '';
+        case 'activity_sessions_v2':
+            return row.session_id !== undefined ? `as:${String(row.session_id)}` : '';
+        case 'cloud_chat_messages':
+            return typeof row.id === 'string' && row.id ? `cm:${row.id}` : '';
+        case 'cloud_rss_snapshot':
+            return typeof row.snapshot_key === 'string' && row.snapshot_key ? `rss:${row.snapshot_key}` : '';
+        case 'stats_counters':
+            return typeof row.counter_key === 'string' && row.counter_key ? `sc:${row.counter_key}` : '';
+        case 'cloud_screenshots':
+            return typeof row.id === 'string' && row.id
+                ? `cs:${row.id}`
+                : typeof row.local_filename === 'string' && row.local_filename
+                  ? `csf:${row.local_filename.toLowerCase()}`
+                  : '';
+        default:
+            return '';
+    }
+}
+
+function finalizeMergedRows(
+    rawSql: string,
+    params: unknown[],
+    rows: Array<Record<string, unknown>>,
+    sortKeys: Array<{ key: string; dir: 'ASC' | 'DESC' }>,
+    injectedAliases: string[]
+): Array<Record<string, unknown>> {
+    if (sortKeys.length > 0) {
+        rows.sort((a, b) => {
+            for (const s of sortKeys) {
+                const cmp = compareSortValues(a[s.key], b[s.key]);
+                if (cmp !== 0) {
+                    return s.dir === 'DESC' ? -cmp : cmp;
+                }
+            }
+            return 0;
+        });
+    }
+
+    const limit = extractSelectLimit(rawSql, params);
+    const sliced = limit !== null ? rows.slice(0, limit) : rows;
+
+    if (injectedAliases.length > 0) {
+        return sliced.map((row) => {
+            const copy = { ...row };
+            for (const alias of injectedAliases) {
+                delete copy[alias];
+            }
+            return copy;
+        });
+    }
+    return sliced;
+}
+
+function mergeDualBusinessRows(
+    table: 'stats_counters' | 'avatar_history' | 'cloud_rss_snapshot' | 'entity_users',
+    rawSql: string,
+    params: unknown[],
+    mysqlRows: Array<Record<string, unknown>>,
+    d1Rows: Array<Record<string, unknown>>,
+    sortKeys: Array<{ key: string; dir: 'ASC' | 'DESC' }>,
+    injectedAliases: string[]
+): Array<Record<string, unknown>> | null {
+    const all = [...mysqlRows, ...d1Rows];
+    if (all.length === 0) return [];
+
+    if (table === 'stats_counters') {
+        const singleTargetKey =
+            typeof params[0] === 'string' && /\bWHERE\b[\s\S]*\bcounter_key\s*=\s*\?/i.test(rawSql) ? params[0] : '';
+        const byKey = new Map<string, Record<string, unknown>>();
+        for (const r of all) {
+            const k =
+                typeof r.counter_key === 'string' && r.counter_key
+                    ? r.counter_key
+                    : singleTargetKey || '__single__';
+            const prev = byKey.get(k);
+            if (!prev) {
+                byKey.set(k, { ...r });
+                continue;
+            }
+            const next = { ...prev };
+            const prevCnt = Number(prev.row_count ?? 0) || 0;
+            const curCnt = Number(r.row_count ?? 0) || 0;
+            if ('row_count' in prev || 'row_count' in r) {
+                // `cloud_total_uptime_seconds` is a monotonic gauge (take max); event counters sum across stores.
+                next.row_count = k === 'cloud_total_uptime_seconds' ? Math.max(prevCnt, curCnt) : prevCnt + curCnt;
+            }
+            const prevUpd = String(prev.updated_at ?? '');
+            const curUpd = String(r.updated_at ?? '');
+            if (('updated_at' in prev || 'updated_at' in r) && curUpd > prevUpd) {
+                next.updated_at = curUpd;
+            }
+            byKey.set(k, next);
+        }
+        return finalizeMergedRows(rawSql, params, Array.from(byKey.values()), sortKeys, injectedAliases);
+    }
+
+    if (table === 'avatar_history') {
+        const hasKey = all.some((r) => typeof r.avatar_id === 'string' && r.avatar_id);
+        if (!hasKey) return null;
+        const byKey = new Map<string, Record<string, unknown>>();
+        for (const r of all) {
+            const k = String(r.avatar_id ?? '');
+            const prev = byKey.get(k);
+            if (!prev) {
+                byKey.set(k, { ...r });
+                continue;
+            }
+            const next = { ...prev };
+            if ('time' in prev || 'time' in r) {
+                next.time = (Number(prev.time ?? 0) || 0) + (Number(r.time ?? 0) || 0);
+            }
+            const prevCreated = String(prev.created_at ?? '');
+            const curCreated = String(r.created_at ?? '');
+            if (('created_at' in prev || 'created_at' in r) && curCreated > prevCreated) {
+                next.created_at = curCreated;
+            }
+            byKey.set(k, next);
+        }
+        return finalizeMergedRows(rawSql, params, Array.from(byKey.values()), sortKeys, injectedAliases);
+    }
+
+    if (table === 'cloud_rss_snapshot') {
+        const byKey = new Map<string, Record<string, unknown>>();
+        for (const r of all) {
+            const k = typeof r.snapshot_key === 'string' && r.snapshot_key ? r.snapshot_key : '__single__';
+            const prev = byKey.get(k);
+            if (!prev) {
+                byKey.set(k, { ...r });
+                continue;
+            }
+            const prevSynced = String(prev.synced_at ?? '');
+            const curSynced = String(r.synced_at ?? '');
+            if (curSynced && (!prevSynced || curSynced > prevSynced)) {
+                byKey.set(k, { ...r });
+            }
+        }
+        return finalizeMergedRows(rawSql, params, Array.from(byKey.values()), sortKeys, injectedAliases);
+    }
+
+    if (table === 'entity_users') {
+        const hasKey = all.some((r) => typeof r.user_id === 'string' && r.user_id);
+        if (!hasKey) return null;
+        const byKey = new Map<string, Record<string, unknown>>();
+        for (const r of all) {
+            const k = String(r.user_id ?? '');
+            const prev = byKey.get(k);
+            if (!prev) {
+                byKey.set(k, { ...r });
+                continue;
+            }
+            const prevUpd = String(prev.updated_at ?? '');
+            const curUpd = String(r.updated_at ?? '');
+            const curIsNewer = Boolean(curUpd) && (!prevUpd || curUpd > prevUpd);
+            const next = curIsNewer ? { ...r } : { ...prev };
+            if ('aliases_text' in prev || 'aliases_text' in r) {
+                const aliasSet = new Set<string>();
+                for (const tok of String(prev.aliases_text ?? '').split(' ').filter(Boolean)) aliasSet.add(tok);
+                for (const tok of String(r.aliases_text ?? '').split(' ').filter(Boolean)) aliasSet.add(tok);
+                const otherName = curIsNewer ? String(prev.display_name ?? '') : String(r.display_name ?? '');
+                if (otherName && otherName !== String(next.display_name ?? '')) {
+                    aliasSet.add(otherName);
+                }
+                next.aliases_text = Array.from(aliasSet).slice(-10).join(' ');
+            }
+            byKey.set(k, next);
+        }
+        return finalizeMergedRows(rawSql, params, Array.from(byKey.values()), sortKeys, injectedAliases);
+    }
+
+    return null;
+}
+
 function mergeDualSelectResults(
+    table: ManagedMysqlTableName,
     rawSql: string,
     params: unknown[],
     mysqlRows: Array<Record<string, unknown>>,
@@ -438,50 +662,38 @@ function mergeDualSelectResults(
         return [out];
     }
 
+    if (
+        table === 'stats_counters' ||
+        table === 'avatar_history' ||
+        table === 'cloud_rss_snapshot' ||
+        table === 'entity_users'
+    ) {
+        const specialMerged = mergeDualBusinessRows(table, rawSql, params, mysqlRows, d1Rows, sortKeys, injectedAliases);
+        if (specialMerged !== null) {
+            return specialMerged;
+        }
+    }
+
     // Deduplicate across D1 + MySQL during live migration windows (MySQL takes precedence)
     const combined: Array<Record<string, unknown>> = [];
     const seenKeys = new Set<string>();
     const addRow = (row: Record<string, unknown>) => {
-        const dedupKey =
-            typeof row.chunk_key === 'string' && row.chunk_key
-                ? `ck:${row.chunk_key}`
-                : typeof row.cache_key === 'string' && row.cache_key
-                  ? `k:${row.cache_key}`
-                  : '';
+        const dedupKey = extractBusinessRowDedupKey(table, row);
         if (dedupKey) {
             if (seenKeys.has(dedupKey)) return;
             seenKeys.add(dedupKey);
+        }
+        if (table === 'cloud_screenshots' && typeof row.local_filename === 'string' && row.local_filename) {
+            const fnKey = `csf:${row.local_filename.toLowerCase()}`;
+            if (seenKeys.has(fnKey)) return;
+            seenKeys.add(fnKey);
         }
         combined.push(row);
     };
     for (const r of mysqlRows) addRow(r);
     for (const r of d1Rows) addRow(r);
 
-    if (sortKeys.length > 0) {
-        combined.sort((a, b) => {
-            for (const s of sortKeys) {
-                const cmp = compareSortValues(a[s.key], b[s.key]);
-                if (cmp !== 0) {
-                    return s.dir === 'DESC' ? -cmp : cmp;
-                }
-            }
-            return 0;
-        });
-    }
-
-    const limit = extractSelectLimit(rawSql, params);
-    const sliced = limit !== null ? combined.slice(0, limit) : combined;
-
-    if (injectedAliases.length > 0) {
-        return sliced.map((row) => {
-            const copy = { ...row };
-            for (const alias of injectedAliases) {
-                delete copy[alias];
-            }
-            return copy;
-        });
-    }
-    return sliced;
+    return finalizeMergedRows(rawSql, params, combined, sortKeys, injectedAliases);
 }
 
 function makeD1Result<T>(
@@ -695,7 +907,7 @@ class HybridMysqlPreparedStatement {
         }
 
         // 2. Direct lookup by chunk ID routes strictly to owning store (MySQL >= 1,000,000; D1 < 1,000,000)
-        if (table !== 'vrc_api_cache' && !isRollup) {
+        if (MANAGED_ARCHIVE_TABLE_SET.has(table)) {
             const whereId = extractWhereIdEqualsParam(this.rawSql, params);
             if (whereId !== null) {
                 if (whereId >= MYSQL_CHUNK_ID_MIN) {
@@ -785,7 +997,7 @@ class HybridMysqlPreparedStatement {
             }
         }
 
-        return mergeDualSelectResults(this.rawSql, params, mysqlRes.rows, d1Rows, sortKeys, injectedAliases);
+        return mergeDualSelectResults(table, this.rawSql, params, mysqlRes.rows, d1Rows, sortKeys, injectedAliases);
     }
 
     private async executeMutation(): Promise<D1Result<Record<string, unknown>>> {
@@ -812,7 +1024,7 @@ class HybridMysqlPreparedStatement {
         }
 
         // UPDATE/DELETE targeting a specific chunk ID routes strictly to the owning store
-        if (table !== 'vrc_api_cache' && !isRollup) {
+        if (MANAGED_ARCHIVE_TABLE_SET.has(table)) {
             const whereId = extractWhereIdEqualsParam(this.rawSql, params);
             if (whereId !== null) {
                 if (whereId >= MYSQL_CHUNK_ID_MIN) {
@@ -835,9 +1047,9 @@ class HybridMysqlPreparedStatement {
             }
         }
 
-        // Rollup delta UPDATE: apply to MySQL first; fall back to D1 ONLY if row did not exist in MySQL
-        // so a single edit/delete never subtracts deltas from both stores.
-        if (isRollup && verb === 'UPDATE') {
+        // Delta UPDATE on rollups or `stats_counters`: apply to MySQL first; fall back to D1 ONLY if row did not
+        // exist in MySQL so a single edit/tick never increments or subtracts deltas in both stores.
+        if ((isRollup || table === 'stats_counters') && verb === 'UPDATE') {
             const rewritten = rewriteManagedSqlForMysql(
                 this.rawSql,
                 table,

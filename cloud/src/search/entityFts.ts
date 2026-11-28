@@ -1,4 +1,5 @@
 import { decodeGameLogChunkRows } from '../db/compactArchive';
+import { isExternalMysqlActiveOnEnv } from '../db/externalMysqlProxy';
 import type { Env } from '../env';
 
 export interface QueryPlanRow {
@@ -101,6 +102,13 @@ export function escapeSqlLikePattern(raw: string): string {
 }
 
 /**
+ * Escapes SQL LIKE wildcards (`!`, `%`, `_`) using `!` as escape char so patterns work identically in SQLite and MySQL 5.7.
+ */
+export function escapeSqlLikePatternBang(raw: string): string {
+    return raw.replaceAll('!', '!!').replaceAll('%', '!%').replaceAll('_', '!_');
+}
+
+/**
  * Escapes arbitrary user input into a safe literal phrase for FTS5 trigram MATCH.
  * Stripping NUL bytes avoids SQLite C-string truncation (`unterminated string`) and
  * wrapping in double quotes neutralizes FTS5 operators (AND/OR/NOT/NEAR/:/-/*).
@@ -188,7 +196,26 @@ export async function searchGameLogByEntity(
         const useTrigramFts = codePointLength >= 3;
         strategy = useTrigramFts ? 'trigram_fts' : 'bounded_short_query';
 
-        if (useTrigramFts) {
+        if (isExternalMysqlActiveOnEnv(env)) {
+            const likePattern = `%${escapeSqlLikePatternBang(query.toLowerCase())}%`;
+            userSql = `
+                SELECT user_id
+                FROM entity_users
+                WHERE LOWER(display_name) LIKE ? ESCAPE '!' OR LOWER(aliases_text) LIKE ? ESCAPE '!'
+                ORDER BY updated_at DESC
+                LIMIT ?
+            `;
+            userParams = [likePattern, likePattern, MAX_ENTITY_IDS];
+
+            worldSql = `
+                SELECT world_id
+                FROM entity_worlds
+                WHERE LOWER(world_name) LIKE ? ESCAPE '!'
+                ORDER BY updated_at DESC
+                LIMIT ?
+            `;
+            worldParams = [likePattern, MAX_ENTITY_IDS];
+        } else if (useTrigramFts) {
             const matchExpr = buildSafeTrigramMatch(query);
             userSql = `
                 SELECT u.user_id
@@ -620,9 +647,10 @@ export async function searchGameLogByEntity(
     };
 
     if (options.includeExplain) {
+        const allowCoreExplain = !isExternalMysqlActiveOnEnv(env);
         const [usersPlan, worldsPlan, jlPlan, locPlan] = await Promise.all([
-            userSql ? explainPlan(env.DB_CORE, userSql, userParams) : Promise.resolve([]),
-            worldSql ? explainPlan(env.DB_CORE, worldSql, worldParams) : Promise.resolve([]),
+            userSql && allowCoreExplain ? explainPlan(env.DB_CORE, userSql, userParams) : Promise.resolve([]),
+            worldSql && allowCoreExplain ? explainPlan(env.DB_CORE, worldSql, worldParams) : Promise.resolve([]),
             jlSql ? explainPlan(env.DB_GAMELOG, jlSql, jlParams) : Promise.resolve([]),
             locSql ? explainPlan(env.DB_GAMELOG, locSql, locParams) : Promise.resolve([])
         ]);

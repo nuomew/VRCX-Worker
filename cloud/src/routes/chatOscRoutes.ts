@@ -849,16 +849,25 @@ export async function syncChatMessageStatusByCmdId(
 
 async function pruneChatMessages(env: Env): Promise<void> {
     const chatDb = getChatDb(env);
-    await chatDb
-        .prepare(
-            `DELETE FROM cloud_chat_messages
-             WHERE id NOT IN (
-                 SELECT id FROM cloud_chat_messages ORDER BY created_at DESC LIMIT ?
-             )`
-        )
-        .bind(MAX_STORED_CHAT_MESSAGES)
-        .run()
-        .catch(() => {});
+    try {
+        const res = await chatDb
+            .prepare('SELECT created_at, id FROM cloud_chat_messages ORDER BY created_at DESC, id DESC LIMIT ?')
+            .bind(MAX_STORED_CHAT_MESSAGES + 1)
+            .all<{ created_at: string; id: string }>();
+        const rows = res.results ?? [];
+        if (rows.length <= MAX_STORED_CHAT_MESSAGES) {
+            return;
+        }
+        const cutoff = rows[MAX_STORED_CHAT_MESSAGES - 1];
+        if (!cutoff) return;
+        await chatDb
+            .prepare('DELETE FROM cloud_chat_messages WHERE created_at < ? OR (created_at = ? AND id < ?)')
+            .bind(cutoff.created_at, cutoff.created_at, cutoff.id)
+            .run()
+            .catch(() => {});
+    } catch {
+        // Ignore when chat table is absent in minimal test fixtures
+    }
 }
 
 async function fetchLiveChatOscHubStatus(env: Env): Promise<{
