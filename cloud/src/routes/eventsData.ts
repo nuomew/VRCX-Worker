@@ -37,7 +37,177 @@ import {
 import { getLegacyImportedStats } from './legacyMigration';
 import { filterGpsTuplesWithFlapGuard } from '../sync/gpsFlapGuard';
 
-const MAX_LIMIT = 100;
+const MAX_LIMIT = 200;
+
+interface UpperCreatedAtBound {
+    value: string;
+    inclusive: boolean;
+}
+
+function resolveUpperCreatedAtBound(
+    dateTo: string,
+    beforeCreatedAt: string,
+    beforeInclusive: boolean
+): UpperCreatedAtBound | null {
+    const cleanDateTo = dateTo.trim();
+    const cleanBefore = beforeCreatedAt.trim();
+    if (!cleanDateTo && !cleanBefore) return null;
+    if (!cleanDateTo) {
+        return { value: cleanBefore, inclusive: beforeInclusive };
+    }
+    if (!cleanBefore) {
+        return { value: cleanDateTo, inclusive: true };
+    }
+    if (cleanBefore < cleanDateTo) {
+        return { value: cleanBefore, inclusive: beforeInclusive };
+    }
+    if (cleanDateTo < cleanBefore) {
+        return { value: cleanDateTo, inclusive: true };
+    }
+    return { value: cleanBefore, inclusive: beforeInclusive };
+}
+
+function matchesCreatedAtBounds(
+    createdAt: string,
+    dateFrom: string,
+    upperBound: UpperCreatedAtBound | null
+): boolean {
+    if (dateFrom && createdAt < dateFrom) return false;
+    if (upperBound) {
+        if (upperBound.inclusive ? createdAt > upperBound.value : createdAt >= upperBound.value) {
+            return false;
+        }
+    }
+    return true;
+}
+
+function parseBoolParam(raw: unknown): boolean {
+    if (raw === true || raw === 1) return true;
+    if (typeof raw === 'string') {
+        const s = raw.trim().toLowerCase();
+        return s === '1' || s === 'true';
+    }
+    return false;
+}
+
+interface ArchiveChunkRow {
+    id: number;
+    chunk_kind: string;
+    min_created_at: string;
+    max_created_at: string;
+    payload_json: string;
+}
+
+/**
+ * Fetches a tightly bounded set of compact archive chunks per kind using `(kind, max_created_at)` index seeks.
+ * When `upperBound` is set, splits per-kind lookup into chunks ending at/before the cursor plus up to 2 chunks
+ * straddling the cursor so wide-span chunks of one kind can never shadow older history of another kind.
+ */
+async function fetchBoundedArchiveChunks(
+    db: D1Database,
+    archiveTable: string,
+    kindColumn: 'feed_kind' | 'gamelog_kind',
+    kinds: string[],
+    dateFrom: string,
+    upperBound: UpperCreatedAtBound | null,
+    perKindLimit: number
+): Promise<ArchiveChunkRow[]> {
+    if (kinds.length === 0) return [];
+    const stmts: D1PreparedStatement[] = [];
+    for (const kind of kinds) {
+        if (!upperBound) {
+            const conds = [`${kindColumn} = ?`];
+            const binds: unknown[] = [kind];
+            if (dateFrom) {
+                conds.push('max_created_at >= ?');
+                binds.push(dateFrom);
+            }
+            stmts.push(
+                db
+                    .prepare(
+                        `SELECT id, ${kindColumn} AS chunk_kind, min_created_at, max_created_at, payload_json
+                         FROM ${archiveTable}
+                         WHERE ${conds.join(' AND ')}
+                         ORDER BY max_created_at DESC, id DESC
+                         LIMIT ?`
+                    )
+                    .bind(...binds, perKindLimit)
+            );
+            continue;
+        }
+
+        // 1) Chunks completely at or before the upper bound (direct index range seek on max_created_at DESC)
+        const olderConds = [`${kindColumn} = ?`, 'max_created_at <= ?'];
+        const olderBinds: unknown[] = [kind, upperBound.value];
+        if (dateFrom) {
+            olderConds.push('max_created_at >= ?');
+            olderBinds.push(dateFrom);
+        }
+        stmts.push(
+            db
+                .prepare(
+                    `SELECT id, ${kindColumn} AS chunk_kind, min_created_at, max_created_at, payload_json
+                     FROM ${archiveTable}
+                     WHERE ${olderConds.join(' AND ')}
+                     ORDER BY max_created_at DESC, id DESC
+                     LIMIT ?`
+                )
+                .bind(...olderBinds, perKindLimit)
+        );
+
+        // 2) Chunks straddling the cursor boundary (min_created_at <= upperBound AND max_created_at > upperBound)
+        const straddleConds = [`${kindColumn} = ?`, 'min_created_at <= ?', 'max_created_at > ?'];
+        const straddleBinds: unknown[] = [kind, upperBound.value, upperBound.value];
+        if (dateFrom) {
+            straddleConds.push('max_created_at >= ?');
+            straddleBinds.push(dateFrom);
+        }
+        stmts.push(
+            db
+                .prepare(
+                    `SELECT id, ${kindColumn} AS chunk_kind, min_created_at, max_created_at, payload_json
+                     FROM ${archiveTable}
+                     WHERE ${straddleConds.join(' AND ')}
+                     ORDER BY max_created_at DESC, id DESC
+                     LIMIT 2`
+                )
+                .bind(...straddleBinds)
+        );
+    }
+
+    const batchResults = (await db.batch(stmts)) as D1Result<ArchiveChunkRow>[];
+    const byId = new Map<number, ArchiveChunkRow>();
+    for (const res of batchResults) {
+        for (const row of res?.results ?? []) {
+            if (!byId.has(row.id)) {
+                byId.set(row.id, row);
+            }
+        }
+    }
+    const chunks = Array.from(byId.values());
+    chunks.sort(
+        (a, b) =>
+            String(b.max_created_at ?? '').localeCompare(String(a.max_created_at ?? '')) ||
+            Number(b.id ?? 0) - Number(a.id ?? 0)
+    );
+    return chunks;
+}
+
+function hasEnoughStrictlyNewerRows(
+    rows: Array<Record<string, unknown>>,
+    thresholdCreatedAt: string,
+    limit: number
+): boolean {
+    if (rows.length < limit || !thresholdCreatedAt) return false;
+    let newerCount = 0;
+    for (const row of rows) {
+        if (String(row.created_at ?? '') > thresholdCreatedAt) {
+            newerCount++;
+            if (newerCount >= limit) return true;
+        }
+    }
+    return false;
+}
 
 function clampLimit(val: string | null, fallback = 50): number {
     if (val == null || val.trim() === '') return fallback;
@@ -1090,6 +1260,8 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
         limit: number,
         types: string[],
         vipList: string[],
+        dateFrom = '',
+        upperBound: UpperCreatedAtBound | null = null,
         negateRowIds = false
     ): Promise<Array<Record<string, unknown>>> => {
         const typeSet = new Set(types.filter(Boolean));
@@ -1097,6 +1269,8 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
         const cleanVips = Array.from(new Set(vipList.map((v) => String(v || '').trim()).filter(Boolean))).slice(0, 80);
         const hasVip = cleanVips.length > 0;
         const vipPh = cleanVips.map(() => '?').join(', ');
+        const cleanDateFrom = dateFrom.trim();
+        const hasDateBound = Boolean(cleanDateFrom || upperBound);
 
         const wantLocation = (!hasTypeFilter || typeSet.has('Location')) && !hasVip;
         const wantJoined = !hasTypeFilter || typeSet.has('OnPlayerJoined');
@@ -1110,7 +1284,18 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
         const activeTables = [wantLocation, wantJl, wantPortal, wantVideo, wantEvent, wantExternal].filter(
             Boolean
         ).length;
-        const perTable = activeTables <= 1 ? limit : Math.max(20, Math.min(limit, 80));
+        const perTable = activeTables <= 1 ? limit : Math.max(20, Math.min(limit, 100));
+
+        const appendDateConds = (conds: string[], binds: unknown[]) => {
+            if (cleanDateFrom) {
+                conds.push('created_at >= ?');
+                binds.push(cleanDateFrom);
+            }
+            if (upperBound) {
+                conds.push(upperBound.inclusive ? 'created_at <= ?' : 'created_at < ?');
+                binds.push(upperBound.value);
+            }
+        };
 
         const stmts: D1PreparedStatement[] = [];
         const slotIndex: Record<'loc' | 'jl' | 'portal' | 'video' | 'ev' | 'ext', number> = {
@@ -1124,7 +1309,15 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
 
         if (wantLocation) {
             slotIndex.loc = stmts.length;
-            stmts.push(db.prepare('SELECT * FROM gamelog_location ORDER BY created_at DESC LIMIT ?').bind(perTable));
+            const conds: string[] = [];
+            const binds: unknown[] = [];
+            appendDateConds(conds, binds);
+            const whereSql = conds.length > 0 ? `WHERE ${conds.join(' AND ')}` : '';
+            stmts.push(
+                db
+                    .prepare(`SELECT * FROM gamelog_location ${whereSql} ORDER BY created_at DESC, id DESC LIMIT ?`)
+                    .bind(...binds, perTable)
+            );
         }
         if (wantJl) {
             slotIndex.jl = stmts.length;
@@ -1139,44 +1332,74 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
                 conds.push(`user_id IN (${vipPh})`);
                 binds.push(...cleanVips);
             }
+            appendDateConds(conds, binds);
             const whereSql = conds.length > 0 ? `WHERE ${conds.join(' AND ')}` : '';
-            const jlOrder = hasVip ? 'ORDER BY id DESC' : 'ORDER BY created_at DESC';
+            const jlOrder = hasVip && !hasDateBound ? 'ORDER BY id DESC' : 'ORDER BY created_at DESC, id DESC';
             stmts.push(
                 db.prepare(`SELECT * FROM gamelog_join_leave ${whereSql} ${jlOrder} LIMIT ?`).bind(...binds, perTable)
             );
         }
         if (wantPortal) {
             slotIndex.portal = stmts.length;
-            const whereSql = hasVip ? `WHERE user_id IN (${vipPh})` : '';
-            const portalOrder = hasVip ? 'ORDER BY id DESC' : 'ORDER BY created_at DESC';
+            const conds: string[] = [];
+            const binds: unknown[] = [];
+            if (hasVip) {
+                conds.push(`user_id IN (${vipPh})`);
+                binds.push(...cleanVips);
+            }
+            appendDateConds(conds, binds);
+            const whereSql = conds.length > 0 ? `WHERE ${conds.join(' AND ')}` : '';
+            const portalOrder = hasVip && !hasDateBound ? 'ORDER BY id DESC' : 'ORDER BY created_at DESC, id DESC';
             stmts.push(
                 db
                     .prepare(`SELECT * FROM gamelog_portal_spawn ${whereSql} ${portalOrder} LIMIT ?`)
-                    .bind(...(hasVip ? cleanVips : []), perTable)
+                    .bind(...binds, perTable)
             );
         }
         if (wantVideo) {
             slotIndex.video = stmts.length;
-            const whereSql = hasVip ? `WHERE user_id IN (${vipPh})` : '';
-            const videoOrder = hasVip ? 'ORDER BY id DESC' : 'ORDER BY created_at DESC';
+            const conds: string[] = [];
+            const binds: unknown[] = [];
+            if (hasVip) {
+                conds.push(`user_id IN (${vipPh})`);
+                binds.push(...cleanVips);
+            }
+            appendDateConds(conds, binds);
+            const whereSql = conds.length > 0 ? `WHERE ${conds.join(' AND ')}` : '';
+            const videoOrder = hasVip && !hasDateBound ? 'ORDER BY id DESC' : 'ORDER BY created_at DESC, id DESC';
             stmts.push(
                 db
                     .prepare(`SELECT * FROM gamelog_video_play ${whereSql} ${videoOrder} LIMIT ?`)
-                    .bind(...(hasVip ? cleanVips : []), perTable)
+                    .bind(...binds, perTable)
             );
         }
         if (wantEvent) {
             slotIndex.ev = stmts.length;
-            stmts.push(db.prepare('SELECT * FROM gamelog_event ORDER BY created_at DESC LIMIT ?').bind(perTable));
+            const conds: string[] = [];
+            const binds: unknown[] = [];
+            appendDateConds(conds, binds);
+            const whereSql = conds.length > 0 ? `WHERE ${conds.join(' AND ')}` : '';
+            stmts.push(
+                db
+                    .prepare(`SELECT * FROM gamelog_event ${whereSql} ORDER BY created_at DESC, id DESC LIMIT ?`)
+                    .bind(...binds, perTable)
+            );
         }
         if (wantExternal) {
             slotIndex.ext = stmts.length;
-            const whereSql = hasVip ? `WHERE user_id IN (${vipPh})` : '';
-            const extOrder = hasVip ? 'ORDER BY id DESC' : 'ORDER BY created_at DESC';
+            const conds: string[] = [];
+            const binds: unknown[] = [];
+            if (hasVip) {
+                conds.push(`user_id IN (${vipPh})`);
+                binds.push(...cleanVips);
+            }
+            appendDateConds(conds, binds);
+            const whereSql = conds.length > 0 ? `WHERE ${conds.join(' AND ')}` : '';
+            const extOrder = hasVip && !hasDateBound ? 'ORDER BY id DESC' : 'ORDER BY created_at DESC, id DESC';
             stmts.push(
                 db
                     .prepare(`SELECT * FROM gamelog_external ${whereSql} ${extOrder} LIMIT ?`)
-                    .bind(...(hasVip ? cleanVips : []), perTable)
+                    .bind(...binds, perTable)
             );
         }
 
@@ -1213,27 +1436,31 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
             if (chunkKinds.length > 0) {
                 const archiveTable = negateRowIds ? 'legacy_gamelog_chunks' : 'gamelog_archive_chunks';
                 try {
-                    const kindPh = chunkKinds.map(() => '?').join(', ');
-                    const chunkRes = await db
-                        .prepare(
-                            `SELECT id, gamelog_kind, payload_json
-                             FROM ${archiveTable}
-                             WHERE gamelog_kind IN (${kindPh})
-                             ORDER BY max_created_at DESC, id DESC
-                             LIMIT ?`
-                        )
-                        .bind(...chunkKinds, hasVip ? 16 : 8)
-                        .all<{ id: number; gamelog_kind: string; payload_json: string }>();
+                    const perKindLimit = hasVip ? 8 : chunkKinds.length <= 2 ? 8 : 4;
+                    const chunks = await fetchBoundedArchiveChunks(
+                        db,
+                        archiveTable,
+                        'gamelog_kind',
+                        chunkKinds,
+                        cleanDateFrom,
+                        upperBound,
+                        perKindLimit
+                    );
                     const vipSet = hasVip ? new Set(cleanVips) : null;
                     const seenLocal = new Set<string>(normalized.map(gamelogDedupKey));
-                    for (const c of chunkRes.results ?? []) {
-                        const unpacked = decodeGameLogChunkRows(c.id, c.gamelog_kind, c.payload_json, {
+                    for (const c of chunks) {
+                        if (hasEnoughStrictlyNewerRows(normalized, c.max_created_at, limit)) {
+                            break;
+                        }
+                        const unpacked = decodeGameLogChunkRows(c.id, c.chunk_kind, c.payload_json, {
                             negateRowIds
                         });
                         for (const entry of unpacked) {
                             const entryType = String(entry.type ?? '');
                             if (hasTypeFilter && !typeSet.has(entryType)) continue;
                             if (vipSet && !vipSet.has(String(entry.userId ?? ''))) continue;
+                            const createdAt = String(entry.created_at ?? '');
+                            if (!matchesCreatedAtBounds(createdAt, cleanDateFrom, upperBound)) continue;
                             const dk = gamelogDedupKey(entry);
                             if (seenLocal.has(dk)) continue;
                             seenLocal.add(dk);
@@ -1252,17 +1479,50 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
     const runFilteredGameLogQuery = async (
         limit: number,
         types: string[],
-        vipList: string[]
+        vipList: string[],
+        dateFrom = '',
+        upperBound: UpperCreatedAtBound | null = null
     ): Promise<Array<Record<string, unknown>>> => {
         const legacyDb = getLegacyDb(env);
         const legacyStats = legacyDb ? await getLegacyImportedStats(env) : null;
-        if (!legacyDb || (legacyStats?.gamelog ?? 0) <= 0) {
-            return runFilteredGameLogQueryOnDb(env.DB_GAMELOG, limit, types, vipList, false);
+        const hasLegacyStats = Boolean(legacyDb && (legacyStats?.gamelog ?? 0) > 0);
+        let primaryRows: Array<Record<string, unknown>>;
+        let legacyRows: Array<Record<string, unknown>> = [];
+
+        if (!legacyDb) {
+            return runFilteredGameLogQueryOnDb(env.DB_GAMELOG, limit, types, vipList, dateFrom, upperBound, false);
         }
-        const [primaryRows, legacyRows] = await Promise.all([
-            runFilteredGameLogQueryOnDb(env.DB_GAMELOG, limit, types, vipList, false),
-            runFilteredGameLogQueryOnDb(legacyDb, limit, types, vipList, true)
-        ]);
+        if (hasLegacyStats) {
+            [primaryRows, legacyRows] = await Promise.all([
+                runFilteredGameLogQueryOnDb(env.DB_GAMELOG, limit, types, vipList, dateFrom, upperBound, false),
+                runFilteredGameLogQueryOnDb(legacyDb, limit, types, vipList, dateFrom, upperBound, true)
+            ]);
+        } else {
+            primaryRows = await runFilteredGameLogQueryOnDb(
+                env.DB_GAMELOG,
+                limit,
+                types,
+                vipList,
+                dateFrom,
+                upperBound,
+                false
+            );
+            // Fallback probe into DB_LEGACY if stats drifted/reset but active shard did not fill the requested page.
+            if (primaryRows.length < limit || upperBound !== null) {
+                legacyRows = await runFilteredGameLogQueryOnDb(
+                    legacyDb,
+                    limit,
+                    types,
+                    vipList,
+                    dateFrom,
+                    upperBound,
+                    true
+                );
+            }
+        }
+        if (legacyRows.length === 0) {
+            return primaryRows.slice(0, limit);
+        }
         const seen = new Set<string>();
         const merged: Array<Record<string, unknown>> = [];
         for (const r of primaryRows) {
@@ -1286,6 +1546,10 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
             types?: unknown;
             filters?: unknown;
             vipList?: unknown;
+            dateFrom?: unknown;
+            dateTo?: unknown;
+            beforeCreatedAt?: unknown;
+            beforeInclusive?: unknown;
         };
         const limit = clampLimit(body.limit != null ? String(body.limit) : null, 100);
         const rawTypes = Array.isArray(body.types) ? body.types : Array.isArray(body.filters) ? body.filters : [];
@@ -1293,7 +1557,12 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
         const vipList = Array.isArray(body.vipList)
             ? body.vipList.map((v) => String(v ?? '').trim()).filter(Boolean)
             : [];
-        const rows = await runFilteredGameLogQuery(limit, filters, vipList);
+        const dateFrom = typeof body.dateFrom === 'string' ? body.dateFrom.trim() : '';
+        const dateTo = typeof body.dateTo === 'string' ? body.dateTo.trim() : '';
+        const beforeCreatedAt = typeof body.beforeCreatedAt === 'string' ? body.beforeCreatedAt.trim() : '';
+        const beforeInclusive = parseBoolParam(body.beforeInclusive);
+        const upperBound = resolveUpperCreatedAtBound(dateTo, beforeCreatedAt, beforeInclusive);
+        const rows = await runFilteredGameLogQuery(limit, filters, vipList, dateFrom, upperBound);
         return Response.json({ ok: true, data: rows });
     }
 
@@ -1307,7 +1576,12 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
                       .map((s) => s.trim())
                       .filter(Boolean)
                 : [];
-            const rows = await runFilteredGameLogQuery(limit, types, []);
+            const dateFrom = (url.searchParams.get('dateFrom') ?? '').trim();
+            const dateTo = (url.searchParams.get('dateTo') ?? '').trim();
+            const beforeCreatedAt = (url.searchParams.get('beforeCreatedAt') ?? '').trim();
+            const beforeInclusive = parseBoolParam(url.searchParams.get('beforeInclusive'));
+            const upperBound = resolveUpperCreatedAtBound(dateTo, beforeCreatedAt, beforeInclusive);
+            const rows = await runFilteredGameLogQuery(limit, types, [], dateFrom, upperBound);
             return Response.json({ ok: true, data: rows });
         }
 
@@ -3794,7 +4068,7 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
         rawTypes: string[],
         rawVipList: string[],
         dateFrom = '',
-        dateTo = '',
+        upperBound: UpperCreatedAtBound | null = null,
         negateRowIds = false
     ): Promise<Array<Record<string, unknown>>> => {
         const requestedTypes = rawTypes.map((t) => String(t || '').trim()).filter(Boolean);
@@ -3808,8 +4082,7 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
         const hasVip = vipIds.length > 0;
         const vipPh = hasVip ? vipIds.map(() => '?').join(', ') : '';
         const cleanDateFrom = dateFrom.trim();
-        const cleanDateTo = dateTo.trim();
-        const hasDateBound = Boolean(cleanDateFrom || cleanDateTo);
+        const hasDateBound = Boolean(cleanDateFrom || upperBound);
         const orderClause = hasDateBound || negateRowIds ? 'ORDER BY created_at DESC, id DESC' : 'ORDER BY id DESC';
 
         const buildTableQuery = (table: string, extraCond?: { clause: string; bind: unknown }): D1PreparedStatement => {
@@ -3827,9 +4100,9 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
                 conds.push('created_at >= ?');
                 binds.push(cleanDateFrom);
             }
-            if (cleanDateTo) {
-                conds.push('created_at <= ?');
-                binds.push(cleanDateTo);
+            if (upperBound) {
+                conds.push(upperBound.inclusive ? 'created_at <= ?' : 'created_at < ?');
+                binds.push(upperBound.value);
             }
             const whereClause = conds.length > 0 ? `WHERE ${conds.join(' AND ')}` : '';
             return db.prepare(`SELECT * FROM ${table} ${whereClause} ${orderClause} LIMIT ?`).bind(...binds, perTable);
@@ -3844,7 +4117,7 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
         const activeTables = Number(wantGps) + Number(wantOnline || wantOffline) + Number(wantStatus) + Number(wantBio);
         if (activeTables === 0) return [];
 
-        const perTable = activeTables === 1 ? Math.min(limit, 100) : Math.max(15, Math.min(limit, 60));
+        const perTable = activeTables === 1 ? Math.min(limit, MAX_LIMIT) : Math.max(20, Math.min(limit, 100));
         const stmts: D1PreparedStatement[] = [];
         const kinds: Array<'gps' | 'oo' | 'status' | 'bio'> = [];
 
@@ -3908,32 +4181,23 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
             if (chunkKinds.length > 0) {
                 const archiveTable = negateRowIds ? 'legacy_feed_chunks' : 'feed_archive_chunks';
                 try {
-                    const kindPh = chunkKinds.map(() => '?').join(', ');
-                    const chunkConds: string[] = [`feed_kind IN (${kindPh})`];
-                    const chunkBinds: unknown[] = [...chunkKinds];
-                    if (cleanDateFrom) {
-                        chunkConds.push('max_created_at >= ?');
-                        chunkBinds.push(cleanDateFrom);
-                    }
-                    if (cleanDateTo) {
-                        chunkConds.push('min_created_at <= ?');
-                        chunkBinds.push(cleanDateTo);
-                    }
-                    const chunkLimit = hasVip ? 16 : Math.min(12, Math.max(4, Math.ceil(limit / 100) + 2));
-                    const chunkRes = await db
-                        .prepare(
-                            `SELECT id, feed_kind, payload_json
-                             FROM ${archiveTable}
-                             WHERE ${chunkConds.join(' AND ')}
-                             ORDER BY max_created_at DESC, id DESC
-                             LIMIT ?`
-                        )
-                        .bind(...chunkBinds, chunkLimit)
-                        .all<{ id: number; feed_kind: string; payload_json: string }>();
+                    const perKindLimit = hasVip ? 8 : chunkKinds.length <= 2 ? 8 : 4;
+                    const chunks = await fetchBoundedArchiveChunks(
+                        db,
+                        archiveTable,
+                        'feed_kind',
+                        chunkKinds,
+                        cleanDateFrom,
+                        upperBound,
+                        perKindLimit
+                    );
                     const vipSet = hasVip ? new Set(vipIds) : null;
                     const seenLocal = new Set<string>(items.map(feedDedupKey));
-                    for (const c of chunkRes.results ?? []) {
-                        const unpacked = decodeFeedChunkRows(c.id, c.feed_kind, c.payload_json, {
+                    for (const c of chunks) {
+                        if (hasEnoughStrictlyNewerRows(items, c.max_created_at, limit)) {
+                            break;
+                        }
+                        const unpacked = decodeFeedChunkRows(c.id, c.chunk_kind, c.payload_json, {
                             negateRowIds
                         });
                         for (const entry of unpacked) {
@@ -3941,8 +4205,7 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
                             if (!useAll && !typeSet.has(entryType)) continue;
                             if (vipSet && !vipSet.has(String(entry.userId ?? ''))) continue;
                             const createdAt = String(entry.created_at ?? '');
-                            if (cleanDateFrom && createdAt < cleanDateFrom) continue;
-                            if (cleanDateTo && createdAt > cleanDateTo) continue;
+                            if (!matchesCreatedAtBounds(createdAt, cleanDateFrom, upperBound)) continue;
                             const dk = feedDedupKey(entry);
                             if (seenLocal.has(dk)) continue;
                             seenLocal.add(dk);
@@ -3964,17 +4227,48 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
         rawTypes: string[],
         rawVipList: string[],
         dateFrom = '',
-        dateTo = ''
+        upperBound: UpperCreatedAtBound | null = null
     ): Promise<Array<Record<string, unknown>>> => {
         const legacyDb = getLegacyDb(env);
         const legacyStats = legacyDb ? await getLegacyImportedStats(env) : null;
-        if (!legacyDb || (legacyStats?.feed ?? 0) <= 0) {
-            return runFilteredFeedQueryOnDb(env.DB_FEED, limit, rawTypes, rawVipList, dateFrom, dateTo, false);
+        const hasLegacyStats = Boolean(legacyDb && (legacyStats?.feed ?? 0) > 0);
+        let primaryRows: Array<Record<string, unknown>>;
+        let legacyRows: Array<Record<string, unknown>> = [];
+
+        if (!legacyDb) {
+            return runFilteredFeedQueryOnDb(env.DB_FEED, limit, rawTypes, rawVipList, dateFrom, upperBound, false);
         }
-        const [primaryRows, legacyRows] = await Promise.all([
-            runFilteredFeedQueryOnDb(env.DB_FEED, limit, rawTypes, rawVipList, dateFrom, dateTo, false),
-            runFilteredFeedQueryOnDb(legacyDb, limit, rawTypes, rawVipList, dateFrom, dateTo, true)
-        ]);
+        if (hasLegacyStats) {
+            [primaryRows, legacyRows] = await Promise.all([
+                runFilteredFeedQueryOnDb(env.DB_FEED, limit, rawTypes, rawVipList, dateFrom, upperBound, false),
+                runFilteredFeedQueryOnDb(legacyDb, limit, rawTypes, rawVipList, dateFrom, upperBound, true)
+            ]);
+        } else {
+            primaryRows = await runFilteredFeedQueryOnDb(
+                env.DB_FEED,
+                limit,
+                rawTypes,
+                rawVipList,
+                dateFrom,
+                upperBound,
+                false
+            );
+            // Fallback probe into DB_LEGACY if stats drifted/reset but active shard did not fill the requested page.
+            if (primaryRows.length < limit || upperBound !== null) {
+                legacyRows = await runFilteredFeedQueryOnDb(
+                    legacyDb,
+                    limit,
+                    rawTypes,
+                    rawVipList,
+                    dateFrom,
+                    upperBound,
+                    true
+                );
+            }
+        }
+        if (legacyRows.length === 0) {
+            return primaryRows.slice(0, limit);
+        }
         const seen = new Set<string>();
         const merged: Array<Record<string, unknown>> = [];
         for (const r of primaryRows) {
@@ -4000,7 +4294,10 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
                 .filter(Boolean);
             const dateFrom = (url.searchParams.get('dateFrom') ?? '').trim();
             const dateTo = (url.searchParams.get('dateTo') ?? '').trim();
-            const items = await runFilteredFeedQuery(limit, rawTypes, [], dateFrom, dateTo);
+            const beforeCreatedAt = (url.searchParams.get('beforeCreatedAt') ?? '').trim();
+            const beforeInclusive = parseBoolParam(url.searchParams.get('beforeInclusive'));
+            const upperBound = resolveUpperCreatedAtBound(dateTo, beforeCreatedAt, beforeInclusive);
+            const items = await runFilteredFeedQuery(limit, rawTypes, [], dateFrom, upperBound);
             return Response.json({ ok: true, data: items });
         }
 
@@ -4054,6 +4351,8 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
             limit?: unknown;
             dateFrom?: unknown;
             dateTo?: unknown;
+            beforeCreatedAt?: unknown;
+            beforeInclusive?: unknown;
         };
         const limit = clampLimit(body.limit != null ? String(body.limit) : null, 100);
         const rawTypes = Array.isArray(body.types) ? body.types.map((t) => String(t ?? '').trim()).filter(Boolean) : [];
@@ -4062,7 +4361,10 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
             : [];
         const dateFrom = typeof body.dateFrom === 'string' ? body.dateFrom.trim() : '';
         const dateTo = typeof body.dateTo === 'string' ? body.dateTo.trim() : '';
-        const items = await runFilteredFeedQuery(limit, rawTypes, rawVipList, dateFrom, dateTo);
+        const beforeCreatedAt = typeof body.beforeCreatedAt === 'string' ? body.beforeCreatedAt.trim() : '';
+        const beforeInclusive = parseBoolParam(body.beforeInclusive);
+        const upperBound = resolveUpperCreatedAtBound(dateTo, beforeCreatedAt, beforeInclusive);
+        const items = await runFilteredFeedQuery(limit, rawTypes, rawVipList, dateFrom, upperBound);
         return Response.json({ ok: true, data: items });
     }
 
@@ -4081,7 +4383,13 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
         }
         if (!q) {
             if (dateFrom || dateTo) {
-                const items = await runFilteredFeedQuery(limit, rawTypes, [], dateFrom, dateTo);
+                const items = await runFilteredFeedQuery(
+                    limit,
+                    rawTypes,
+                    [],
+                    dateFrom,
+                    resolveUpperCreatedAtBound(dateTo, '', false)
+                );
                 return Response.json({ ok: true, data: items });
             }
             return Response.json({ ok: true, data: [] });

@@ -296,18 +296,46 @@
                         </PaginationItem>
                         <PaginationEllipsis v-else />
                     </template>
-                    <PaginationNext />
+                    <Button
+                        v-if="onLoadMore && canLoadMore && isOnLastPage"
+                        variant="ghost"
+                        size="default"
+                        class="text-[13px] gap-1 px-2.5 sm:pr-2.5"
+                        :disabled="loadingMore || loading"
+                        @click="handleLoadMore">
+                        <Spinner v-if="loadingMore" class="size-3.5" />
+                        <template v-else>
+                            <span class="hidden sm:block">
+                                {{ t('table.pagination.next') }}
+                            </span>
+                            <ChevronRightIcon class="size-4" />
+                        </template>
+                    </Button>
+                    <PaginationNext v-else />
                 </PaginationContent>
             </Pagination>
-            <div class="dt-pagination-spacer flex-1"></div>
+            <div class="dt-pagination-spacer flex-1 flex items-center justify-start">
+                <Button
+                    v-if="onLoadMore && (canLoadMore || loadingMore)"
+                    variant="outline"
+                    size="sm"
+                    class="h-8 gap-1.5 text-xs"
+                    :disabled="loadingMore || loading"
+                    @click="handleLoadMore">
+                    <Spinner v-if="loadingMore" class="size-3.5" />
+                    <span>{{ loadingMore ? t('table.pagination.loading_more') : t('table.pagination.load_more') }}</span>
+                </Button>
+            </div>
         </div>
     </div>
 </template>
 
 <script setup>
     import { computed, nextTick, ref, watch } from 'vue';
+    import { ChevronRightIcon } from 'lucide-vue-next';
     import { DragDropProvider } from '@dnd-kit/vue';
     import { FlexRender } from '@tanstack/vue-table';
+    import { Button } from '../button';
     import { Spinner } from '@/components/ui/spinner';
     import { isSortable } from '@dnd-kit/vue/sortable';
     import { storeToRefs } from 'pinia';
@@ -406,6 +434,18 @@
         autoHeight: {
             type: Boolean,
             default: false
+        },
+        canLoadMore: {
+            type: Boolean,
+            default: false
+        },
+        loadingMore: {
+            type: Boolean,
+            default: false
+        },
+        onLoadMore: {
+            type: Function,
+            default: null
         }
     });
 
@@ -623,6 +663,21 @@
             }
         }
     });
+
+    const pageCount = computed(() => Math.max(1, props.table?.getPageCount?.() ?? 1));
+    const isOnLastPage = computed(() => currentPage.value >= pageCount.value);
+
+    const handleLoadMore = async () => {
+        if (!props.onLoadMore || props.loadingMore || props.loading) return;
+        const prevPageCount = props.table?.getPageCount?.() ?? 0;
+        const wasOnLastPage = currentPage.value >= Math.max(1, prevPageCount);
+        await props.onLoadMore();
+        await nextTick();
+        const nextPageCount = props.table?.getPageCount?.() ?? 0;
+        if (wasOnLastPage && nextPageCount > prevPageCount) {
+            currentPage.value = prevPageCount + 1;
+        }
+    };
 
     const sortBy = computed(() => props.table.atoms?.sorting?.get() ?? []);
 

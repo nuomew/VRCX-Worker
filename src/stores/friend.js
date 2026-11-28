@@ -245,6 +245,11 @@ export const useFriendStore = defineStore('Friend', () => {
     let pendingOfflineWorker = null;
     const pendingOfflineMap = new Map();
 
+    const FRIENDLOG_CLOUD_INIT_BATCH = 300;
+    const FRIENDLOG_CLOUD_PAGE_BATCH = 200;
+    const FRIENDLOG_CLOUD_MAX_REQUEST_LIMIT = 500;
+    let friendLogLoadEpoch = 0;
+
     const friendLogTable = ref({
         data: [],
         filters: /** @type {import('@/types/vrcx').TableFilter[]} */ ([
@@ -263,7 +268,9 @@ export const useFriendStore = defineStore('Friend', () => {
             }
         ]),
         pageSizeLinked: true,
-        loading: false
+        loading: false,
+        loadingMore: false,
+        hasMore: false
     });
 
     watch(
@@ -989,9 +996,102 @@ export const useFriendStore = defineStore('Friend', () => {
     }
 
     async function initFriendLogHistoryTable() {
+        const epoch = ++friendLogLoadEpoch;
         friendLogTable.value.loading = true;
-        friendLogTable.value.data = await database.getFriendLogHistory();
-        friendLogTable.value.loading = false;
+        friendLogTable.value.loadingMore = false;
+        try {
+            const supportsCursor = Boolean(database.supportsHistoryCursorPagination);
+            const rows = supportsCursor
+                ? await database.getFriendLogHistory({ limit: FRIENDLOG_CLOUD_INIT_BATCH })
+                : await database.getFriendLogHistory();
+            if (epoch !== friendLogLoadEpoch) return;
+            const list = Array.isArray(rows) ? rows : [];
+            friendLogTable.value.data = list;
+            friendLogTable.value.hasMore = Boolean(supportsCursor && list.length >= FRIENDLOG_CLOUD_INIT_BATCH);
+        } finally {
+            if (epoch === friendLogLoadEpoch) {
+                friendLogTable.value.loading = false;
+            }
+        }
+    }
+
+    async function loadMoreFriendLogHistory() {
+        if (
+            !database.supportsHistoryCursorPagination ||
+            friendLogTable.value.loading ||
+            friendLogTable.value.loadingMore ||
+            !friendLogTable.value.hasMore
+        ) {
+            return 0;
+        }
+        let oldest = '';
+        for (const r of friendLogTable.value.data) {
+            const ts = String(r?.created_at ?? '').trim();
+            if (!ts) continue;
+            if (!oldest || ts < oldest) oldest = ts;
+        }
+        if (!oldest) {
+            friendLogTable.value.hasMore = false;
+            return 0;
+        }
+        let sameTsCount = 0;
+        for (const r of friendLogTable.value.data) {
+            if (String(r?.created_at ?? '').trim() === oldest) sameTsCount++;
+        }
+        const friendLogKey = (r) =>
+            `${String(r?.created_at ?? '')}|${String(r?.type ?? '')}|${String(r?.userId ?? '')}|${String(r?.displayName ?? '')}`;
+        const epoch = friendLogLoadEpoch;
+        friendLogTable.value.loadingMore = true;
+        try {
+            const existingKeys = new Set(friendLogTable.value.data.map(friendLogKey));
+            let requestLimit = Math.min(
+                FRIENDLOG_CLOUD_MAX_REQUEST_LIMIT,
+                FRIENDLOG_CLOUD_PAGE_BATCH + Math.min(sameTsCount, 100)
+            );
+            let fetched = await database.getFriendLogHistory({
+                limit: requestLimit,
+                beforeCreatedAt: oldest,
+                beforeInclusive: true
+            });
+            if (epoch !== friendLogLoadEpoch) return 0;
+
+            const newRows = [];
+            for (const row of Array.isArray(fetched) ? fetched : []) {
+                const key = friendLogKey(row);
+                if (existingKeys.has(key)) continue;
+                existingKeys.add(key);
+                newRows.push(row);
+            }
+
+            if (newRows.length === 0 && Array.isArray(fetched) && fetched.length >= requestLimit) {
+                requestLimit = FRIENDLOG_CLOUD_PAGE_BATCH;
+                fetched = await database.getFriendLogHistory({
+                    limit: requestLimit,
+                    beforeCreatedAt: oldest,
+                    beforeInclusive: false
+                });
+                if (epoch !== friendLogLoadEpoch) return 0;
+                for (const row of Array.isArray(fetched) ? fetched : []) {
+                    const key = friendLogKey(row);
+                    if (existingKeys.has(key)) continue;
+                    existingKeys.add(key);
+                    newRows.push(row);
+                }
+            }
+
+            if (newRows.length > 0) {
+                friendLogTable.value.data = [...friendLogTable.value.data, ...newRows];
+                friendLogTable.value.hasMore = Array.isArray(fetched) && fetched.length >= requestLimit;
+                return newRows.length;
+            }
+
+            friendLogTable.value.hasMore = false;
+            return 0;
+        } finally {
+            if (epoch === friendLogLoadEpoch) {
+                friendLogTable.value.loadingMore = false;
+            }
+        }
     }
 
     /**
@@ -1352,6 +1452,7 @@ export const useFriendStore = defineStore('Friend', () => {
         resetDerivedDebugCounters,
         getDerivedDebugCounters,
         initFriendLogHistoryTable,
+        loadMoreFriendLogHistory,
         setIsRefreshFriendsLoading
     };
 });

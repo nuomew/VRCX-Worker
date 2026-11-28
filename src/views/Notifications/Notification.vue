@@ -6,7 +6,10 @@
             auto-height
             :page-sizes="pageSizes"
             :total-items="totalItems"
-            :on-page-size-change="handlePageSizeChange">
+            :on-page-size-change="handlePageSizeChange"
+            :can-load-more="notificationTable.hasMore"
+            :loading-more="notificationTable.loadingMore"
+            :on-load-more="loadMoreNotifications">
             <template #toolbar>
                 <div class="mb-2 flex justify-between items-center gap-2">
                     <Select
@@ -121,6 +124,7 @@
     const { notificationTable, isNotificationsLoading } = storeToRefs(useNotificationStore());
     const {
         refreshNotifications,
+        loadMoreNotifications,
         acceptFriendRequestNotification,
         hideNotification,
         hideNotificationPrompt,
@@ -248,6 +252,9 @@
 
     const totalItems = computed(() => {
         const length = table.getFilteredRowModel().rows.length;
+        if (notificationTable.value.historyExpanded) {
+            return length;
+        }
         const max = vrcxStore.maxTableSize;
         return length > max && length < max + 51 ? max : length;
     });

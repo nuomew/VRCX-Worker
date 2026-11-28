@@ -6,7 +6,10 @@
             auto-height
             :page-sizes="pageSizes"
             :total-items="totalItems"
-            :on-page-size-change="handlePageSizeChange">
+            :on-page-size-change="handlePageSizeChange"
+            :can-load-more="feedTable.hasMore"
+            :loading-more="feedTable.loadingMore"
+            :on-load-more="loadMoreFeedHistory">
             <template #toolbar>
                 <div class="mt-0 mx-0 mb-2" style="display: flex; align-items: center">
                     <div style="flex: none; display: flex; align-items: center" class="mr-2">
@@ -110,7 +113,7 @@
     import { useVrcxVueTable } from '../../lib/table/useVrcxVueTable';
 
     const { feedTable, feedTableData } = storeToRefs(useFeedStore());
-    const { feedTableLookup } = useFeedStore();
+    const { feedTableLookup, loadMoreFeedHistory } = useFeedStore();
     const appearanceSettingsStore = useAppearanceSettingsStore();
     const { weekStartsOn } = storeToRefs(appearanceSettingsStore);
     const vrcxStore = useVrcxStore();
@@ -183,6 +186,9 @@
 
     const totalItems = computed(() => {
         const length = table.getFilteredRowModel().rows.length;
+        if (feedTable.value.historyExpanded) {
+            return length;
+        }
         const max = vrcxStore.maxTableSize;
         return length > max && length < max + 51 ? max : length;
     });

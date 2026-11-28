@@ -5271,4 +5271,209 @@ describe('External MySQL 5.7+ Database Integration (Hybrid New-Writes Mode & Ful
         // Oversized >= 512 KiB batch skipped synchronous gzip to stay well under Workers Free 10ms CPU
         expect(storedChunks.every((r) => !String(r.payload_json ?? '').startsWith('gz:'))).toBe(true);
     });
+
+    it('paginates imported legacy Feed, GameLog, FriendLog, and Notifications across multiple external MySQL archive chunks beyond 100 rows without wide-chunk shadowing', async () => {
+        await ensureSchemaReady(env);
+        const fakeMysql = new FakeMysql57Server();
+        setMysqlConnectionFactoryForTests(async () => fakeMysql.createConnection());
+
+        const headers = { 'Content-Type': 'application/json', Origin: 'http://example.com' };
+        const saveRes = await exports.default.fetch('http://example.com/api/storage/mysql/config', {
+            method: 'PUT',
+            headers,
+            body: JSON.stringify({
+                enabled: true,
+                mode: 'new_writes_only',
+                connectionType: 'direct',
+                host: 'mysql57.example.com',
+                port: 3306,
+                database: 'vrcx_cursor_test',
+                username: 'vrcx_u',
+                password: 'secret-password',
+                sslMode: 'disabled',
+                tablePrefix: 'vrcx_'
+            })
+        });
+        expect(saveRes.status).toBe(200);
+
+        const seedConn = fakeMysql.createConnection();
+        await ensureMysqlSchemaOnConnection(seedConn, {
+            connectionType: 'direct',
+            host: 'mysql57.example.com',
+            port: 3306,
+            database: 'vrcx_cursor_test',
+            username: 'vrcx_u',
+            password: 'secret-password',
+            sslMode: 'disabled',
+            tablePrefix: 'vrcx_'
+        });
+        await seedConn.close();
+
+        // Seed 3 chronological GPS chunks (240 rows total across 2024..2026) + 1 wide-span Bio chunk (2022..2026)
+        // directly into MySQL `vrcx_legacy_feed_chunks`, WITHOUT setting `imported_stats` to also verify stats-drift fallback!
+        const feedChunksTbl = fakeMysql.tables.get('vrcx_legacy_feed_chunks')!;
+        const buildIso = (idx: number) => new Date(Date.UTC(2024, 0, 1) + idx * 3600_000).toISOString();
+        const gpsChunkDefs = [
+            { start: 0, count: 80, key: 'legacy_gps_old' },
+            { start: 80, count: 80, key: 'legacy_gps_mid' },
+            { start: 160, count: 80, key: 'legacy_gps_new' }
+        ];
+        for (const def of gpsChunkDefs) {
+            const tuples = Array.from({ length: def.count }, (_, offset) => {
+                const idx = def.start + offset;
+                return [buildIso(idx), `usr_${idx % 10}`, `User_${idx}`, `wrld_${idx}:1`, `World_${idx}`, '', 60, ''];
+            });
+            feedChunksTbl.rows.push({
+                id: feedChunksTbl.autoInc++,
+                chunk_key: def.key,
+                feed_kind: 'gps',
+                min_created_at: String(tuples[0]![0]),
+                max_created_at: String(tuples[tuples.length - 1]![0]),
+                row_count: tuples.length,
+                payload_json: JSON.stringify(tuples)
+            });
+        }
+        // Wide-span Bio chunk spanning earlier than oldest GPS through newer than newest GPS
+        const bioTuples = [
+            ['2022-01-01T00:00:00.000Z', 'usr_bio', 'BioFriend', 'bio_2022', '', '[]', '[]'],
+            ['2026-12-01T00:00:00.000Z', 'usr_bio', 'BioFriend', 'bio_2026', 'bio_2022', '[]', '[]']
+        ];
+        feedChunksTbl.rows.push({
+            id: feedChunksTbl.autoInc++,
+            chunk_key: 'legacy_bio_wide',
+            feed_kind: 'bio',
+            min_created_at: '2022-01-01T00:00:00.000Z',
+            max_created_at: '2026-12-01T00:00:00.000Z',
+            row_count: bioTuples.length,
+            payload_json: JSON.stringify(bioTuples)
+        });
+
+        // Page 1: newest 100 rows (1 Bio 2026 + 99 GPS rows)
+        const feedP1Res = await exports.default.fetch('http://example.com/api/feed?limit=100', { headers });
+        expect(feedP1Res.status).toBe(200);
+        const feedP1 = ((await feedP1Res.json()) as { data: Array<Record<string, unknown>> }).data;
+        expect(feedP1.length).toBe(100);
+        expect(feedP1[0]?.type).toBe('Bio');
+        expect(feedP1[0]?.created_at).toBe('2026-12-01T00:00:00.000Z');
+        const cursor1 = String(feedP1[feedP1.length - 1]?.created_at);
+
+        // Page 2: next 100 older rows via POST /api/feed/query beforeCreatedAt (exclusive)
+        const feedP2Res = await exports.default.fetch('http://example.com/api/feed/query', {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({ limit: 100, beforeCreatedAt: cursor1 })
+        });
+        expect(feedP2Res.status).toBe(200);
+        const feedP2 = ((await feedP2Res.json()) as { data: Array<Record<string, unknown>> }).data;
+        expect(feedP2.length).toBe(100);
+        expect(String(feedP2[0]?.created_at) < cursor1).toBe(true);
+        const cursor2 = String(feedP2[feedP2.length - 1]?.created_at);
+
+        // Page 3: remaining 42 older rows (41 GPS + 1 Bio 2022)
+        const feedP3Res = await exports.default.fetch('http://example.com/api/feed/query', {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({ limit: 100, beforeCreatedAt: cursor2 })
+        });
+        expect(feedP3Res.status).toBe(200);
+        const feedP3 = ((await feedP3Res.json()) as { data: Array<Record<string, unknown>> }).data;
+        expect(feedP3.length).toBe(42);
+        expect(feedP3[feedP3.length - 1]?.created_at).toBe('2022-01-01T00:00:00.000Z');
+
+        // Verify full 242 rows are strictly descending with zero loss across all 4 archive chunks
+        const allFeed = [...feedP1, ...feedP2, ...feedP3];
+        expect(allFeed.length).toBe(242);
+        for (let i = 1; i < allFeed.length; i++) {
+            expect(String(allFeed[i - 1]?.created_at) >= String(allFeed[i]?.created_at)).toBe(true);
+        }
+
+        // Seed 220 legacy GameLog rows across 3 chunks including 5 same-timestamp OnPlayerJoined rows at the page boundary
+        const glChunksTbl = fakeMysql.tables.get('vrcx_legacy_gamelog_chunks')!;
+        const glTuplesAll: unknown[][] = [];
+        const boundaryTs = '2025-06-15T12:00:00.000Z';
+        for (let i = 0; i < 115; i++) {
+            const ts = new Date(Date.UTC(2025, 0, 1) + i * 60_000).toISOString();
+            glTuplesAll.push([ts, 'OnPlayerJoined', `OldPlayer_${i}`, 'wrld_old:1', `usr_old_${i}`, 0]);
+        }
+        for (let b = 0; b < 5; b++) {
+            glTuplesAll.push([boundaryTs, 'OnPlayerJoined', `BurstPlayer_${b}`, 'wrld_burst:1', `usr_burst_${b}`, 0]);
+        }
+        for (let i = 0; i < 100; i++) {
+            const ts = new Date(Date.UTC(2025, 6, 1) + i * 60_000).toISOString();
+            glTuplesAll.push([ts, 'OnPlayerJoined', `NewPlayer_${i}`, 'wrld_new:1', `usr_new_${i}`, 0]);
+        }
+        for (let c = 0; c < glTuplesAll.length; c += 75) {
+            const slice = glTuplesAll.slice(c, c + 75);
+            glChunksTbl.rows.push({
+                id: glChunksTbl.autoInc++,
+                chunk_key: `legacy_gl_${c}`,
+                gamelog_kind: 'join_leave',
+                min_created_at: String(slice[0]![0]),
+                max_created_at: String(slice[slice.length - 1]![0]),
+                row_count: slice.length,
+                payload_json: JSON.stringify(slice)
+            });
+        }
+
+        // GameLog Page 1 (102 rows -> slices right into the 5 same-timestamp BurstPlayer rows)
+        const glP1Res = await exports.default.fetch('http://example.com/api/gamelog?limit=102', { headers });
+        expect(glP1Res.status).toBe(200);
+        const glP1 = ((await glP1Res.json()) as { data: Array<Record<string, unknown>> }).data;
+        expect(glP1.length).toBe(102);
+        const glCursor1 = String(glP1[glP1.length - 1]?.created_at);
+        expect(glCursor1).toBe(boundaryTs);
+
+        // GameLog Page 2 with beforeInclusive: true + overlap headroom recovers remaining BurstPlayers AND older chunk rows
+        const glP2Res = await exports.default.fetch('http://example.com/api/gamelog/query', {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({ limit: 150, beforeCreatedAt: glCursor1, beforeInclusive: true })
+        });
+        expect(glP2Res.status).toBe(200);
+        const glP2 = ((await glP2Res.json()) as { data: Array<Record<string, unknown>> }).data;
+        const uniquePlayers = new Set([...glP1, ...glP2].map((r) => String(r.displayName)));
+        expect(uniquePlayers.size).toBe(220);
+        for (let b = 0; b < 5; b++) {
+            expect(uniquePlayers.has(`BurstPlayer_${b}`)).toBe(true);
+        }
+        expect(uniquePlayers.has('OldPlayer_0')).toBe(true);
+
+        // Also verify FriendLog & Notifications cursor pagination over legacy_core_chunks
+        const coreChunksTbl = fakeMysql.tables.get('vrcx_legacy_core_chunks')!;
+        const flTuples = Array.from({ length: 12 }, (_, i) => [
+            new Date(Date.UTC(2024, 0, 1) + i * 86_400_000).toISOString(),
+            'Friend',
+            `usr_fl_${i}`,
+            `Friend_${i}`,
+            '',
+            '',
+            '',
+            i + 1
+        ]);
+        coreChunksTbl.rows.push({
+            id: coreChunksTbl.autoInc++,
+            chunk_key: 'legacy_fl_chunk',
+            core_kind: 'friend_log',
+            min_created_at: String(flTuples[0]![0]),
+            max_created_at: String(flTuples[flTuples.length - 1]![0]),
+            row_count: flTuples.length,
+            payload_json: JSON.stringify(flTuples)
+        });
+        const flP1 = (
+            (await (await exports.default.fetch('http://example.com/api/friend-log/history?limit=5', { headers })).json()) as {
+                data: Array<Record<string, unknown>>;
+            }
+        ).data;
+        expect(flP1.length).toBe(5);
+        const flP2 = (
+            (await (
+                await exports.default.fetch(
+                    `http://example.com/api/friend-log/history?limit=10&beforeCreatedAt=${encodeURIComponent(String(flP1[4]?.created_at))}`,
+                    { headers }
+                )
+            ).json()) as { data: Array<Record<string, unknown>> }
+        ).data;
+        expect(flP2.length).toBe(7);
+        expect(flP2[flP2.length - 1]?.display_name).toBe('Friend_0');
+    });
 });

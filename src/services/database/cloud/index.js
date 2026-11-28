@@ -591,6 +591,7 @@ if (typeof window !== 'undefined' && typeof window.addEventListener === 'functio
 
 export function createCloudDatabase(dbVars) {
     return {
+        supportsHistoryCursorPagination: true,
         setMaxTableSize(limit) {
             dbVars.maxTableSize = limit;
         },
@@ -1203,8 +1204,17 @@ export function createCloudDatabase(dbVars) {
             pendingFriendLogCurrent.delete(userId);
             await cloudFetch(`/api/friend-log/current?userId=${encodeURIComponent(userId)}`, { method: 'DELETE' });
         },
-        async getFriendLogHistory() {
-            const rows = await cloudFetch('/api/friend-log/history?limit=300').catch(() => []);
+        async getFriendLogHistory(options = {}) {
+            const limit = Math.min(Math.max(Number(options?.limit) || 300, 1), 500);
+            const params = new URLSearchParams({ limit: String(limit) });
+            const beforeCreatedAt = String(options?.beforeCreatedAt || '').trim();
+            if (beforeCreatedAt) {
+                params.set('beforeCreatedAt', beforeCreatedAt);
+                if (options?.beforeInclusive) {
+                    params.set('beforeInclusive', '1');
+                }
+            }
+            const rows = await cloudFetch(`/api/friend-log/history?${params.toString()}`).catch(() => []);
             return rows.map((r) => ({
                 rowId: r.id,
                 created_at: r.created_at,
@@ -1275,8 +1285,17 @@ export function createCloudDatabase(dbVars) {
         },
 
         // ===== notifications (v1 & v2) =====
-        async getNotifications() {
-            const rows = await cloudFetch('/api/notifications?v=1&limit=150').catch(() => []);
+        async getNotifications(options = {}) {
+            const limit = Math.min(Math.max(Number(options?.limit) || 150, 1), 200);
+            const params = new URLSearchParams({ v: '1', limit: String(limit) });
+            const beforeCreatedAt = String(options?.beforeCreatedAt || '').trim();
+            if (beforeCreatedAt) {
+                params.set('beforeCreatedAt', beforeCreatedAt);
+                if (options?.beforeInclusive) {
+                    params.set('beforeInclusive', '1');
+                }
+            }
+            const rows = await cloudFetch(`/api/notifications?${params.toString()}`).catch(() => []);
             if (!Array.isArray(rows)) return [];
             return rows.map((r) => ({
                 id: r.id || '',
@@ -1347,8 +1366,17 @@ export function createCloudDatabase(dbVars) {
                 json: { version: 1, id: entry.id, expired: true }
             });
         },
-        async getNotificationsV2() {
-            const rows = await cloudFetch('/api/notifications?v=2&limit=150').catch(() => []);
+        async getNotificationsV2(options = {}) {
+            const limit = Math.min(Math.max(Number(options?.limit) || 150, 1), 200);
+            const params = new URLSearchParams({ v: '2', limit: String(limit) });
+            const beforeCreatedAt = String(options?.beforeCreatedAt || '').trim();
+            if (beforeCreatedAt) {
+                params.set('beforeCreatedAt', beforeCreatedAt);
+                if (options?.beforeInclusive) {
+                    params.set('beforeInclusive', '1');
+                }
+            }
+            const rows = await cloudFetch(`/api/notifications?${params.toString()}`).catch(() => []);
             if (!Array.isArray(rows)) return [];
             const parseJson = (raw, fallback) => {
                 if (raw && typeof raw === 'object') return raw;
@@ -1423,17 +1451,25 @@ export function createCloudDatabase(dbVars) {
         async getGamelogDatabase() {
             return cloudFetch('/api/gamelog/current-instance').catch(() => []);
         },
-        async lookupGameLogDatabase(filters, vipList, maxEntries = 100) {
-            const limit = Math.min(maxEntries || 100, 100);
+        async lookupGameLogDatabase(filters, vipList, maxEntries = 100, options = {}) {
+            const limit = Math.min(Math.max(Number(maxEntries) || 100, 1), 200);
             const hasFilters = Array.isArray(filters) && filters.length > 0;
             const hasVip = Array.isArray(vipList) && vipList.length > 0;
-            if (hasFilters || hasVip) {
+            const beforeCreatedAt = String(options?.beforeCreatedAt || '').trim();
+            const beforeInclusive = Boolean(options?.beforeInclusive);
+            const dateFrom = String(options?.dateFrom || '').trim();
+            const dateTo = String(options?.dateTo || '').trim();
+            if (hasFilters || hasVip || beforeCreatedAt || dateFrom || dateTo) {
                 const rows = await cloudFetch('/api/gamelog/query', {
                     method: 'POST',
                     json: {
                         types: hasFilters ? filters : [],
                         vipList: hasVip ? vipList : [],
-                        limit
+                        limit,
+                        dateFrom: dateFrom || undefined,
+                        dateTo: dateTo || undefined,
+                        beforeCreatedAt: beforeCreatedAt || undefined,
+                        beforeInclusive: beforeCreatedAt ? beforeInclusive : undefined
                     }
                 }).catch(() => []);
                 return Array.isArray(rows) ? rows : [];
@@ -2139,8 +2175,8 @@ export function createCloudDatabase(dbVars) {
             queueFeedWrite(entry);
             return { ...entry, rowId: allocateSyntheticTempRowId() };
         },
-        async lookupFeedDatabase(filters, vipList, maxEntries = 100, dateFrom = '', dateTo = '') {
-            const limit = Math.min(maxEntries || 100, 100);
+        async lookupFeedDatabase(filters, vipList, maxEntries = 100, dateFrom = '', dateTo = '', options = {}) {
+            const limit = Math.min(Math.max(Number(maxEntries) || 100, 1), 200);
             const hasFilters = Array.isArray(filters) && filters.length > 0;
             const supportedFeedTypes = new Set(['GPS', 'Status', 'Bio', 'Online', 'Offline']);
             if (hasFilters && filters.every((t) => !supportedFeedTypes.has(t))) {
@@ -2149,7 +2185,9 @@ export function createCloudDatabase(dbVars) {
             const hasVip = Array.isArray(vipList) && vipList.length > 0;
             const cleanDateFrom = String(dateFrom || '').trim();
             const cleanDateTo = String(dateTo || '').trim();
-            if (hasFilters || hasVip || cleanDateFrom || cleanDateTo) {
+            const beforeCreatedAt = String(options?.beforeCreatedAt || '').trim();
+            const beforeInclusive = Boolean(options?.beforeInclusive);
+            if (hasFilters || hasVip || cleanDateFrom || cleanDateTo || beforeCreatedAt) {
                 const rows = await cloudFetch('/api/feed/query', {
                     method: 'POST',
                     json: {
@@ -2157,7 +2195,9 @@ export function createCloudDatabase(dbVars) {
                         vipList: hasVip ? vipList : [],
                         limit,
                         dateFrom: cleanDateFrom || undefined,
-                        dateTo: cleanDateTo || undefined
+                        dateTo: cleanDateTo || undefined,
+                        beforeCreatedAt: beforeCreatedAt || undefined,
+                        beforeInclusive: beforeCreatedAt ? beforeInclusive : undefined
                     }
                 }).catch(() => []);
                 return Array.isArray(rows) ? rows : [];

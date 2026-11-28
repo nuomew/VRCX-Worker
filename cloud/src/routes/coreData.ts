@@ -2103,56 +2103,110 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
         if (request.method === 'GET') {
             const userId = url.searchParams.get('userId');
             const limit = clampQueryLimit(url.searchParams.get('limit'), 200, 500);
+            const beforeCreatedAt = (url.searchParams.get('beforeCreatedAt') ?? '').trim();
+            const beforeInclusiveRaw = (url.searchParams.get('beforeInclusive') ?? '').trim().toLowerCase();
+            const beforeInclusive = beforeInclusiveRaw === '1' || beforeInclusiveRaw === 'true';
+            const upperOp = beforeInclusive ? '<=' : '<';
+            const matchesBefore = (createdAt: string): boolean => {
+                if (!beforeCreatedAt) return true;
+                return beforeInclusive ? createdAt <= beforeCreatedAt : createdAt < beforeCreatedAt;
+            };
             const legacyDb = getLegacyDb(env);
             const legacyStats = legacyDb ? await getLegacyImportedStats(env) : null;
             const hasLegacyFriendLog = Boolean(legacyDb && (legacyStats?.friend_log ?? 0) > 0);
-            const [res, legacyRes] = await Promise.all([
-                userId
-                    ? env.DB_CORE.prepare('SELECT * FROM friend_log_history WHERE user_id = ? ORDER BY id DESC LIMIT ?')
-                          .bind(userId, limit)
-                          .all<Record<string, unknown>>()
-                    : env.DB_CORE.prepare('SELECT * FROM friend_log_history ORDER BY id DESC LIMIT ?')
-                          .bind(limit)
-                          .all<Record<string, unknown>>(),
-                hasLegacyFriendLog && legacyDb
-                    ? userId
-                        ? legacyDb
-                              .prepare(
-                                  'SELECT -id AS id, created_at, type, user_id, display_name, previous_display_name, trust_level, previous_trust_level, friend_number FROM friend_log_history WHERE user_id = ? ORDER BY created_at DESC, id DESC LIMIT ?'
-                              )
-                              .bind(userId, limit)
-                              .all<Record<string, unknown>>()
-                        : legacyDb
-                              .prepare(
-                                  'SELECT -id AS id, created_at, type, user_id, display_name, previous_display_name, trust_level, previous_trust_level, friend_number FROM friend_log_history ORDER BY created_at DESC, id DESC LIMIT ?'
-                              )
-                              .bind(limit)
-                              .all<Record<string, unknown>>()
-                    : Promise.resolve(null)
-            ]);
-            const primaryRows: Array<Record<string, unknown>> = [...(res.results ?? [])];
-            const legacyRows: Array<Record<string, unknown>> = [...(legacyRes?.results ?? [])];
+            const buildFriendLogSelect = (db: D1Database, isLegacy: boolean) => {
+                const cols = isLegacy
+                    ? '-id AS id, created_at, type, user_id, display_name, previous_display_name, trust_level, previous_trust_level, friend_number'
+                    : '*';
+                const conds: string[] = [];
+                const binds: unknown[] = [];
+                if (userId) {
+                    conds.push('user_id = ?');
+                    binds.push(userId);
+                }
+                if (beforeCreatedAt) {
+                    conds.push(`created_at ${upperOp} ?`);
+                    binds.push(beforeCreatedAt);
+                }
+                const whereSql = conds.length > 0 ? `WHERE ${conds.join(' AND ')}` : '';
+                const orderSql =
+                    isLegacy || beforeCreatedAt ? 'ORDER BY created_at DESC, id DESC' : 'ORDER BY id DESC';
+                return db
+                    .prepare(`SELECT ${cols} FROM friend_log_history ${whereSql} ${orderSql} LIMIT ?`)
+                    .bind(...binds, limit)
+                    .all<Record<string, unknown>>();
+            };
             const readFriendLogChunks = async (
                 db: D1Database,
                 archiveTable: 'core_archive_chunks' | 'legacy_core_chunks',
                 negateRowIds: boolean
             ): Promise<Array<Record<string, unknown>>> => {
                 try {
-                    const chunkRes = await db
-                        .prepare(
-                            `SELECT id, payload_json
-                             FROM ${archiveTable}
-                             WHERE core_kind = 'friend_log'
-                             ORDER BY max_created_at DESC, id DESC
-                             LIMIT ?`
-                        )
-                        .bind(userId ? 12 : 6)
-                        .all<{ id: number; payload_json: string }>();
+                    const chunkLimit = userId ? 12 : 8;
+                    const stmts: D1PreparedStatement[] = beforeCreatedAt
+                        ? [
+                              db
+                                  .prepare(
+                                      `SELECT id, max_created_at, payload_json
+                                       FROM ${archiveTable}
+                                       WHERE core_kind = 'friend_log' AND max_created_at <= ?
+                                       ORDER BY max_created_at DESC, id DESC
+                                       LIMIT ?`
+                                  )
+                                  .bind(beforeCreatedAt, chunkLimit),
+                              db
+                                  .prepare(
+                                      `SELECT id, max_created_at, payload_json
+                                       FROM ${archiveTable}
+                                       WHERE core_kind = 'friend_log' AND min_created_at <= ? AND max_created_at > ?
+                                       ORDER BY max_created_at DESC, id DESC
+                                       LIMIT 2`
+                                  )
+                                  .bind(beforeCreatedAt, beforeCreatedAt)
+                          ]
+                        : [
+                              db
+                                  .prepare(
+                                      `SELECT id, max_created_at, payload_json
+                                       FROM ${archiveTable}
+                                       WHERE core_kind = 'friend_log'
+                                       ORDER BY max_created_at DESC, id DESC
+                                       LIMIT ?`
+                                  )
+                                  .bind(chunkLimit)
+                          ];
+                    const batchRes = (await db.batch(stmts)) as D1Result<{
+                        id: number;
+                        max_created_at: string;
+                        payload_json: string;
+                    }>[];
+                    const byId = new Map<number, { id: number; max_created_at: string; payload_json: string }>();
+                    for (const res of batchRes) {
+                        for (const c of res?.results ?? []) {
+                            if (!byId.has(c.id)) byId.set(c.id, c);
+                        }
+                    }
+                    const chunks = Array.from(byId.values()).sort(
+                        (a, b) =>
+                            String(b.max_created_at ?? '').localeCompare(String(a.max_created_at ?? '')) ||
+                            Number(b.id ?? 0) - Number(a.id ?? 0)
+                    );
                     const out: Array<Record<string, unknown>> = [];
-                    for (const c of chunkRes.results ?? []) {
+                    for (const c of chunks) {
+                        if (out.length >= limit) {
+                            let strictlyNewer = 0;
+                            for (const row of out) {
+                                if (String(row.created_at ?? '') > c.max_created_at) {
+                                    strictlyNewer++;
+                                    if (strictlyNewer >= limit) break;
+                                }
+                            }
+                            if (strictlyNewer >= limit) break;
+                        }
                         const unpacked = decodeCoreChunkRows(c.id, 'friend_log', c.payload_json, { negateRowIds });
                         for (const entry of unpacked) {
                             if (userId && String(entry.user_id ?? '') !== userId) continue;
+                            if (!matchesBefore(String(entry.created_at ?? ''))) continue;
                             out.push(entry);
                         }
                     }
@@ -2161,16 +2215,29 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
                     return [];
                 }
             };
-            const [activeArchiveRows, legacyArchiveRows] = await Promise.all([
+            const [res, activeArchiveRows, legacyRes, legacyArchiveRows] = await Promise.all([
+                buildFriendLogSelect(env.DB_CORE, false),
                 readFriendLogChunks(env.DB_CORE, 'core_archive_chunks', false),
+                hasLegacyFriendLog && legacyDb ? buildFriendLogSelect(legacyDb, true) : Promise.resolve(null),
                 hasLegacyFriendLog && legacyDb
                     ? readFriendLogChunks(legacyDb, 'legacy_core_chunks', true)
                     : Promise.resolve([])
             ]);
+            const primaryRows: Array<Record<string, unknown>> = [...(res.results ?? [])];
+            let legacyRows: Array<Record<string, unknown>> = [...(legacyRes?.results ?? [])];
+            let finalLegacyArchiveRows = legacyArchiveRows;
             const friendLogKey = (r: Record<string, unknown>) =>
                 `${String(r.created_at ?? '')}|${String(r.type ?? '')}|${String(r.user_id ?? '')}|${String(r.display_name ?? '')}`;
             const primaryMerged = mergePrimaryAndLegacy(primaryRows, activeArchiveRows, friendLogKey);
-            const legacyMerged = mergePrimaryAndLegacy(legacyRows, legacyArchiveRows, friendLogKey);
+            if (!hasLegacyFriendLog && legacyDb && (primaryMerged.length < limit || Boolean(beforeCreatedAt))) {
+                const [fallbackRes, fallbackChunks] = await Promise.all([
+                    buildFriendLogSelect(legacyDb, true),
+                    readFriendLogChunks(legacyDb, 'legacy_core_chunks', true)
+                ]);
+                legacyRows = [...(fallbackRes?.results ?? [])];
+                finalLegacyArchiveRows = fallbackChunks;
+            }
+            const legacyMerged = mergePrimaryAndLegacy(legacyRows, finalLegacyArchiveRows, friendLogKey);
             const merged = mergePrimaryAndLegacy(primaryMerged, legacyMerged, friendLogKey)
                 .sort((a, b) => String(b.created_at ?? '').localeCompare(String(a.created_at ?? '')))
                 .slice(0, limit);
@@ -2309,57 +2376,129 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
         if (request.method === 'GET') {
             const version = url.searchParams.get('v') === '2' ? 2 : 1;
             const limit = clampQueryLimit(url.searchParams.get('limit'), 100, 200);
+            const beforeCreatedAt = (url.searchParams.get('beforeCreatedAt') ?? '').trim();
+            const beforeInclusiveRaw = (url.searchParams.get('beforeInclusive') ?? '').trim().toLowerCase();
+            const beforeInclusive = beforeInclusiveRaw === '1' || beforeInclusiveRaw === 'true';
+            const upperOp = beforeInclusive ? '<=' : '<';
+            const matchesBefore = (createdAt: string): boolean => {
+                if (!beforeCreatedAt) return true;
+                return beforeInclusive ? createdAt <= beforeCreatedAt : createdAt < beforeCreatedAt;
+            };
             const table = version === 2 ? 'notifications_v2' : 'notifications';
             const coreKind = version === 2 ? 'notif_v2' : 'notif_v1';
             const legacyDb = getLegacyDb(env);
             const legacyStats = legacyDb ? await getLegacyImportedStats(env) : null;
             const hasLegacyNotif = Boolean(legacyDb && (legacyStats?.notifications ?? 0) > 0);
-            const [res, legacyRes] = await Promise.all([
-                env.DB_CORE.prepare(`SELECT * FROM ${table} ORDER BY created_at DESC LIMIT ?`)
+            const buildNotifSelect = (db: D1Database) => {
+                if (beforeCreatedAt) {
+                    return db
+                        .prepare(`SELECT * FROM ${table} WHERE created_at ${upperOp} ? ORDER BY created_at DESC LIMIT ?`)
+                        .bind(beforeCreatedAt, limit)
+                        .all<Record<string, unknown>>();
+                }
+                return db
+                    .prepare(`SELECT * FROM ${table} ORDER BY created_at DESC LIMIT ?`)
                     .bind(limit)
-                    .all<Record<string, unknown>>(),
-                hasLegacyNotif && legacyDb
-                    ? legacyDb
-                          .prepare(`SELECT * FROM ${table} ORDER BY created_at DESC LIMIT ?`)
-                          .bind(limit)
-                          .all<Record<string, unknown>>()
-                    : Promise.resolve(null)
-            ]);
-            const primaryRows: Array<Record<string, unknown>> = [...(res.results ?? [])];
-            const legacyRows: Array<Record<string, unknown>> = [...(legacyRes?.results ?? [])];
+                    .all<Record<string, unknown>>();
+            };
             const readNotifChunks = async (
                 db: D1Database,
                 archiveTable: 'core_archive_chunks' | 'legacy_core_chunks',
                 negateRowIds: boolean
             ): Promise<Array<Record<string, unknown>>> => {
                 try {
-                    const chunkRes = await db
-                        .prepare(
-                            `SELECT id, payload_json
-                             FROM ${archiveTable}
-                             WHERE core_kind = ?
-                             ORDER BY max_created_at DESC, id DESC
-                             LIMIT 6`
-                        )
-                        .bind(coreKind)
-                        .all<{ id: number; payload_json: string }>();
+                    const stmts: D1PreparedStatement[] = beforeCreatedAt
+                        ? [
+                              db
+                                  .prepare(
+                                      `SELECT id, max_created_at, payload_json
+                                       FROM ${archiveTable}
+                                       WHERE core_kind = ? AND max_created_at <= ?
+                                       ORDER BY max_created_at DESC, id DESC
+                                       LIMIT 8`
+                                  )
+                                  .bind(coreKind, beforeCreatedAt),
+                              db
+                                  .prepare(
+                                      `SELECT id, max_created_at, payload_json
+                                       FROM ${archiveTable}
+                                       WHERE core_kind = ? AND min_created_at <= ? AND max_created_at > ?
+                                       ORDER BY max_created_at DESC, id DESC
+                                       LIMIT 2`
+                                  )
+                                  .bind(coreKind, beforeCreatedAt, beforeCreatedAt)
+                          ]
+                        : [
+                              db
+                                  .prepare(
+                                      `SELECT id, max_created_at, payload_json
+                                       FROM ${archiveTable}
+                                       WHERE core_kind = ?
+                                       ORDER BY max_created_at DESC, id DESC
+                                       LIMIT 8`
+                                  )
+                                  .bind(coreKind)
+                          ];
+                    const batchRes = (await db.batch(stmts)) as D1Result<{
+                        id: number;
+                        max_created_at: string;
+                        payload_json: string;
+                    }>[];
+                    const byId = new Map<number, { id: number; max_created_at: string; payload_json: string }>();
+                    for (const res of batchRes) {
+                        for (const c of res?.results ?? []) {
+                            if (!byId.has(c.id)) byId.set(c.id, c);
+                        }
+                    }
+                    const chunks = Array.from(byId.values()).sort(
+                        (a, b) =>
+                            String(b.max_created_at ?? '').localeCompare(String(a.max_created_at ?? '')) ||
+                            Number(b.id ?? 0) - Number(a.id ?? 0)
+                    );
                     const out: Array<Record<string, unknown>> = [];
-                    for (const c of chunkRes.results ?? []) {
-                        out.push(...decodeCoreChunkRows(c.id, coreKind, c.payload_json, { negateRowIds }));
+                    for (const c of chunks) {
+                        if (out.length >= limit) {
+                            let strictlyNewer = 0;
+                            for (const row of out) {
+                                if (String(row.created_at ?? '') > c.max_created_at) {
+                                    strictlyNewer++;
+                                    if (strictlyNewer >= limit) break;
+                                }
+                            }
+                            if (strictlyNewer >= limit) break;
+                        }
+                        const unpacked = decodeCoreChunkRows(c.id, coreKind, c.payload_json, { negateRowIds });
+                        for (const entry of unpacked) {
+                            if (!matchesBefore(String(entry.created_at ?? ''))) continue;
+                            out.push(entry);
+                        }
                     }
                     return out;
                 } catch {
                     return [];
                 }
             };
-            const [activeArchiveRows, legacyArchiveRows] = await Promise.all([
+            const [res, activeArchiveRows, legacyRes, legacyArchiveRows] = await Promise.all([
+                buildNotifSelect(env.DB_CORE),
                 readNotifChunks(env.DB_CORE, 'core_archive_chunks', false),
+                hasLegacyNotif && legacyDb ? buildNotifSelect(legacyDb) : Promise.resolve(null),
                 hasLegacyNotif && legacyDb
                     ? readNotifChunks(legacyDb, 'legacy_core_chunks', true)
                     : Promise.resolve([])
             ]);
+            const primaryRows: Array<Record<string, unknown>> = [...(res.results ?? [])];
+            let legacyRows: Array<Record<string, unknown>> = [...(legacyRes?.results ?? [])];
+            let finalLegacyArchiveRows = legacyArchiveRows;
             const primaryMerged = mergePrimaryAndLegacy(primaryRows, activeArchiveRows, (r) => String(r.id ?? ''));
-            const legacyMerged = mergePrimaryAndLegacy(legacyRows, legacyArchiveRows, (r) => String(r.id ?? ''));
+            if (!hasLegacyNotif && legacyDb && (primaryMerged.length < limit || Boolean(beforeCreatedAt))) {
+                const [fallbackRes, fallbackChunks] = await Promise.all([
+                    buildNotifSelect(legacyDb),
+                    readNotifChunks(legacyDb, 'legacy_core_chunks', true)
+                ]);
+                legacyRows = [...(fallbackRes?.results ?? [])];
+                finalLegacyArchiveRows = fallbackChunks;
+            }
+            const legacyMerged = mergePrimaryAndLegacy(legacyRows, finalLegacyArchiveRows, (r) => String(r.id ?? ''));
             const merged = mergePrimaryAndLegacy(primaryMerged, legacyMerged, (r) => String(r.id ?? ''))
                 .sort((a, b) => String(b.created_at ?? '').localeCompare(String(a.created_at ?? '')))
                 .slice(0, limit);

@@ -74,9 +74,15 @@ export const useNotificationStore = defineStore('Notification', () => {
     const instanceStore = useInstanceStore();
     const modalStore = useModalStore();
 
+    const NOTIFICATION_CLOUD_PAGE_BATCH = 150;
+    const NOTIFICATION_CLOUD_MAX_REQUEST_LIMIT = 200;
+
     const notificationInitStatus = ref(false);
     const notificationTable = ref({
         data: [],
+        loadingMore: false,
+        hasMore: false,
+        historyExpanded: false,
         filters: /** @type {import('@/types/vrcx').TableFilter[]} */ ([
             {
                 prop: 'type',
@@ -93,6 +99,9 @@ export const useNotificationStore = defineStore('Notification', () => {
             layout: 'sizes,prev,pager,next,total'
         }
     });
+    let notifHasMoreV1 = false;
+    let notifHasMoreV2 = false;
+    let notifLoadEpoch = 0;
     const unseenNotifications = ref([]);
     const isNotificationsLoading = ref(false);
     const isNotificationCenterOpen = ref(false);
@@ -1133,24 +1142,165 @@ export const useNotificationStore = defineStore('Notification', () => {
     }
 
     async function initNotifications() {
+        const epoch = ++notifLoadEpoch;
         notificationInitStatus.value = false;
+        notificationTable.value.loadingMore = false;
+        notificationTable.value.historyExpanded = false;
+        notifHasMoreV1 = false;
+        notifHasMoreV2 = false;
         try {
+            const supportsCursor = Boolean(database.supportsHistoryCursorPagination);
             const [v2Rows, v1Rows] = await Promise.all([
-                Promise.resolve(database.getNotificationsV2()).catch(() => []),
-                Promise.resolve(database.getNotifications()).catch(() => [])
+                Promise.resolve(
+                    supportsCursor
+                        ? database.getNotificationsV2({ limit: NOTIFICATION_CLOUD_PAGE_BATCH })
+                        : database.getNotificationsV2()
+                ).catch(() => []),
+                Promise.resolve(
+                    supportsCursor
+                        ? database.getNotifications({ limit: NOTIFICATION_CLOUD_PAGE_BATCH })
+                        : database.getNotifications()
+                ).catch(() => [])
             ]);
-            let tableData = Array.isArray(v2Rows) ? [...v2Rows] : [];
-            const notifications = Array.isArray(v1Rows) ? v1Rows : [];
-            tableData = tableData.concat(notifications.filter((n) => !tableData.some((t) => t.id === n.id)));
+            if (epoch !== notifLoadEpoch) return;
+            const listV2 = Array.isArray(v2Rows) ? v2Rows : [];
+            const listV1 = Array.isArray(v1Rows) ? v1Rows : [];
+            let tableData = [...listV2];
+            tableData = tableData.concat(listV1.filter((n) => !tableData.some((t) => t.id === n.id)));
             tableData.sort(
                 (a, b) => Date.parse(b.created_at || b.createdAt || '') - Date.parse(a.created_at || a.createdAt || '')
             );
             tableData.splice(dbVars.maxTableSize);
             notificationTable.value.data = tableData;
+            notifHasMoreV2 = supportsCursor && listV2.length >= NOTIFICATION_CLOUD_PAGE_BATCH;
+            notifHasMoreV1 = supportsCursor && listV1.length >= NOTIFICATION_CLOUD_PAGE_BATCH;
+            notificationTable.value.hasMore = notifHasMoreV1 || notifHasMoreV2;
         } catch (err) {
             console.error('Failed to hydrate notifications from database:', err);
         }
         refreshNotifications();
+    }
+
+    async function loadMoreNotifications() {
+        if (
+            !database.supportsHistoryCursorPagination ||
+            isNotificationsLoading.value ||
+            notificationTable.value.loadingMore ||
+            !notificationTable.value.hasMore
+        ) {
+            return 0;
+        }
+        const getNotifCreatedAt = (row) => String(row?.created_at || row?.createdAt || '').trim();
+        let oldest = '';
+        for (const row of notificationTable.value.data) {
+            const ts = getNotifCreatedAt(row);
+            if (!ts) continue;
+            if (!oldest || ts < oldest) oldest = ts;
+        }
+        if (!oldest) {
+            notificationTable.value.hasMore = false;
+            return 0;
+        }
+        let sameTsCount = 0;
+        for (const row of notificationTable.value.data) {
+            if (getNotifCreatedAt(row) === oldest) sameTsCount++;
+        }
+        const epoch = notifLoadEpoch;
+        notificationTable.value.loadingMore = true;
+        try {
+            const existingIds = new Set(notificationTable.value.data.map((r) => String(r?.id ?? '')));
+            const requestLimit = Math.min(
+                NOTIFICATION_CLOUD_MAX_REQUEST_LIMIT,
+                NOTIFICATION_CLOUD_PAGE_BATCH + Math.min(sameTsCount, 50)
+            );
+            const [v2Fetched, v1Fetched] = await Promise.all([
+                notifHasMoreV2
+                    ? Promise.resolve(
+                          database.getNotificationsV2({
+                              limit: requestLimit,
+                              beforeCreatedAt: oldest,
+                              beforeInclusive: true
+                          })
+                      ).catch(() => [])
+                    : Promise.resolve([]),
+                notifHasMoreV1
+                    ? Promise.resolve(
+                          database.getNotifications({
+                              limit: requestLimit,
+                              beforeCreatedAt: oldest,
+                              beforeInclusive: true
+                          })
+                      ).catch(() => [])
+                    : Promise.resolve([])
+            ]);
+            if (epoch !== notifLoadEpoch) return 0;
+
+            const v2List = Array.isArray(v2Fetched) ? v2Fetched : [];
+            const v1List = Array.isArray(v1Fetched) ? v1Fetched : [];
+            const newRows = [];
+            for (const row of [...v2List, ...v1List]) {
+                const key = String(row?.id ?? '');
+                if (key && existingIds.has(key)) continue;
+                if (key) existingIds.add(key);
+                newRows.push(row);
+            }
+
+            notifHasMoreV2 = notifHasMoreV2 && v2List.length >= requestLimit;
+            notifHasMoreV1 = notifHasMoreV1 && v1List.length >= requestLimit;
+
+            if (newRows.length === 0 && (notifHasMoreV1 || notifHasMoreV2)) {
+                const [v2Strict, v1Strict] = await Promise.all([
+                    notifHasMoreV2
+                        ? Promise.resolve(
+                              database.getNotificationsV2({
+                                  limit: NOTIFICATION_CLOUD_PAGE_BATCH,
+                                  beforeCreatedAt: oldest,
+                                  beforeInclusive: false
+                              })
+                          ).catch(() => [])
+                        : Promise.resolve([]),
+                    notifHasMoreV1
+                        ? Promise.resolve(
+                              database.getNotifications({
+                                  limit: NOTIFICATION_CLOUD_PAGE_BATCH,
+                                  beforeCreatedAt: oldest,
+                                  beforeInclusive: false
+                              })
+                          ).catch(() => [])
+                        : Promise.resolve([])
+                ]);
+                if (epoch !== notifLoadEpoch) return 0;
+                const s2 = Array.isArray(v2Strict) ? v2Strict : [];
+                const s1 = Array.isArray(v1Strict) ? v1Strict : [];
+                for (const row of [...s2, ...s1]) {
+                    const key = String(row?.id ?? '');
+                    if (key && existingIds.has(key)) continue;
+                    if (key) existingIds.add(key);
+                    newRows.push(row);
+                }
+                notifHasMoreV2 = notifHasMoreV2 && s2.length >= NOTIFICATION_CLOUD_PAGE_BATCH;
+                notifHasMoreV1 = notifHasMoreV1 && s1.length >= NOTIFICATION_CLOUD_PAGE_BATCH;
+            }
+
+            if (newRows.length > 0) {
+                const merged = [...notificationTable.value.data, ...newRows];
+                merged.sort(
+                    (a, b) =>
+                        Date.parse(b.created_at || b.createdAt || '') - Date.parse(a.created_at || a.createdAt || '')
+                );
+                notificationTable.value.data = merged;
+                notificationTable.value.historyExpanded = true;
+                notificationTable.value.hasMore = notifHasMoreV1 || notifHasMoreV2;
+                return newRows.length;
+            }
+
+            notificationTable.value.hasMore = false;
+            return 0;
+        } finally {
+            if (epoch === notifLoadEpoch) {
+                notificationTable.value.loadingMore = false;
+            }
+        }
     }
 
     async function checkInventoryBundles() {
@@ -1532,6 +1682,7 @@ export const useNotificationStore = defineStore('Notification', () => {
         freeStoreItemDialog,
 
         initNotifications,
+        loadMoreNotifications,
         expireNotification,
         refreshNotifications,
         checkInventoryBundles,

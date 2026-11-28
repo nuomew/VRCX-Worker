@@ -6,7 +6,10 @@
             auto-height
             :page-sizes="pageSizes"
             :total-items="totalItems"
-            :on-page-size-change="handlePageSizeChange">
+            :on-page-size-change="handlePageSizeChange"
+            :can-load-more="friendLogTable.hasMore"
+            :loading-more="friendLogTable.loadingMore"
+            :on-load-more="loadMoreFriendLogHistory">
             <template #toolbar>
                 <div class="mt-0 mx-0 mb-2" style="display: flex; align-items: center">
                     <Select
@@ -76,7 +79,9 @@
     const vrcxStore = useVrcxStore();
     const modalStore = useModalStore();
     const { hideUnfriends } = storeToRefs(appearanceSettingsStore);
-    const { friendLogTable } = storeToRefs(useFriendStore());
+    const friendStore = useFriendStore();
+    const { friendLogTable } = storeToRefs(friendStore);
+    const { loadMoreFriendLogHistory } = friendStore;
 
     const friendLogRef = ref(null);
 

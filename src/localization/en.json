@@ -3536,7 +3536,9 @@
             "previous": "Previous",
             "next": "Next",
             "last": "Last",
-            "more_pages": "More pages"
+            "more_pages": "More pages",
+            "load_more": "Load older",
+            "loading_more": "Loading..."
         },
         "feed": {
             "date": "Date",

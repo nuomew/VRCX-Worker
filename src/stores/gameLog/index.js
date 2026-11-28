@@ -71,15 +71,56 @@ export const useGameLogStore = defineStore('GameLog', () => {
         lastLocationAvatarList: new Map()
     });
 
+    const GAMELOG_CLOUD_PAGE_BATCH = 100;
+    const GAMELOG_CLOUD_MAX_REQUEST_LIMIT = 200;
+
     const gameLogTableData = shallowRef([]);
     const gameLogTable = ref({
         loading: false,
+        loadingMore: false,
+        hasMore: false,
+        historyExpanded: false,
         search: '',
         filter: [],
         pageSize: 20,
         pageSizeLinked: true,
         vip: false
     });
+    let gameLogLookupEpoch = 0;
+    let gameLogHistoryCapacity = 0;
+
+    function gameLogRowDedupKey(r) {
+        const type = String(r?.type ?? '');
+        const created = String(r?.created_at ?? '');
+        if (type === 'Location') return `Location|${created}|${String(r?.location ?? '')}`;
+        if (type === 'OnPlayerJoined' || type === 'OnPlayerLeft') {
+            return `${type}|${created}|${String(r?.displayName ?? '')}`;
+        }
+        if (type === 'PortalSpawn') return `PortalSpawn|${created}|${String(r?.displayName ?? '')}`;
+        if (type === 'VideoPlay') return `VideoPlay|${created}|${String(r?.videoUrl ?? '')}`;
+        if (type === 'Event') return `Event|${created}|${String(r?.data ?? '')}`;
+        if (type === 'External') return `External|${created}|${String(r?.message ?? '')}`;
+        return `${type}|${created}|${String(r?.rowId ?? '')}`;
+    }
+
+    function getOldestGameLogCursor(rows) {
+        let oldest = '';
+        for (const r of rows) {
+            const ts = String(r?.created_at ?? '').trim();
+            if (!ts) continue;
+            if (!oldest || ts < oldest) {
+                oldest = ts;
+            }
+        }
+        if (!oldest) return { oldest: '', sameTsCount: 0 };
+        let sameTsCount = 0;
+        for (const r of rows) {
+            if (String(r?.created_at ?? '').trim() === oldest) {
+                sameTsCount++;
+            }
+        }
+        return { oldest, sameTsCount };
+    }
 
     // ── Sessions view state ──
     const sessionsViewMode = ref('sessions'); // 'sessions' | 'table'
@@ -389,13 +430,18 @@ export const useGameLogStore = defineStore('GameLog', () => {
     async function gameLogTableLookup() {
         await configRepository.setString('VRCX_gameLogTableFilters', JSON.stringify(gameLogTable.value.filter));
         await configRepository.setBool('VRCX_gameLogTableVIPFilter', gameLogTable.value.vip);
+        const epoch = ++gameLogLookupEpoch;
         gameLogTable.value.loading = true;
+        gameLogTable.value.loadingMore = false;
+        gameLogTable.value.historyExpanded = false;
+        gameLogHistoryCapacity = 0;
         try {
             let vipList = [];
             if (gameLogTable.value.vip) {
                 vipList = Array.from(friendStore.localFavoriteFriends.values());
             }
             const search = gameLogTable.value.search.trim();
+            const supportsCursor = Boolean(database.supportsHistoryCursorPagination);
             let rows = [];
             if (search) {
                 rows = await database.searchGameLogDatabase(
@@ -404,17 +450,104 @@ export const useGameLogStore = defineStore('GameLog', () => {
                     vipList,
                     vrcxStore.searchLimit
                 );
+            } else if (supportsCursor) {
+                rows = await database.lookupGameLogDatabase(
+                    gameLogTable.value.filter,
+                    vipList,
+                    GAMELOG_CLOUD_PAGE_BATCH
+                );
             } else {
                 rows = await database.lookupGameLogDatabase(gameLogTable.value.filter, vipList);
             }
+            if (epoch !== gameLogLookupEpoch) return;
 
             for (const row of rows) {
                 row.isFriend = gameLogIsFriend(row);
                 row.isFavorite = gameLogIsFavorite(row);
             }
             gameLogTableData.value = rows;
+            gameLogTable.value.hasMore = Boolean(supportsCursor && !search && rows.length >= GAMELOG_CLOUD_PAGE_BATCH);
         } finally {
-            gameLogTable.value.loading = false;
+            if (epoch === gameLogLookupEpoch) {
+                gameLogTable.value.loading = false;
+            }
+        }
+    }
+
+    async function loadMoreGameLogHistory() {
+        if (
+            !database.supportsHistoryCursorPagination ||
+            gameLogTable.value.loading ||
+            gameLogTable.value.loadingMore ||
+            !gameLogTable.value.hasMore ||
+            gameLogTable.value.search.trim()
+        ) {
+            return 0;
+        }
+        const { oldest, sameTsCount } = getOldestGameLogCursor(gameLogTableData.value);
+        if (!oldest) {
+            gameLogTable.value.hasMore = false;
+            return 0;
+        }
+        const epoch = gameLogLookupEpoch;
+        gameLogTable.value.loadingMore = true;
+        try {
+            let vipList = [];
+            if (gameLogTable.value.vip) {
+                vipList = Array.from(friendStore.localFavoriteFriends.values());
+            }
+            const existingKeys = new Set(gameLogTableData.value.map(gameLogRowDedupKey));
+            let requestLimit = Math.min(
+                GAMELOG_CLOUD_MAX_REQUEST_LIMIT,
+                GAMELOG_CLOUD_PAGE_BATCH + Math.min(sameTsCount, 80)
+            );
+            let fetched = await database.lookupGameLogDatabase(gameLogTable.value.filter, vipList, requestLimit, {
+                beforeCreatedAt: oldest,
+                beforeInclusive: true
+            });
+            if (epoch !== gameLogLookupEpoch) return 0;
+
+            let newRows = [];
+            for (const row of Array.isArray(fetched) ? fetched : []) {
+                const key = gameLogRowDedupKey(row);
+                if (existingKeys.has(key)) continue;
+                existingKeys.add(key);
+                row.isFriend = gameLogIsFriend(row);
+                row.isFavorite = gameLogIsFavorite(row);
+                newRows.push(row);
+            }
+
+            if (newRows.length === 0 && Array.isArray(fetched) && fetched.length >= requestLimit) {
+                requestLimit = GAMELOG_CLOUD_PAGE_BATCH;
+                fetched = await database.lookupGameLogDatabase(gameLogTable.value.filter, vipList, requestLimit, {
+                    beforeCreatedAt: oldest,
+                    beforeInclusive: false
+                });
+                if (epoch !== gameLogLookupEpoch) return 0;
+                for (const row of Array.isArray(fetched) ? fetched : []) {
+                    const key = gameLogRowDedupKey(row);
+                    if (existingKeys.has(key)) continue;
+                    existingKeys.add(key);
+                    row.isFriend = gameLogIsFriend(row);
+                    row.isFavorite = gameLogIsFavorite(row);
+                    newRows.push(row);
+                }
+            }
+
+            if (newRows.length > 0) {
+                gameLogTableData.value = [...gameLogTableData.value, ...newRows];
+                gameLogHistoryCapacity = Math.max(gameLogHistoryCapacity, gameLogTableData.value.length);
+                gameLogTable.value.historyExpanded = true;
+                gameLogTable.value.hasMore = Array.isArray(fetched) && fetched.length >= requestLimit;
+                return newRows.length;
+            }
+
+            gameLogTable.value.hasMore = false;
+            return 0;
+        } finally {
+            if (epoch === gameLogLookupEpoch) {
+                gameLogTable.value.loadingMore = false;
+            }
         }
     }
 
@@ -486,7 +619,8 @@ export const useGameLogStore = defineStore('GameLog', () => {
 
     function sweepGameLog() {
         const j = gameLogTableData.value.length;
-        if (j > vrcxStore.maxTableSize + 50) {
+        const effectiveCap = Math.max(vrcxStore.maxTableSize, gameLogHistoryCapacity);
+        if (j > effectiveCap + 50) {
             gameLogTableData.value = gameLogTableData.value.slice(0, -50);
         }
     }
@@ -1180,6 +1314,7 @@ export const useGameLogStore = defineStore('GameLog', () => {
         gameLogIsFriend,
         gameLogIsFavorite,
         gameLogTableLookup,
+        loadMoreGameLogHistory,
         addGameLog,
         addGamelogLocationToDatabase,
 

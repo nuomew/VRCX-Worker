@@ -39,7 +39,10 @@
                 auto-height
                 :page-sizes="pageSizes"
                 :total-items="totalItems"
-                :on-page-size-change="handlePageSizeChange">
+                :on-page-size-change="handlePageSizeChange"
+                :can-load-more="gameLogTable.hasMore"
+                :loading-more="gameLogTable.loadingMore"
+                :on-load-more="loadMoreGameLogHistory">
                 <template #toolbar>
                     <div class="mt-0 mx-0 mb-2" style="display: flex; align-items: center">
                         <div class="mr-2" style="flex: none; display: flex; align-items: center">
@@ -148,7 +151,7 @@
     import { useVrcxVueTable } from '../../lib/table/useVrcxVueTable';
     import GameLogSessions from './components/GameLogSessions.vue';
 
-    const { gameLogTableLookup, setSessionsViewMode } = useGameLogStore();
+    const { gameLogTableLookup, loadMoreGameLogHistory, setSessionsViewMode } = useGameLogStore();
     const { gameLogTable, gameLogTableData, sessionsViewMode } = storeToRefs(useGameLogStore());
     const appearanceSettingsStore = useAppearanceSettingsStore();
     const vrcxStore = useVrcxStore();
@@ -243,6 +246,9 @@
 
     const totalItems = computed(() => {
         const length = table.getFilteredRowModel().rows.length;
+        if (gameLogTable.value.historyExpanded) {
+            return length;
+        }
         const max = vrcxStore.maxTableSize;
         return length > max && length < max + 51 ? max : length;
     });
