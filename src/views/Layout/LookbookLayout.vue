@@ -176,16 +176,15 @@
 
                     <!-- Quick Theme & Accent Switcher -->
                     <DropdownMenu>
-                        <TooltipWrapper side="bottom" :content="t('view.settings.appearance.appearance.editorial_quick_theme')">
-                            <DropdownMenuTrigger as-child>
-                                <button
-                                    type="button"
-                                    class="lb-icon-btn inline-flex items-center justify-center size-8 rounded-full cursor-pointer"
-                                    :aria-label="t('view.settings.appearance.appearance.editorial_quick_theme')">
-                                    <Palette class="size-4" />
-                                </button>
-                            </DropdownMenuTrigger>
-                        </TooltipWrapper>
+                        <DropdownMenuTrigger as-child>
+                            <button
+                                type="button"
+                                class="lb-icon-btn inline-flex items-center justify-center size-8 rounded-full cursor-pointer"
+                                :title="t('view.settings.appearance.appearance.editorial_quick_theme')"
+                                :aria-label="t('view.settings.appearance.appearance.editorial_quick_theme')">
+                                <Palette class="size-4" />
+                            </button>
+                        </DropdownMenuTrigger>
                         <DropdownMenuContent side="bottom" align="end" class="w-56">
                             <DropdownMenuLabel>{{ t('view.settings.appearance.appearance.theme_mode') }}</DropdownMenuLabel>
                             <DropdownMenuCheckboxItem
@@ -232,21 +231,20 @@
 
                     <!-- Manage Dropdown (Full Parity with NavMenuFooter) -->
                     <DropdownMenu>
-                        <TooltipWrapper side="bottom" :content="t('nav_tooltip.manage')">
-                            <DropdownMenuTrigger as-child>
-                                <button
-                                    type="button"
-                                    class="lb-icon-btn relative inline-flex items-center justify-center size-8 rounded-full cursor-pointer"
-                                    :data-active="isSettingsRoute"
-                                    :aria-label="t('nav_tooltip.manage')">
-                                    <Settings class="size-4" />
-                                    <span
-                                        v-if="pendingVRCXUpdate || pendingVRCXInstall"
-                                        class="lb-notify-dot top-0.5 right-0.5"
-                                        aria-hidden="true" />
-                                </button>
-                            </DropdownMenuTrigger>
-                        </TooltipWrapper>
+                        <DropdownMenuTrigger as-child>
+                            <button
+                                type="button"
+                                class="lb-icon-btn relative inline-flex items-center justify-center size-8 rounded-full cursor-pointer"
+                                :data-active="isSettingsRoute"
+                                :title="t('nav_tooltip.manage')"
+                                :aria-label="t('nav_tooltip.manage')">
+                                <Settings class="size-4" />
+                                <span
+                                    v-if="pendingVRCXUpdate || pendingVRCXInstall"
+                                    class="lb-notify-dot top-0.5 right-0.5"
+                                    aria-hidden="true" />
+                            </button>
+                        </DropdownMenuTrigger>
                         <DropdownMenuContent side="bottom" align="end" class="w-58">
                             <div class="flex items-center gap-2 px-2 py-1.5">
                                 <img

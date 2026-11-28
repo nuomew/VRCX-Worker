@@ -1,4 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { mount } from '@vue/test-utils';
+import { defineComponent, nextTick, ref } from 'vue';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -18,6 +20,12 @@ vi.mock('../../services/config.js', () => ({
 import { THEME_CONFIG } from '../../shared/constants/themes';
 import { changeAppThemeStyle, getThemeMode } from '../../shared/utils/base/ui';
 import { normalizePublicUiPreferences } from '../cloudState';
+import {
+    DropdownMenu,
+    DropdownMenuCheckboxItem,
+    DropdownMenuContent,
+    DropdownMenuTrigger
+} from '../../components/ui/dropdown-menu';
 import enLocale from '../../localization/en.json';
 import zhCnLocale from '../../localization/zh-CN.json';
 import zhTwLocale from '../../localization/zh-TW.json';
@@ -170,7 +178,57 @@ describe('Official Anime-Site Dual Themes (Lookbook & Azure Archive) registratio
             expect(src).toContain('loadNavMenuConfig()');
             expect(src).toContain('<Sidebar />');
             expect(src).toContain('<StatusBar />');
+            // Regression guard: never wrap DropdownMenuTrigger inside TooltipWrapper (breaks Reka UI pointerdown)
+            expect(src).not.toMatch(/<TooltipWrapper[\s\S]{0,200}<DropdownMenuTrigger/);
         }
+    });
+
+    it('opens the theme switcher dropdown on click and switches themes via DropdownMenuTrigger', async () => {
+        const selected = ref('lookbook');
+        const onSelect = vi.fn((theme) => {
+            selected.value = theme;
+            changeAppThemeStyle(theme);
+        });
+
+        const Harness = defineComponent({
+            components: { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuCheckboxItem },
+            setup() {
+                return { selected, onSelect };
+            },
+            template: `
+                <DropdownMenu>
+                    <DropdownMenuTrigger as-child>
+                        <button type="button" data-testid="theme-btn">Theme</button>
+                    </DropdownMenuTrigger>
+                    <DropdownMenuContent>
+                        <DropdownMenuCheckboxItem
+                            data-testid="opt-archive"
+                            :model-value="selected === 'archive'"
+                            @select="onSelect('archive')">
+                            Archive
+                        </DropdownMenuCheckboxItem>
+                    </DropdownMenuContent>
+                </DropdownMenu>
+            `
+        });
+
+        const wrapper = mount(Harness, { attachTo: document.body });
+        const trigger = wrapper.get('[data-testid="theme-btn"]');
+
+        // Reka UI DropdownMenuTrigger opens on left-button click
+        trigger.element.dispatchEvent(new MouseEvent('click', { button: 0, ctrlKey: false, bubbles: true }));
+        await nextTick();
+        await nextTick();
+
+        expect(trigger.attributes('aria-expanded')).toBe('true');
+        const option = document.body.querySelector('[data-testid="opt-archive"]');
+        expect(option).not.toBeNull();
+        option.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+        await nextTick();
+
+        expect(onSelect).toHaveBeenCalledWith('archive');
+        expect(document.documentElement.getAttribute('data-theme')).toBe('archive');
+        wrapper.unmount();
     });
 
     it('strictly scopes every CSS selector in lookbook.css and archive.css to its own data-theme', () => {
