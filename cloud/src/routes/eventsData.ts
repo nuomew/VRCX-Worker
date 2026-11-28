@@ -110,7 +110,8 @@ async function fetchBoundedArchiveChunks(
     kinds: string[],
     dateFrom: string,
     upperBound: UpperCreatedAtBound | null,
-    perKindLimit: number
+    perKindLimit: number,
+    straddleLimit = 1
 ): Promise<ArchiveChunkRow[]> {
     if (kinds.length === 0) return [];
     const stmts: D1PreparedStatement[] = [];
@@ -164,7 +165,7 @@ async function fetchBoundedArchiveChunks(
             straddleConds.push('max_created_at >= ?');
             straddleBinds.push(dateFrom);
         }
-        const straddleLimit = dateFrom ? 2 : 1;
+        const safeStraddleLimit = Math.max(1, straddleLimit);
         stmts.push(
             db
                 .prepare(
@@ -174,7 +175,7 @@ async function fetchBoundedArchiveChunks(
                      ORDER BY max_created_at ASC, id ASC
                      LIMIT ?`
                 )
-                .bind(...straddleBinds, straddleLimit)
+                .bind(...straddleBinds, safeStraddleLimit)
         );
     }
 
@@ -1442,8 +1443,8 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
                     const perKindLimit = hasVip
                         ? 5
                         : chunkKinds.length <= 2
-                          ? 6
-                          : upperBound
+                          ? 4
+                          : upperBound || limit <= 50
                             ? 2
                             : 3;
                     const chunks = await fetchBoundedArchiveChunks(
@@ -1453,7 +1454,8 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
                         chunkKinds,
                         cleanDateFrom,
                         upperBound,
-                        perKindLimit
+                        perKindLimit,
+                        cleanDateFrom && limit > 50 ? 2 : 1
                     );
                     const vipSet = hasVip ? new Set(cleanVips) : null;
                     const seenLocal = new Set<string>(normalized.map(gamelogDedupKey));
@@ -4193,8 +4195,8 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
                     const perKindLimit = hasVip
                         ? 5
                         : chunkKinds.length <= 2
-                          ? 6
-                          : upperBound
+                          ? 4
+                          : upperBound || limit <= 50
                             ? 2
                             : 3;
                     const chunks = await fetchBoundedArchiveChunks(
@@ -4204,7 +4206,8 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
                         chunkKinds,
                         cleanDateFrom,
                         upperBound,
-                        perKindLimit
+                        perKindLimit,
+                        cleanDateFrom && limit > 50 ? 2 : 1
                     );
                     const vipSet = hasVip ? new Set(vipIds) : null;
                     const seenLocal = new Set<string>(items.map(feedDedupKey));

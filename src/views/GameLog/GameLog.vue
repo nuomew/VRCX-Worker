@@ -246,6 +246,11 @@
         }
     });
 
+    const initialPageSize = Number(pagination.value?.pageSize);
+    if (gameLogTable.value && Number.isFinite(initialPageSize) && initialPageSize > 0) {
+        gameLogTable.value.pageSize = initialPageSize;
+    }
+
     const totalItems = computed(() => {
         const length = table.getFilteredRowModel().rows.length;
         if (gameLogTable.value.historyExpanded) {
@@ -256,11 +261,19 @@
     });
 
     const handlePageSizeChange = (size) => {
+        const prevSize = pagination.value?.pageSize;
         pagination.value = {
             ...pagination.value,
             pageIndex: 0,
             pageSize: size
         };
+        if (size !== prevSize) {
+            if (typeof gameLogStore.setGameLogPageSize === 'function') {
+                gameLogStore.setGameLogPageSize(size);
+            } else if (gameLogTable.value) {
+                gameLogTable.value.pageSize = size;
+            }
+        }
     };
 
     /**

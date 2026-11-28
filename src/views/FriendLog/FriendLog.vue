@@ -197,15 +197,28 @@
         }
     });
 
+    const initialPageSize = Number(pagination.value?.pageSize);
+    if (friendLogTable.value && Number.isFinite(initialPageSize) && initialPageSize > 0) {
+        friendLogTable.value.pageSize = initialPageSize;
+    }
+
     const totalItems = computed(() => {
         return table.getFilteredRowModel().rows.length;
     });
 
     const handlePageSizeChange = (size) => {
+        const prevSize = pagination.value?.pageSize;
         pagination.value = {
             ...pagination.value,
             pageIndex: 0,
             pageSize: size
         };
+        if (size !== prevSize) {
+            if (typeof friendStore.setFriendLogPageSize === 'function') {
+                friendStore.setFriendLogPageSize(size);
+            } else if (friendLogTable.value) {
+                friendLogTable.value.pageSize = size;
+            }
+        }
     };
 </script>

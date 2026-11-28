@@ -1,7 +1,7 @@
 import { ref, shallowRef, watch } from 'vue';
 import { defineStore } from 'pinia';
 
-import { createHistoryDateController } from '../composables/useHistoryDateNavigation';
+import { createHistoryDateController, resolveHistoryPageBatchSize } from '../composables/useHistoryDateNavigation';
 import { database } from '../services/database';
 import { useFriendStore } from './friend';
 import { useVrcxStore } from './vrcx';
@@ -13,9 +13,7 @@ export const useFeedStore = defineStore('Feed', () => {
     const friendStore = useFriendStore();
     const vrcxStore = useVrcxStore();
 
-    const FEED_CLOUD_PAGE_BATCH = 200;
     const FEED_CLOUD_MAX_REQUEST_LIMIT = 200;
-    const FEED_DAY_AUTO_MAX_BATCHES = 5;
 
     const feedTableData = shallowRef([]);
     const feedTable = ref({
@@ -29,11 +27,30 @@ export const useFeedStore = defineStore('Feed', () => {
         hasMore: false,
         historyExpanded: false,
         filter: [],
-        pageSize: 20,
+        pageSize: resolveHistoryPageBatchSize('feed', 20, FEED_CLOUD_MAX_REQUEST_LIMIT),
         pageSizeLinked: true
     });
     let feedLookupEpoch = 0;
     let feedHistoryCapacity = 0;
+
+    function getFeedCloudPageSize() {
+        const raw = Number(feedTable.value.pageSize);
+        if (Number.isFinite(raw) && raw > 0) {
+            return Math.min(Math.max(Math.floor(raw), 1), FEED_CLOUD_MAX_REQUEST_LIMIT);
+        }
+        return resolveHistoryPageBatchSize('feed', 20, FEED_CLOUD_MAX_REQUEST_LIMIT);
+    }
+
+    function setFeedPageSize(size) {
+        const next = Number(size);
+        if (!Number.isFinite(next) || next <= 0) return;
+        const normalized = Math.min(Math.max(Math.floor(next), 1), FEED_CLOUD_MAX_REQUEST_LIMIT);
+        const changed = normalized !== feedTable.value.pageSize;
+        feedTable.value.pageSize = normalized;
+        if (changed && (database.supportsHistoryCursorPagination || feedDateNav.enabled.value)) {
+            feedTableLookup();
+        }
+    }
 
     const feedDateNav = createHistoryDateController('feed', async ({ dateFrom, dateTo }) => {
         feedTable.value.customDateRange = false;
@@ -210,6 +227,8 @@ export const useFeedStore = defineStore('Feed', () => {
             }
 
             const { dateFrom, dateTo } = feedTable.value;
+            const pageSize = getFeedCloudPageSize();
+            const requestLimit = Math.min(FEED_CLOUD_MAX_REQUEST_LIMIT, pageSize + 1);
             const rows =
                 search || (!supportsCursor && (dateFrom || dateTo))
                     ? await database.searchFeedDatabase(
@@ -224,79 +243,21 @@ export const useFeedStore = defineStore('Feed', () => {
                       ? await database.lookupFeedDatabase(
                             feedTable.value.filter,
                             vipList,
-                            FEED_CLOUD_PAGE_BATCH,
+                            requestLimit,
                             dateFrom,
                             dateTo,
                             { throwOnError: true }
                         )
                       : await database.lookupFeedDatabase(feedTable.value.filter, vipList);
             if (epoch !== feedLookupEpoch) return;
-            let list = Array.isArray(rows) ? [...rows] : [];
-            let hasMore = Boolean(supportsCursor && !search && list.length >= FEED_CLOUD_PAGE_BATCH);
-
-            // In Day mode, automatically fetch remaining batches for the selected day (each <=200 rows, safely within 10ms CPU)
-            // so the user sees the complete day's pages immediately without clicking "Load older".
-            if (
-                hasMore &&
-                supportsDateNav &&
-                !feedTable.value.customDateRange &&
-                feedDateNav.mode.value === 'day' &&
-                dateFrom &&
-                dateTo
-            ) {
-                const existingKeys = new Set(list.map(feedRowDedupKey));
-                for (let batch = 1; batch < FEED_DAY_AUTO_MAX_BATCHES && hasMore; batch++) {
-                    const { oldest, sameTsCount } = getOldestCreatedAtCursor(list);
-                    if (!oldest || oldest <= dateFrom) {
-                        hasMore = false;
-                        break;
-                    }
-                    let reqLimit = Math.min(
-                        FEED_CLOUD_MAX_REQUEST_LIMIT,
-                        FEED_CLOUD_PAGE_BATCH + Math.min(sameTsCount, 80)
-                    );
-                    let fetched = await database.lookupFeedDatabase(
-                        feedTable.value.filter,
-                        vipList,
-                        reqLimit,
-                        dateFrom,
-                        dateTo,
-                        { beforeCreatedAt: oldest, beforeInclusive: true, throwOnError: true }
-                    );
-                    if (epoch !== feedLookupEpoch) return;
-                    const batchNew = [];
-                    for (const row of Array.isArray(fetched) ? fetched : []) {
-                        const key = feedRowDedupKey(row);
-                        if (existingKeys.has(key)) continue;
-                        existingKeys.add(key);
-                        batchNew.push(row);
-                    }
-                    if (batchNew.length === 0 && Array.isArray(fetched) && fetched.length >= reqLimit) {
-                        reqLimit = FEED_CLOUD_PAGE_BATCH;
-                        fetched = await database.lookupFeedDatabase(
-                            feedTable.value.filter,
-                            vipList,
-                            reqLimit,
-                            dateFrom,
-                            dateTo,
-                            { beforeCreatedAt: oldest, beforeInclusive: false, throwOnError: true }
-                        );
-                        if (epoch !== feedLookupEpoch) return;
-                        for (const row of Array.isArray(fetched) ? fetched : []) {
-                            const key = feedRowDedupKey(row);
-                            if (existingKeys.has(key)) continue;
-                            existingKeys.add(key);
-                            batchNew.push(row);
-                        }
-                    }
-                    if (batchNew.length === 0) {
-                        hasMore = false;
-                        break;
-                    }
-                    list = [...list, ...batchNew];
-                    hasMore = Array.isArray(fetched) && fetched.length >= reqLimit;
-                }
-            }
+            const rawList = Array.isArray(rows) ? [...rows] : [];
+            const isPagedCloudLookup = supportsCursor && !search;
+            const hasMore = Boolean(
+                isPagedCloudLookup &&
+                    (rawList.length > pageSize ||
+                        (pageSize >= FEED_CLOUD_MAX_REQUEST_LIMIT && rawList.length >= requestLimit))
+            );
+            const list = isPagedCloudLookup && rawList.length > pageSize ? rawList.slice(0, pageSize) : rawList;
 
             feedTableData.value = list;
             feedHistoryCapacity = Math.max(feedHistoryCapacity, list.length);
@@ -336,11 +297,9 @@ export const useFeedStore = defineStore('Feed', () => {
                 vipList = Array.from(friendStore.localFavoriteFriends.values());
             }
             const { dateFrom, dateTo } = feedTable.value;
+            const pageSize = getFeedCloudPageSize();
             const existingKeys = new Set(feedTableData.value.map(feedRowDedupKey));
-            let requestLimit = Math.min(
-                FEED_CLOUD_MAX_REQUEST_LIMIT,
-                FEED_CLOUD_PAGE_BATCH + Math.min(sameTsCount, 80)
-            );
+            let requestLimit = Math.min(FEED_CLOUD_MAX_REQUEST_LIMIT, pageSize + Math.min(sameTsCount, 80) + 1);
             let fetched = await database.lookupFeedDatabase(
                 feedTable.value.filter,
                 vipList,
@@ -361,7 +320,7 @@ export const useFeedStore = defineStore('Feed', () => {
 
             // If an extreme burst of >requestLimit rows shares the exact same timestamp, advance strictly past it.
             if (newRows.length === 0 && Array.isArray(fetched) && fetched.length >= requestLimit) {
-                requestLimit = FEED_CLOUD_PAGE_BATCH;
+                requestLimit = Math.min(FEED_CLOUD_MAX_REQUEST_LIMIT, pageSize + 1);
                 fetched = await database.lookupFeedDatabase(
                     feedTable.value.filter,
                     vipList,
@@ -380,11 +339,14 @@ export const useFeedStore = defineStore('Feed', () => {
             }
 
             if (newRows.length > 0) {
-                feedTableData.value = [...feedTableData.value, ...newRows];
+                const hasExtraInBatch = newRows.length > pageSize;
+                const pageRows = hasExtraInBatch ? newRows.slice(0, pageSize) : newRows;
+                feedTableData.value = [...feedTableData.value, ...pageRows];
                 feedHistoryCapacity = Math.max(feedHistoryCapacity, feedTableData.value.length);
                 feedTable.value.historyExpanded = true;
-                feedTable.value.hasMore = Array.isArray(fetched) && fetched.length >= requestLimit;
-                return newRows.length;
+                feedTable.value.hasMore =
+                    hasExtraInBatch || (Array.isArray(fetched) && fetched.length >= requestLimit);
+                return pageRows.length;
             }
 
             feedTable.value.hasMore = false;
@@ -492,6 +454,7 @@ export const useFeedStore = defineStore('Feed', () => {
         initFeedTable,
         feedTableLookup,
         loadMoreFeedHistory,
+        setFeedPageSize,
         mergeRecentFeeds,
         addFeedEntry
     };

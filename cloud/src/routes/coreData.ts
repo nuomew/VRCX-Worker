@@ -2170,7 +2170,8 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
                 negateRowIds: boolean
             ): Promise<Array<Record<string, unknown>>> => {
                 try {
-                    const chunkLimit = userId ? 12 : 8;
+                    const chunkLimit = userId ? 12 : limit <= 50 ? 4 : 6;
+                    const straddleLimit = limit <= 50 ? 1 : 2;
                     const stmts: D1PreparedStatement[] = [];
                     if (upperValue) {
                         const olderConds = ["core_kind = 'friend_log'", 'max_created_at <= ?'];
@@ -2207,9 +2208,9 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
                                      FROM ${archiveTable}
                                      WHERE ${straddleConds.join(' AND ')}
                                      ORDER BY max_created_at ASC, id ASC
-                                     LIMIT 2`
+                                     LIMIT ?`
                                 )
-                                .bind(...straddleBinds)
+                                .bind(...straddleBinds, straddleLimit)
                         );
                     } else {
                         const conds = ["core_kind = 'friend_log'"];
@@ -2491,6 +2492,8 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
                 negateRowIds: boolean
             ): Promise<Array<Record<string, unknown>>> => {
                 try {
+                    const chunkLimit = limit <= 50 ? 4 : 6;
+                    const straddleLimit = limit <= 50 ? 1 : 2;
                     const stmts: D1PreparedStatement[] = [];
                     if (upperValue) {
                         const olderConds = ['core_kind = ?', 'max_created_at <= ?'];
@@ -2506,9 +2509,9 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
                                      FROM ${archiveTable}
                                      WHERE ${olderConds.join(' AND ')}
                                      ORDER BY max_created_at DESC, id DESC
-                                     LIMIT 8`
+                                     LIMIT ?`
                                 )
-                                .bind(...olderBinds)
+                                .bind(...olderBinds, chunkLimit)
                         );
                         const straddleConds = ['core_kind = ?', 'min_created_at <= ?', 'max_created_at > ?'];
                         const straddleBinds: unknown[] = [coreKind, upperValue, upperValue];
@@ -2523,9 +2526,9 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
                                      FROM ${archiveTable}
                                      WHERE ${straddleConds.join(' AND ')}
                                      ORDER BY max_created_at ASC, id ASC
-                                     LIMIT 2`
+                                     LIMIT ?`
                                 )
-                                .bind(...straddleBinds)
+                                .bind(...straddleBinds, straddleLimit)
                         );
                     } else {
                         const conds = ['core_kind = ?'];
@@ -2541,9 +2544,9 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
                                      FROM ${archiveTable}
                                      WHERE ${conds.join(' AND ')}
                                      ORDER BY max_created_at DESC, id DESC
-                                     LIMIT 8`
+                                     LIMIT ?`
                                 )
-                                .bind(...binds)
+                                .bind(...binds, chunkLimit)
                         );
                     }
                     const batchRes = (await db.batch(stmts)) as D1Result<{

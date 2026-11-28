@@ -4,6 +4,37 @@ import dayjs from 'dayjs';
 import { database } from '../services/database';
 
 /**
+ * Resolves the active persisted `pageSize` for a table (matching `useVrcxVueTable`'s `vrcx:table:<persistKey>` storage),
+ * falling back to `fallback` and clamping to `[1, maxBatch]`.
+ *
+ * @param {string} persistKey
+ * @param {number} [fallback]
+ * @param {number} [maxBatch]
+ * @returns {number}
+ */
+export function resolveHistoryPageBatchSize(persistKey, fallback = 20, maxBatch = 200) {
+    let candidate = Number(fallback);
+    if (persistKey && typeof localStorage !== 'undefined') {
+        try {
+            const raw = localStorage.getItem(`vrcx:table:${persistKey}`);
+            if (raw) {
+                const parsed = JSON.parse(raw);
+                const persisted = Number(parsed?.pageSize);
+                if (Number.isFinite(persisted) && persisted > 0) {
+                    candidate = persisted;
+                }
+            }
+        } catch {
+            // Ignore storage errors in restricted environments
+        }
+    }
+    if (!Number.isFinite(candidate) || candidate <= 0) {
+        candidate = 20;
+    }
+    return Math.min(Math.max(Math.floor(candidate), 1), maxBatch);
+}
+
+/**
  * Converts a local calendar day (`YYYY-MM-DD`) into exact UTC ISO start/end bounds.
  *
  * @param {string} dayStr

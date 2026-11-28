@@ -191,6 +191,11 @@
         }
     });
 
+    const initialPageSize = Number(pagination.value?.pageSize);
+    if (feedTable.value && Number.isFinite(initialPageSize) && initialPageSize > 0) {
+        feedTable.value.pageSize = initialPageSize;
+    }
+
     const totalItems = computed(() => {
         const length = table.getFilteredRowModel().rows.length;
         if (feedTable.value.historyExpanded) {
@@ -201,11 +206,19 @@
     });
 
     const handlePageSizeChange = (size) => {
+        const prevSize = pagination.value?.pageSize;
         pagination.value = {
             ...pagination.value,
             pageIndex: 0,
             pageSize: size
         };
+        if (size !== prevSize) {
+            if (typeof feedStore.setFeedPageSize === 'function') {
+                feedStore.setFeedPageSize(size);
+            } else if (feedTable.value) {
+                feedTable.value.pageSize = size;
+            }
+        }
     };
 
     const activeFilterSelection = computed(() => {

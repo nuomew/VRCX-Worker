@@ -11,7 +11,7 @@ import {
     gameLogSearchFilter,
     getGroupName
 } from '../../shared/utils';
-import { createHistoryDateController } from '../../composables/useHistoryDateNavigation';
+import { createHistoryDateController, resolveHistoryPageBatchSize } from '../../composables/useHistoryDateNavigation';
 import { createMediaParsers } from './mediaParsers';
 import { createNowPlayingSpecHandler } from './nowPlayingSpec';
 import { database } from '../../services/database';
@@ -72,9 +72,7 @@ export const useGameLogStore = defineStore('GameLog', () => {
         lastLocationAvatarList: new Map()
     });
 
-    const GAMELOG_CLOUD_PAGE_BATCH = 200;
     const GAMELOG_CLOUD_MAX_REQUEST_LIMIT = 200;
-    const GAMELOG_DAY_AUTO_MAX_BATCHES = 5;
 
     const gameLogTableData = shallowRef([]);
     const gameLogTable = ref({
@@ -86,12 +84,31 @@ export const useGameLogStore = defineStore('GameLog', () => {
         dateTo: '',
         search: '',
         filter: [],
-        pageSize: 20,
+        pageSize: resolveHistoryPageBatchSize('gameLog', 20, GAMELOG_CLOUD_MAX_REQUEST_LIMIT),
         pageSizeLinked: true,
         vip: false
     });
     let gameLogLookupEpoch = 0;
     let gameLogHistoryCapacity = 0;
+
+    function getGameLogCloudPageSize() {
+        const raw = Number(gameLogTable.value.pageSize);
+        if (Number.isFinite(raw) && raw > 0) {
+            return Math.min(Math.max(Math.floor(raw), 1), GAMELOG_CLOUD_MAX_REQUEST_LIMIT);
+        }
+        return resolveHistoryPageBatchSize('gameLog', 20, GAMELOG_CLOUD_MAX_REQUEST_LIMIT);
+    }
+
+    function setGameLogPageSize(size) {
+        const next = Number(size);
+        if (!Number.isFinite(next) || next <= 0) return;
+        const normalized = Math.min(Math.max(Math.floor(next), 1), GAMELOG_CLOUD_MAX_REQUEST_LIMIT);
+        const changed = normalized !== gameLogTable.value.pageSize;
+        gameLogTable.value.pageSize = normalized;
+        if (changed && (database.supportsHistoryCursorPagination || gameLogDateNav.enabled.value)) {
+            gameLogTableLookup();
+        }
+    }
 
     const gameLogDateNav = createHistoryDateController('gamelog', async ({ dateFrom, dateTo }) => {
         gameLogTable.value.dateFrom = dateFrom;
@@ -471,6 +488,8 @@ export const useGameLogStore = defineStore('GameLog', () => {
             }
 
             const { dateFrom, dateTo } = gameLogTable.value;
+            const pageSize = getGameLogCloudPageSize();
+            const requestLimit = Math.min(GAMELOG_CLOUD_MAX_REQUEST_LIMIT, pageSize + 1);
             let rows = [];
             if (search) {
                 rows = await database.searchGameLogDatabase(
@@ -480,76 +499,24 @@ export const useGameLogStore = defineStore('GameLog', () => {
                     vrcxStore.searchLimit
                 );
             } else if (supportsCursor) {
-                rows = await database.lookupGameLogDatabase(
-                    gameLogTable.value.filter,
-                    vipList,
-                    GAMELOG_CLOUD_PAGE_BATCH,
-                    {
-                        dateFrom,
-                        dateTo,
-                        throwOnError: true
-                    }
-                );
+                rows = await database.lookupGameLogDatabase(gameLogTable.value.filter, vipList, requestLimit, {
+                    dateFrom,
+                    dateTo,
+                    throwOnError: true
+                });
             } else {
                 rows = await database.lookupGameLogDatabase(gameLogTable.value.filter, vipList);
             }
             if (epoch !== gameLogLookupEpoch) return;
 
-            let list = Array.isArray(rows) ? [...rows] : [];
-            let hasMore = Boolean(supportsCursor && !search && list.length >= GAMELOG_CLOUD_PAGE_BATCH);
-
-            if (hasMore && supportsDateNav && gameLogDateNav.mode.value === 'day' && dateFrom && dateTo) {
-                const existingKeys = new Set(list.map(gameLogRowDedupKey));
-                for (let batch = 1; batch < GAMELOG_DAY_AUTO_MAX_BATCHES && hasMore; batch++) {
-                    const { oldest, sameTsCount } = getOldestGameLogCursor(list);
-                    if (!oldest || oldest <= dateFrom) {
-                        hasMore = false;
-                        break;
-                    }
-                    let reqLimit = Math.min(
-                        GAMELOG_CLOUD_MAX_REQUEST_LIMIT,
-                        GAMELOG_CLOUD_PAGE_BATCH + Math.min(sameTsCount, 80)
-                    );
-                    let fetched = await database.lookupGameLogDatabase(gameLogTable.value.filter, vipList, reqLimit, {
-                        dateFrom,
-                        dateTo,
-                        beforeCreatedAt: oldest,
-                        beforeInclusive: true,
-                        throwOnError: true
-                    });
-                    if (epoch !== gameLogLookupEpoch) return;
-                    const batchNew = [];
-                    for (const row of Array.isArray(fetched) ? fetched : []) {
-                        const key = gameLogRowDedupKey(row);
-                        if (existingKeys.has(key)) continue;
-                        existingKeys.add(key);
-                        batchNew.push(row);
-                    }
-                    if (batchNew.length === 0 && Array.isArray(fetched) && fetched.length >= reqLimit) {
-                        reqLimit = GAMELOG_CLOUD_PAGE_BATCH;
-                        fetched = await database.lookupGameLogDatabase(gameLogTable.value.filter, vipList, reqLimit, {
-                            dateFrom,
-                            dateTo,
-                            beforeCreatedAt: oldest,
-                            beforeInclusive: false,
-                            throwOnError: true
-                        });
-                        if (epoch !== gameLogLookupEpoch) return;
-                        for (const row of Array.isArray(fetched) ? fetched : []) {
-                            const key = gameLogRowDedupKey(row);
-                            if (existingKeys.has(key)) continue;
-                            existingKeys.add(key);
-                            batchNew.push(row);
-                        }
-                    }
-                    if (batchNew.length === 0) {
-                        hasMore = false;
-                        break;
-                    }
-                    list = [...list, ...batchNew];
-                    hasMore = Array.isArray(fetched) && fetched.length >= reqLimit;
-                }
-            }
+            const rawList = Array.isArray(rows) ? [...rows] : [];
+            const isPagedCloudLookup = supportsCursor && !search;
+            const hasMore = Boolean(
+                isPagedCloudLookup &&
+                    (rawList.length > pageSize ||
+                        (pageSize >= GAMELOG_CLOUD_MAX_REQUEST_LIMIT && rawList.length >= requestLimit))
+            );
+            const list = isPagedCloudLookup && rawList.length > pageSize ? rawList.slice(0, pageSize) : rawList;
 
             for (const row of list) {
                 row.isFriend = gameLogIsFriend(row);
@@ -593,11 +560,9 @@ export const useGameLogStore = defineStore('GameLog', () => {
                 vipList = Array.from(friendStore.localFavoriteFriends.values());
             }
             const { dateFrom, dateTo } = gameLogTable.value;
+            const pageSize = getGameLogCloudPageSize();
             const existingKeys = new Set(gameLogTableData.value.map(gameLogRowDedupKey));
-            let requestLimit = Math.min(
-                GAMELOG_CLOUD_MAX_REQUEST_LIMIT,
-                GAMELOG_CLOUD_PAGE_BATCH + Math.min(sameTsCount, 80)
-            );
+            let requestLimit = Math.min(GAMELOG_CLOUD_MAX_REQUEST_LIMIT, pageSize + Math.min(sameTsCount, 80) + 1);
             let fetched = await database.lookupGameLogDatabase(gameLogTable.value.filter, vipList, requestLimit, {
                 dateFrom,
                 dateTo,
@@ -618,7 +583,7 @@ export const useGameLogStore = defineStore('GameLog', () => {
             }
 
             if (newRows.length === 0 && Array.isArray(fetched) && fetched.length >= requestLimit) {
-                requestLimit = GAMELOG_CLOUD_PAGE_BATCH;
+                requestLimit = Math.min(GAMELOG_CLOUD_MAX_REQUEST_LIMIT, pageSize + 1);
                 fetched = await database.lookupGameLogDatabase(gameLogTable.value.filter, vipList, requestLimit, {
                     dateFrom,
                     dateTo,
@@ -638,11 +603,14 @@ export const useGameLogStore = defineStore('GameLog', () => {
             }
 
             if (newRows.length > 0) {
-                gameLogTableData.value = [...gameLogTableData.value, ...newRows];
+                const hasExtraInBatch = newRows.length > pageSize;
+                const pageRows = hasExtraInBatch ? newRows.slice(0, pageSize) : newRows;
+                gameLogTableData.value = [...gameLogTableData.value, ...pageRows];
                 gameLogHistoryCapacity = Math.max(gameLogHistoryCapacity, gameLogTableData.value.length);
                 gameLogTable.value.historyExpanded = true;
-                gameLogTable.value.hasMore = Array.isArray(fetched) && fetched.length >= requestLimit;
-                return newRows.length;
+                gameLogTable.value.hasMore =
+                    hasExtraInBatch || (Array.isArray(fetched) && fetched.length >= requestLimit);
+                return pageRows.length;
             }
 
             gameLogTable.value.hasMore = false;
@@ -1431,6 +1399,7 @@ export const useGameLogStore = defineStore('GameLog', () => {
         gameLogIsFavorite,
         gameLogTableLookup,
         loadMoreGameLogHistory,
+        setGameLogPageSize,
         addGameLog,
         addGamelogLocationToDatabase,
 

@@ -199,6 +199,7 @@ describe('Cloud history cursor pagination (adapter + Feed store)', () => {
         });
 
         const feedStore = useFeedStore();
+        feedStore.feedTable.pageSize = 200;
         await feedStore.feedTableLookup();
 
         // Initial page: 200 rows, hasMore = true
@@ -383,6 +384,7 @@ describe('Cloud history cursor pagination (adapter + Feed store)', () => {
         });
 
         const feedStore = useFeedStore();
+        feedStore.feedTable.pageSize = 200;
         await feedStore.feedTableLookup();
         expect(feedStore.feedTableData.length).toBe(200);
 
@@ -651,6 +653,143 @@ describe('Cloud history cursor pagination (adapter + Feed store)', () => {
         expect(feedStore.feedDateNav.selectedDate.value).toBe('2026-05-04');
         expect(feedStore.feedTableData.length).toBe(5);
         expect(wrapper.find('[data-testid="history-date-trigger"]').text()).toContain('2026-05-04');
+
+        mockDb.supportsHistoryDateNavigation = false;
+    });
+
+    it('loads strictly 1 page matching active pageSize (20), re-fetches on pageSize change (25), and fetches only the next 25 rows on Next', async () => {
+        const { useVrcxVueTable } = await import('../../lib/table/useVrcxVueTable.js');
+        const DataTableLayout = (await import('../../components/ui/data-table/DataTableLayout.vue')).default;
+
+        mockDb.supportsHistoryDateNavigation = true;
+        mockDb.getHistoryDates.mockResolvedValue({
+            scope: 'feed',
+            months: [{ month: '2026-11', approxRows: 120 }],
+            minMonth: '2026-11',
+            maxMonth: '2026-11',
+            activeMonth: '2026-11',
+            days: ['2026-11-28'],
+            latestDay: '2026-11-28',
+            earliestDay: '2026-11-28'
+        });
+
+        // 120 rows all on 2026-11-28, newest-first
+        const dayRows = Array.from({ length: 120 }, (_, i) => ({
+            rowId: -(5000 - i),
+            created_at: new Date(Date.UTC(2026, 10, 28, 12, 0, 0) - i * 30_000).toISOString(),
+            type: 'GPS',
+            userId: `usr_${i % 6}`,
+            displayName: `DayFriend_${i}`,
+            location: `wrld_${i}:1`,
+            worldName: `DayWorld_${i}`
+        }));
+
+        const queryLog = [];
+        mockDb.lookupFeedDatabase.mockImplementation(async (_filters, _vip, maxEntries = 200, _df, _dt, opts = {}) => {
+            queryLog.push({
+                limit: maxEntries,
+                beforeCreatedAt: opts?.beforeCreatedAt || '',
+                beforeInclusive: Boolean(opts?.beforeInclusive)
+            });
+            const before = opts?.beforeCreatedAt || '';
+            const inclusive = Boolean(opts?.beforeInclusive);
+            const filtered = before
+                ? dayRows.filter((r) => (inclusive ? r.created_at <= before : r.created_at < before))
+                : dayRows;
+            return filtered.slice(0, maxEntries);
+        });
+
+        localStorage.removeItem('vrcx:table:feed');
+        const feedStore = useFeedStore();
+
+        const Host = defineComponent({
+            components: { DataTableLayout },
+            setup() {
+                const { table, pagination } = useVrcxVueTable({
+                    persistKey: 'test-on-demand-pagesize',
+                    get data() {
+                        return feedStore.feedTableData;
+                    },
+                    columns: [{ accessorKey: 'displayName', id: 'displayName', header: 'Name' }],
+                    getRowId: (row) => `row:${row.rowId}`,
+                    initialSorting: [],
+                    initialPagination: { pageIndex: 0, pageSize: 20 },
+                    tableOptions: { autoResetPageIndex: false }
+                });
+                const handlePageSizeChange = (size) => {
+                    const prevSize = pagination.value?.pageSize;
+                    pagination.value = { ...pagination.value, pageIndex: 0, pageSize: size };
+                    if (size !== prevSize) {
+                        feedStore.setFeedPageSize(size);
+                    }
+                };
+                return { table, pagination, feedStore, handlePageSizeChange };
+            },
+            template: `
+                <DataTableLayout
+                    :table="table"
+                    :loading="feedStore.feedTable.loading"
+                    :total-items="feedStore.feedTableData.length"
+                    :page-sizes="[10, 20, 25, 50, 100]"
+                    :on-page-size-change="handlePageSizeChange"
+                    :can-load-more="feedStore.feedTable.hasMore"
+                    :loading-more="feedStore.feedTable.loadingMore"
+                    :on-load-more="feedStore.loadMoreFeedHistory"
+                    :history-date-nav="feedStore.feedDateNav" />
+            `
+        });
+
+        const wrapper = mount(Host, {
+            global: { mocks: { $t: (k) => k } }
+        });
+
+        // 1) Initial lookup at default pageSize=20 -> single request with limit=21, strictly 20 rows loaded (never all 120)
+        await feedStore.feedTableLookup();
+        await nextTick();
+        expect(queryLog).toHaveLength(1);
+        expect(queryLog[0]).toMatchObject({ limit: 21, beforeCreatedAt: '' });
+        expect(feedStore.feedTableData.length).toBe(20);
+        expect(feedStore.feedTable.hasMore).toBe(true);
+        expect(wrapper.vm.table.getRowModel().rows.length).toBe(20);
+
+        // 2) Switch pageSize 20 -> 25 -> resets to page 1 and re-fetches strictly 25 rows (1 request with limit=26)
+        wrapper.vm.handlePageSizeChange(25);
+        await new Promise((r) => setTimeout(r, 10));
+        await nextTick();
+        expect(queryLog).toHaveLength(2);
+        expect(queryLog[1]).toMatchObject({ limit: 26, beforeCreatedAt: '' });
+        expect(feedStore.feedTableData.length).toBe(25);
+        expect(feedStore.feedTable.hasMore).toBe(true);
+        expect(wrapper.vm.pagination.pageIndex).toBe(0);
+        expect(wrapper.vm.pagination.pageSize).toBe(25);
+
+        // 3) Click Next -> fetches strictly the next 25 rows (limit = 25 + 1 same-ts + 1 lookahead = 27) and advances to page 2
+        const nextBtn = wrapper.findAll('button').find((b) => b.text().includes('table.pagination.next'));
+        expect(nextBtn).toBeTruthy();
+        await nextBtn.trigger('click');
+        await new Promise((r) => setTimeout(r, 10));
+        await nextTick();
+        await nextTick();
+        expect(queryLog).toHaveLength(3);
+        expect(queryLog[2]).toMatchObject({
+            limit: 27,
+            beforeCreatedAt: dayRows[24].created_at,
+            beforeInclusive: true
+        });
+        expect(feedStore.feedTableData.length).toBe(50);
+        expect(feedStore.feedTable.hasMore).toBe(true);
+        expect(wrapper.vm.pagination.pageIndex).toBe(1);
+        expect(wrapper.vm.table.getRowModel().rows[0].original.displayName).toBe('DayFriend_25');
+
+        // 4) Switch pageSize 25 -> 10 -> resets back to page 1 and re-fetches strictly 10 rows (limit=11)
+        wrapper.vm.handlePageSizeChange(10);
+        await new Promise((r) => setTimeout(r, 10));
+        await nextTick();
+        expect(queryLog).toHaveLength(4);
+        expect(queryLog[3]).toMatchObject({ limit: 11, beforeCreatedAt: '' });
+        expect(feedStore.feedTableData.length).toBe(10);
+        expect(feedStore.feedTable.hasMore).toBe(true);
+        expect(wrapper.vm.pagination.pageIndex).toBe(0);
 
         mockDb.supportsHistoryDateNavigation = false;
     });

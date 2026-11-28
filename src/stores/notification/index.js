@@ -33,7 +33,7 @@ import {
     getUserIdFromNoty as getUserIdFromNotyBase,
     toNotificationText
 } from '../../shared/utils/notificationMessage';
-import { createHistoryDateController } from '../../composables/useHistoryDateNavigation';
+import { createHistoryDateController, resolveHistoryPageBatchSize } from '../../composables/useHistoryDateNavigation';
 import { database, dbVars } from '../../services/database';
 import { getNotificationCategory, getNotificationTs } from '../../shared/utils/notificationCategory';
 import { AppDebug } from '../../services/appConfig';
@@ -75,9 +75,7 @@ export const useNotificationStore = defineStore('Notification', () => {
     const instanceStore = useInstanceStore();
     const modalStore = useModalStore();
 
-    const NOTIFICATION_CLOUD_PAGE_BATCH = 200;
     const NOTIFICATION_CLOUD_MAX_REQUEST_LIMIT = 200;
-    const NOTIFICATION_DAY_AUTO_MAX_BATCHES = 5;
 
     const notificationInitStatus = ref(false);
     const notificationTable = ref({
@@ -98,7 +96,7 @@ export const useNotificationStore = defineStore('Notification', () => {
                 value: ''
             }
         ]),
-        pageSize: 20,
+        pageSize: resolveHistoryPageBatchSize('notifications', 20, NOTIFICATION_CLOUD_MAX_REQUEST_LIMIT),
         pageSizeLinked: true,
         paginationProps: {
             layout: 'sizes,prev,pager,next,total'
@@ -107,6 +105,25 @@ export const useNotificationStore = defineStore('Notification', () => {
     let notifHasMoreV1 = false;
     let notifHasMoreV2 = false;
     let notifLoadEpoch = 0;
+
+    function getNotificationCloudPageSize() {
+        const raw = Number(notificationTable.value.pageSize);
+        if (Number.isFinite(raw) && raw > 0) {
+            return Math.min(Math.max(Math.floor(raw), 1), NOTIFICATION_CLOUD_MAX_REQUEST_LIMIT);
+        }
+        return resolveHistoryPageBatchSize('notifications', 20, NOTIFICATION_CLOUD_MAX_REQUEST_LIMIT);
+    }
+
+    function setNotificationPageSize(size) {
+        const next = Number(size);
+        if (!Number.isFinite(next) || next <= 0) return;
+        const normalized = Math.min(Math.max(Math.floor(next), 1), NOTIFICATION_CLOUD_MAX_REQUEST_LIMIT);
+        const changed = normalized !== notificationTable.value.pageSize;
+        notificationTable.value.pageSize = normalized;
+        if (changed && (database.supportsHistoryCursorPagination || notificationDateNav.enabled.value)) {
+            loadNotificationsForDateRange({ refreshLive: false });
+        }
+    }
 
     const notificationDateNav = createHistoryDateController('notifications', async ({ dateFrom, dateTo }) => {
         notificationTable.value.dateFrom = dateFrom;
@@ -1203,11 +1220,13 @@ export const useNotificationStore = defineStore('Notification', () => {
                 }
             }
             const { dateFrom, dateTo } = notificationTable.value;
+            const pageSize = getNotificationCloudPageSize();
+            const requestLimit = Math.min(NOTIFICATION_CLOUD_MAX_REQUEST_LIMIT, pageSize + 1);
             const [v2Rows, v1Rows] = await Promise.all([
                 Promise.resolve(
                     supportsCursor
                         ? database.getNotificationsV2({
-                              limit: NOTIFICATION_CLOUD_PAGE_BATCH,
+                              limit: requestLimit,
                               dateFrom,
                               dateTo,
                               throwOnError: true
@@ -1217,7 +1236,7 @@ export const useNotificationStore = defineStore('Notification', () => {
                 Promise.resolve(
                     supportsCursor
                         ? database.getNotifications({
-                              limit: NOTIFICATION_CLOUD_PAGE_BATCH,
+                              limit: requestLimit,
                               dateFrom,
                               dateTo,
                               throwOnError: true
@@ -1230,87 +1249,25 @@ export const useNotificationStore = defineStore('Notification', () => {
             const listV1 = Array.isArray(v1Rows) ? v1Rows : [];
             let tableData = [...listV2];
             tableData = tableData.concat(listV1.filter((n) => !tableData.some((t) => t.id === n.id)));
-            notifHasMoreV2 = supportsCursor && listV2.length >= NOTIFICATION_CLOUD_PAGE_BATCH;
-            notifHasMoreV1 = supportsCursor && listV1.length >= NOTIFICATION_CLOUD_PAGE_BATCH;
-
-            if (
-                (notifHasMoreV1 || notifHasMoreV2) &&
-                supportsDateNav &&
-                notificationDateNav.mode.value === 'day' &&
-                dateFrom &&
-                dateTo
-            ) {
-                const existingIds = new Set(tableData.map((r) => String(r?.id ?? '')));
-                for (let batch = 1; batch < NOTIFICATION_DAY_AUTO_MAX_BATCHES && (notifHasMoreV1 || notifHasMoreV2); batch++) {
-                    let oldest = '';
-                    for (const row of tableData) {
-                        const ts = getNotifCreatedAt(row);
-                        if (ts && (!oldest || ts < oldest)) oldest = ts;
-                    }
-                    if (!oldest || oldest <= dateFrom) {
-                        notifHasMoreV1 = false;
-                        notifHasMoreV2 = false;
-                        break;
-                    }
-                    let sameTsCount = 0;
-                    for (const row of tableData) {
-                        if (getNotifCreatedAt(row) === oldest) sameTsCount++;
-                    }
-                    const reqLimit = Math.min(
-                        NOTIFICATION_CLOUD_MAX_REQUEST_LIMIT,
-                        NOTIFICATION_CLOUD_PAGE_BATCH + Math.min(sameTsCount, 50)
-                    );
-                    const [v2Next, v1Next] = await Promise.all([
-                        notifHasMoreV2
-                            ? Promise.resolve(
-                                  database.getNotificationsV2({
-                                      limit: reqLimit,
-                                      dateFrom,
-                                      dateTo,
-                                      beforeCreatedAt: oldest,
-                                      beforeInclusive: true,
-                                      throwOnError: true
-                                  })
-                              )
-                            : Promise.resolve([]),
-                        notifHasMoreV1
-                            ? Promise.resolve(
-                                  database.getNotifications({
-                                      limit: reqLimit,
-                                      dateFrom,
-                                      dateTo,
-                                      beforeCreatedAt: oldest,
-                                      beforeInclusive: true,
-                                      throwOnError: true
-                                  })
-                              )
-                            : Promise.resolve([])
-                    ]);
-                    if (epoch !== notifLoadEpoch) return;
-                    const n2 = Array.isArray(v2Next) ? v2Next : [];
-                    const n1 = Array.isArray(v1Next) ? v1Next : [];
-                    let added = 0;
-                    for (const row of [...n2, ...n1]) {
-                        const key = String(row?.id ?? '');
-                        if (key && existingIds.has(key)) continue;
-                        if (key) existingIds.add(key);
-                        tableData.push(row);
-                        added++;
-                    }
-                    notifHasMoreV2 = notifHasMoreV2 && n2.length >= reqLimit;
-                    notifHasMoreV1 = notifHasMoreV1 && n1.length >= reqLimit;
-                    if (added === 0) {
-                        notifHasMoreV1 = false;
-                        notifHasMoreV2 = false;
-                        break;
-                    }
-                }
-            }
-
             tableData.sort(
                 (a, b) => Date.parse(b.created_at || b.createdAt || '') - Date.parse(a.created_at || a.createdAt || '')
             );
-            if (!supportsDateNav) {
+
+            if (supportsCursor) {
+                const pageRows = tableData.length > pageSize ? tableData.slice(0, pageSize) : tableData;
+                const keptIds = new Set(pageRows.map((r) => String(r?.id ?? '')));
+                const v2Dropped = listV2.some((r) => {
+                    const key = String(r?.id ?? '');
+                    return key && !keptIds.has(key);
+                });
+                const v1Dropped = listV1.some((r) => {
+                    const key = String(r?.id ?? '');
+                    return key && !keptIds.has(key);
+                });
+                notifHasMoreV2 = listV2.length >= requestLimit || v2Dropped;
+                notifHasMoreV1 = listV1.length >= requestLimit || v1Dropped;
+                tableData = pageRows;
+            } else if (!supportsDateNav) {
                 tableData.splice(dbVars.maxTableSize);
             }
             notificationTable.value.data = tableData;
@@ -1361,16 +1318,17 @@ export const useNotificationStore = defineStore('Notification', () => {
         notificationTable.value.loadingMore = true;
         try {
             const { dateFrom, dateTo } = notificationTable.value;
-            const existingIds = new Set(notificationTable.value.data.map((r) => String(r?.id ?? '')));
-            const requestLimit = Math.min(
-                NOTIFICATION_CLOUD_MAX_REQUEST_LIMIT,
-                NOTIFICATION_CLOUD_PAGE_BATCH + Math.min(sameTsCount, 50)
-            );
+            const pageSize = getNotificationCloudPageSize();
+            const preExistingIds = new Set(notificationTable.value.data.map((r) => String(r?.id ?? '')));
+            const existingIds = new Set(preExistingIds);
+            let usedLimit = Math.min(NOTIFICATION_CLOUD_MAX_REQUEST_LIMIT, pageSize + Math.min(sameTsCount, 50) + 1);
+            let hadMoreV2 = notifHasMoreV2;
+            let hadMoreV1 = notifHasMoreV1;
             const [v2Fetched, v1Fetched] = await Promise.all([
-                notifHasMoreV2
+                hadMoreV2
                     ? Promise.resolve(
                           database.getNotificationsV2({
-                              limit: requestLimit,
+                              limit: usedLimit,
                               dateFrom,
                               dateTo,
                               beforeCreatedAt: oldest,
@@ -1379,10 +1337,10 @@ export const useNotificationStore = defineStore('Notification', () => {
                           })
                       )
                     : Promise.resolve([]),
-                notifHasMoreV1
+                hadMoreV1
                     ? Promise.resolve(
                           database.getNotifications({
-                              limit: requestLimit,
+                              limit: usedLimit,
                               dateFrom,
                               dateTo,
                               beforeCreatedAt: oldest,
@@ -1394,25 +1352,25 @@ export const useNotificationStore = defineStore('Notification', () => {
             ]);
             if (epoch !== notifLoadEpoch) return 0;
 
-            const v2List = Array.isArray(v2Fetched) ? v2Fetched : [];
-            const v1List = Array.isArray(v1Fetched) ? v1Fetched : [];
+            let usedV2 = Array.isArray(v2Fetched) ? v2Fetched : [];
+            let usedV1 = Array.isArray(v1Fetched) ? v1Fetched : [];
             const newRows = [];
-            for (const row of [...v2List, ...v1List]) {
+            for (const row of [...usedV2, ...usedV1]) {
                 const key = String(row?.id ?? '');
                 if (key && existingIds.has(key)) continue;
                 if (key) existingIds.add(key);
                 newRows.push(row);
             }
 
-            notifHasMoreV2 = notifHasMoreV2 && v2List.length >= requestLimit;
-            notifHasMoreV1 = notifHasMoreV1 && v1List.length >= requestLimit;
-
-            if (newRows.length === 0 && (notifHasMoreV1 || notifHasMoreV2)) {
+            if (newRows.length === 0 && (hadMoreV2 && usedV2.length >= usedLimit || hadMoreV1 && usedV1.length >= usedLimit)) {
+                hadMoreV2 = hadMoreV2 && usedV2.length >= usedLimit;
+                hadMoreV1 = hadMoreV1 && usedV1.length >= usedLimit;
+                usedLimit = Math.min(NOTIFICATION_CLOUD_MAX_REQUEST_LIMIT, pageSize + 1);
                 const [v2Strict, v1Strict] = await Promise.all([
-                    notifHasMoreV2
+                    hadMoreV2
                         ? Promise.resolve(
                               database.getNotificationsV2({
-                                  limit: NOTIFICATION_CLOUD_PAGE_BATCH,
+                                  limit: usedLimit,
                                   dateFrom,
                                   dateTo,
                                   beforeCreatedAt: oldest,
@@ -1421,10 +1379,10 @@ export const useNotificationStore = defineStore('Notification', () => {
                               })
                           )
                         : Promise.resolve([]),
-                    notifHasMoreV1
+                    hadMoreV1
                         ? Promise.resolve(
                               database.getNotifications({
-                                  limit: NOTIFICATION_CLOUD_PAGE_BATCH,
+                                  limit: usedLimit,
                                   dateFrom,
                                   dateTo,
                                   beforeCreatedAt: oldest,
@@ -1435,20 +1393,35 @@ export const useNotificationStore = defineStore('Notification', () => {
                         : Promise.resolve([])
                 ]);
                 if (epoch !== notifLoadEpoch) return 0;
-                const s2 = Array.isArray(v2Strict) ? v2Strict : [];
-                const s1 = Array.isArray(v1Strict) ? v1Strict : [];
-                for (const row of [...s2, ...s1]) {
+                usedV2 = Array.isArray(v2Strict) ? v2Strict : [];
+                usedV1 = Array.isArray(v1Strict) ? v1Strict : [];
+                for (const row of [...usedV2, ...usedV1]) {
                     const key = String(row?.id ?? '');
                     if (key && existingIds.has(key)) continue;
                     if (key) existingIds.add(key);
                     newRows.push(row);
                 }
-                notifHasMoreV2 = notifHasMoreV2 && s2.length >= NOTIFICATION_CLOUD_PAGE_BATCH;
-                notifHasMoreV1 = notifHasMoreV1 && s1.length >= NOTIFICATION_CLOUD_PAGE_BATCH;
             }
 
             if (newRows.length > 0) {
-                const merged = [...notificationTable.value.data, ...newRows];
+                newRows.sort(
+                    (a, b) =>
+                        Date.parse(b.created_at || b.createdAt || '') - Date.parse(a.created_at || a.createdAt || '')
+                );
+                const pageRows = newRows.length > pageSize ? newRows.slice(0, pageSize) : newRows;
+                const keptNewIds = new Set(pageRows.map((r) => String(r?.id ?? '')));
+                const v2Dropped = usedV2.some((r) => {
+                    const key = String(r?.id ?? '');
+                    return key && !preExistingIds.has(key) && !keptNewIds.has(key);
+                });
+                const v1Dropped = usedV1.some((r) => {
+                    const key = String(r?.id ?? '');
+                    return key && !preExistingIds.has(key) && !keptNewIds.has(key);
+                });
+                notifHasMoreV2 = hadMoreV2 && (usedV2.length >= usedLimit || v2Dropped);
+                notifHasMoreV1 = hadMoreV1 && (usedV1.length >= usedLimit || v1Dropped);
+
+                const merged = [...notificationTable.value.data, ...pageRows];
                 merged.sort(
                     (a, b) =>
                         Date.parse(b.created_at || b.createdAt || '') - Date.parse(a.created_at || a.createdAt || '')
@@ -1456,9 +1429,11 @@ export const useNotificationStore = defineStore('Notification', () => {
                 notificationTable.value.data = merged;
                 notificationTable.value.historyExpanded = true;
                 notificationTable.value.hasMore = notifHasMoreV1 || notifHasMoreV2;
-                return newRows.length;
+                return pageRows.length;
             }
 
+            notifHasMoreV1 = false;
+            notifHasMoreV2 = false;
             notificationTable.value.hasMore = false;
             return 0;
         } catch (err) {
@@ -1852,6 +1827,7 @@ export const useNotificationStore = defineStore('Notification', () => {
 
         initNotifications,
         loadMoreNotifications,
+        setNotificationPageSize,
         expireNotification,
         refreshNotifications,
         checkInventoryBundles,

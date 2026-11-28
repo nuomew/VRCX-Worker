@@ -253,6 +253,11 @@
         }
     });
 
+    const initialPageSize = Number(pagination.value?.pageSize);
+    if (notificationTable.value && Number.isFinite(initialPageSize) && initialPageSize > 0) {
+        notificationTable.value.pageSize = initialPageSize;
+    }
+
     const totalItems = computed(() => {
         const length = table.getFilteredRowModel().rows.length;
         if (notificationTable.value.historyExpanded) {
@@ -263,11 +268,19 @@
     });
 
     const handlePageSizeChange = (size) => {
+        const prevSize = pagination.value?.pageSize;
         pagination.value = {
             ...pagination.value,
             pageIndex: 0,
             pageSize: size
         };
+        if (size !== prevSize) {
+            if (typeof notificationStore.setNotificationPageSize === 'function') {
+                notificationStore.setNotificationPageSize(size);
+            } else if (notificationTable.value) {
+                notificationTable.value.pageSize = size;
+            }
+        }
     };
 
     const sendInviteResponseDialog = ref({
