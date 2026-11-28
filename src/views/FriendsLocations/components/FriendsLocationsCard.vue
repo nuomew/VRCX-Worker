@@ -190,8 +190,9 @@
         --card-scale: 1;
         --card-spacing: 1;
         gap: calc(14px * var(--card-scale) * var(--card-spacing));
-        max-width: var(--friend-card-target-width, 220px);
-        min-width: var(--friend-card-min-width, 220px);
+        width: 100%;
+        max-width: var(--friend-card-target-width, 100%);
+        min-width: var(--friend-card-min-width, 0px);
     }
 
     .friend-card__world-bg-img {

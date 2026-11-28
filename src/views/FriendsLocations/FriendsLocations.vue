@@ -536,10 +536,6 @@
         () => showSameInstance.value && activeSegment.value === 'same-instance' && !normalizedSearchTerm.value
     );
 
-    const shouldMergeSameInstance = computed(
-        () => !showSameInstance.value && activeSegment.value === 'online' && !normalizedSearchTerm.value
-    );
-
     const displayInstanceInfo = computed(() => activeSegment.value !== 'active' && activeSegment.value !== 'offline');
 
     const buildSameInstanceGroups = (entries = []) => {
@@ -575,82 +571,47 @@
         return buildSameInstanceGroups(filteredFriends.value);
     });
 
-    const mergedEntriesBySection = computed(() => {
-        if (!shouldMergeSameInstance.value) {
-            return {
-                sameInstance: [],
-                online: []
-            };
+    const DESKTOP_FIXED_COLUMNS = 4;
+    const ROW_HORIZONTAL_PADDING = 12;
+
+    /**
+     * Resolves card grid columns: fixed to 4 per row on desktop widths,
+     * stepping down cleanly only on narrow/mobile viewports to prevent squishing.
+     *
+     * @param {number} containerWidth
+     * @returns {number}
+     */
+    const resolveGridColumns = (containerWidth) => {
+        if (!Number.isFinite(containerWidth) || containerWidth <= 0 || containerWidth >= 680) {
+            return DESKTOP_FIXED_COLUMNS;
         }
-
-        const sameInstance = [];
-        const online = [];
-        for (const entry of filteredFriends.value) {
-            if (entry.section === 'same-instance') {
-                sameInstance.push(entry);
-            } else {
-                online.push(entry);
-            }
+        if (containerWidth >= 500) {
+            return 3;
         }
-
-        return {
-            sameInstance,
-            online
-        };
-    });
-
-    const mergedSameInstanceEntries = computed(() => {
-        return mergedEntriesBySection.value.sameInstance;
-    });
-
-    const mergedOnlineEntries = computed(() => {
-        return mergedEntriesBySection.value.online;
-    });
-
-    const mergedSameInstanceGroups = computed(() => {
-        if (!shouldMergeSameInstance.value) {
-            return [];
+        if (containerWidth >= 340) {
+            return 2;
         }
-        return buildSameInstanceGroups(mergedSameInstanceEntries.value);
-    });
+        return 1;
+    };
 
-    const computeGridLayout = (count = 1, options = {}) => {
-        const baseWidth = 220;
+    const computeGridLayout = (_count = 1, options = {}) => {
         const baseGap = 14;
         const scale = cardScale.value;
         const spacing = cardSpacing.value;
-        const minWidth = baseWidth * scale;
-        const gap = Math.max(6, (baseGap + (scale - 1) * 10) * spacing);
+        const gap = Math.max(6, Math.round((baseGap + (scale - 1) * 10) * spacing));
         const containerWidth = Math.max(gridWidth.value ?? 0, 0);
-        const itemCount = Math.max(Number(count) || 0, 0);
-        const safeCount = itemCount > 0 ? itemCount : 1;
-        const maxColumns = Math.max(1, Math.floor((containerWidth + gap) / (minWidth + gap)) || 1);
+        const maxColumns = resolveGridColumns(containerWidth);
         const preferredColumns = options?.preferredColumns;
-        const requestedColumns = preferredColumns
+        const columns = preferredColumns
             ? Math.max(1, Math.min(Math.round(preferredColumns), maxColumns))
             : maxColumns;
-        const columns = Math.max(1, Math.min(safeCount, requestedColumns));
-        const forceStretch = Boolean(options?.forceStretch);
-        const disableAutoStretch = Boolean(options?.disableAutoStretch);
-        const matchMaxColumnWidth = Boolean(options?.matchMaxColumnWidth);
-        const shouldStretch = !disableAutoStretch && (forceStretch || itemCount >= maxColumns);
 
-        let cardWidth = minWidth;
-        const maxColumnWidth = maxColumns > 0 ? (containerWidth - gap * (maxColumns - 1)) / maxColumns : minWidth;
-
-        if (shouldStretch && columns > 0) {
-            const columnsWidth = containerWidth - gap * (columns - 1);
-            const rawWidth = columnsWidth > 0 ? columnsWidth / columns : minWidth;
-
-            if (Number.isFinite(rawWidth) && rawWidth > 0) {
-                cardWidth = Math.max(minWidth, rawWidth);
-            }
-        } else if (matchMaxColumnWidth && Number.isFinite(maxColumnWidth) && maxColumnWidth > 0) {
-            cardWidth = Math.max(minWidth, maxColumnWidth);
-        }
+        const innerWidth = Math.max(0, containerWidth - ROW_HORIZONTAL_PADDING);
+        const rawColumnWidth = innerWidth > 0 ? Math.floor((innerWidth - gap * (columns - 1)) / columns) : 0;
+        const cardWidth = Number.isFinite(rawColumnWidth) && rawColumnWidth > 0 ? rawColumnWidth : null;
 
         return {
-            minWidth,
+            minWidth: 0,
             gap,
             columns,
             cardWidth
@@ -661,9 +622,9 @@
         return (count = 1, options = {}) => {
             const { minWidth, gap, cardWidth, columns } = computeGridLayout(count, options);
             return {
-                '--friend-card-min-width': `${Math.round(minWidth)}px`,
-                '--friend-card-gap': `${Math.round(gap)}px`,
-                '--friend-card-target-width': `${Math.round(cardWidth)}px`,
+                '--friend-card-min-width': `${minWidth}px`,
+                '--friend-card-gap': `${gap}px`,
+                '--friend-card-target-width': cardWidth ? `${cardWidth}px` : '1fr',
                 '--friend-grid-columns': `${columns}`,
                 '--friend-card-spacing': `${cardSpacing.value.toFixed(2)}`
             };
@@ -675,7 +636,7 @@
         if (!safeItems.length) {
             return [];
         }
-        const { columns } = computeGridLayout(safeItems.length, { matchMaxColumnWidth: true });
+        const { columns } = computeGridLayout(safeItems.length);
         const safeColumns = Math.max(1, columns || 1);
         /** @type {VirtualRow[]} */
         const rows = [];
@@ -724,43 +685,6 @@
                     }));
                     rows.push(...chunkCardItems(items, `g:${group.instanceId}`));
                 }
-            }
-
-            return rows;
-        }
-
-        if (shouldMergeSameInstance.value) {
-            for (const group of mergedSameInstanceGroups.value) {
-                rows.push({
-                    type: 'header',
-                    key: `h:${group.instanceId}`,
-                    instanceId: group.instanceId,
-                    count: Array.isArray(group.friends) ? group.friends.length : 0
-                });
-
-                const friends = Array.isArray(group.friends) ? group.friends : [];
-                if (friends.length) {
-                    const items = friends.map((friend) => ({
-                        key: `f:${getFriendIdentity(friend)}`,
-                        friend,
-                        displayInstanceInfo: displayInstanceInfo.value
-                    }));
-                    rows.push(...chunkCardItems(items, `mg:${group.instanceId}`));
-                }
-            }
-
-            if (mergedSameInstanceGroups.value.length && mergedOnlineEntries.value.length) {
-                rows.push({ type: 'divider', key: 'divider:merged' });
-            }
-
-            const online = mergedOnlineEntries.value;
-            if (online.length) {
-                const items = online.map((entry) => ({
-                    key: `e:${getEntryIdentity(entry)}`,
-                    friend: entry.friend,
-                    displayInstanceInfo: displayInstanceInfo.value
-                }));
-                rows.push(...chunkCardItems(items, 'o:merged'));
             }
 
             return rows;
@@ -1028,8 +952,8 @@
     .friend-view__row {
         display: grid;
         grid-template-columns: repeat(
-            var(--friend-grid-columns, 1),
-            minmax(var(--friend-card-min-width, 200px), var(--friend-card-target-width, 1fr))
+            var(--friend-grid-columns, 4),
+            minmax(var(--friend-card-min-width, 0px), var(--friend-card-target-width, 1fr))
         );
         gap: var(--friend-card-gap, 14px);
         justify-content: start;

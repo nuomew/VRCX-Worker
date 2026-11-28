@@ -322,4 +322,62 @@ describe('FriendsLocations.vue', () => {
 
         expect(wrapper.get('[data-testid="empty-state"]').text()).toBe('nomatch');
     });
+
+    test('flattens same-instance and other online friends into a single 4-per-row grid on Online tab', async () => {
+        const f1 = makeFriend('usr_1', 'Futon', 'wrld_mizi:1');
+        const f2 = makeFriend('usr_2', 'Lumia', 'wrld_mizi:1');
+        const f3 = makeFriend('usr_3', 'Baibuhe', 'wrld_yoinagi:2');
+        const f4 = makeFriend('usr_4', 'Aiaidis', 'private');
+        const f5 = makeFriend('usr_5', 'Eris', 'wrld_other:3');
+        const f6 = makeFriend('usr_6', 'Momo', 'private');
+
+        mocks.friendsInSameInstance.value = [[f1, f2]];
+        mocks.onlineFriends.value = [f1, f2, f3, f4, f5, f6];
+
+        const wrapper = mount(FriendsLocations);
+        await flushSettings();
+
+        // No same-instance header or divider splits the Online tab into 2+2 rows
+        expect(wrapper.find('.friend-view__instance-header').exists()).toBe(false);
+        expect(wrapper.find('.friend-view__divider').exists()).toBe(false);
+
+        const rows = wrapper.findAll('.friend-view__row');
+        expect(rows).toHaveLength(2);
+        expect(rows[0].findAll('[data-testid="friend-card"]').map((n) => n.text())).toEqual([
+            'Futon',
+            'Lumia',
+            'Baibuhe',
+            'Aiaidis'
+        ]);
+        expect(rows[1].findAll('[data-testid="friend-card"]').map((n) => n.text())).toEqual(['Eris', 'Momo']);
+
+        const virtualEl = wrapper.get('.friend-view__virtual');
+        expect(virtualEl.attributes('style')).toContain('--friend-grid-columns: 4');
+    });
+
+    test('keeps 4 columns across desktop container widths without horizontal overflow', async () => {
+        mocks.onlineFriends.value = Array.from({ length: 5 }, (_, i) => makeFriend(`usr_${i + 1}`, `Friend${i + 1}`));
+        const wrapper = mount(FriendsLocations);
+        await flushSettings();
+
+        for (const width of [760, 1112, 1680]) {
+            wrapper.vm.gridWidth = width;
+            await nextTick();
+
+            const rows = wrapper.findAll('.friend-view__row');
+            expect(rows).toHaveLength(2);
+            expect(rows[0].findAll('[data-testid="friend-card"]')).toHaveLength(4);
+            expect(rows[1].findAll('[data-testid="friend-card"]')).toHaveLength(1);
+
+            const style = wrapper.get('.friend-view__virtual').attributes('style') || '';
+            expect(style).toContain('--friend-grid-columns: 4');
+            const targetMatch = style.match(/--friend-card-target-width:\s*(\d+)px/);
+            const gapMatch = style.match(/--friend-card-gap:\s*(\d+)px/);
+            expect(targetMatch).not.toBeNull();
+            expect(gapMatch).not.toBeNull();
+            const cardW = Number(targetMatch[1]);
+            const gap = Number(gapMatch[1]);
+            expect(cardW * 4 + gap * 3 + 12).toBeLessThanOrEqual(width);
+        }
+    });
 });
