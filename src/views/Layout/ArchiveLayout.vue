@@ -627,12 +627,12 @@
             @save="handleCustomNavSave"
             @dashboard-created="handleDashboardCreated" />
 
-        <!-- Non-interactive viewport dimmer scoped strictly to Archive lifecycle -->
+        <!-- Non-interactive viewport dimmer scoped strictly to Archive lifecycle (above all portals/dialogs/toasts) -->
         <Teleport to="body">
             <div
                 v-if="dimOverlayOpacity > 0"
-                class="arc-brightness-dimmer pointer-events-none fixed inset-0 z-[9999]"
-                :style="{ backgroundColor: `rgba(14, 24, 38, ${dimOverlayOpacity})` }"
+                class="arc-brightness-dimmer pointer-events-none fixed inset-0 z-[2147483647]"
+                :style="{ backgroundColor: `rgba(14, 24, 38, ${dimOverlayOpacity})`, zIndex: 2147483647 }"
                 aria-hidden="true" />
         </Teleport>
     </div>

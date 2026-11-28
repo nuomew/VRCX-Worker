@@ -669,12 +669,12 @@
             @save="handleCustomNavSave"
             @dashboard-created="handleDashboardCreated" />
 
-        <!-- Non-interactive viewport dimmer scoped strictly to Lookbook lifecycle -->
+        <!-- Non-interactive viewport dimmer scoped strictly to Lookbook lifecycle (above all portals/dialogs/toasts) -->
         <Teleport to="body">
             <div
                 v-if="dimOverlayOpacity > 0"
-                class="lb-brightness-dimmer pointer-events-none fixed inset-0 z-[9999]"
-                :style="{ backgroundColor: `rgba(22, 16, 20, ${dimOverlayOpacity})` }"
+                class="lb-brightness-dimmer pointer-events-none fixed inset-0 z-[2147483647]"
+                :style="{ backgroundColor: `rgba(22, 16, 20, ${dimOverlayOpacity})`, zIndex: 2147483647 }"
                 aria-hidden="true" />
         </Teleport>
     </div>

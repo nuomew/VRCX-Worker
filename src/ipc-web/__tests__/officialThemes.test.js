@@ -206,6 +206,9 @@ describe('Official Anime-Site Dual Themes (Lookbook & Azure Archive) registratio
 
         expect(lookbookSrc).toContain('lb-brightness-dimmer');
         expect(archiveSrc).toContain('arc-brightness-dimmer');
+        // Brightness dimmer must sit above all modals (10000+), dropdowns (12000), cloud overlays (20000), and toasts (999999999)
+        expect(lookbookSrc).toContain('z-[2147483647]');
+        expect(archiveSrc).toContain('z-[2147483647]');
         // Lookbook left cover card reuses native categorized FriendsSidebar (favorites/subgroups, online, active, offline + virtual scroll)
         expect(lookbookSrc).toContain('<FriendsSidebar hide-me :render-edit-profile-dialog="false"');
         expect(lookbookSrc).toContain('lb-folio-friends-scroll');
