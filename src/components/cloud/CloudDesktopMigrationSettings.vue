@@ -367,7 +367,7 @@
                                 <div class="flex flex-wrap items-center gap-2">
                                     <span class="font-medium text-foreground">{{ categoryLabel(item.key) }}</span>
                                     <span
-                                        v-if="item.rowCount > 0 && importedStats[item.key] === item.rowCount"
+                                        v-if="isCategorySyncedComplete(item)"
                                         class="rounded bg-status-online/15 px-1.5 py-0.5 text-[10px] font-medium text-status-online">
                                         {{ t('cloud_hub.migration.synced_complete_badge', { count: importedStats[item.key].toLocaleString() }) }}
                                     </span>
@@ -377,7 +377,7 @@
                                         {{ t('cloud_hub.migration.already_imported_badge', { count: importedStats[item.key].toLocaleString() }) }}
                                     </span>
                                     <span
-                                        v-if="item.rowCount > 0 && importedStats[item.key] > 0 && importedStats[item.key] < item.rowCount"
+                                        v-if="!isCategorySyncedComplete(item) && item.rowCount > 0 && importedStats[item.key] > 0 && importedStats[item.key] < item.rowCount"
                                         class="rounded bg-destructive/15 px-1.5 py-0.5 text-[10px] font-medium text-destructive">
                                         {{
                                             t('cloud_hub.migration.missing_rows_badge', {
@@ -583,6 +583,7 @@
 
     let pollTimer = null;
     let lastCompletedJobId = '';
+    let autoRescannedJobId = '';
 
     const hasOnlineDevice = computed(() => devices.value.some((d) => d.online));
     const inventoryAccounts = computed(() => (Array.isArray(inventory.value?.accounts) ? inventory.value.accounts : []));
@@ -661,9 +662,28 @@
             .filter((item) => item.rowCount > 0 && selectedCategories[item.key])
             .map((item) => item.key)
     );
+    function isCategorySyncedComplete(item) {
+        if (!item || item.rowCount <= 0) return false;
+        const cloudRows = Number(importedStats[item.key] || 0);
+        if (cloudRows <= 0) return false;
+        if (cloudRows === item.rowCount) return true;
+        // When the latest migration completed cleanly with only in-table desktop duplicates skipped,
+        // avoid showing a false "missing rows" mismatch badge.
+        if (
+            cloudRows < item.rowCount &&
+            job.value?.status === 'completed' &&
+            Array.isArray(job.value.completedCategories) &&
+            job.value.completedCategories.includes(item.key) &&
+            !(Array.isArray(job.value.mismatches) && job.value.mismatches.some((m) => m.category === item.key))
+        ) {
+            return true;
+        }
+        return false;
+    }
+
     const mismatchedCategoryItems = computed(() =>
         mergedCategoryList.value.filter(
-            (item) => item.rowCount > 0 && importedStats[item.key] > 0 && importedStats[item.key] !== item.rowCount
+            (item) => item.rowCount > 0 && importedStats[item.key] > 0 && !isCategorySyncedComplete(item)
         )
     );
     const hasSelectedResumeCursor = computed(() =>
@@ -874,7 +894,24 @@
                 job.value.jobId !== lastCompletedJobId
             ) {
                 lastCompletedJobId = job.value.jobId;
-                toast.warning(t('cloud_hub.migration.job_mismatch_toast'));
+                const excessOnly =
+                    Array.isArray(job.value.mismatches) &&
+                    job.value.mismatches.length > 0 &&
+                    job.value.mismatches.every((m) => Number(m.delta || 0) > 0);
+                if (excessOnly && hasOnlineDevice.value && autoRescannedJobId !== job.value.jobId) {
+                    // Desktop VRCX may have appended fresh rows during a multi-minute upload; refresh
+                    // the desktop inventory once before flagging excess duplicates.
+                    autoRescannedJobId = job.value.jobId;
+                    refreshDesktopInventoryQuietly().then(() => {
+                        if (job.value?.status === 'completed') {
+                            toast.success(t('cloud_hub.migration.job_completed_toast'));
+                        } else if (job.value?.status === 'incomplete_mismatch') {
+                            toast.warning(t('cloud_hub.migration.job_mismatch_toast'));
+                        }
+                    });
+                } else {
+                    toast.warning(t('cloud_hub.migration.job_mismatch_toast'));
+                }
             }
         } catch (err) {
             if (!silent) {
@@ -967,9 +1004,47 @@
         }
     }
 
+    async function refreshDesktopInventoryQuietly(timeoutMs = 15_000) {
+        if (!hasOnlineDevice.value) return false;
+        const beforeScannedAt = inventory.value?.scannedAt || '';
+        const startedAtMs = Date.now();
+        try {
+            await cloudFetch('/api/migration/scan', {
+                method: 'POST',
+                json: { deviceId: selectedDeviceId.value || inventory.value?.deviceId || undefined }
+            });
+        } catch {
+            return false;
+        }
+        while (Date.now() - startedAtMs < timeoutMs) {
+            await new Promise((resolve) => setTimeout(resolve, 1000));
+            await loadMigrationState({ silent: true });
+            if (inventory.value?.scannedAt && inventory.value.scannedAt !== beforeScannedAt) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     async function repairMismatchedCategories() {
-        const targets = mismatchedCategoryItems.value.map((item) => item.key);
+        if (startingJob.value) return;
+        let targets = mismatchedCategoryItems.value.map((item) => item.key);
         if (targets.length === 0) return;
+        // Refresh the desktop SQLite inventory first when the Agent is online so newly added
+        // desktop rows since the last scan are never misreported as excess cloud duplicates.
+        if (hasOnlineDevice.value) {
+            startingJob.value = true;
+            try {
+                await refreshDesktopInventoryQuietly();
+            } finally {
+                startingJob.value = false;
+            }
+            targets = mismatchedCategoryItems.value.map((item) => item.key);
+            if (targets.length === 0) {
+                toast.success(t('cloud_hub.migration.already_synced_toast'));
+                return;
+            }
+        }
         resetSelectionsToOff();
         for (const key of targets) {
             selectedCategories[key] = true;

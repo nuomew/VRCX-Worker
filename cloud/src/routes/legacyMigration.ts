@@ -1529,15 +1529,16 @@ function evaluateMigrationCategoryMismatches(
         totalShortfall <= skippedRows;
 
     const hasBlockingMismatch = !explainedByFullDedup;
+    if (!hasBlockingMismatch) {
+        return { mismatches: [], hasBlockingMismatch: false, summaryMessage: '' };
+    }
     const summaryParts = mismatches.map((m) => {
         if (m.delta < 0) {
             return `${m.category}: cloud ${m.cloudRows.toLocaleString()} / desktop ${m.desktopRows.toLocaleString()} (missing ${(-m.delta).toLocaleString()})`;
         }
         return `${m.category}: cloud ${m.cloudRows.toLocaleString()} / desktop ${m.desktopRows.toLocaleString()} (+${m.delta.toLocaleString()} extra)`;
     });
-    const summaryMessage = hasBlockingMismatch
-        ? `Cloud row count does not match desktop database — ${summaryParts.join('; ')}.`
-        : '';
+    const summaryMessage = `Cloud row count does not match desktop database — ${summaryParts.join('; ')}.`;
 
     return { mismatches, hasBlockingMismatch, summaryMessage };
 }
@@ -1679,7 +1680,7 @@ async function ingestLegacyCategoryBatch(
     legacyDb: D1Database,
     category: LegacyCategory,
     items: Array<Record<string, unknown>>,
-    options: { externalMysqlActive?: boolean; batchTextClean?: boolean; rawPayloadBytes?: number } = {}
+    options: { externalMysqlActive?: boolean; batchTextClean?: boolean; rawPayloadBytes?: number; bulkDedupScope?: string } = {}
 ): Promise<{ inserted: number; skipped: number; legacyDbBytes: number }> {
     const effectiveChunkMaxBytes = options.externalMysqlActive ? EXTERNAL_MYSQL_CHUNK_MAX_BYTES : COMPACT_CHUNK_MAX_BYTES;
     const effectiveStoredMaxBytes = options.externalMysqlActive ? EXTERNAL_MYSQL_STORED_PAYLOAD_MAX_BYTES : 0;
@@ -1730,9 +1731,9 @@ async function ingestLegacyCategoryBatch(
     const resolveCreatedAt = (rawTs: unknown): string => {
         const s = asStr(rawTs, 64).trim();
         if (s) return s;
-        // Generate distinct fallback timestamps within the batch so legacy rows with blank created_at
-        // are never collapsed together by in-batch deduplication keys.
-        return new Date(nowMs + missingTsSeq++).toISOString();
+        // Deterministic per-batch fallback timestamps keep retries byte-identical (same chunk_key)
+        // while preserving distinct rows with blank created_at and staying below the 2014 date-index floor.
+        return new Date(missingTsSeq++).toISOString();
     };
 
     for (const raw of items) {
@@ -2172,6 +2173,7 @@ async function ingestLegacyCategoryBatch(
             maxStoredBytes: effectiveStoredMaxBytes,
             negateRowIds: true,
             bulkMigration: true,
+            bulkDedupScope: options.bulkDedupScope,
             skipGzipForHugeBatch
         });
         inserted += res.inserted;
@@ -2201,6 +2203,7 @@ async function ingestLegacyCategoryBatch(
             maxStoredBytes: effectiveStoredMaxBytes,
             negateRowIds: true,
             bulkMigration: true,
+            bulkDedupScope: options.bulkDedupScope,
             skipGzipForHugeBatch
         });
         inserted += res.inserted;
@@ -2256,7 +2259,8 @@ async function ingestLegacyCategoryBatch(
             maxJsonBytes: effectiveChunkMaxBytes,
             maxStoredBytes: effectiveStoredMaxBytes,
             negateRowIds: true,
-            bulkMigration: true
+            bulkMigration: true,
+            bulkDedupScope: options.bulkDedupScope
         });
         inserted += res.inserted;
         if (res.sizeAfter > legacyDbBytes) legacyDbBytes = res.sizeAfter;
@@ -2564,7 +2568,12 @@ export async function handleLegacyMigrationAgentRoutes(
                     legacyDb,
                     category,
                     rawItems as Array<Record<string, unknown>>,
-                    { externalMysqlActive, batchTextClean, rawPayloadBytes: rawBytes.byteLength }
+                    {
+                        externalMysqlActive,
+                        batchTextClean,
+                        rawPayloadBytes: rawBytes.byteLength,
+                        bulkDedupScope: jobId
+                    }
                 );
                 inserted = result.inserted;
                 skipped = result.skipped;

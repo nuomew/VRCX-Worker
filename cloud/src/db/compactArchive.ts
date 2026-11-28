@@ -1144,7 +1144,60 @@ async function buildEncodedChunkSlices(
     return encoded;
 }
 
-export async function appendTuplesToCompactTailChunk(options: {
+const RECENT_BULK_DEDUP_TTL_MS = 45_000;
+const RECENT_BULK_DEDUP_MAX_KEYS_PER_SCOPE = 2000;
+const RECENT_BULK_DEDUP_MAX_SCOPES = 16;
+
+interface RecentBulkDedupBucket {
+    updatedAt: number;
+    keys: Set<string>;
+}
+
+const recentBulkDedupCache = new Map<string, RecentBulkDedupBucket>();
+
+function pruneRecentBulkDedupCache(nowMs: number): void {
+    for (const [k, bucket] of recentBulkDedupCache.entries()) {
+        if (nowMs - bucket.updatedAt > RECENT_BULK_DEDUP_TTL_MS) {
+            recentBulkDedupCache.delete(k);
+        }
+    }
+    while (recentBulkDedupCache.size > RECENT_BULK_DEDUP_MAX_SCOPES) {
+        const oldestKey = recentBulkDedupCache.keys().next().value;
+        if (oldestKey === undefined) break;
+        recentBulkDedupCache.delete(oldestKey);
+    }
+}
+
+function getRecentBulkDedupKeys(scopeKey: string, nowMs: number): Set<string> | null {
+    const bucket = recentBulkDedupCache.get(scopeKey);
+    if (!bucket) return null;
+    if (nowMs - bucket.updatedAt > RECENT_BULK_DEDUP_TTL_MS) {
+        recentBulkDedupCache.delete(scopeKey);
+        return null;
+    }
+    return bucket.keys;
+}
+
+function recordRecentBulkDedupKeys(scopeKey: string, keys: Iterable<string>, nowMs: number): void {
+    pruneRecentBulkDedupCache(nowMs);
+    let bucket = recentBulkDedupCache.get(scopeKey);
+    if (!bucket) {
+        bucket = { updatedAt: nowMs, keys: new Set<string>() };
+        recentBulkDedupCache.set(scopeKey, bucket);
+    } else {
+        bucket.updatedAt = nowMs;
+    }
+    for (const k of keys) {
+        if (!k) continue;
+        if (bucket.keys.size >= RECENT_BULK_DEDUP_MAX_KEYS_PER_SCOPE) {
+            const oldest = bucket.keys.values().next().value;
+            if (oldest !== undefined) bucket.keys.delete(oldest);
+        }
+        bucket.keys.add(k);
+    }
+}
+
+export function appendTuplesToCompactTailChunk(options: {
     db: D1Database;
     archiveTable: CompactArchiveTableName;
     kindColumn: 'feed_kind' | 'gamelog_kind' | 'core_kind' | null;
@@ -1175,10 +1228,37 @@ export async function appendTuplesToCompactTailChunk(options: {
      */
     bulkMigration?: boolean;
     /**
+     * Optional per-job scope token (e.g. `jobId`) enabling zero-SQL in-memory dedup across immediate
+     * 503/1102 adaptive half-split retries within the same migration job without cross-job interference.
+     */
+    bulkDedupScope?: string;
+    /**
      * Skips synchronous gzip on oversized legacy batches (e.g. legacy Agent v1.14.2 1,000-row / 512 KiB
      * payloads where JSON.parse + SHA-256 already consume ~4.5ms), storing <=36 KiB raw JSON slices directly
      * so total request CPU stays strictly below Cloudflare Workers Free's 10ms limit (Error 1102).
      */
+    skipGzipForHugeBatch?: boolean;
+}): Promise<AppendTailChunkResult>;
+export async function appendTuplesToCompactTailChunk(options: {
+    db: D1Database;
+    archiveTable: CompactArchiveTableName;
+    kindColumn: 'feed_kind' | 'gamelog_kind' | 'core_kind' | null;
+    kindValue: string;
+    tuples: unknown[][];
+    inputIndices?: number[];
+    dedupKeyFn: (tuple: unknown[]) => string;
+    mergeConflictTuple?: (existing: unknown[], incoming: unknown[]) => unknown[] | null;
+    fallbackIso?: string;
+    maxRows?: number;
+    maxJsonBytes?: number;
+    maxStoredBytes?: number;
+    negateRowIds?: boolean;
+    filterFreshTuples?: (
+        existingRecentTuples: unknown[][],
+        incomingFresh: Array<{ tuple: unknown[]; inputIndex: number }>
+    ) => Array<{ tuple: unknown[]; inputIndex: number }>;
+    bulkMigration?: boolean;
+    bulkDedupScope?: string;
     skipGzipForHugeBatch?: boolean;
 }): Promise<AppendTailChunkResult> {
     const {
@@ -1194,6 +1274,7 @@ export async function appendTuplesToCompactTailChunk(options: {
         maxRows = COMPACT_CHUNK_MAX_ROWS,
         negateRowIds = false,
         bulkMigration = false,
+        bulkDedupScope = '',
         skipGzipForHugeBatch = false
     } = options;
     const isExternalMysqlTarget = isHybridMysqlD1Database(db);
@@ -1271,12 +1352,42 @@ export async function appendTuplesToCompactTailChunk(options: {
                 estBatchBytes += estimateTupleJsonBytes(batchDeduped[i]!.tuple);
             }
             shouldUseFastPath =
-                batchDeduped.length >= Math.max(1, Math.floor(maxRows * 0.25)) ||
+                batchDeduped.length >= Math.min(100, Math.max(1, Math.floor(maxRows * 0.25))) ||
                 estBatchBytes >= Math.max(4096, Math.floor(maxJsonBytes * 0.25));
         }
         if (shouldUseFastPath) {
+            const nowMs = Date.now();
+            const dedupScopeKey = bulkDedupScope ? `${bulkDedupScope}|${archiveTable}|${kindValue}` : '';
+            let effectiveBatch = batchDeduped;
+            let preSkippedFast = batchSkipped;
+
+            // Zero-SQL job-scoped sliding dedup: catches immediate 503/1102 adaptive half-split retries
+            // (70+70 / 35+35 rows whose chunk_key differs from the already-persisted 140-row chunk)
+            // with O(1) memory lookup and ZERO extra MySQL/D1 SELECT queries (anti-1102 safe).
+            if (dedupScopeKey && effectiveBatch.length > 0) {
+                const seenKeys = getRecentBulkDedupKeys(dedupScopeKey, nowMs);
+                if (seenKeys && seenKeys.size > 0) {
+                    const filtered: typeof effectiveBatch = [];
+                    for (const item of effectiveBatch) {
+                        if (item.key && seenKeys.has(item.key)) {
+                            preSkippedFast++;
+                            continue;
+                        }
+                        filtered.push(item);
+                    }
+                    effectiveBatch = filtered;
+                }
+            }
+
+            if (effectiveBatch.length === 0) {
+                return {
+                    ...emptyResult,
+                    skipped: preSkippedFast
+                };
+            }
+
             const slices = await buildEncodedChunkSlices(
-                batchDeduped.map((x) => x.tuple),
+                effectiveBatch.map((x) => x.tuple),
                 kindValue,
                 fallbackIso,
                 maxRows,
@@ -1319,8 +1430,9 @@ export async function appendTuplesToCompactTailChunk(options: {
             let lastChunkIdFast = 0;
             let lastVirtualRowIdFast = 0;
             let sizeAfterFast = 0;
-            let duplicateCountFast = batchSkipped;
+            let duplicateCountFast = preSkippedFast;
             const insertedTuplesFast: unknown[][] = [];
+            const insertedKeysFast: string[] = [];
             const insertedRowIdsByInputIndexFast = new Map<number, number>();
             for (let sIdx = 0; sIdx < results.length; sIdx++) {
                 const r = results[sIdx]!;
@@ -1334,17 +1446,21 @@ export async function appendTuplesToCompactTailChunk(options: {
                     if (cid > 0) lastChunkIdFast = cid;
                     for (let rIdx = 0; rIdx < meta.rows.length; rIdx++) {
                         const tuple = meta.rows[rIdx]!;
-                        const origInputIndex = batchDeduped[meta.startOffset + rIdx]!.inputIndex;
+                        const entry = effectiveBatch[meta.startOffset + rIdx]!;
                         insertedTuplesFast.push(tuple);
+                        if (entry.key) insertedKeysFast.push(entry.key);
                         if (cid > 0) {
                             const vrid = computeVirtualRowId(cid, rIdx);
-                            insertedRowIdsByInputIndexFast.set(origInputIndex, vrid);
+                            insertedRowIdsByInputIndexFast.set(entry.inputIndex, vrid);
                             lastVirtualRowIdFast = vrid;
                         }
                     }
                 } else {
                     duplicateCountFast += meta.rows.length;
                 }
+            }
+            if (dedupScopeKey && insertedKeysFast.length > 0) {
+                recordRecentBulkDedupKeys(dedupScopeKey, insertedKeysFast, nowMs);
             }
             return {
                 inserted: insertedTuplesFast.length,

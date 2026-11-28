@@ -4278,6 +4278,265 @@ describe('External MySQL 5.7+ Database Integration (Hybrid New-Writes Mode & Ful
         }
     });
 
+    it('prevents duplicate rows on 503/1102 half-split retries, blank-timestamp retries, and reconciles cleanly after fresh desktop scan', async () => {
+        await ensureSchemaReady(env);
+        const legacyDb = env.DB_LEGACY!;
+        const fakeMysql = new FakeMysql57Server();
+        setMysqlConnectionFactoryForTests(async () => fakeMysql.createConnection());
+        clearMysqlSchemaReadyCache();
+        invalidateExternalDbConfigCache();
+
+        const webHeaders = { 'Content-Type': 'application/json', Origin: 'http://example.com' };
+        const accountPrefix = 'usrsplitretry000000000000000000001';
+        let deviceId = '';
+
+        try {
+            const saveRes = await exports.default.fetch('http://example.com/api/storage/mysql/config', {
+                method: 'PUT',
+                headers: webHeaders,
+                body: JSON.stringify({
+                    enabled: true,
+                    mode: 'new_writes_only',
+                    connectionType: 'direct',
+                    host: 'mysql-split-retry.example.com',
+                    port: 3306,
+                    database: 'vrcx_split_test',
+                    username: 'vrcx_user',
+                    password: 'secret-split-retry-pw',
+                    sslMode: 'disabled',
+                    tablePrefix: 'vrcx_'
+                })
+            });
+            expect(saveRes.status).toBe(200);
+
+            const keyRes = await exports.default.fetch('http://example.com/api/agent/sync-key', {
+                method: 'POST',
+                headers: webHeaders,
+                body: JSON.stringify({ deviceName: 'Desktop-SplitTest' })
+            });
+            expect(keyRes.status).toBe(200);
+            const keyJson = (await keyRes.json()) as { data: { deviceId: string; syncKey: string } };
+            deviceId = keyJson.data.deviceId;
+            const agentHeaders = {
+                Authorization: `Bearer ${keyJson.data.syncKey}`,
+                'X-Device-Id': deviceId,
+                'Content-Type': 'application/json'
+            };
+
+            // 1. Upload an older desktop inventory (140 rows), while live desktop actually grew to 144 rows (with 2 in-table duplicates)
+            const staleInvRes = await exports.default.fetch('http://example.com/api/agent/migration/inventory', {
+                method: 'POST',
+                headers: agentHeaders,
+                body: JSON.stringify({
+                    deviceName: 'Desktop-SplitTest',
+                    dbFound: true,
+                    dbFileName: 'VRCX.sqlite3',
+                    dbFileBytes: 12 * 1024 * 1024,
+                    sharedCategories: [],
+                    accounts: [
+                        {
+                            prefix: accountPrefix,
+                            label: 'Split Test Account',
+                            categories: [{ key: 'feed', rowCount: 140, rawBytes: 28000, tables: [`${accountPrefix}_feed_gps`] }]
+                        }
+                    ]
+                })
+            });
+            expect(staleInvRes.status).toBe(200);
+
+            const startRes = await exports.default.fetch('http://example.com/api/migration/start', {
+                method: 'POST',
+                headers: webHeaders,
+                body: JSON.stringify({
+                    deviceId,
+                    accountPrefix,
+                    categories: ['feed'],
+                    concurrency: 4,
+                    resume: false
+                })
+            });
+            expect(startRes.status).toBe(200);
+            const jobId = ((await startRes.json()) as { data: { job: { jobId: string } } }).data.job.jobId;
+
+            // 2. Upload 140-row batch (including 2 blank created_at rows)
+            const batch140 = Array.from({ length: 140 }, (_, i) => ({
+                type: 'GPS',
+                created_at:
+                    i < 2
+                        ? ''
+                        : `2026-06-01T${String(Math.floor(i / 60)).padStart(2, '0')}:${String(i % 60).padStart(2, '0')}:00.000Z`,
+                userId: `usr_split_${i}`,
+                displayName: `Friend ${i}`,
+                location: `wrld_split:${i}`,
+                worldName: `Split World ${i}`,
+                previousLocation: '',
+                time: 30,
+                groupName: ''
+            }));
+            const r1 = await exports.default.fetch('http://example.com/api/agent/migration/batch', {
+                method: 'POST',
+                headers: agentHeaders,
+                body: JSON.stringify({ jobId, category: 'feed', items: batch140, categoryDone: false, allDone: false })
+            });
+            expect(r1.status).toBe(200);
+            expect(((await r1.json()) as { data: { inserted: number } }).data.inserted).toBe(140);
+
+            // 3. Exact retry of the same 140-row batch (must stay idempotent even with blank created_at rows!)
+            const rRetryExact = await exports.default.fetch('http://example.com/api/agent/migration/batch', {
+                method: 'POST',
+                headers: agentHeaders,
+                body: JSON.stringify({ jobId, category: 'feed', items: batch140, categoryDone: false, allDone: false })
+            });
+            expect(rRetryExact.status).toBe(200);
+            const rRetryExactJson = (await rRetryExact.json()) as { data: { inserted: number; skipped: number } };
+            expect(rRetryExactJson.data.inserted).toBe(0);
+            expect(rRetryExactJson.data.skipped).toBe(140);
+
+            // 4. Simulated 503/1102 adaptive half-split retry (70 + 70 rows) MUST insert 0 duplicate rows
+            const left70 = batch140.slice(0, 70);
+            const right70 = batch140.slice(70);
+            const rLeft = await exports.default.fetch('http://example.com/api/agent/migration/batch', {
+                method: 'POST',
+                headers: agentHeaders,
+                body: JSON.stringify({ jobId, category: 'feed', items: left70, categoryDone: false, allDone: false })
+            });
+            expect(rLeft.status).toBe(200);
+            expect(((await rLeft.json()) as { data: { inserted: number; skipped: number } }).data).toMatchObject({
+                inserted: 0,
+                skipped: 70
+            });
+            const rRight = await exports.default.fetch('http://example.com/api/agent/migration/batch', {
+                method: 'POST',
+                headers: agentHeaders,
+                body: JSON.stringify({ jobId, category: 'feed', items: right70, categoryDone: false, allDone: false })
+            });
+            expect(rRight.status).toBe(200);
+            expect(((await rRight.json()) as { data: { inserted: number; skipped: number } }).data).toMatchObject({
+                inserted: 0,
+                skipped: 70
+            });
+
+            // 5. Upload 4 newly appended desktop rows (2 unique + 2 exact in-table duplicates) and finalize
+            const tail4 = [
+                {
+                    type: 'GPS',
+                    created_at: '2026-06-02T01:00:00.000Z',
+                    userId: 'usr_new_1',
+                    displayName: 'New 1',
+                    location: 'wrld_new:1',
+                    worldName: 'New World 1',
+                    previousLocation: '',
+                    time: 10,
+                    groupName: ''
+                },
+                {
+                    type: 'GPS',
+                    created_at: '2026-06-02T01:00:00.000Z',
+                    userId: 'usr_new_1',
+                    displayName: 'New 1',
+                    location: 'wrld_new:1',
+                    worldName: 'New World 1',
+                    previousLocation: '',
+                    time: 10,
+                    groupName: ''
+                },
+                {
+                    type: 'GPS',
+                    created_at: '2026-06-02T01:05:00.000Z',
+                    userId: 'usr_new_2',
+                    displayName: 'New 2',
+                    location: 'wrld_new:2',
+                    worldName: 'New World 2',
+                    previousLocation: '',
+                    time: 20,
+                    groupName: ''
+                },
+                {
+                    type: 'GPS',
+                    created_at: '2026-06-02T01:05:00.000Z',
+                    userId: 'usr_new_2',
+                    displayName: 'New 2',
+                    location: 'wrld_new:2',
+                    worldName: 'New World 2',
+                    previousLocation: '',
+                    time: 20,
+                    groupName: ''
+                }
+            ];
+            const rTail = await exports.default.fetch('http://example.com/api/agent/migration/batch', {
+                method: 'POST',
+                headers: agentHeaders,
+                body: JSON.stringify({
+                    jobId,
+                    category: 'feed',
+                    items: tail4,
+                    categoryDone: true,
+                    allDone: true,
+                    cursorUpdate: { table: 'feed_gps', createdAt: '2026-06-02T01:05:00.000Z', rowId: 144, completed: true, rowsDone: 144 }
+                })
+            });
+            expect(rTail.status).toBe(200);
+            expect(((await rTail.json()) as { data: { inserted: number; skipped: number } }).data).toMatchObject({
+                inserted: 2,
+                skipped: 2
+            });
+
+            // Against stale 140-row inventory, state initially surfaces +2 excess (142 cloud vs 140 stale desktop)
+            const staleStateRes = await exports.default.fetch('http://example.com/api/migration/state');
+            const staleStateJson = (await staleStateRes.json()) as {
+                data: { importedStats: Record<string, number>; job: { status: string; mismatches?: unknown[] } };
+            };
+            expect(staleStateJson.data.importedStats.feed).toBe(142);
+            expect(staleStateJson.data.job.status).toBe('incomplete_mismatch');
+
+            // 6. Once desktop re-scans and reports true 144 rows, /api/migration/state immediately reconciles
+            // 142 cloud + 2 deduped === 144 desktop -> completed with ZERO residual mismatch banner
+            const freshInvRes = await exports.default.fetch('http://example.com/api/agent/migration/inventory', {
+                method: 'POST',
+                headers: agentHeaders,
+                body: JSON.stringify({
+                    deviceName: 'Desktop-SplitTest',
+                    dbFound: true,
+                    dbFileName: 'VRCX.sqlite3',
+                    dbFileBytes: 12 * 1024 * 1024,
+                    sharedCategories: [],
+                    accounts: [
+                        {
+                            prefix: accountPrefix,
+                            label: 'Split Test Account',
+                            categories: [{ key: 'feed', rowCount: 144, rawBytes: 28800, tables: [`${accountPrefix}_feed_gps`] }]
+                        }
+                    ]
+                })
+            });
+            expect(freshInvRes.status).toBe(200);
+
+            const freshStateRes = await exports.default.fetch('http://example.com/api/migration/state');
+            const freshStateJson = (await freshStateRes.json()) as {
+                data: { importedStats: Record<string, number>; job: { status: string; mismatches?: unknown[] } };
+            };
+            expect(freshStateJson.data.importedStats.feed).toBe(142);
+            expect(freshStateJson.data.job.status).toBe('completed');
+            expect(freshStateJson.data.job.mismatches ?? []).toHaveLength(0);
+        } finally {
+            setMysqlConnectionFactoryForTests(null);
+            await legacyDb.batch([
+                legacyDb.prepare('DELETE FROM legacy_configs'),
+                legacyDb.prepare('DELETE FROM legacy_migration_state')
+            ]).catch(() => {});
+            if (deviceId) {
+                await env.DB_CORE.batch([
+                    env.DB_CORE.prepare('DELETE FROM cloud_devices WHERE device_id = ?').bind(deviceId),
+                    env.DB_CORE.prepare('DELETE FROM cloud_commands WHERE device_id = ?').bind(deviceId)
+                ]).catch(() => {});
+            }
+            await saveExternalDbConfig(env, defaultExternalDbConfig());
+            await saveExternalDbMigrationState(env, defaultExternalDbMigrationState());
+            invalidateExternalDbConfigCache();
+            clearMysqlSchemaReadyCache();
+        }
+    });
+
     it('keeps high-entropy bio batches, trailing small batches, and business-table batches within strict CPU & 40 KiB packet budgets (anti-1102)', async () => {
         await ensureSchemaReady(env);
         const legacyDb = env.DB_LEGACY!;
