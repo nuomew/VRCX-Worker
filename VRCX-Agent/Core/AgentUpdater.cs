@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Net;
 using System.Net.Http;
 using System.Security.Cryptography;
 using System.Text.RegularExpressions;
@@ -38,6 +39,7 @@ public sealed class AgentUpdater
     public const string ReleasesPageUrl = "https://github.com/nuomew/VRCX-Worker/releases";
     public const string LatestApiUrl = "https://api.github.com/repos/nuomew/VRCX-Worker/releases/latest";
     public const string LatestWebRedirectUrl = "https://github.com/nuomew/VRCX-Worker/releases/latest";
+    public static readonly TimeSpan AutoUpdateCheckInterval = TimeSpan.FromMinutes(10);
 
     private static readonly Regex SemVerRegex = new(@"^v?(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$", RegexOptions.IgnoreCase | RegexOptions.Compiled);
     private static readonly Regex TagInUrlRegex = new(@"/releases/tag/(v?\d+\.\d+\.\d+)(?:[/?#""'<\s]|$)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
@@ -52,6 +54,9 @@ public sealed class AgentUpdater
 
     private readonly Func<HttpClient> _httpProvider;
     private readonly Func<HttpClient>? _downloadHttpFactory;
+    private readonly object _cacheLock = new();
+    private string _cachedApiEtag = string.Empty;
+    private AgentReleaseInfo? _cachedApiRelease;
 
     public AgentUpdater(HttpClient httpClient)
     {
@@ -63,6 +68,36 @@ public sealed class AgentUpdater
     {
         _httpProvider = httpProvider;
         _downloadHttpFactory = downloadHttpFactory;
+    }
+
+    /// <summary>
+    /// Clears cached GitHub API ETag/release metadata so the next check fetches fresh data.
+    /// </summary>
+    public void ClearCache()
+    {
+        lock (_cacheLock)
+        {
+            _cachedApiEtag = string.Empty;
+            _cachedApiRelease = null;
+        }
+    }
+
+    /// <summary>
+    /// Returns true strictly when background auto-update is enabled, this is an Inno Setup installation,
+    /// and the release has a newer version with a trusted download URL and valid SHA-256 digest.
+    /// </summary>
+    public static bool ShouldAutoDownloadAndInstall(
+        bool autoUpdateEnabled,
+        bool isInstalledBuild,
+        AgentReleaseInfo? release)
+    {
+        return autoUpdateEnabled &&
+               isInstalledBuild &&
+               release != null &&
+               release.IsUpdateAvailable &&
+               !string.IsNullOrWhiteSpace(release.SetupDownloadUrl) &&
+               IsTrustedDownloadUrl(release.SetupDownloadUrl) &&
+               IsValidSha256(release.ExpectedSha256);
     }
 
     /// <summary>
@@ -150,11 +185,21 @@ public sealed class AgentUpdater
             return string.Empty;
         }
         string escapedName = Regex.Escape(assetFileName);
-        var pattern = new Regex(
-            escapedName + @"[^\r\n]{0,80}?\b([0-9a-fA-F]{64})\b",
+        var sameLinePattern = new Regex(
+            escapedName + @"[^\r\n]{0,120}?\b([0-9a-fA-F]{64})\b",
             RegexOptions.IgnoreCase);
-        Match m = pattern.Match(text);
-        return m.Success ? m.Groups[1].Value.ToLowerInvariant() : string.Empty;
+        Match m = sameLinePattern.Match(text);
+        if (m.Success)
+        {
+            return m.Groups[1].Value.ToLowerInvariant();
+        }
+
+        // Fallback when GitHub wraps rendered HTML elements across lines inside the same list item
+        var wrappedMarkupPattern = new Regex(
+            escapedName + @"(?:</?(?:code|strong|span|em|a)\b[^>]*>|[\s:`\-]){0,20}\b([0-9a-fA-F]{64})\b",
+            RegexOptions.IgnoreCase);
+        Match wrapped = wrappedMarkupPattern.Match(text);
+        return wrapped.Success ? wrapped.Groups[1].Value.ToLowerInvariant() : string.Empty;
     }
 
     /// <summary>
@@ -249,30 +294,79 @@ public sealed class AgentUpdater
         };
     }
 
+    private static AgentReleaseInfo CloneForVersion(AgentReleaseInfo source, string currentVersion)
+    {
+        return new AgentReleaseInfo
+        {
+            TagName = source.TagName,
+            VersionText = source.VersionText,
+            HtmlUrl = source.HtmlUrl,
+            SetupFileName = source.SetupFileName,
+            SetupDownloadUrl = source.SetupDownloadUrl,
+            ExpectedSha256 = source.ExpectedSha256,
+            FileSizeBytes = source.FileSizeBytes,
+            ReleaseNotes = source.ReleaseNotes,
+            IsUpdateAvailable = IsNewerVersion(currentVersion, source.TagName),
+            UsedFallbackRedirect = source.UsedFallbackRedirect
+        };
+    }
+
     /// <summary>
-    /// Queries GitHub Releases for the latest version. Falls back to `/releases/latest` redirect
-    /// when `api.github.com` is rate-limited (HTTP 403/429 on shared proxy exit IPs).
+    /// Queries GitHub Releases for the latest version using conditional ETag (`If-None-Match`) caching
+    /// so periodic 10-minute checks consume zero anonymous API quota when unchanged. Falls back to
+    /// `/releases/latest` redirect when `api.github.com` is rate-limited (HTTP 403/429 on shared proxy IPs).
     /// </summary>
-    public async Task<AgentReleaseInfo> CheckForUpdateAsync(string currentVersion, CancellationToken ct)
+    public async Task<AgentReleaseInfo> CheckForUpdateAsync(
+        string currentVersion,
+        CancellationToken ct,
+        bool bypassCache = false)
     {
         HttpClient http = _httpProvider();
         string userAgent = $"VRCX.Agent/{currentVersion} (+https://github.com/{RepoOwner}/{RepoName})";
 
+        string cachedEtag = string.Empty;
+        AgentReleaseInfo? cachedRelease = null;
+        if (!bypassCache)
+        {
+            lock (_cacheLock)
+            {
+                cachedEtag = _cachedApiEtag;
+                cachedRelease = _cachedApiRelease;
+            }
+        }
+
         try
         {
             using var apiCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-            apiCts.CancelAfter(TimeSpan.FromSeconds(10));
+            apiCts.CancelAfter(TimeSpan.FromSeconds(12));
             using var apiReq = new HttpRequestMessage(HttpMethod.Get, LatestApiUrl);
             apiReq.Headers.TryAddWithoutValidation("User-Agent", userAgent);
             apiReq.Headers.TryAddWithoutValidation("Accept", "application/vnd.github+json");
+            if (!string.IsNullOrEmpty(cachedEtag) && cachedRelease != null)
+            {
+                apiReq.Headers.TryAddWithoutValidation("If-None-Match", cachedEtag);
+            }
 
             using HttpResponseMessage apiRes = await http.SendAsync(apiReq, apiCts.Token).ConfigureAwait(false);
+            if (apiRes.StatusCode == HttpStatusCode.NotModified && cachedRelease != null)
+            {
+                return CloneForVersion(cachedRelease, currentVersion);
+            }
             if (apiRes.IsSuccessStatusCode)
             {
                 string json = await apiRes.Content.ReadAsStringAsync(apiCts.Token).ConfigureAwait(false);
                 AgentReleaseInfo? parsed = ParseReleaseApiJson(json, currentVersion);
                 if (parsed != null)
                 {
+                    string? etag = apiRes.Headers.ETag?.ToString();
+                    if (!string.IsNullOrWhiteSpace(etag))
+                    {
+                        lock (_cacheLock)
+                        {
+                            _cachedApiEtag = etag;
+                            _cachedApiRelease = CloneForVersion(parsed, currentVersion);
+                        }
+                    }
                     return parsed;
                 }
             }

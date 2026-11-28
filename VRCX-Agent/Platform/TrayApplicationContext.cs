@@ -45,10 +45,13 @@ public sealed class TrayApplicationContext : ApplicationContext
     private readonly SemaphoreSlim _syncLock = new(1, 1);
     private readonly SemaphoreSlim _chatOscSyncLock = new(1, 1);
     private readonly SemaphoreSlim _updateCheckLock = new(1, 1);
+    private readonly SemaphoreSlim _autoUpdateWakeSignal = new(0, 1);
     private readonly object _configLock = new();
     private readonly object _migrationLock = new();
+    private readonly object _autoUpdateDownloadLock = new();
     private readonly CancellationTokenSource _cts = new();
     private CancellationTokenSource? _activeMigrationCts;
+    private CancellationTokenSource? _autoUpdateDownloadCts;
     private string _activeMigrationJobId = string.Empty;
 
     private readonly NotifyIcon _trayIcon;
@@ -60,6 +63,7 @@ public sealed class TrayApplicationContext : ApplicationContext
     private readonly ToolStripMenuItem _syncScreenshotsItem;
     private readonly ToolStripMenuItem _compressScreenshotsItem;
     private readonly ToolStripMenuItem _autoStartItem;
+    private readonly ToolStripMenuItem _autoUpdateItem;
     private readonly ToolStripMenuItem _checkUpdateItem;
     private readonly System.Windows.Forms.Timer _singleClickTimer;
     private readonly SynchronizationContext? _uiSyncContext;
@@ -77,9 +81,8 @@ public sealed class TrayApplicationContext : ApplicationContext
     private AgentReleaseInfo? _availableUpdate;
     private volatile bool _isAutoUpdating;
     private string _autoUpdatingTag = string.Empty;
-    private string _failedAutoUpdateTag = string.Empty;
     private string _lastNotifiedUpdateTag = string.Empty;
-    private string _pendingAutoInstallPath = string.Empty;
+    private volatile string _pendingAutoInstallPath = string.Empty;
     private bool _balloonPointsToUpdate;
     private long _lastDoubleClickMonoMs;
     private long _lastSyncSuccessUtcTicks;
@@ -189,6 +192,13 @@ public sealed class TrayApplicationContext : ApplicationContext
         };
         _autoStartItem.Click += (_, _) => ToggleAutoStart(_autoStartItem.Checked);
 
+        _autoUpdateItem = new ToolStripMenuItem(AgentStrings.MenuAutoUpdate)
+        {
+            CheckOnClick = true,
+            Checked = _config.AutoCheckUpdates
+        };
+        _autoUpdateItem.Click += (_, _) => ToggleAutoUpdate(_autoUpdateItem.Checked);
+
         _checkUpdateItem = new ToolStripMenuItem(AgentStrings.FormatMenuCheckUpdate(AgentMetadata.Version));
         _checkUpdateItem.Click += (_, _) => HandleCheckUpdateAction();
 
@@ -207,6 +217,7 @@ public sealed class TrayApplicationContext : ApplicationContext
         menu.Items.Add(AgentStrings.MenuOpenWebUi, null, (_, _) => OpenCloudWebUi());
         menu.Items.Add(AgentStrings.MenuExportCloudData, null, (_, _) => ShowCloudExportFlow());
         menu.Items.Add(_autoStartItem);
+        menu.Items.Add(_autoUpdateItem);
         menu.Items.Add(_checkUpdateItem);
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(AgentStrings.MenuExit, null, (_, _) => ShutdownAndExit());
@@ -1058,11 +1069,13 @@ public sealed class TrayApplicationContext : ApplicationContext
             {
                 bool wasScreenshotSyncEnabled;
                 bool wasCompressEnabled;
+                bool wasAutoCheckUpdatesEnabled;
                 AgentConfig savedCfg;
                 lock (_configLock)
                 {
                     wasScreenshotSyncEnabled = _config.AutoUploadScreenshots;
                     wasCompressEnabled = _config.CompressScreenshots;
+                    wasAutoCheckUpdatesEnabled = _config.AutoCheckUpdates;
                     _config = dialog.SavedConfig;
                     savedCfg = _config.Clone();
                     Interlocked.Increment(ref _configGeneration);
@@ -1081,11 +1094,21 @@ public sealed class TrayApplicationContext : ApplicationContext
                     autoStartFailed = !AgentConfigStore.SetAutoStartEnabled(dialog.AutoStartEnabled);
                 }
                 _autoStartItem.Checked = AgentConfigStore.IsAutoStartEnabled();
+                _autoUpdateItem.Checked = savedCfg.AutoCheckUpdates;
                 _proxyModeItem.Checked = savedCfg.ProxyEnabled;
                 _syncScreenshotsItem.Checked = savedCfg.AutoUploadScreenshots;
                 _compressScreenshotsItem.Checked = savedCfg.CompressScreenshots;
                 _compressScreenshotsItem.Enabled = savedCfg.AutoUploadScreenshots;
                 RebuildCloudHttpClient();
+                if (!savedCfg.AutoCheckUpdates)
+                {
+                    CancelInFlightAutoUpdate();
+                }
+                else if (!wasAutoCheckUpdatesEnabled)
+                {
+                    _updater.ClearCache();
+                    SignalAutoUpdateCheck();
+                }
                 _oscRealtimeClient.NotifyConfigChanged();
                 _consecutiveFailures = 0;
                 _lastSyncError = string.Empty;
@@ -1151,7 +1174,7 @@ public sealed class TrayApplicationContext : ApplicationContext
             _pendingAutoInstallPath = string.Empty;
             if (!string.IsNullOrWhiteSpace(deferredInstallPath) && !_isExiting && !_shutdownToken.IsCancellationRequested)
             {
-                if (File.Exists(deferredInstallPath))
+                if (GetConfigSnapshot().AutoCheckUpdates && File.Exists(deferredInstallPath))
                 {
                     LaunchDownloadedInstallerAndExit(deferredInstallPath);
                 }
@@ -1245,6 +1268,58 @@ public sealed class TrayApplicationContext : ApplicationContext
             AgentStrings.AppTitle,
             actual ? AgentStrings.BalloonAutoStartOn : AgentStrings.BalloonAutoStartOff,
             ToolTipIcon.Info);
+    }
+
+    private void ToggleAutoUpdate(bool enabled)
+    {
+        lock (_configLock)
+        {
+            AgentConfig next = _config.Clone();
+            next.AutoCheckUpdates = enabled;
+            _config = next;
+            _configStore.SaveConfig(next);
+        }
+        _autoUpdateItem.Checked = enabled;
+        if (enabled)
+        {
+            _updater.ClearCache();
+            SignalAutoUpdateCheck();
+        }
+        else
+        {
+            CancelInFlightAutoUpdate();
+        }
+        _balloonPointsToUpdate = false;
+        _trayIcon.ShowBalloonTip(
+            3000,
+            AgentStrings.AppTitle,
+            enabled ? AgentStrings.BalloonAutoUpdateOn : AgentStrings.BalloonAutoUpdateOff,
+            ToolTipIcon.Info);
+    }
+
+    private void SignalAutoUpdateCheck()
+    {
+        try
+        {
+            if (_autoUpdateWakeSignal.CurrentCount == 0)
+            {
+                _autoUpdateWakeSignal.Release();
+            }
+        }
+        catch
+        {
+            // Ignore race if already signaled or shutting down
+        }
+    }
+
+    private void CancelInFlightAutoUpdate()
+    {
+        _pendingAutoInstallPath = string.Empty;
+        lock (_autoUpdateDownloadLock)
+        {
+            try { _autoUpdateDownloadCts?.Cancel(); } catch { /* ignore */ }
+        }
+        RunOnUiThread(RestoreCheckUpdateMenuText);
     }
 
     private void OnLocalOscChatCaptured()
@@ -1447,8 +1522,12 @@ public sealed class TrayApplicationContext : ApplicationContext
         _cloudHttp = nextCloud;
         _screenshotHttp = nextScreenshot;
         _oscRealtimeClient.NotifyConfigChanged();
-        _failedAutoUpdateTag = string.Empty;
+        _updater.ClearCache();
         _availableUpdate = null;
+        if (updatedCfg.AutoCheckUpdates)
+        {
+            SignalAutoUpdateCheck();
+        }
         _ = Task.Delay(TimeSpan.FromSeconds(45)).ContinueWith(_ => oldClient.Dispose());
         _ = Task.Delay(TimeSpan.FromSeconds(190)).ContinueWith(_ => oldScreenshotClient.Dispose());
 
@@ -1471,9 +1550,13 @@ public sealed class TrayApplicationContext : ApplicationContext
         AgentConfig snapshot = GetConfigSnapshot();
         _cloudHttp = ProxyHttpClientFactory.CreateHttpClient(snapshot);
         _screenshotHttp = ProxyHttpClientFactory.CreateHttpClient(snapshot, TimeSpan.FromSeconds(180));
-        // Clear cached failed-update/stale-release state so switching proxy immediately retries fresh release checks.
-        _failedAutoUpdateTag = string.Empty;
+        // Clear cached release metadata so switching network/proxy immediately retries a fresh release check.
+        _updater.ClearCache();
         _availableUpdate = null;
+        if (snapshot.AutoCheckUpdates)
+        {
+            SignalAutoUpdateCheck();
+        }
         // Delay disposal so any in-flight HTTP request finishes cleanly without ObjectDisposedException.
         _ = Task.Delay(TimeSpan.FromSeconds(45)).ContinueWith(_ => oldClient.Dispose());
         _ = Task.Delay(TimeSpan.FromSeconds(190)).ContinueWith(_ => oldScreenshotClient.Dispose());
@@ -1590,7 +1673,7 @@ public sealed class TrayApplicationContext : ApplicationContext
             {
                 string deferredInstallPath = _pendingAutoInstallPath;
                 _pendingAutoInstallPath = string.Empty;
-                if (File.Exists(deferredInstallPath))
+                if (GetConfigSnapshot().AutoCheckUpdates && File.Exists(deferredInstallPath))
                 {
                     LaunchDownloadedInstallerAndExit(deferredInstallPath);
                 }
@@ -1643,12 +1726,14 @@ public sealed class TrayApplicationContext : ApplicationContext
         string summary = AgentStrings.FormatTrayMenuStatus(syncText, nextPart, netTag, vrc, queuePart);
         string tip = TruncateNotifyText(AgentStrings.FormatTrayTooltip(syncText, netTag, vrc));
         bool proxyChecked = cfg.ProxyEnabled;
+        bool autoUpdateChecked = cfg.AutoCheckUpdates;
 
         RunOnUiThread(() =>
         {
             if (_isExiting) return;
             _statusMenuItem.Text = summary;
             _proxyModeItem.Checked = proxyChecked;
+            _autoUpdateItem.Checked = autoUpdateChecked;
             _trayIcon.Text = tip;
         });
     }
@@ -1666,8 +1751,9 @@ public sealed class TrayApplicationContext : ApplicationContext
                 Log.Info("Cleaned up {Count} old installer file(s) in {Dir}.", cleaned, updatesDir);
             }
 
-            // Wait another 15s so initial UI & first sync finish cleanly without contention.
-            await Task.Delay(TimeSpan.FromSeconds(15), ct).ConfigureAwait(false);
+            // Wait up to 15s so initial UI & first sync finish cleanly without contention,
+            // while allowing explicit user toggles to wake immediately.
+            await _autoUpdateWakeSignal.WaitAsync(TimeSpan.FromSeconds(15), ct).ConfigureAwait(false);
         }
         catch (OperationCanceledException)
         {
@@ -1683,7 +1769,7 @@ public sealed class TrayApplicationContext : ApplicationContext
 
             try
             {
-                await Task.Delay(TimeSpan.FromHours(6), ct).ConfigureAwait(false);
+                await _autoUpdateWakeSignal.WaitAsync(AgentUpdater.AutoUpdateCheckInterval, ct).ConfigureAwait(false);
             }
             catch (OperationCanceledException)
             {
@@ -1694,8 +1780,15 @@ public sealed class TrayApplicationContext : ApplicationContext
 
     private bool TryHandlePendingAutoInstallOnUiThread()
     {
-        if (string.IsNullOrWhiteSpace(_pendingAutoInstallPath) || !File.Exists(_pendingAutoInstallPath))
+        string pendingPath = _pendingAutoInstallPath;
+        if (string.IsNullOrWhiteSpace(pendingPath) || !File.Exists(pendingPath))
         {
+            return false;
+        }
+        if (!GetConfigSnapshot().AutoCheckUpdates)
+        {
+            _pendingAutoInstallPath = string.Empty;
+            RestoreCheckUpdateMenuText();
             return false;
         }
         if ((_activeSettingsDialog != null && !_activeSettingsDialog.IsDisposed) ||
@@ -1705,7 +1798,6 @@ public sealed class TrayApplicationContext : ApplicationContext
             ShowNoticeMessage(AgentStrings.FormatBalloonAutoInstallingUpdate(tag), MessageBoxIcon.Information);
             return true;
         }
-        string pendingPath = _pendingAutoInstallPath;
         _pendingAutoInstallPath = string.Empty;
         LaunchDownloadedInstallerAndExit(pendingPath);
         return true;
@@ -1713,6 +1805,10 @@ public sealed class TrayApplicationContext : ApplicationContext
 
     private async Task CheckForUpdatesAsync(bool manual, CancellationToken ct)
     {
+        if (!manual && (!GetConfigSnapshot().AutoCheckUpdates || Volatile.Read(ref _updateDownloadActive) != 0))
+        {
+            return;
+        }
         if (manual && !string.IsNullOrWhiteSpace(_pendingAutoInstallPath) && File.Exists(_pendingAutoInstallPath))
         {
             RunOnUiThread(() => { _ = TryHandlePendingAutoInstallOnUiThread(); });
@@ -1768,7 +1864,9 @@ public sealed class TrayApplicationContext : ApplicationContext
         {
             using var checkCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
             checkCts.CancelAfter(TimeSpan.FromSeconds(35));
-            AgentReleaseInfo release = await _updater.CheckForUpdateAsync(AgentMetadata.Version, checkCts.Token).ConfigureAwait(false);
+            AgentReleaseInfo release = await _updater
+                .CheckForUpdateAsync(AgentMetadata.Version, checkCts.Token, bypassCache: manual)
+                .ConfigureAwait(false);
 
             if (release.IsUpdateAvailable)
             {
@@ -1782,31 +1880,36 @@ public sealed class TrayApplicationContext : ApplicationContext
                         HandleManualOrPromptedUpdate(release);
                     });
                 }
-                else if (GetConfigSnapshot().AutoCheckUpdates &&
-                         IsInstalledBuild() &&
-                         !string.IsNullOrWhiteSpace(release.SetupDownloadUrl) &&
-                         AgentUpdater.IsValidSha256(release.ExpectedSha256) &&
-                         !string.Equals(_failedAutoUpdateTag, release.TagName, StringComparison.OrdinalIgnoreCase))
-                {
-                    autoUpdateTarget = release;
-                }
                 else
                 {
-                    RunOnUiThread(() =>
+                    bool autoUpdateEnabled = GetConfigSnapshot().AutoCheckUpdates;
+                    if (!autoUpdateEnabled)
                     {
-                        _checkUpdateItem.Enabled = true;
-                        _checkUpdateItem.Text = AgentStrings.FormatMenuUpdateAvailable(release.TagName);
-                        if (!string.Equals(_lastNotifiedUpdateTag, release.TagName, StringComparison.OrdinalIgnoreCase))
+                        // User turned off auto-update while this background check was in flight: stay completely silent.
+                        RunOnUiThread(RestoreCheckUpdateMenuText);
+                    }
+                    else if (AgentUpdater.ShouldAutoDownloadAndInstall(autoUpdateEnabled, IsInstalledBuild(), release))
+                    {
+                        autoUpdateTarget = release;
+                    }
+                    else
+                    {
+                        RunOnUiThread(() =>
                         {
-                            _lastNotifiedUpdateTag = release.TagName;
-                            _balloonPointsToUpdate = true;
-                            _trayIcon.ShowBalloonTip(
-                                6000,
-                                AgentStrings.AppTitle,
-                                AgentStrings.FormatBalloonUpdateAvailableManual(release.TagName, AgentMetadata.Version),
-                                ToolTipIcon.Info);
-                        }
-                    });
+                            _checkUpdateItem.Enabled = true;
+                            _checkUpdateItem.Text = AgentStrings.FormatMenuUpdateAvailable(release.TagName);
+                            if (!string.Equals(_lastNotifiedUpdateTag, release.TagName, StringComparison.OrdinalIgnoreCase))
+                            {
+                                _lastNotifiedUpdateTag = release.TagName;
+                                _balloonPointsToUpdate = true;
+                                _trayIcon.ShowBalloonTip(
+                                    6000,
+                                    AgentStrings.AppTitle,
+                                    AgentStrings.FormatBalloonUpdateAvailableManual(release.TagName, AgentMetadata.Version),
+                                    ToolTipIcon.Info);
+                            }
+                        });
+                    }
                 }
             }
             else
@@ -1855,7 +1958,7 @@ public sealed class TrayApplicationContext : ApplicationContext
             _updateCheckLock.Release();
         }
 
-        if (autoUpdateTarget != null && !ct.IsCancellationRequested)
+        if (autoUpdateTarget != null && !ct.IsCancellationRequested && GetConfigSnapshot().AutoCheckUpdates)
         {
             await AutoDownloadAndInstallAsync(autoUpdateTarget, ct).ConfigureAwait(false);
         }
@@ -1880,18 +1983,18 @@ public sealed class TrayApplicationContext : ApplicationContext
 
     /// <summary>
     /// Automatically downloads, SHA-256 verifies, and silently launches the official installer
-    /// in the background when a newer GitHub Release is detected.
+    /// in the background when auto-update is enabled and a newer GitHub Release is detected.
+    /// Transient download failures do not permanently blacklist the version so the next 10-minute check retries cleanly.
     /// </summary>
     private async Task AutoDownloadAndInstallAsync(AgentReleaseInfo release, CancellationToken ct)
     {
-        if (!AgentUpdater.IsValidSha256(release.ExpectedSha256))
+        if (!AgentUpdater.ShouldAutoDownloadAndInstall(GetConfigSnapshot().AutoCheckUpdates, IsInstalledBuild(), release))
         {
-            Log.Warn("Skipping background silent auto-update for {Tag}: official SHA-256 checksum unavailable.", release.TagName);
-            RunOnUiThread(() =>
+            if (GetConfigSnapshot().AutoCheckUpdates && !AgentUpdater.IsValidSha256(release.ExpectedSha256))
             {
-                _checkUpdateItem.Enabled = true;
-                _checkUpdateItem.Text = AgentStrings.FormatMenuUpdateAvailable(release.TagName);
-            });
+                Log.Warn("Skipping background silent auto-update for {Tag}: official SHA-256 checksum unavailable.", release.TagName);
+            }
+            RunOnUiThread(RestoreCheckUpdateMenuText);
             return;
         }
 
@@ -1918,11 +2021,16 @@ public sealed class TrayApplicationContext : ApplicationContext
             }
         });
 
+        using var downloadCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        downloadCts.CancelAfter(TimeSpan.FromMinutes(10));
+        lock (_autoUpdateDownloadLock)
+        {
+            _autoUpdateDownloadCts = downloadCts;
+        }
+
         try
         {
             string updatesDir = Path.Combine(_configStore.DataDirectory, "updates");
-            using var downloadCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-            downloadCts.CancelAfter(TimeSpan.FromMinutes(10));
 
             string installerPath = await _updater.DownloadAndVerifyInstallerAsync(
                 release,
@@ -1930,7 +2038,10 @@ public sealed class TrayApplicationContext : ApplicationContext
                 progress: null,
                 downloadCts.Token).ConfigureAwait(false);
 
-            if (ct.IsCancellationRequested || !File.Exists(installerPath))
+            if (ct.IsCancellationRequested ||
+                downloadCts.IsCancellationRequested ||
+                !GetConfigSnapshot().AutoCheckUpdates ||
+                !File.Exists(installerPath))
             {
                 if (!ct.IsCancellationRequested)
                 {
@@ -1941,6 +2052,11 @@ public sealed class TrayApplicationContext : ApplicationContext
 
             RunOnUiThread(() =>
             {
+                if (!GetConfigSnapshot().AutoCheckUpdates)
+                {
+                    RestoreCheckUpdateMenuText();
+                    return;
+                }
                 if ((_activeSettingsDialog != null && !_activeSettingsDialog.IsDisposed) ||
                     (_activeExportDialog != null && !_activeExportDialog.IsDisposed))
                 {
@@ -1957,14 +2073,16 @@ public sealed class TrayApplicationContext : ApplicationContext
                 LaunchDownloadedInstallerAndExit(installerPath);
             });
         }
-        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        catch (OperationCanceledException) when (ct.IsCancellationRequested || !GetConfigSnapshot().AutoCheckUpdates)
         {
-            // Shutting down
+            if (!ct.IsCancellationRequested)
+            {
+                RunOnUiThread(RestoreCheckUpdateMenuText);
+            }
         }
         catch (Exception ex)
         {
-            _failedAutoUpdateTag = release.TagName;
-            Log.Warn(ex, "Background auto-update download failed for {Tag}.", release.TagName);
+            Log.Warn(ex, "Background auto-update download failed for {Tag}; will retry on next 10-minute check.", release.TagName);
             RunOnUiThread(() =>
             {
                 _checkUpdateItem.Enabled = true;
@@ -1973,6 +2091,13 @@ public sealed class TrayApplicationContext : ApplicationContext
         }
         finally
         {
+            lock (_autoUpdateDownloadLock)
+            {
+                if (ReferenceEquals(_autoUpdateDownloadCts, downloadCts))
+                {
+                    _autoUpdateDownloadCts = null;
+                }
+            }
             _isAutoUpdating = false;
             _autoUpdatingTag = string.Empty;
             Interlocked.Exchange(ref _updateDownloadActive, 0);
@@ -2199,6 +2324,10 @@ public sealed class TrayApplicationContext : ApplicationContext
         _isExiting = true;
 
         try { _cts.Cancel(); } catch { /* ignore */ }
+        lock (_autoUpdateDownloadLock)
+        {
+            try { _autoUpdateDownloadCts?.Cancel(); } catch { /* ignore */ }
+        }
         lock (_migrationLock)
         {
             try { _activeMigrationCts?.Cancel(); } catch { /* ignore */ }

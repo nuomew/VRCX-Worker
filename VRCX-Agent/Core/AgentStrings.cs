@@ -292,6 +292,18 @@ public static class AgentStrings
         ? "自动检测并自动更新新版本"
         : "Automatically check && install updates";
 
+    public static string MenuAutoUpdate => IsChinese
+        ? "自动更新"
+        : "Auto Update";
+
+    public static string BalloonAutoUpdateOn => IsChinese
+        ? "已开启自动更新，将每 10 分钟自动检测并更新新版本。"
+        : "Auto update enabled. Checking for updates every 10 minutes.";
+
+    public static string BalloonAutoUpdateOff => IsChinese
+        ? "已关闭自动更新，将不再自动检测或安装新版本。"
+        : "Auto update disabled. Automatic checks and installs are paused.";
+
     public static string FormatMenuCheckUpdate(string currentVersion) => IsChinese
         ? $"检查更新 · v{currentVersion}…"
         : $"Check for Updates · v{currentVersion}...";

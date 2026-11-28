@@ -3559,6 +3559,144 @@ INSERT INTO {acctPrefix}_friend_log_history (created_at, type, user_id, display_
         Assert.True(send2Ok);
     }
 
+    [Fact]
+    public async Task AgentUpdater_TenMinuteInterval_SwitchGating_Etag304Cache_AndMultilineHtmlChecksum()
+    {
+        // 1. Background polling cadence is strictly 10 minutes
+        Assert.Equal(TimeSpan.FromMinutes(10), AgentUpdater.AutoUpdateCheckInterval);
+
+        // 2. ShouldAutoDownloadAndInstall strictly enforces the AutoCheckUpdates switch, installed build, trusted URL, and SHA-256
+        string validSha = new string('a', 64);
+        var validRelease = new AgentReleaseInfo
+        {
+            TagName = "v1.15.0",
+            VersionText = "1.15.0",
+            SetupFileName = "VRCX.Agent-v1.15.0-Setup-win-x64.exe",
+            SetupDownloadUrl = "https://github.com/nuomew/VRCX-Worker/releases/download/v1.15.0/VRCX.Agent-v1.15.0-Setup-win-x64.exe",
+            ExpectedSha256 = validSha,
+            IsUpdateAvailable = true
+        };
+        Assert.True(AgentUpdater.ShouldAutoDownloadAndInstall(autoUpdateEnabled: true, isInstalledBuild: true, validRelease));
+        Assert.False(AgentUpdater.ShouldAutoDownloadAndInstall(autoUpdateEnabled: false, isInstalledBuild: true, validRelease));
+        Assert.False(AgentUpdater.ShouldAutoDownloadAndInstall(autoUpdateEnabled: true, isInstalledBuild: false, validRelease));
+        Assert.False(AgentUpdater.ShouldAutoDownloadAndInstall(autoUpdateEnabled: true, isInstalledBuild: true, null));
+
+        var sameVersionRelease = new AgentReleaseInfo
+        {
+            TagName = "v1.14.7",
+            SetupDownloadUrl = validRelease.SetupDownloadUrl,
+            ExpectedSha256 = validSha,
+            IsUpdateAvailable = false
+        };
+        Assert.False(AgentUpdater.ShouldAutoDownloadAndInstall(autoUpdateEnabled: true, isInstalledBuild: true, sameVersionRelease));
+
+        var untrustedRelease = new AgentReleaseInfo
+        {
+            TagName = "v1.15.0",
+            SetupDownloadUrl = "https://evil.example/VRCX.Agent-v1.15.0-Setup-win-x64.exe",
+            ExpectedSha256 = validSha,
+            IsUpdateAvailable = true
+        };
+        Assert.False(AgentUpdater.ShouldAutoDownloadAndInstall(autoUpdateEnabled: true, isInstalledBuild: true, untrustedRelease));
+
+        var missingShaRelease = new AgentReleaseInfo
+        {
+            TagName = "v1.15.0",
+            SetupDownloadUrl = validRelease.SetupDownloadUrl,
+            ExpectedSha256 = string.Empty,
+            IsUpdateAvailable = true
+        };
+        Assert.False(AgentUpdater.ShouldAutoDownloadAndInstall(autoUpdateEnabled: true, isInstalledBuild: true, missingShaRelease));
+
+        // 3. ETag / If-None-Match 304 caching avoids consuming anonymous GitHub API quota across 10-minute polls
+        int apiCalls = 0;
+        var seenIfNoneMatch = new List<string?>();
+        string apiJson = $@"{{
+            ""tag_name"": ""v1.15.0"",
+            ""html_url"": ""https://github.com/nuomew/VRCX-Worker/releases/tag/v1.15.0"",
+            ""body"": """",
+            ""assets"": [
+                {{
+                    ""name"": ""VRCX.Agent-v1.15.0-Setup-win-x64.exe"",
+                    ""size"": 37500000,
+                    ""digest"": ""sha256:{validSha}"",
+                    ""browser_download_url"": ""https://github.com/nuomew/VRCX-Worker/releases/download/v1.15.0/VRCX.Agent-v1.15.0-Setup-win-x64.exe""
+                }}
+            ]
+        }}";
+
+        using var etagHttp = new HttpClient(new StubHttpHandler(req =>
+        {
+            Assert.Equal(AgentUpdater.LatestApiUrl, req.RequestUri!.AbsoluteUri);
+            apiCalls++;
+            string? inm = req.Headers.TryGetValues("If-None-Match", out var vals) ? string.Join(",", vals) : null;
+            seenIfNoneMatch.Add(inm);
+
+            if (inm == "W/\"etag-v1150\"")
+            {
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NotModified));
+            }
+            var okRes = new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(apiJson, Encoding.UTF8, "application/json")
+            };
+            okRes.Headers.TryAddWithoutValidation("ETag", "W/\"etag-v1150\"");
+            return Task.FromResult(okRes);
+        }));
+
+        var updater = new AgentUpdater(etagHttp);
+        AgentReleaseInfo first = await updater.CheckForUpdateAsync("1.14.7", CancellationToken.None);
+        Assert.True(first.IsUpdateAvailable);
+        Assert.Equal("v1.15.0", first.TagName);
+        Assert.Null(seenIfNoneMatch[0]);
+
+        // Second check sends If-None-Match and handles 304 cleanly while recomputing IsUpdateAvailable for currentVersion
+        AgentReleaseInfo second = await updater.CheckForUpdateAsync("1.14.7", CancellationToken.None);
+        Assert.Equal("W/\"etag-v1150\"", seenIfNoneMatch[1]);
+        Assert.True(second.IsUpdateAvailable);
+        Assert.Equal(validSha, second.ExpectedSha256);
+
+        AgentReleaseInfo alreadyLatest = await updater.CheckForUpdateAsync("1.15.0", CancellationToken.None);
+        Assert.Equal("W/\"etag-v1150\"", seenIfNoneMatch[2]);
+        Assert.False(alreadyLatest.IsUpdateAvailable);
+
+        // Manual check (bypassCache: true) omits If-None-Match to force a fresh fetch
+        AgentReleaseInfo manualFresh = await updater.CheckForUpdateAsync("1.14.7", CancellationToken.None, bypassCache: true);
+        Assert.Null(seenIfNoneMatch[3]);
+        Assert.True(manualFresh.IsUpdateAvailable);
+        Assert.Equal(4, apiCalls);
+
+        // 4. Multiline HTML markup checksum fallback extracts exact Setup SHA-256 without bleeding into other assets
+        string setupSha = new string('b', 64);
+        string zipSha = new string('c', 64);
+        string wrappedHtml = $@"<ul>
+<li><code>VRCX.Agent-v1.15.0-Setup-win-x64.exe</code>:
+<code>{setupSha}</code></li>
+<li><code>VRCX.Agent-v1.15.0-win-x64-standalone.zip</code>: <code>{zipSha}</code></li>
+</ul>";
+        Assert.Equal(setupSha, AgentUpdater.ExtractSha256FromText(wrappedHtml, "VRCX.Agent-v1.15.0-Setup-win-x64.exe"));
+
+        // 5. Localized tray auto-update switch & balloon strings (zero WinForms '&&' leak in balloons)
+        string? prevLang = AgentStrings.LanguageOverride;
+        try
+        {
+            AgentStrings.LanguageOverride = "zh-CN";
+            Assert.Equal("自动更新", AgentStrings.MenuAutoUpdate);
+            Assert.Contains("10 分钟", AgentStrings.BalloonAutoUpdateOn);
+            Assert.DoesNotContain("&&", AgentStrings.BalloonAutoUpdateOff);
+
+            AgentStrings.LanguageOverride = "en-US";
+            Assert.Equal("Auto Update", AgentStrings.MenuAutoUpdate);
+            Assert.Contains("10 minutes", AgentStrings.BalloonAutoUpdateOn);
+            Assert.DoesNotContain("&&", AgentStrings.BalloonAutoUpdateOn);
+            Assert.DoesNotContain("&&", AgentStrings.BalloonAutoUpdateOff);
+        }
+        finally
+        {
+            AgentStrings.LanguageOverride = prevLang;
+        }
+    }
+
     private sealed class StubHttpHandler : HttpMessageHandler
     {
         private readonly Func<HttpRequestMessage, Task<HttpResponseMessage>> _responder;
