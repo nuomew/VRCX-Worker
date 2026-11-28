@@ -555,4 +555,90 @@ describe('Cloud history cursor pagination (adapter + Feed store)', () => {
 
         mockDb.supportsHistoryDateNavigation = false;
     });
+
+    it('renders HistoryDateNavigator through real Pinia useFeedStore().feedDateNav without ref unwrapping and switches from a 2-row day to previous day', async () => {
+        const { useVrcxVueTable } = await import('../../lib/table/useVrcxVueTable.js');
+        const DataTableLayout = (await import('../../components/ui/data-table/DataTableLayout.vue')).default;
+
+        mockDb.supportsHistoryDateNavigation = true;
+        mockDb.getHistoryDates.mockResolvedValue({
+            scope: 'feed',
+            months: [{ month: '2026-05', approxRows: 500 }],
+            minMonth: '2026-05',
+            maxMonth: '2026-05',
+            activeMonth: '2026-05',
+            days: ['2026-05-04', '2026-05-05'],
+            latestDay: '2026-05-05',
+            earliestDay: '2026-05-04'
+        });
+        mockDb.lookupFeedDatabase.mockImplementation(async (_filters, _vip, _limit, dateFrom = '', dateTo = '') => {
+            if (dateFrom.includes('2026-05-04') && dateTo.includes('2026-05-05')) {
+                // Local 2026-05-05 (2 rows)
+                return [
+                    { rowId: 1, created_at: '2026-05-05T01:22:00.000Z', type: 'Online', userId: 'u1', displayName: 'A' },
+                    { rowId: 2, created_at: '2026-05-05T01:22:01.000Z', type: 'Online', userId: 'u2', displayName: 'B' }
+                ];
+            }
+            // Previous day 2026-05-04 (5 rows)
+            return Array.from({ length: 5 }, (_, i) => ({
+                rowId: 10 + i,
+                created_at: `2026-05-04T10:0${i}:00.000Z`,
+                type: 'GPS',
+                userId: `u_${i}`,
+                displayName: `Prev_${i}`
+            }));
+        });
+
+        const feedStore = useFeedStore();
+        // Verify Pinia did NOT unwrap feedDateNav's nested refs
+        expect(feedStore.feedDateNav.enabled.value).toBe(true);
+        await feedStore.feedTableLookup();
+        expect(feedStore.feedTableData.length).toBe(2);
+        expect(feedStore.feedDateNav.selectedDate.value).toBe('2026-05-05');
+
+        const Host = defineComponent({
+            components: { DataTableLayout },
+            setup() {
+                const { table } = useVrcxVueTable({
+                    persistKey: 'test-pinia-feed-date-nav',
+                    get data() {
+                        return feedStore.feedTableData;
+                    },
+                    columns: [{ accessorKey: 'displayName', id: 'displayName', header: 'Name' }],
+                    getRowId: (row) => `row:${row.rowId}`,
+                    initialSorting: [],
+                    initialPagination: { pageIndex: 0, pageSize: 20 },
+                    tableOptions: { autoResetPageIndex: false }
+                });
+                return { table, feedStore };
+            },
+            template: `
+                <DataTableLayout
+                    :table="table"
+                    :total-items="feedStore.feedTableData.length"
+                    :page-sizes="[10, 20]"
+                    :history-date-nav="feedStore.feedDateNav" />
+            `
+        });
+
+        const wrapper = mount(Host, {
+            global: { mocks: { $t: (k) => k } }
+        });
+
+        // Navigator MUST be visibly rendered next to pagination with current date & enabled prev button
+        expect(wrapper.find('[data-testid="history-date-navigator"]').exists()).toBe(true);
+        expect(wrapper.find('[data-testid="history-date-trigger"]').text()).toContain('2026-05-05');
+        const prevBtn = wrapper.find('[data-testid="history-date-prev"]');
+        expect(prevBtn.attributes('disabled')).toBeUndefined();
+
+        // Clicking prev switches to 2026-05-04 and loads previous day's records
+        await prevBtn.trigger('click');
+        await new Promise((r) => setTimeout(r, 10));
+        await nextTick();
+        expect(feedStore.feedDateNav.selectedDate.value).toBe('2026-05-04');
+        expect(feedStore.feedTableData.length).toBe(5);
+        expect(wrapper.find('[data-testid="history-date-trigger"]').text()).toContain('2026-05-04');
+
+        mockDb.supportsHistoryDateNavigation = false;
+    });
 });

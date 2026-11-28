@@ -317,7 +317,7 @@
             </Pagination>
             <div class="dt-pagination-spacer flex-1 flex items-center justify-start">
                 <HistoryDateNavigator
-                    v-if="historyDateNav?.enabled?.value"
+                    v-if="isHistoryDateNavEnabled"
                     :nav="historyDateNav"
                     :disabled="loading || loadingMore" />
                 <Button
@@ -337,7 +337,7 @@
 </template>
 
 <script setup>
-    import { computed, nextTick, ref, watch } from 'vue';
+    import { computed, nextTick, ref, unref, watch } from 'vue';
     import { ChevronRightIcon } from 'lucide-vue-next';
     import { DragDropProvider } from '@dnd-kit/vue';
     import { FlexRender } from '@tanstack/vue-table';
@@ -722,14 +722,16 @@
         }
     );
 
+    const isHistoryDateNavEnabled = computed(() => Boolean(unref(props.historyDateNav?.enabled)));
+
     watch(
         () => [
-            props.historyDateNav?.mode?.value,
-            props.historyDateNav?.selectedDate?.value,
-            props.historyDateNav?.selectedMonth?.value
+            unref(props.historyDateNav?.mode),
+            unref(props.historyDateNav?.selectedDate),
+            unref(props.historyDateNav?.selectedMonth)
         ],
         ([mode, day, month], [prevMode, prevDay, prevMonth]) => {
-            if (!props.historyDateNav?.enabled?.value) return;
+            if (!isHistoryDateNavEnabled.value) return;
             if (!prevDay && !prevMonth) return;
             if (mode !== prevMode || day !== prevDay || month !== prevMonth) {
                 props.table?.setPageIndex?.(0);

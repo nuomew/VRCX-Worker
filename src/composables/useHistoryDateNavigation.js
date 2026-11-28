@@ -1,4 +1,4 @@
-import { computed, ref, shallowRef } from 'vue';
+import { computed, markRaw, ref, shallowRef } from 'vue';
 import dayjs from 'dayjs';
 
 import { database } from '../services/database';
@@ -441,7 +441,8 @@ export function createHistoryDateController(scope, onSelectionChange) {
         return Array.isArray(list) ? list : [];
     }
 
-    return {
+    // Wrap with markRaw so Pinia setup stores do not deeply unwrap the nested refs/computeds via reactive().
+    return markRaw({
         scope,
         enabled,
         mode,
@@ -474,5 +475,5 @@ export function createHistoryDateController(scope, onSelectionChange) {
         goLatest,
         isDayRecorded,
         getDaysForMonth
-    };
+    });
 }
