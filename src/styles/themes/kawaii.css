@@ -1,0 +1,508 @@
+/* ==========================================================================
+ * Kawaii Pastel Theme (ゆめかわ × Soft Pastel Stage)
+ * Scoped strictly to :root[data-theme='kawaii'] so existing themes stay untouched.
+ * ========================================================================== */
+
+:root[data-theme='kawaii'] {
+    color-scheme: light;
+    accent-color: #c93b76;
+
+    /* Palette primitives (3 dreamy pastel hues + warm milkfoam + deep plum ink >= 4.5:1) */
+    --kawaii-bg-base: #fff7fb;
+    --kawaii-pink: #f6bee0;
+    --kawaii-lavender: #c9b8f6;
+    --kawaii-aqua: #b2e4f8;
+    --kawaii-peach: #fddcc8;
+    --kawaii-shadow-rgb: 184 106 160;
+    --kawaii-surface-glass: rgb(255 251 254 / 0.78);
+    --kawaii-surface-elevated: rgb(255 252 254 / 0.92);
+    --kawaii-sidebar-glass: rgb(255 245 251 / 0.72);
+    --kawaii-ease-poyon: cubic-bezier(0.34, 1.56, 0.64, 1);
+    --kawaii-ease-soft: cubic-bezier(0.22, 1, 0.36, 1);
+
+    /* Semantic UI tokens */
+    --radius: 0.9rem;
+    --background: #fff7fb;
+    --foreground: #3b2e5a;
+    --card: rgb(255 252 254 / 0.88);
+    --card-foreground: #3b2e5a;
+    --profile-card: rgb(255 246 252 / 0.86);
+    --popover: rgb(255 251 254 / 0.95);
+    --popover-foreground: #3b2e5a;
+    --primary: #c93b76;
+    --primary-foreground: #ffffff;
+    --secondary: #fde6f2;
+    --secondary-foreground: #68254c;
+    --muted: #f5eaf8;
+    --muted-foreground: #67527f;
+    --accent: #f4e4fb;
+    --accent-foreground: #4c235c;
+    --destructive: #c83353;
+    --destructive-foreground: #ffffff;
+    --border: #e5c2db;
+    --input: #d9aecc;
+    --ring: #d64e89;
+
+    /* Pastel data visualization palette */
+    --chart-1: #dc548e;
+    --chart-2: #8a6ce0;
+    --chart-3: #3b9fd1;
+    --chart-4: #ea8363;
+    --chart-5: #3eb086;
+
+    /* Sidebar tokens */
+    --sidebar: rgb(255 245 251 / 0.74);
+    --sidebar-foreground: #3b2e5a;
+    --sidebar-primary: #c93b76;
+    --sidebar-primary-foreground: #ffffff;
+    --sidebar-accent: #fde0f0;
+    --sidebar-accent-foreground: #6f244a;
+    --sidebar-border: #eac9e0;
+    --sidebar-ring: #d64e89;
+}
+
+/* Accent color variants preserving Kawaii pastel surfaces & >= 4.5:1 ink contrast */
+:root[data-theme='kawaii'][data-theme-color='blue'] {
+    accent-color: #2575b3;
+    --primary: #2575b3;
+    --primary-foreground: #ffffff;
+    --secondary: #e4f3fc;
+    --secondary-foreground: #1b4b73;
+    --accent: #e5f2fc;
+    --accent-foreground: #1e4b72;
+    --ring: #4798d6;
+    --sidebar-primary: #2575b3;
+    --sidebar-accent: #dff2fc;
+    --sidebar-accent-foreground: #1b4b73;
+    --sidebar-ring: #4798d6;
+}
+
+:root[data-theme='kawaii'][data-theme-color='green'] {
+    accent-color: #1f7f55;
+    --primary: #1f7f55;
+    --primary-foreground: #ffffff;
+    --secondary: #e2f6ec;
+    --secondary-foreground: #164f36;
+    --accent: #e4f6ee;
+    --accent-foreground: #164f36;
+    --ring: #44ab7e;
+    --sidebar-primary: #1f7f55;
+    --sidebar-accent: #ddf4e9;
+    --sidebar-accent-foreground: #164f36;
+    --sidebar-ring: #44ab7e;
+}
+
+:root[data-theme='kawaii'][data-theme-color='orange'] {
+    accent-color: #be4c20;
+    --primary: #be4c20;
+    --primary-foreground: #ffffff;
+    --secondary: #fdece3;
+    --secondary-foreground: #722b11;
+    --accent: #fdebe2;
+    --accent-foreground: #722b11;
+    --ring: #e3764b;
+    --sidebar-primary: #be4c20;
+    --sidebar-accent: #fde9df;
+    --sidebar-accent-foreground: #722b11;
+    --sidebar-ring: #e3764b;
+}
+
+:root[data-theme='kawaii'][data-theme-color='red'] {
+    accent-color: #c52e4a;
+    --primary: #c52e4a;
+    --primary-foreground: #ffffff;
+    --secondary: #fde5ea;
+    --secondary-foreground: #771a2d;
+    --accent: #fde4e9;
+    --accent-foreground: #771a2d;
+    --ring: #e25872;
+    --sidebar-primary: #c52e4a;
+    --sidebar-accent: #fde2e8;
+    --sidebar-accent-foreground: #771a2d;
+    --sidebar-ring: #e25872;
+}
+
+:root[data-theme='kawaii'][data-theme-color='rose'] {
+    accent-color: #c23171;
+    --primary: #c23171;
+    --primary-foreground: #ffffff;
+    --secondary: #fde3ef;
+    --secondary-foreground: #701d44;
+    --accent: #fde2ee;
+    --accent-foreground: #701d44;
+    --ring: #df5b96;
+    --sidebar-primary: #c23171;
+    --sidebar-accent: #fde0ee;
+    --sidebar-accent-foreground: #701d44;
+    --sidebar-ring: #df5b96;
+}
+
+:root[data-theme='kawaii'][data-theme-color='violet'] {
+    accent-color: #6c49c2;
+    --primary: #6c49c2;
+    --primary-foreground: #ffffff;
+    --secondary: #efe6fd;
+    --secondary-foreground: #3e257b;
+    --accent: #ede5fc;
+    --accent-foreground: #3e257b;
+    --ring: #9375e2;
+    --sidebar-primary: #6c49c2;
+    --sidebar-accent: #ece3fc;
+    --sidebar-accent-foreground: #3e257b;
+    --sidebar-ring: #9375e2;
+}
+
+:root[data-theme='kawaii'][data-theme-color='yellow'] {
+    accent-color: #936207;
+    --primary: #936207;
+    --primary-foreground: #ffffff;
+    --secondary: #fcf3d7;
+    --secondary-foreground: #5c3d05;
+    --accent: #fbf2d4;
+    --accent-foreground: #5c3d05;
+    --ring: #cc9c2a;
+    --sidebar-primary: #936207;
+    --sidebar-accent: #fcf0ce;
+    --sidebar-accent-foreground: #5c3d05;
+    --sidebar-ring: #cc9c2a;
+}
+
+/* Text selection & native scrollbar harmony (WCAG >= 3:1 thumb contrast) */
+:root[data-theme='kawaii'] ::selection {
+    background-color: #ffd0e7;
+    color: #3b2e5a;
+}
+
+:root[data-theme='kawaii'] * {
+    scrollbar-color: #c187ae transparent;
+}
+
+:root[data-theme='kawaii'] ::-webkit-scrollbar-thumb {
+    background-color: rgb(193 135 174 / 0.74);
+    border-radius: 9999px;
+    border: 2px solid transparent;
+    background-clip: content-box;
+}
+
+:root[data-theme='kawaii'] ::-webkit-scrollbar-thumb:hover {
+    background-color: rgb(176 105 154 / 0.92);
+}
+
+/* Dreamy ゆめかわ watercolor marble canvas + faint ambient sparkle texture (single unified canvas) */
+:root[data-theme='kawaii'] body {
+    background-color: var(--kawaii-bg-base);
+    background-image:
+        radial-gradient(circle at 8% 12%, rgb(255 255 255 / 0.85) 0 2px, transparent 3px),
+        radial-gradient(circle at 92% 24%, rgb(255 255 255 / 0.8) 0 2px, transparent 3px),
+        radial-gradient(circle at 26% 78%, rgb(255 255 255 / 0.75) 0 1.5px, transparent 2.5px),
+        radial-gradient(46% 42% at 10% 14%, rgb(246 190 224 / 0.72) 0%, transparent 72%),
+        radial-gradient(48% 44% at 90% 12%, rgb(178 228 248 / 0.72) 0%, transparent 72%),
+        radial-gradient(52% 48% at 76% 84%, rgb(201 184 246 / 0.68) 0%, transparent 72%),
+        radial-gradient(40% 36% at 16% 88%, rgb(253 220 200 / 0.64) 0%, transparent 72%),
+        radial-gradient(34% 32% at 50% 48%, rgb(255 255 255 / 0.88) 0%, transparent 72%);
+    background-attachment: fixed;
+    color: var(--foreground);
+    /* Rounded friendly display/body feel (local rounded faces first, bundled Noto fallback, zero network block) */
+    font-family:
+        'Nunito', 'Quicksand', 'M PLUS Rounded 1c', 'Zen Maru Gothic', 'Hiragino Maru Gothic ProN', 'Yuanti SC',
+        'PingFang SC', var(--font-western), var(--font-symbol), var(--font-primary-cjk), var(--font-fallback-cjk);
+}
+
+/* Keep inset shell transparent so the dreamy pastel canvas breathes softly around glass panels */
+:root[data-theme='kawaii'] [data-slot='sidebar-inset'] {
+    background-color: transparent;
+}
+
+/* Left navigation frosted glass sidebar */
+:root[data-theme='kawaii'] [data-slot='sidebar-inner'],
+:root[data-theme='kawaii'] [data-slot='sidebar'][data-variant='sidebar'] > div:last-child {
+    background: var(--kawaii-sidebar-glass);
+    backdrop-filter: blur(18px) saturate(1.32);
+    border-color: rgb(255 255 255 / 0.84);
+    box-shadow: inset -1px 0 0 rgb(232 195 221 / 0.7);
+}
+
+/* Sidebar nav items: single charm point = sakura-lavender candy capsule + dainty indicator pill */
+:root[data-theme='kawaii'] [data-slot='sidebar-menu-button'] {
+    position: relative;
+    border-radius: 14px;
+    transition:
+        background-color 0.2s var(--kawaii-ease-soft),
+        color 0.2s var(--kawaii-ease-soft),
+        box-shadow 0.22s var(--kawaii-ease-soft);
+}
+
+:root[data-theme='kawaii'] [data-slot='sidebar-menu-button']:hover {
+    background-color: rgb(253 224 240 / 0.78);
+    color: var(--sidebar-accent-foreground);
+}
+
+:root[data-theme='kawaii'] [data-slot='sidebar-menu-button'][data-active='true'] {
+    background: linear-gradient(135deg, var(--sidebar-accent) 0%, rgb(242 232 255 / 0.92) 100%);
+    color: var(--sidebar-accent-foreground);
+    font-weight: 600;
+    box-shadow:
+        inset 0 1px 0 rgb(255 255 255 / 0.9),
+        0 4px 14px rgb(var(--kawaii-shadow-rgb) / 0.2);
+}
+
+:root[data-theme='kawaii'] [data-state='expanded'] [data-slot='sidebar-menu-button'][data-active='true']::before {
+    content: '';
+    position: absolute;
+    left: 2px;
+    top: 50%;
+    width: 4px;
+    height: 16px;
+    translate: 0 -50%;
+    border-radius: 9999px;
+    background-color: var(--primary);
+}
+
+/* Main stage container: luminous milkfoam frosted glass */
+:root[data-theme='kawaii'] .x-container {
+    background: var(--kawaii-surface-glass);
+    backdrop-filter: blur(16px) saturate(1.28);
+    border-radius: 22px;
+    border: 1px solid rgb(255 255 255 / 0.9);
+    box-shadow:
+        inset 0 1px 0 rgb(255 255 255 / 0.96),
+        inset 0 20px 36px -26px rgb(246 184 222 / 0.36),
+        0 12px 30px rgb(var(--kawaii-shadow-rgb) / 0.16),
+        0 0 0 1px rgb(229 194 219 / 0.58);
+}
+
+/* Right friend sidebar panel */
+:root[data-theme='kawaii'] .x-aside-container {
+    background: rgb(255 248 253 / 0.56);
+    backdrop-filter: blur(12px) saturate(1.22);
+}
+
+:root[data-theme='kawaii'] .x-aside-container .search-container > button {
+    background: rgb(255 255 255 / 0.88);
+    border-color: var(--input);
+    border-radius: 9999px;
+    box-shadow: 0 3px 10px rgb(var(--kawaii-shadow-rgb) / 0.12);
+}
+
+:root[data-theme='kawaii'] .x-aside-container .search-container > button:hover {
+    border-color: var(--ring);
+    background: #ffffff;
+}
+
+/* Sticker-rim highlight on circular avatars for crisp anime portrait framing */
+:root[data-theme='kawaii'] [data-slot='avatar'] {
+    box-shadow:
+        0 0 0 2px rgb(255 255 255 / 0.92),
+        0 3px 8px rgb(var(--kawaii-shadow-rgb) / 0.18);
+}
+
+/* Cards & Panels */
+:root[data-theme='kawaii'] [data-slot='card'] {
+    background: var(--kawaii-surface-elevated);
+    border-radius: 20px;
+    border: 1px solid rgb(229 194 219 / 0.82);
+    box-shadow:
+        inset 0 1px 0 rgb(255 255 255 / 0.92),
+        0 8px 24px rgb(var(--kawaii-shadow-rgb) / 0.13);
+}
+
+/* Dialogs, Popovers, Dropdowns & Selects */
+:root[data-theme='kawaii'] [data-slot='dialog-overlay'],
+:root[data-theme='kawaii'] [data-slot='alert-dialog-overlay'] {
+    background-color: rgb(74 46 98 / 0.32);
+    backdrop-filter: blur(5px);
+}
+
+:root[data-theme='kawaii'] [data-slot='dialog-content'],
+:root[data-theme='kawaii'] [data-slot='alert-dialog-content'] {
+    background: var(--kawaii-surface-elevated);
+    backdrop-filter: blur(18px) saturate(1.32);
+    border-radius: 24px;
+    border: 1px solid rgb(255 255 255 / 0.92);
+    box-shadow:
+        inset 0 3px 0 0 rgb(246 190 224 / 0.88),
+        0 22px 50px rgb(120 72 146 / 0.24),
+        0 0 0 1px rgb(229 194 219 / 0.78);
+}
+
+:root[data-theme='kawaii'] [data-slot='popover-content'],
+:root[data-theme='kawaii'] [data-slot='dropdown-menu-content'],
+:root[data-theme='kawaii'] [data-slot='dropdown-menu-sub-content'],
+:root[data-theme='kawaii'] [data-slot='select-content'],
+:root[data-theme='kawaii'] [data-slot='context-menu-content'],
+:root[data-theme='kawaii'] [data-slot='context-menu-sub-content'],
+:root[data-theme='kawaii'] [data-slot='hover-card-content'] {
+    background: var(--kawaii-surface-elevated);
+    backdrop-filter: blur(16px) saturate(1.3);
+    border-radius: 16px;
+    border: 1px solid rgb(229 194 219 / 0.86);
+    box-shadow:
+        inset 0 1px 0 rgb(255 255 255 / 0.92),
+        0 14px 34px rgb(var(--kawaii-shadow-rgb) / 0.22);
+}
+
+:root[data-theme='kawaii'] [data-slot='dropdown-menu-item'],
+:root[data-theme='kawaii'] [data-slot='dropdown-menu-checkbox-item'],
+:root[data-theme='kawaii'] [data-slot='dropdown-menu-sub-trigger'],
+:root[data-theme='kawaii'] [data-slot='select-item'],
+:root[data-theme='kawaii'] [data-slot='context-menu-item'],
+:root[data-theme='kawaii'] [data-slot='context-menu-checkbox-item'] {
+    border-radius: 10px;
+}
+
+/* Buttons: soft rounded pastel silhouettes + high-contrast berry primary */
+:root[data-theme='kawaii'] [data-slot='button'] {
+    border-radius: 14px;
+    transition:
+        background-color 0.18s var(--kawaii-ease-soft),
+        border-color 0.18s var(--kawaii-ease-soft),
+        color 0.18s var(--kawaii-ease-soft),
+        box-shadow 0.2s var(--kawaii-ease-soft);
+}
+
+:root[data-theme='kawaii'] [data-slot='button'].rounded-full {
+    border-radius: 9999px;
+}
+
+:root[data-theme='kawaii'] [data-slot='button'][data-variant='default'],
+:root[data-theme='kawaii'] [data-slot='button']:not([data-variant]) {
+    box-shadow: 0 5px 14px rgb(var(--kawaii-shadow-rgb) / 0.3);
+}
+
+:root[data-theme='kawaii'] [data-slot='button'][data-variant='outline'] {
+    background-color: rgb(255 255 255 / 0.84);
+    border-color: var(--input);
+}
+
+:root[data-theme='kawaii'] [data-slot='button'][data-variant='outline']:hover {
+    background-color: var(--secondary);
+    border-color: var(--ring);
+}
+
+/* Inputs, Selects & Textareas */
+:root[data-theme='kawaii'] [data-slot='input'],
+:root[data-theme='kawaii'] [data-slot='select-trigger'],
+:root[data-theme='kawaii'] [data-slot='input-group'] {
+    background-color: rgb(255 255 255 / 0.9);
+    border-color: var(--input);
+    border-radius: 12px;
+}
+
+:root[data-theme='kawaii'] [data-slot='input']:focus-visible,
+:root[data-theme='kawaii'] [data-slot='select-trigger']:focus-visible {
+    border-color: var(--ring);
+    box-shadow: 0 0 0 3px rgb(214 78 137 / 0.2);
+}
+
+/* Tabs: candy capsule rail with floating milkfoam active pill */
+:root[data-theme='kawaii'] [data-slot='tabs-list'] {
+    background: rgb(246 229 248 / 0.84);
+    border: 1px solid rgb(229 194 219 / 0.74);
+    border-radius: 9999px;
+    padding: 3px;
+}
+
+:root[data-theme='kawaii'] [data-slot='tabs-trigger'] {
+    border-radius: 9999px;
+}
+
+:root[data-theme='kawaii'] [data-slot='tabs-trigger'][data-state='active'] {
+    background: #ffffff;
+    color: var(--primary);
+    box-shadow: 0 3px 10px rgb(var(--kawaii-shadow-rgb) / 0.24);
+}
+
+/* Badges & Switches */
+:root[data-theme='kawaii'] [data-slot='badge'] {
+    border-radius: 9999px;
+}
+
+:root[data-theme='kawaii'] [data-slot='switch'] {
+    box-shadow: inset 0 1px 2px rgb(92 48 96 / 0.14);
+}
+
+:root[data-theme='kawaii'] [data-slot='switch-thumb'] {
+    background-color: #ffffff;
+    box-shadow: 0 2px 5px rgb(92 48 96 / 0.24);
+}
+
+/* Data tables: calm blush header + airy hover tint (zero geometry drift) */
+:root[data-theme='kawaii'] [data-slot='table-header'] {
+    background-color: rgb(252 235 246 / 0.76);
+}
+
+:root[data-theme='kawaii'] [data-slot='table-head'] {
+    color: #5a3c74;
+    font-weight: 600;
+}
+
+:root[data-theme='kawaii'] [data-slot='table-row'] {
+    border-color: rgb(229 201 221 / 0.72);
+}
+
+:root[data-theme='kawaii'] [data-slot='table-body'] [data-slot='table-row']:hover {
+    background-color: rgb(253 230 244 / 0.6);
+}
+
+/* Soft pastel toast cards */
+:root[data-theme='kawaii'] [data-sonner-toast] {
+    background: var(--kawaii-surface-elevated);
+    border-color: var(--border);
+    border-radius: 16px;
+    color: var(--foreground);
+    box-shadow: 0 10px 26px rgb(var(--kawaii-shadow-rgb) / 0.24);
+}
+
+/* Headings balance */
+:root[data-theme='kawaii'] h1,
+:root[data-theme='kawaii'] h2,
+:root[data-theme='kawaii'] h3 {
+    text-wrap: balance;
+}
+
+/* Opt-in compositor-only poyon micro-motion strictly when user allows motion */
+@media (prefers-reduced-motion: no-preference) {
+    :root[data-theme='kawaii'] [data-slot='button'],
+    :root[data-theme='kawaii'] [data-slot='sidebar-menu-button'] {
+        transition:
+            transform 0.22s var(--kawaii-ease-poyon),
+            background-color 0.18s var(--kawaii-ease-soft),
+            border-color 0.18s var(--kawaii-ease-soft),
+            color 0.18s var(--kawaii-ease-soft),
+            box-shadow 0.22s var(--kawaii-ease-soft);
+    }
+
+    :root[data-theme='kawaii'] [data-slot='button']:not(:disabled):hover {
+        transform: translateY(-1px);
+    }
+
+    :root[data-theme='kawaii'] [data-slot='button']:not(:disabled):active {
+        transform: translateY(0) scale(0.98);
+    }
+}
+
+/* High-contrast / Windows Forced Colors Mode compliance */
+@media (forced-colors: active) {
+    :root[data-theme='kawaii'] body {
+        background-image: none;
+        background-color: Canvas;
+        color: CanvasText;
+    }
+
+    :root[data-theme='kawaii'] .x-container,
+    :root[data-theme='kawaii'] [data-slot='card'],
+    :root[data-theme='kawaii'] [data-slot='dialog-content'],
+    :root[data-theme='kawaii'] [data-slot='popover-content'],
+    :root[data-theme='kawaii'] [data-slot='dropdown-menu-content'],
+    :root[data-theme='kawaii'] [data-slot='sidebar-inner'] {
+        background: Canvas;
+        backdrop-filter: none;
+        border: 1px solid CanvasText;
+        box-shadow: none;
+    }
+
+    :root[data-theme='kawaii'] [data-slot='sidebar-menu-button'][data-active='true'] {
+        background: Canvas;
+        border: 1px solid Highlight;
+    }
+}

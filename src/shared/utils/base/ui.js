@@ -449,10 +449,10 @@ async function getThemeMode(configRepository) {
     const initThemeMode = await configRepository.getString('VRCX_ThemeMode', 'system');
 
     let isDarkMode;
-    if (initThemeMode === 'light') {
-        isDarkMode = false;
-    } else if (initThemeMode === 'system') {
+    if (initThemeMode === 'system') {
         isDarkMode = systemIsDarkMode();
+    } else if (THEME_CONFIG[initThemeMode]) {
+        isDarkMode = THEME_CONFIG[initThemeMode].isDark === true;
     } else {
         isDarkMode = true;
     }

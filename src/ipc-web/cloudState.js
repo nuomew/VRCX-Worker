@@ -10,7 +10,7 @@ export const MAX_CLOUD_2FA_TRUST_SECONDS = MAX_CLOUD_2FA_TRUST_DAYS * 24 * 60 * 
 export const DEFAULT_CLOUD_2FA_TRUST_SECONDS = 7 * 24 * 60 * 60;
 export const CLOUD_2FA_TRUST_PRESETS = Object.freeze([0, 3600, 43200, 86400, 259200, 604800, 1209600, 2592000]);
 
-const ALLOWED_UI_THEME_MODES = new Set(['system', 'light', 'dark', 'midnight']);
+const ALLOWED_UI_THEME_MODES = new Set(['system', 'light', 'dark', 'midnight', 'kawaii']);
 const ALLOWED_UI_THEME_COLORS = new Set(['default', 'blue', 'green', 'orange', 'red', 'rose', 'violet', 'yellow']);
 const ALLOWED_UI_LANGUAGE_RE = /^[a-z]{2,3}(?:-[A-Za-z0-9]{2,4})?$/;
 

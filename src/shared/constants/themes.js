@@ -15,6 +15,11 @@ export const THEME_CONFIG = {
         isDark: true,
         name: 'Midnight',
         file: 'midnight.css'
+    },
+    kawaii: {
+        isDark: false,
+        name: 'Kawaii Pastel',
+        file: 'kawaii.css'
     }
 };
 
