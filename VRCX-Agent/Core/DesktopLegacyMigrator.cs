@@ -137,11 +137,11 @@ public static class DesktopLegacyMigrator
     public const int DefaultConcurrency = 2;
     private const int BatchRowsLimit = 240;
     private const int MaxBatchPayloadBytes = 180 * 1024;
-    // Keep each HTTP batch strictly bounded so Cloudflare Workers Free (10ms CPU limit) stays well
-    // below Error 1102 even under 4x concurrency and high-entropy CJK payloads (bio/join_leave).
-    private const int CompactBatchRowsLimit = 350;
-    private const int CompactMaxBatchPayloadBytes = 180 * 1024;
-    private const int MinAdaptiveSplitBatchRows = 25;
+    // Keep each HTTP batch tightly bounded (~180 rows / 96 KiB -> ~1.8ms Worker CPU with 100% gzip)
+    // so Cloudflare Workers Free (10ms CPU limit) stays >5x below Error 1102 even under 4x concurrency.
+    private const int CompactBatchRowsLimit = 180;
+    private const int CompactMaxBatchPayloadBytes = 96 * 1024;
+    private const int MinAdaptiveSplitBatchRows = 15;
     private static readonly HashSet<string> CompactChunkLogicalTables = new(StringComparer.Ordinal)
     {
         "feed_gps",

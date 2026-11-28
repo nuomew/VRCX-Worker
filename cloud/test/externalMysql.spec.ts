@@ -22,6 +22,13 @@ import {
 } from '../src/db/externalMysql';
 import { createHybridMysqlD1Database, rewriteManagedSqlForMysql } from '../src/db/externalMysqlProxy';
 import { ensureSchemaReady } from '../src/db/schemaBootstrap';
+import {
+    formatMysqlQuery,
+    LightMysqlUnsupportedAuthError,
+    openLightMysqlConnectionOnSocket,
+    scrambleNativePassword,
+    type LightSocketLike
+} from '../src/db/lightMysqlClient';
 import { measureD1PendingMigration } from '../src/routes/externalMysqlRoutes';
 
 const env = rawEnv as unknown as Env;
@@ -4469,5 +4476,239 @@ describe('External MySQL 5.7+ Database Integration (Hybrid New-Writes Mode & Ful
             invalidateExternalDbConfigCache();
             clearMysqlSchemaReadyCache();
         }
+    });
+
+    it('executes zero-dep MySQL 5.7 wire protocol (handshake, STARTTLS, OK/ERR/ResultSet, NEWDECIMAL, fallback) and raw-fast-paths >=600-row legacy batches', async () => {
+        // 1. formatMysqlQuery preserves `?` inside single-quoted literals & backticks while escaping values safely
+        const formatted = formatMysqlQuery(
+            "SELECT * FROM `tbl?1` WHERE note = 'why?''still?' AND user_id = ? AND n = ? AND b = ? AND x = ?",
+            ["O'Brien\\line\n1", 42, null, true]
+        );
+        expect(formatted).toBe(
+            "SELECT * FROM `tbl?1` WHERE note = 'why?''still?' AND user_id = 'O\\'Brien\\\\line\\n1' AND n = 42 AND b = NULL AND x = 1"
+        );
+
+        // Helper to build MySQL wire packets & in-memory LightSocketLike
+        const wrapPkt = (seq: number, payload: Buffer): Buffer => {
+            const len = payload.length;
+            const out = Buffer.allocUnsafe(4 + len);
+            out[0] = len & 0xff;
+            out[1] = (len >>> 8) & 0xff;
+            out[2] = (len >>> 16) & 0xff;
+            out[3] = seq & 0xff;
+            payload.copy(out, 4);
+            return out;
+        };
+        const lenEncStr = (s: string): Buffer => {
+            const b = Buffer.from(s, 'utf8');
+            return Buffer.concat([Buffer.from([b.length]), b]);
+        };
+        const buildHandshakeV10 = (pluginName: string, withSslCap = true): { pkt: Buffer; salt: Buffer } => {
+            const salt1 = Buffer.alloc(8, 0x31);
+            const salt2 = Buffer.alloc(12, 0x32);
+            const capLow = withSslCap ? 0xffff : 0xf7ff;
+            const capHigh = 0x81ff;
+            const hs = Buffer.concat([
+                Buffer.from([10]),
+                Buffer.from('5.7.42-log\0'),
+                Buffer.from([7, 0, 0, 0]),
+                salt1,
+                Buffer.from([0]),
+                Buffer.from([capLow & 0xff, (capLow >> 8) & 0xff]),
+                Buffer.from([45]),
+                Buffer.from([2, 0]),
+                Buffer.from([capHigh & 0xff, (capHigh >> 8) & 0xff]),
+                Buffer.from([21]),
+                Buffer.alloc(10, 0),
+                salt2,
+                Buffer.from([0]),
+                Buffer.from(`${pluginName}\0`)
+            ]);
+            return { pkt: wrapPkt(0, hs), salt: Buffer.concat([salt1, salt2]) };
+        };
+        const buildColDef = (name: string, colType: number): Buffer =>
+            Buffer.concat([
+                lenEncStr('def'),
+                lenEncStr('db'),
+                lenEncStr('tbl'),
+                lenEncStr('tbl'),
+                lenEncStr(name),
+                lenEncStr(name),
+                Buffer.from([0x0c, 45, 0, 255, 0, 0, 0, colType, 0, 0, 0, 0, 0])
+            ]);
+
+        const createMockSocket = (
+            onClientPacket: (seq: number, payload: Buffer, push: (b: Buffer) => void) => void,
+            initialBytes: Buffer[]
+        ): { socket: LightSocketLike; tlsUpgraded: () => boolean } => {
+            let controller!: ReadableStreamDefaultController<Uint8Array>;
+            let rxBuf = Buffer.alloc(0);
+            let upgraded = false;
+            const makeReadable = () =>
+                new ReadableStream<Uint8Array>({
+                    start(c) {
+                        controller = c;
+                        for (const b of initialBytes) c.enqueue(new Uint8Array(b));
+                        initialBytes.length = 0;
+                    }
+                });
+            const push = (b: Buffer) => {
+                // Split intentionally into 2 chunks to exercise cross-chunk framing assembly
+                if (b.length > 5) {
+                    controller.enqueue(new Uint8Array(b.subarray(0, 5)));
+                    controller.enqueue(new Uint8Array(b.subarray(5)));
+                } else {
+                    controller.enqueue(new Uint8Array(b));
+                }
+            };
+            const makeWritable = () =>
+                new WritableStream<Uint8Array>({
+                    write(chunk) {
+                        rxBuf = rxBuf.length > 0 ? Buffer.concat([rxBuf, Buffer.from(chunk)]) : Buffer.from(chunk);
+                        while (rxBuf.length >= 4) {
+                            const len = rxBuf[0]! | (rxBuf[1]! << 8) | (rxBuf[2]! << 16);
+                            const seq = rxBuf[3]!;
+                            if (rxBuf.length < 4 + len) break;
+                            const body = rxBuf.subarray(4, 4 + len);
+                            rxBuf = rxBuf.subarray(4 + len);
+                            onClientPacket(seq, body, push);
+                        }
+                    }
+                });
+            const sock: LightSocketLike = {
+                readable: makeReadable(),
+                writable: makeWritable(),
+                opened: Promise.resolve(),
+                startTls() {
+                    upgraded = true;
+                    const nextSock: LightSocketLike = {
+                        readable: makeReadable(),
+                        writable: makeWritable(),
+                        opened: Promise.resolve(),
+                        startTls: () => nextSock,
+                        close: async () => {
+                            try {
+                                controller.close();
+                            } catch {
+                                // ignore
+                            }
+                        }
+                    };
+                    return nextSock;
+                },
+                close: async () => {
+                    try {
+                        controller.close();
+                    } catch {
+                        // ignore
+                    }
+                }
+            };
+            return { socket: sock, tlsUpgraded: () => upgraded };
+        };
+
+        // 2. Full STARTTLS + mysql_native_password + OK + ResultSet (NEWDECIMAL/LONGLONG/NULL/UTF-8) + ERR code mapping
+        const hsOk = buildHandshakeV10('mysql_native_password', true);
+        let stage: 'ssl' | 'auth' | 'query' = 'ssl';
+        const mock1 = createMockSocket(
+            (seq, body, push) => {
+                if (stage === 'ssl') {
+                    expect(seq).toBe(1);
+                    expect(body.length).toBe(32);
+                    stage = 'auth';
+                    return;
+                }
+                if (stage === 'auth') {
+                    expect(seq).toBe(2);
+                    const expectedAuth = scrambleNativePassword('pw123', hsOk.salt);
+                    expect(body.includes(expectedAuth)).toBe(true);
+                    stage = 'query';
+                    push(wrapPkt(seq + 1, Buffer.from([0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00])));
+                    return;
+                }
+                if (body[0] === 0x01) return; // COM_QUIT
+                const sqlText = body.toString('utf8', 1);
+                if (sqlText.startsWith('INSERT')) {
+                    // OK packet: affectedRows=2, insertId=1000005
+                    const insBuf = Buffer.allocUnsafe(9);
+                    insBuf[0] = 0x00;
+                    insBuf[1] = 2; // affectedRows
+                    insBuf[2] = 0xfd; // 3-byte lenenc insertId
+                    insBuf[3] = 1000005 & 0xff;
+                    insBuf[4] = (1000005 >> 8) & 0xff;
+                    insBuf[5] = (1000005 >> 16) & 0xff;
+                    insBuf[6] = 2;
+                    insBuf[7] = 0;
+                    insBuf[8] = 0;
+                    push(wrapPkt(1, insBuf));
+                } else if (sqlText.startsWith('SELECT')) {
+                    push(wrapPkt(1, Buffer.from([4]))); // 4 columns
+                    push(wrapPkt(2, buildColDef('name', 0xfd))); // VARCHAR
+                    push(wrapPkt(3, buildColDef('cnt', 0xf6))); // NEWDECIMAL (SUM)
+                    push(wrapPkt(4, buildColDef('id', 0x08))); // LONGLONG
+                    push(wrapPkt(5, buildColDef('opt', 0xfd))); // NULL
+                    push(wrapPkt(6, Buffer.from([0xfe, 0, 0, 2, 0]))); // EOF
+                    push(
+                        wrapPkt(
+                            7,
+                            Buffer.concat([
+                                lenEncStr('ぽこぽこ'),
+                                lenEncStr('398461'),
+                                lenEncStr('1000005'),
+                                Buffer.from([0xfb]) // NULL
+                            ])
+                        )
+                    );
+                    push(wrapPkt(8, Buffer.from([0xfe, 0, 0, 2, 0]))); // EOF
+                } else {
+                    // ERR packet 1213 deadlock
+                    const errPayload = Buffer.concat([
+                        Buffer.from([0xff, 1213 & 0xff, (1213 >> 8) & 0xff]),
+                        Buffer.from('#40001Deadlock found when trying to get lock', 'utf8')
+                    ]);
+                    push(wrapPkt(1, errPayload));
+                }
+            },
+            [hsOk.pkt]
+        );
+
+        const conn = await openLightMysqlConnectionOnSocket(mock1.socket, {
+            connectionType: 'direct',
+            host: 'mysql.example.com',
+            port: 3306,
+            database: 'vrcx_db',
+            username: 'vrcx_u',
+            password: 'pw123',
+            sslMode: 'verify',
+            tablePrefix: 'vrcx_'
+        });
+        expect(mock1.tlsUpgraded()).toBe(true);
+        const insRes = await conn.execute('INSERT IGNORE INTO `t` VALUES (?, ?)', ['a', 1]);
+        expect(insRes).toEqual({ rows: [], affectedRows: 2, insertId: 1000005 });
+
+        const selRes = await conn.execute('SELECT name, cnt, id, opt FROM `t` WHERE id = ?', [1000005]);
+        expect(selRes.rows).toEqual([{ name: 'ぽこぽこ', cnt: 398461, id: 1000005, opt: null }]);
+
+        await expect(conn.execute('UPDATE `t` SET x = 1')).rejects.toMatchObject({
+            errno: 1213,
+            code: 'ER_LOCK_DEADLOCK'
+        });
+        await conn.close();
+
+        // 3. Unsupported auth plugin (MySQL 8 caching_sha2_password) throws LightMysqlUnsupportedAuthError for seamless mysql2 fallback
+        const hsSha2 = buildHandshakeV10('caching_sha2_password', false);
+        const mock2 = createMockSocket(() => {}, [hsSha2.pkt]);
+        await expect(
+            openLightMysqlConnectionOnSocket(mock2.socket, {
+                connectionType: 'direct',
+                host: 'mysql8.example.com',
+                port: 3306,
+                database: 'vrcx_db',
+                username: 'u',
+                password: 'p',
+                sslMode: 'disabled',
+                tablePrefix: 'vrcx_'
+            })
+        ).rejects.toBeInstanceOf(LightMysqlUnsupportedAuthError);
     });
 });

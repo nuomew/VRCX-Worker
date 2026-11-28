@@ -1679,10 +1679,23 @@ async function ingestLegacyCategoryBatch(
     legacyDb: D1Database,
     category: LegacyCategory,
     items: Array<Record<string, unknown>>,
-    options: { externalMysqlActive?: boolean } = {}
+    options: { externalMysqlActive?: boolean; batchTextClean?: boolean } = {}
 ): Promise<{ inserted: number; skipped: number; legacyDbBytes: number }> {
     const effectiveChunkMaxBytes = options.externalMysqlActive ? EXTERNAL_MYSQL_CHUNK_MAX_BYTES : COMPACT_CHUNK_MAX_BYTES;
     const effectiveStoredMaxBytes = options.externalMysqlActive ? EXTERNAL_MYSQL_STORED_PAYLOAD_MAX_BYTES : 0;
+    // Skip synchronous gzip only for oversized legacy v1.14.2 batches (>= 600 rows) on external MySQL,
+    // where JSON.parse + SHA-256 already spend ~4.5ms; <= 400-row batches stay 100% gzip-compressed.
+    const skipGzipForHugeBatch = Boolean(options.externalMysqlActive && items.length >= 600);
+    const fastStr = (val: unknown, maxLen: number): string => {
+        if (options.batchTextClean && typeof val === 'string') {
+            if (val.length <= maxLen) return val;
+            let cut = maxLen;
+            const lastCode = val.charCodeAt(cut - 1);
+            if (lastCode >= 0xd800 && lastCode <= 0xdbff) cut--;
+            return val.slice(0, cut);
+        }
+        return asStr(val, maxLen);
+    };
     const businessInsertBuckets = new Map<string, { columns: readonly string[]; rows: unknown[][] }>();
     const queueBusinessRow = (table: string, columns: readonly string[], row: unknown[]): void => {
         let bucket = businessInsertBuckets.get(table);
@@ -1992,7 +2005,7 @@ async function ingestLegacyCategoryBatch(
                 ]);
             }
         } else if (category === 'feed') {
-            const rawType = asStr(raw.type ?? kind, 64).trim();
+            const rawType = fastStr(raw.type ?? kind, 64).trim();
             const lowerType = rawType.toLowerCase();
             const type =
                 lowerType === 'gps'
@@ -2007,24 +2020,24 @@ async function ingestLegacyCategoryBatch(
                             ? 'Bio'
                             : rawType;
             const createdAt = resolveCreatedAt(raw.created_at ?? raw.createdAt);
-            const userId = asStr(raw.userId ?? raw.user_id, 128);
-            const displayName = asStr(raw.displayName ?? raw.display_name, 256);
+            const userId = fastStr(raw.userId ?? raw.user_id, 128);
+            const displayName = fastStr(raw.displayName ?? raw.display_name, 256);
             if (type === 'GPS') {
-                const location = asStr(raw.location, 512);
-                const worldName = asStr(raw.worldName ?? raw.world_name, 512);
+                const location = fastStr(raw.location, 512);
+                const worldName = fastStr(raw.worldName ?? raw.world_name, 512);
                 feedGpsRows.push([
                     createdAt,
                     userId,
                     displayName,
                     location,
                     worldName,
-                    asStr(raw.previousLocation ?? raw.previous_location, 512),
+                    fastStr(raw.previousLocation ?? raw.previous_location, 512),
                     Math.max(0, asFiniteInt(raw.time, 0)),
-                    asStr(raw.groupName ?? raw.group_name, 256)
+                    fastStr(raw.groupName ?? raw.group_name, 256)
                 ]);
             } else if (type === 'Online' || type === 'Offline') {
-                const location = asStr(raw.location, 512);
-                const worldName = asStr(raw.worldName ?? raw.world_name, 512);
+                const location = fastStr(raw.location, 512);
+                const worldName = fastStr(raw.worldName ?? raw.world_name, 512);
                 feedOnlineOfflineRows.push([
                     createdAt,
                     userId,
@@ -2033,25 +2046,25 @@ async function ingestLegacyCategoryBatch(
                     location,
                     worldName,
                     Math.max(0, asFiniteInt(raw.time, 0)),
-                    asStr(raw.groupName ?? raw.group_name, 256)
+                    fastStr(raw.groupName ?? raw.group_name, 256)
                 ]);
             } else if (type === 'Status') {
                 feedStatusRows.push([
                     createdAt,
                     userId,
                     displayName,
-                    asStr(raw.status, 64),
-                    asStr(raw.statusDescription ?? raw.status_description, 1024),
-                    asStr(raw.previousStatus ?? raw.previous_status, 64),
-                    asStr(raw.previousStatusDescription ?? raw.previous_status_description, 1024)
+                    fastStr(raw.status, 64),
+                    fastStr(raw.statusDescription ?? raw.status_description, 1024),
+                    fastStr(raw.previousStatus ?? raw.previous_status, 64),
+                    fastStr(raw.previousStatusDescription ?? raw.previous_status_description, 1024)
                 ]);
             } else if (type === 'Bio') {
                 feedBioRows.push([
                     createdAt,
                     userId,
                     displayName,
-                    asStr(raw.bio, 4096),
-                    asStr(raw.previousBio ?? raw.previous_bio, 4096),
+                    fastStr(raw.bio, 4096),
+                    fastStr(raw.previousBio ?? raw.previous_bio, 4096),
                     typeof raw.bioLinks === 'string'
                         ? raw.bioLinks.slice(0, 4096)
                         : typeof raw.bio_links === 'string'
@@ -2155,7 +2168,8 @@ async function ingestLegacyCategoryBatch(
             maxJsonBytes: effectiveChunkMaxBytes,
             maxStoredBytes: effectiveStoredMaxBytes,
             negateRowIds: true,
-            bulkMigration: true
+            bulkMigration: true,
+            skipGzipForHugeBatch
         });
         inserted += res.inserted;
         if (res.sizeAfter > legacyDbBytes) legacyDbBytes = res.sizeAfter;
@@ -2183,7 +2197,8 @@ async function ingestLegacyCategoryBatch(
             maxJsonBytes: effectiveChunkMaxBytes,
             maxStoredBytes: effectiveStoredMaxBytes,
             negateRowIds: true,
-            bulkMigration: true
+            bulkMigration: true,
+            skipGzipForHugeBatch
         });
         inserted += res.inserted;
         if (res.sizeAfter > legacyDbBytes) legacyDbBytes = res.sizeAfter;
@@ -2411,8 +2426,15 @@ export async function handleLegacyMigrationAgentRoutes(
         }
 
         let body: Record<string, unknown>;
+        let batchTextClean = false;
         try {
             const rawText = rawBytes.byteLength > 0 ? utf8Decoder.decode(rawBytes) : '';
+            batchTextClean =
+                rawText.indexOf('\0') === -1 &&
+                rawText.indexOf('\\u0000') === -1 &&
+                rawText.indexOf('\\uD') === -1 &&
+                rawText.indexOf('\\ud') === -1 &&
+                (rawText as string & { isWellFormed?: () => boolean }).isWellFormed?.() === true;
             const parsed = rawText ? (JSON.parse(rawText) as unknown) : {};
             if (!isPlainObject(parsed)) {
                 return Response.json(
@@ -2539,7 +2561,7 @@ export async function handleLegacyMigrationAgentRoutes(
                     legacyDb,
                     category,
                     rawItems as Array<Record<string, unknown>>,
-                    { externalMysqlActive }
+                    { externalMysqlActive, batchTextClean }
                 );
                 inserted = result.inserted;
                 skipped = result.skipped;

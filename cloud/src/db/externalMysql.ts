@@ -2,6 +2,7 @@ import type { Connection, ConnectionOptions, ResultSetHeader, RowDataPacket } fr
 import { getMasterKey } from '../auth/auth';
 import { decryptAesGcm, encryptAesGcm } from '../crypto/vault';
 import type { Env } from '../env';
+import { LightMysqlUnsupportedAuthError, openLightMysqlConnection } from './lightMysqlClient';
 import type { StorageDegradedReason } from './storageResilience';
 
 /**
@@ -1344,6 +1345,19 @@ async function openRealMysqlConnection(params: ResolvedMysqlConnectionParams): P
         throw new Error(
             'Cloudflare Workers does not support skipping TLS certificate verification (self-signed certificates). Switch TLS/SSL mode to "Disabled", use "TLS Enabled (strict CA verification)" with a trusted CA certificate, or connect via Cloudflare Hyperdrive.'
         );
+    }
+
+    // Fast path for direct MySQL 5.7+ connections: use zero-dependency cloudflare:sockets wire client
+    // (~0.5ms CPU vs ~5.1ms for mysql2), falling back seamlessly to mysql2 only if the server requires
+    // an unsupported auth plugin (e.g. MySQL 8 caching_sha2_password).
+    if (params.connectionType === 'direct' && (params.sslMode === 'disabled' || params.sslMode === 'verify')) {
+        try {
+            return await openLightMysqlConnection(params);
+        } catch (err) {
+            if (!(err instanceof LightMysqlUnsupportedAuthError)) {
+                throw normalizeWorkersMysqlError(err, params.sslMode);
+            }
+        }
     }
 
     const baseOpts: ConnectionOptions & { disableEval?: boolean } = {

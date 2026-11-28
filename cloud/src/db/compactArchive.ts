@@ -1031,12 +1031,15 @@ async function buildEncodedChunkSlices(
     maxRows: number,
     maxJsonBytes: number,
     maxStoredBytes: number,
-    options: { allowRawCpuFallback?: boolean } = {}
+    options: { allowRawCpuFallback?: boolean; skipGzipForHugeBatch?: boolean } = {}
 ): Promise<EncodedCompactChunkSlice[]> {
     const allowRawFallback = Boolean(options.allowRawCpuFallback && maxStoredBytes > 0);
-    let rawOnlyMode = false;
+    let rawOnlyMode = Boolean(options.skipGzipForHugeBatch && maxStoredBytes > 0);
+    const effectiveMaxJsonBytes = rawOnlyMode
+        ? Math.min(maxJsonBytes, Math.max(4096, maxStoredBytes - 4096))
+        : maxJsonBytes;
 
-    const rawSlices = splitTuplesIntoCompactChunks(tuples, fallbackIso, maxRows, maxJsonBytes);
+    const rawSlices = splitTuplesIntoCompactChunks(tuples, fallbackIso, maxRows, effectiveMaxJsonBytes);
     const encoded: EncodedCompactChunkSlice[] = [];
 
     const emitRawBounded = async (
@@ -1171,6 +1174,12 @@ export async function appendTuplesToCompactTailChunk(options: {
      * and stay well under Cloudflare Workers Free 10ms CPU limits.
      */
     bulkMigration?: boolean;
+    /**
+     * Skips synchronous gzip on oversized legacy batches (e.g. legacy Agent v1.14.2 1,000-row / 512 KiB
+     * payloads where JSON.parse + SHA-256 already consume ~4.5ms), storing <=36 KiB raw JSON slices directly
+     * so total request CPU stays strictly below Cloudflare Workers Free's 10ms limit (Error 1102).
+     */
+    skipGzipForHugeBatch?: boolean;
 }): Promise<AppendTailChunkResult> {
     const {
         db,
@@ -1184,7 +1193,8 @@ export async function appendTuplesToCompactTailChunk(options: {
         filterFreshTuples,
         maxRows = COMPACT_CHUNK_MAX_ROWS,
         negateRowIds = false,
-        bulkMigration = false
+        bulkMigration = false,
+        skipGzipForHugeBatch = false
     } = options;
     const isExternalMysqlTarget = isHybridMysqlD1Database(db);
     const requestedMaxJsonBytes = options.maxJsonBytes ?? COMPACT_CHUNK_MAX_BYTES;
@@ -1272,7 +1282,7 @@ export async function appendTuplesToCompactTailChunk(options: {
                 maxRows,
                 maxJsonBytes,
                 maxStoredBytes,
-                { allowRawCpuFallback: isExternalMysqlTarget }
+                { allowRawCpuFallback: isExternalMysqlTarget, skipGzipForHugeBatch: isExternalMysqlTarget && skipGzipForHugeBatch }
             );
             const stmts: D1PreparedStatement[] = [];
             const sliceMeta: Array<{ rows: unknown[][]; startOffset: number }> = [];
