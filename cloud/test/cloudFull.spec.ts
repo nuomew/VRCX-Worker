@@ -23,6 +23,7 @@ import {
     serializeBoundedRssSnapshot
 } from '../src/cache/vrcCache';
 import { diffFriendSnapshot, runBackgroundFeedSync } from '../src/sync/backgroundFeedSync';
+import { isLocationSuppressedByFlapState } from '../src/sync/gpsFlapGuard';
 
 const env = rawEnv as unknown as Env;
 const exports = rawExports as unknown as { default: Fetcher };
@@ -11023,5 +11024,208 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
                 .run()
                 .catch(() => {});
         }
+    });
+
+    it('silently suppresses dual-box A<->B GPS ping-pong, nonce/same-location dupes, and burst rate abuse across diffFriendSnapshot and POST /api/feed without false positives', async () => {
+        const headers = { 'Content-Type': 'application/json', Origin: 'http://example.com' };
+        const locA = 'wrld_aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa:1001~friends(usr_a)~region(jp)';
+        const locB = 'wrld_bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb:2002~friends(usr_b)~region(jp)';
+        const locC = 'wrld_cccccccc-cccc-cccc-cccc-cccccccccccc:3003~public~region(jp)';
+        const worldNames = new Map<string, string>([
+            ['wrld_aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'PokoPoko Farm'],
+            ['wrld_bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', 'Forge Warband Idle'],
+            ['wrld_cccccccc-cccc-cccc-cccc-cccccccccccc', 'Timeglow KTV']
+        ]);
+
+        // 1. diffFriendSnapshot: A <-> B dual-box oscillation (like Chiye / NinTa screenshot)
+        const baseMs = Date.parse('2026-11-28T01:50:00.000Z');
+        const isoAt = (minOffset: number) => new Date(baseMs + minOffset * 60_000).toISOString();
+        const mkFriend = (loc: string) => [
+            { id: 'usr_dual_1', displayName: 'Chiye', location: loc, status: 'active', platform: 'standalonewindows' }
+        ];
+
+        let snap = diffFriendSnapshot(null, mkFriend(locA), isoAt(0), worldNames).nextSnapshot;
+        // Hop 1: A -> B (accepted)
+        let step = diffFriendSnapshot(snap, mkFriend(locB), isoAt(1), worldNames);
+        expect(step.feedItems.filter((x) => x.type === 'GPS')).toHaveLength(1);
+        snap = step.nextSnapshot;
+
+        // Same instance with transient ~nonce jitter within 1 min (silently dropped)
+        step = diffFriendSnapshot(snap, mkFriend(`${locB}~nonce(deadbeef)`), isoAt(2), worldNames);
+        expect(step.feedItems.filter((x) => x.type === 'GPS')).toHaveLength(0);
+        snap = step.nextSnapshot;
+
+        // Hop 2: B -> A (single round-trip A -> B -> A must NOT false-positive)
+        step = diffFriendSnapshot(snap, mkFriend(locA), isoAt(3), worldNames);
+        expect(step.feedItems.filter((x) => x.type === 'GPS')).toHaveLength(1);
+        snap = step.nextSnapshot;
+        const stableLaBeforeLock = snap.usr_dual_1!.la;
+
+        // Hop 3: A -> B (3rd alternating hop within 15 min -> locks {A, B} and silently drops)
+        step = diffFriendSnapshot(snap, mkFriend(locB), isoAt(4), worldNames);
+        expect(step.feedItems.filter((x) => x.type === 'GPS')).toHaveLength(0);
+        snap = step.nextSnapshot;
+        expect(snap.usr_dual_1?.l).toBe(locA);
+        expect(snap.usr_dual_1?.la).toBe(stableLaBeforeLock);
+        expect(isLocationSuppressedByFlapState(snap.usr_dual_1?.fg, locB, baseMs + 4 * 60_000)).toBe(true);
+
+        // Hops 4..7: continued every-minute A <-> B ping-pong all silently dropped, sliding TTL renewed
+        for (const [m, loc] of [
+            [5, locA],
+            [6, locB],
+            [7, locA],
+            [8, locB]
+        ] as Array<[number, string]>) {
+            step = diffFriendSnapshot(snap, mkFriend(loc), isoAt(m), worldNames);
+            expect(step.feedItems.filter((x) => x.type === 'GPS')).toHaveLength(0);
+            snap = step.nextSnapshot;
+            expect(snap.usr_dual_1?.la).toBe(stableLaBeforeLock);
+        }
+
+        // Steady single-client stay in B (closed client A): stops renewing TTL, cleanly recovers after 30 min
+        step = diffFriendSnapshot(snap, mkFriend(locB), isoAt(20), worldNames);
+        expect(step.feedItems.filter((x) => x.type === 'GPS')).toHaveLength(0);
+        snap = step.nextSnapshot;
+        step = diffFriendSnapshot(snap, mkFriend(locB), isoAt(39), worldNames);
+        expect(step.feedItems.filter((x) => x.type === 'GPS')).toHaveLength(1);
+        expect(step.feedItems[0]?.location).toBe(locB);
+        snap = step.nextSnapshot;
+
+        // Re-lock {A, B} then immediately escape to a genuine 3rd world C -> unlocks & emits GPS -> C
+        step = diffFriendSnapshot(snap, mkFriend(locA), isoAt(40), worldNames);
+        expect(step.feedItems.filter((x) => x.type === 'GPS')).toHaveLength(1);
+        snap = step.nextSnapshot;
+        step = diffFriendSnapshot(snap, mkFriend(locB), isoAt(41), worldNames);
+        expect(step.feedItems.filter((x) => x.type === 'GPS')).toHaveLength(0);
+        snap = step.nextSnapshot;
+        step = diffFriendSnapshot(snap, mkFriend(locC), isoAt(42), worldNames);
+        expect(step.feedItems.filter((x) => x.type === 'GPS')).toHaveLength(1);
+        expect(step.feedItems[0]?.location).toBe(locC);
+        expect(step.nextSnapshot.usr_dual_1?.fg?.p).toBeUndefined();
+
+        // Offline immediately clears flap state
+        const offStep = diffFriendSnapshot(snap, [], isoAt(43), worldNames);
+        expect(offStep.feedItems.filter((x) => x.type === 'Offline')).toHaveLength(1);
+        expect(offStep.nextSnapshot.usr_dual_1).toBeUndefined();
+
+        // 2. Unified POST /api/feed gate: blocks Web-side ping-pong, paired dupes, and 6/10m burst abuse
+        const postFeed = async (items: Array<Record<string, unknown>>) => {
+            const res = await exports.default.fetch('http://example.com/api/feed', {
+                method: 'POST',
+                headers,
+                body: JSON.stringify({ items })
+            });
+            expect(res.status).toBe(200);
+            const json = (await res.json()) as { ok: boolean; data: { count: number; inserted: number } };
+            expect(json.ok).toBe(true);
+            return json.data;
+        };
+
+        // 2a. Paired duplicate + A <-> B ping-pong via POST /api/feed
+        const r1 = await postFeed([
+            {
+                type: 'GPS',
+                created_at: '2026-11-28T02:01:00.000Z',
+                userId: 'usr_web_dual',
+                displayName: 'NinTa',
+                location: locB,
+                worldName: 'Forge Warband Idle',
+                previousLocation: locA,
+                time: 60000
+            },
+            {
+                // Duplicate same instance 30s later (with nonce diff) -> dropped
+                type: 'GPS',
+                created_at: '2026-11-28T02:01:30.000Z',
+                userId: 'usr_web_dual',
+                displayName: 'NinTa',
+                location: `${locB}~nonce(1234)`,
+                worldName: 'Forge Warband Idle',
+                previousLocation: locA,
+                time: 30000
+            },
+            {
+                // Single round-trip back to A -> accepted
+                type: 'GPS',
+                created_at: '2026-11-28T02:02:00.000Z',
+                userId: 'usr_web_dual',
+                displayName: 'NinTa',
+                location: locA,
+                worldName: 'PokoPoko Farm',
+                previousLocation: locB,
+                time: 60000
+            },
+            {
+                // 3rd alternating hop A -> B -> silently dropped
+                type: 'GPS',
+                created_at: '2026-11-28T02:03:00.000Z',
+                userId: 'usr_web_dual',
+                displayName: 'NinTa',
+                location: locB,
+                worldName: 'Forge Warband Idle',
+                previousLocation: locA,
+                time: 60000
+            }
+        ]);
+        expect(r1.inserted).toBe(2);
+
+        // Subsequent separate request oscillating back to B or A within 30m -> 0 DB writes
+        const r2 = await postFeed([
+            {
+                type: 'GPS',
+                created_at: '2026-11-28T02:06:00.000Z',
+                userId: 'usr_web_dual',
+                displayName: 'NinTa',
+                location: locB,
+                worldName: 'Forge Warband Idle',
+                previousLocation: locA,
+                time: 60000
+            }
+        ]);
+        expect(r2.inserted).toBe(0);
+
+        // Moving to genuine 3rd room C -> accepted immediately
+        const r3 = await postFeed([
+            {
+                type: 'GPS',
+                created_at: '2026-11-28T02:07:00.000Z',
+                userId: 'usr_web_dual',
+                displayName: 'NinTa',
+                location: locC,
+                worldName: 'Timeglow KTV',
+                previousLocation: locA,
+                time: 180000
+            }
+        ]);
+        expect(r3.inserted).toBe(1);
+
+        // 2b. Per-user sliding-window rate breaker (max 6 GPS writes / 10 min) for 3-client / crash loops
+        const burstItems = Array.from({ length: 8 }, (_, idx) => ({
+            type: 'GPS',
+            created_at: new Date(Date.parse('2026-11-28T03:00:00.000Z') + idx * 60_000).toISOString(),
+            userId: 'usr_burst_3client',
+            displayName: 'TriBoxer',
+            location: `wrld_dddddddd-dddd-dddd-dddd-ddddddddddd${idx}:${100 + idx}`,
+            worldName: `World ${idx}`,
+            previousLocation: idx === 0 ? locA : `wrld_dddddddd-dddd-dddd-dddd-ddddddddddd${idx - 1}:${99 + idx}`,
+            time: 60000
+        }));
+        const burstRes = await postFeed(burstItems);
+        expect(burstRes.inserted).toBe(6);
+
+        // After the 10-minute window cools down, normal GPS writes resume cleanly
+        const afterCoolRes = await postFeed([
+            {
+                type: 'GPS',
+                created_at: '2026-11-28T03:12:00.000Z',
+                userId: 'usr_burst_3client',
+                displayName: 'TriBoxer',
+                location: locC,
+                worldName: 'Timeglow KTV',
+                previousLocation: burstItems[5]!.location,
+                time: 420000
+            }
+        ]);
+        expect(afterCoolRes.inserted).toBe(1);
     });
 });

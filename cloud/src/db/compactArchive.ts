@@ -1087,6 +1087,14 @@ export async function appendTuplesToCompactTailChunk(options: {
     maxStoredBytes?: number;
     negateRowIds?: boolean;
     /**
+     * Optional post-dedup filter that can inspect the already-loaded recent tail tuples
+     * (zero extra DB queries) and drop abusive/flap tuples before writing chunks.
+     */
+    filterFreshTuples?: (
+        existingRecentTuples: unknown[][],
+        incomingFresh: Array<{ tuple: unknown[]; inputIndex: number }>
+    ) => Array<{ tuple: unknown[]; inputIndex: number }>;
+    /**
      * Enables the high-throughput desktop migration fast path: large full-sized batches (>= 25% of a chunk)
      * bypass reading/gunzipping existing tail chunks and optimistic CAS retries, writing directly via
      * idempotent `INSERT OR IGNORE` (`UNIQUE(chunk_key)`) so concurrent workers have zero CAS contention
@@ -1103,6 +1111,7 @@ export async function appendTuplesToCompactTailChunk(options: {
         inputIndices,
         dedupKeyFn,
         mergeConflictTuple,
+        filterFreshTuples,
         maxRows = COMPACT_CHUNK_MAX_ROWS,
         negateRowIds = false,
         bulkMigration = false
@@ -1339,7 +1348,7 @@ export async function appendTuplesToCompactTailChunk(options: {
             parsedChunks.push({ meta: c, rows, dirty: false, dirtyUpdates: 0, keyToIdx });
         }
 
-        const fresh: Array<{ tuple: unknown[]; inputIndex: number }> = [];
+        let fresh: Array<{ tuple: unknown[]; inputIndex: number }> = [];
         let duplicateCount = batchSkipped;
 
         for (const item of batchDeduped) {
@@ -1359,6 +1368,12 @@ export async function appendTuplesToCompactTailChunk(options: {
                 continue;
             }
             fresh.push({ tuple: item.tuple, inputIndex: item.inputIndex });
+        }
+
+        if (filterFreshTuples && fresh.length > 0) {
+            const beforeLen = fresh.length;
+            fresh = filterFreshTuples(recentExistingTuples, fresh);
+            duplicateCount += beforeLen - fresh.length;
         }
 
         let lastChunkId = 0;

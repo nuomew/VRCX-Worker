@@ -26,6 +26,11 @@ import type { Env } from '../env';
 import { parseCloudSyncIntervalSeconds, parseWebSyncIntervalSeconds } from '../routes/coreData';
 import { ingestFeedItems } from '../routes/eventsData';
 import {
+    evaluateSnapshotGpsFlap,
+    isLocationSuppressedByFlapState,
+    type FriendGpsFlapState
+} from './gpsFlapGuard';
+import {
     buildConditionalSaveCookieJarStatement,
     buildCookieHeader,
     decryptCookieJarVaultRow,
@@ -75,6 +80,8 @@ export interface FriendSnapshotEntry {
     o: boolean;
     /** Consecutive truncated-page polls where this friend was unseen (cleared immediately when seen again) */
     m?: number;
+    /** Compact dual-box GPS flap guard state (omitted when idle/empty) */
+    fg?: FriendGpsFlapState;
 }
 
 export interface FriendPresenceTime {
@@ -220,13 +227,13 @@ export function diffFriendSnapshot(
         const resolvedWorldName = worldId ? (worldNameLookup.get(worldId) ?? '') : '';
 
         // Keep previous stable location while traveling so transient traveling ticks never generate bogus GPS rows.
-        const effectiveLocation = isTraveling ? (prev?.l ?? '') : isGameOnline ? rawLoc : '';
-        const effectiveWorldName = isTraveling
+        let effectiveLocation = isTraveling ? (prev?.l ?? '') : isGameOnline ? rawLoc : '';
+        let effectiveWorldName = isTraveling
             ? (prev?.w ?? '')
             : isGameOnline
               ? resolvedWorldName || (prev?.l === rawLoc ? (prev?.w ?? '') : '')
               : '';
-        const effectiveGroupName = isTraveling ? (prev?.g ?? '') : '';
+        let effectiveGroupName = isTraveling ? (prev?.g ?? '') : '';
 
         let nextLocationAt = prev?.la && prev.la > 0 ? prev.la : nowMs;
         let nextOnlineAt = isGameOnline
@@ -236,6 +243,7 @@ export function diffFriendSnapshot(
                   ? prev.la
                   : nowMs
             : 0;
+        let nextFlapState: FriendGpsFlapState | undefined = isGameOnline && isTraveling ? prev?.fg : undefined;
 
         if (!isBaseline) {
             const wasGameOnline = Boolean(prev?.o);
@@ -244,6 +252,7 @@ export function diffFriendSnapshot(
             if (isGameOnline && !wasGameOnline) {
                 nextLocationAt = nowMs;
                 nextOnlineAt = nowMs;
+                nextFlapState = undefined;
                 feedItems.push({
                     created_at: nowIso,
                     type: 'Online',
@@ -268,23 +277,35 @@ export function diffFriendSnapshot(
                 });
                 nextLocationAt = nowMs;
                 nextOnlineAt = 0;
+                nextFlapState = undefined;
             } else if (isGameOnline && wasGameOnline && prev && !isTraveling) {
                 // 2. GPS (world/instance change, including first arrival after coming online while traveling)
                 const prevLoc = prev.l;
-                if (prevLoc !== rawLoc) {
-                    const elapsedMs = prev.la > 0 ? Math.max(0, nowMs - prev.la) : 0;
-                    feedItems.push({
-                        created_at: nowIso,
-                        type: 'GPS',
-                        userId,
-                        displayName,
-                        location: rawLoc,
-                        worldName: resolvedWorldName,
-                        previousLocation: prevLoc,
-                        groupName: '',
-                        time: elapsedMs
-                    });
-                    nextLocationAt = nowMs;
+                if (prevLoc !== rawLoc || Boolean(prev.fg?.p) || Boolean(prev.fg?.r?.length)) {
+                    const decision = evaluateSnapshotGpsFlap(prev.fg, prevLoc, rawLoc, nowMs);
+                    nextFlapState = decision.nextState;
+                    if (decision.suppress) {
+                        // Silently drop dual-box A <-> B ping-pong / duplicate / burst writes and
+                        // preserve last stable location + dwell timestamp (`la`).
+                        effectiveLocation = prev.l;
+                        effectiveWorldName = prev.w;
+                        effectiveGroupName = prev.g;
+                        nextLocationAt = prev.la && prev.la > 0 ? prev.la : nowMs;
+                    } else if (!decision.unchanged && prevLoc !== rawLoc) {
+                        const elapsedMs = prev.la > 0 ? Math.max(0, nowMs - prev.la) : 0;
+                        feedItems.push({
+                            created_at: nowIso,
+                            type: 'GPS',
+                            userId,
+                            displayName,
+                            location: rawLoc,
+                            worldName: resolvedWorldName,
+                            previousLocation: prevLoc,
+                            groupName: '',
+                            time: elapsedMs
+                        });
+                        nextLocationAt = nowMs;
+                    }
                 }
             }
 
@@ -319,6 +340,7 @@ export function diffFriendSnapshot(
             d: statusDescription,
             la: nextLocationAt,
             ...(isGameOnline && nextOnlineAt > 0 ? { oa: nextOnlineAt } : {}),
+            ...(nextFlapState ? { fg: nextFlapState } : {}),
             o: isGameOnline
         };
     }
@@ -1664,6 +1686,7 @@ export async function runBackgroundFeedSync(
             const wid = extractWorldIdFromLocation(loc);
             if (!wid) continue;
             const prev = snapshot?.[f.id ?? ''];
+            if (isLocationSuppressedByFlapState(prev?.fg, loc, nowMs)) continue;
             if (!snapshot || !prev || prev.l !== loc || !prev.w) {
                 worldIdsToResolve.push(wid);
             }

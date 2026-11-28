@@ -1,4 +1,5 @@
 import { getGroupName, getWorldName, parseLocation } from '../shared/utils';
+import { clearFriendGpsFlapState, shouldSuppressFriendGpsFeed } from '../shared/utils/gpsFlapGuard';
 import { AppDebug } from '../services/appConfig';
 import { database } from '../services/database';
 import { isCloudFeedWriteSuppressed } from '../services/database/cloud/index.js';
@@ -83,6 +84,12 @@ export async function runHandleUserUpdateFlow(ref, props, { now = Date.now, nowI
         }
     }
     if (
+        (props.location && (props.location[0] === 'offline' || props.location[0] === '')) ||
+        (props.state && props.state[0] === 'offline')
+    ) {
+        clearFriendGpsFlapState(ref.id);
+    }
+    if (
         !props.state &&
         props.location &&
         props.location[0] !== 'offline' &&
@@ -119,24 +126,34 @@ export async function runHandleUserUpdateFlow(ref, props, { now = Date.now, nowI
             ref.$location_at = now() - time;
         } else {
             if (!suppressCloudFeed) {
-                const worldName = await getWorldName(newLocation);
-                const groupName = await getGroupName(newLocation);
-                feed = {
-                    created_at: nowIso(),
-                    type: 'GPS',
-                    userId: ref.id,
-                    displayName: ref.displayName,
+                const suppressedByFlapGuard = shouldSuppressFriendGpsFeed(ref.id, {
                     location: newLocation,
-                    worldName,
-                    groupName,
                     previousLocation,
-                    time
-                };
-                notificationStore.queueFeedNoty(feed);
-                sharedFeedStore.addEntry(feed);
-                const persistedFeed = await database.addGPSToDatabase(feed);
-                if (persistedFeed) {
-                    feedStore.addFeedEntry(persistedFeed);
+                    nowMs: now()
+                });
+                if (suppressedByFlapGuard) {
+                    // Silently suppress dual-box ping-pong / duplicate / burst GPS churn and preserve dwell time.
+                    ref.$location_at = now() - time;
+                } else {
+                    const worldName = await getWorldName(newLocation);
+                    const groupName = await getGroupName(newLocation);
+                    feed = {
+                        created_at: nowIso(),
+                        type: 'GPS',
+                        userId: ref.id,
+                        displayName: ref.displayName,
+                        location: newLocation,
+                        worldName,
+                        groupName,
+                        previousLocation,
+                        time
+                    };
+                    notificationStore.queueFeedNoty(feed);
+                    sharedFeedStore.addEntry(feed);
+                    const persistedFeed = await database.addGPSToDatabase(feed);
+                    if (persistedFeed) {
+                        feedStore.addFeedEntry(persistedFeed);
+                    }
                 }
             }
             // clear previousLocation after GPS

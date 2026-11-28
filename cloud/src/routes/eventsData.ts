@@ -35,6 +35,7 @@ import {
     upsertEntityWorldsBatch
 } from './coreData';
 import { getLegacyImportedStats } from './legacyMigration';
+import { filterGpsTuplesWithFlapGuard } from '../sync/gpsFlapGuard';
 
 const MAX_LIMIT = 100;
 
@@ -382,6 +383,11 @@ export async function ingestFeedItems(
             kindValue: kind,
             tuples,
             dedupKeyFn: (t) => feedTupleDedupKey(kind, t),
+            filterFreshTuples:
+                kind === 'gps'
+                    ? (existingRecent, incomingFresh) =>
+                          filterGpsTuplesWithFlapGuard(existingRecent, incomingFresh, nowIso)
+                    : undefined,
             fallbackIso: nowIso,
             maxRows: COMPACT_CHUNK_MAX_ROWS,
             maxJsonBytes: COMPACT_CHUNK_MAX_BYTES,
@@ -395,9 +401,11 @@ export async function ingestFeedItems(
         }
     }
 
-    await upsertEntityUsersBatch(env.DB_CORE, users, 50);
-    await upsertEntityWorldsBatch(env.DB_CORE, worlds, 50);
-    await incrementCountersBatch(env.DB_CORE, counterDeltas);
+    if (inserted > 0) {
+        await upsertEntityUsersBatch(env.DB_CORE, users, 50);
+        await upsertEntityWorldsBatch(env.DB_CORE, worlds, 50);
+        await incrementCountersBatch(env.DB_CORE, counterDeltas);
+    }
 
     return { count: totalAccepted, inserted, lastRowId };
 }
