@@ -17,7 +17,7 @@
 
         <!-- Borderless High-Fashion Editorial Topbar -->
         <header class="lb-topbar relative z-20 shrink-0 px-3 sm:px-6">
-            <div class="max-w-[1520px] mx-auto h-14 flex items-center justify-between gap-2.5">
+            <div class="max-w-[1600px] mx-auto h-14 flex items-center justify-between gap-2">
                 <!-- Left Serif Brand + Cover Toggle -->
                 <TooltipWrapper side="bottom" :content="t('view.settings.appearance.appearance.editorial_lookbook_toggle_cover')">
                     <button
@@ -38,25 +38,25 @@
                     <ContextMenuTrigger as-child>
                         <nav
                             ref="navContainerRef"
-                            class="relative flex items-center gap-1 flex-1 min-w-0 overflow-hidden px-1"
+                            class="relative flex items-center gap-0.5 flex-1 min-w-0 overflow-hidden"
                             :aria-label="t('nav_menu.custom_nav.header')">
-                            <!-- Off-flow measurement mirror so whole items move into More without mid-character slicing -->
+                            <!-- Off-flow measurement mirror matching live nav item typography & padding exactly -->
                             <div
                                 ref="navMeasureRef"
-                                class="pointer-events-none invisible fixed -top-[9999px] left-0 flex items-center gap-1"
+                                class="pointer-events-none invisible fixed -top-[9999px] left-0 flex items-center gap-0.5"
                                 aria-hidden="true">
                                 <span
                                     v-for="item in menuItems"
                                     :key="`m-${item.index}`"
                                     data-priority-item
-                                    class="inline-flex items-center gap-1.5 h-9 px-2.5 text-[13px] font-bold whitespace-nowrap shrink-0">
+                                    class="lb-nav-link inline-flex items-center gap-1 h-9 px-2 text-[13px] whitespace-nowrap shrink-0">
                                     <i :class="item.icon" class="text-[14px] leading-none shrink-0" />
                                     <span>{{ getItemLabel(item) }}</span>
                                     <ChevronDown v-if="item.children?.length" class="size-3.5 shrink-0" />
                                 </span>
                                 <span
                                     data-priority-more
-                                    class="inline-flex items-center gap-1 h-9 px-2.5 text-[13px] font-bold whitespace-nowrap shrink-0">
+                                    class="lb-nav-link inline-flex items-center gap-1 h-9 px-2 text-[13px] whitespace-nowrap shrink-0">
                                     <span>{{ t('view.settings.appearance.appearance.editorial_nav_more') }}</span>
                                     <ChevronDown class="size-3.5 shrink-0" />
                                 </span>
@@ -68,7 +68,7 @@
                                         <ContextMenuTrigger as-child>
                                             <button
                                                 type="button"
-                                                class="lb-nav-link relative inline-flex items-center gap-1.5 h-9 px-2.5 text-[13px] whitespace-nowrap shrink-0 cursor-pointer"
+                                                class="lb-nav-link relative inline-flex items-center gap-1 h-9 px-2 text-[13px] whitespace-nowrap shrink-0 cursor-pointer"
                                                 :data-active="activeMenuIndex === item.index"
                                                 :title="getItemLabel(item)"
                                                 @click="handleMenuItemClick(item)">
@@ -112,7 +112,7 @@
                                         <DropdownMenuTrigger as-child>
                                             <button
                                                 type="button"
-                                                class="lb-nav-link relative inline-flex items-center gap-1.5 h-9 px-2.5 text-[13px] whitespace-nowrap shrink-0 cursor-pointer"
+                                                class="lb-nav-link relative inline-flex items-center gap-1 h-9 px-2 text-[13px] whitespace-nowrap shrink-0 cursor-pointer"
                                                 :data-active="isFolderActive(item)"
                                                 :title="getItemLabel(item)">
                                                 <i :class="item.icon" class="text-[14px] leading-none opacity-80 shrink-0" />
@@ -158,7 +158,7 @@
                                     <DropdownMenuTrigger as-child>
                                         <button
                                             type="button"
-                                            class="lb-nav-link relative inline-flex items-center gap-1 h-9 px-2.5 text-[13px] whitespace-nowrap shrink-0 cursor-pointer"
+                                            class="lb-nav-link relative inline-flex items-center gap-1 h-9 px-2 text-[13px] whitespace-nowrap shrink-0 cursor-pointer"
                                             :data-active="hasActiveOverflow"
                                             :title="t('view.settings.appearance.appearance.editorial_nav_more')">
                                             <span>{{ t('view.settings.appearance.appearance.editorial_nav_more') }}</span>
@@ -456,7 +456,7 @@
 
         <!-- Centered Editorial Lookbook 2-Column Workspace -->
         <div class="relative z-10 flex-1 min-h-0 min-w-0 overflow-hidden px-3 sm:px-6 py-3">
-            <div class="max-w-[1520px] mx-auto h-full flex gap-4 min-h-0 min-w-0">
+            <div class="max-w-[1600px] mx-auto h-full flex gap-4 min-h-0 min-w-0">
                 <!-- Left Collapsible Lookbook Cover & Profile Folio -->
                 <aside
                     v-if="coverOpen && !isCompactViewport"
@@ -890,8 +890,8 @@
         activeMenuIndex,
         isNavItemNotified,
         locale,
-        gap: 4,
-        moreButtonWidth: 78
+        gap: 2,
+        moreButtonWidth: 66
     });
 
     const toggleCover = () => {

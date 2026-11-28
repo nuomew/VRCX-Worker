@@ -15,7 +15,7 @@
 
         <!-- Crisp White & Azure Slanted Official-Site Topbar -->
         <header class="arc-topbar relative z-20 shrink-0 px-3 sm:px-5">
-            <div class="max-w-[1520px] mx-auto h-13 flex items-center justify-between gap-2.5">
+            <div class="max-w-[1600px] mx-auto h-13 flex items-center justify-between gap-2">
                 <!-- Left Slanted Brand Badge + Online Strip Toggle -->
                 <TooltipWrapper side="bottom" :content="t('view.settings.appearance.appearance.editorial_archive_toggle_strip')">
                     <button
@@ -38,18 +38,18 @@
                     <ContextMenuTrigger as-child>
                         <nav
                             ref="navContainerRef"
-                            class="relative flex items-center gap-1.5 flex-1 min-w-0 overflow-hidden px-2 py-1"
+                            class="relative flex items-center gap-1 flex-1 min-w-0 overflow-hidden px-1 py-1"
                             :aria-label="t('nav_menu.custom_nav.header')">
                             <!-- Off-flow measurement mirror so whole skewed tabs move into More cleanly -->
                             <div
                                 ref="navMeasureRef"
-                                class="pointer-events-none invisible fixed -top-[9999px] left-0 flex items-center gap-1.5"
+                                class="pointer-events-none invisible fixed -top-[9999px] left-0 flex items-center gap-1"
                                 aria-hidden="true">
                                 <span
                                     v-for="item in menuItems"
                                     :key="`m-${item.index}`"
                                     data-priority-item
-                                    class="arc-nav-tab arc-skew inline-flex items-center h-8 px-3 text-xs whitespace-nowrap shrink-0">
+                                    class="arc-nav-tab arc-skew inline-flex items-center h-8 px-2.5 text-xs whitespace-nowrap shrink-0">
                                     <span>
                                         <i :class="item.icon" class="text-[14px] leading-none shrink-0" />
                                         <span>{{ getItemLabel(item) }}</span>
@@ -58,7 +58,7 @@
                                 </span>
                                 <span
                                     data-priority-more
-                                    class="arc-nav-tab arc-skew inline-flex items-center h-8 px-3 text-xs whitespace-nowrap shrink-0">
+                                    class="arc-nav-tab arc-skew inline-flex items-center h-8 px-2.5 text-xs whitespace-nowrap shrink-0">
                                     <span>
                                         <span>{{ t('view.settings.appearance.appearance.editorial_nav_more') }}</span>
                                         <ChevronDown class="size-3.5 shrink-0" />
@@ -72,7 +72,7 @@
                                         <ContextMenuTrigger as-child>
                                             <button
                                                 type="button"
-                                                class="arc-nav-tab arc-skew relative h-8 px-3 text-xs whitespace-nowrap shrink-0 cursor-pointer"
+                                                class="arc-nav-tab arc-skew relative h-8 px-2.5 text-xs whitespace-nowrap shrink-0 cursor-pointer"
                                                 :data-active="activeMenuIndex === item.index"
                                                 :title="getItemLabel(item)"
                                                 @click="handleMenuItemClick(item)">
@@ -118,7 +118,7 @@
                                         <DropdownMenuTrigger as-child>
                                             <button
                                                 type="button"
-                                                class="arc-nav-tab arc-skew relative h-8 px-3 text-xs whitespace-nowrap shrink-0 cursor-pointer"
+                                                class="arc-nav-tab arc-skew relative h-8 px-2.5 text-xs whitespace-nowrap shrink-0 cursor-pointer"
                                                 :data-active="isFolderActive(item)"
                                                 :title="getItemLabel(item)">
                                                 <span>
@@ -161,7 +161,7 @@
                                     <DropdownMenuTrigger as-child>
                                         <button
                                             type="button"
-                                            class="arc-nav-tab arc-skew relative h-8 px-3 text-xs whitespace-nowrap shrink-0 cursor-pointer"
+                                            class="arc-nav-tab arc-skew relative h-8 px-2.5 text-xs whitespace-nowrap shrink-0 cursor-pointer"
                                             :data-active="hasActiveOverflow"
                                             :title="t('view.settings.appearance.appearance.editorial_nav_more')">
                                             <span>
@@ -468,7 +468,7 @@
 
         <!-- Signature Horizontal Online Friends Halo Strip (Collapsible) -->
         <section v-if="onlineStripOpen" class="relative z-10 shrink-0 px-3 sm:px-5 pt-2.5">
-            <div class="arc-strip-card max-w-[1520px] mx-auto px-3.5 py-2 flex items-center gap-3">
+            <div class="arc-strip-card max-w-[1600px] mx-auto px-3.5 py-2 flex items-center gap-3">
                 <!-- Current User Quick Anchor -->
                 <button
                     type="button"
@@ -553,7 +553,7 @@
 
         <!-- Asymmetric Blueprint Workspace: Crisp Main Stage + Right Friends Roster -->
         <div class="relative z-10 flex-1 min-h-0 min-w-0 overflow-hidden px-3 sm:px-5 py-2.5">
-            <div class="max-w-[1520px] mx-auto h-full flex gap-3 min-h-0 min-w-0">
+            <div class="max-w-[1600px] mx-auto h-full flex gap-3 min-h-0 min-w-0">
                 <main class="arc-main-stage flex-1 min-h-0 min-w-0 flex flex-col overflow-hidden">
                     <div
                         v-if="isWeb && cloudState.storageDegraded.active && !cloudState.storageDegraded.dismissed"
@@ -856,8 +856,8 @@
         activeMenuIndex,
         isNavItemNotified,
         locale,
-        gap: 6,
-        moreButtonWidth: 88
+        gap: 4,
+        moreButtonWidth: 74
     });
 
     const toggleOnlineStrip = () => {

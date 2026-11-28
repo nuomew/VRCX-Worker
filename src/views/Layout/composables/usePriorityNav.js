@@ -19,7 +19,7 @@ export function computePriorityNavSplit(itemWidths, containerWidth, { gap = 4, m
     for (let i = 0; i < count; i++) {
         totalAll += itemWidths[i] + (i > 0 ? gap : 0);
     }
-    if (totalAll <= containerWidth) {
+    if (totalAll <= containerWidth + 0.5) {
         return count;
     }
 
@@ -29,7 +29,7 @@ export function computePriorityNavSplit(itemWidths, containerWidth, { gap = 4, m
     let visible = 0;
     for (let i = 0; i < count; i++) {
         const nextWidth = itemWidths[i] + (visible > 0 ? gap : 0);
-        if (used + nextWidth > budget) {
+        if (used + nextWidth > budget + 0.5) {
             break;
         }
         used += nextWidth;
@@ -80,13 +80,13 @@ export function usePriorityNav({
             return;
         }
 
-        // Subtract horizontal padding (clientWidth includes padding) plus a 2px subpixel buffer.
+        // Subtract horizontal padding (clientWidth includes padding) without artificially inflating item widths.
         let padX = 0;
         if (typeof window !== 'undefined' && typeof window.getComputedStyle === 'function') {
             const style = window.getComputedStyle(container);
             padX = (parseFloat(style.paddingLeft) || 0) + (parseFloat(style.paddingRight) || 0);
         }
-        const available = Math.floor(container.clientWidth - padX - 2);
+        const available = container.clientWidth - padX;
         if (available <= 0) {
             visibleCount.value = items.length;
             return;
@@ -99,10 +99,10 @@ export function usePriorityNav({
         }
 
         const moreEl = measure.querySelector('[data-priority-more]');
-        const measuredMoreWidth = moreEl ? Math.ceil(moreEl.getBoundingClientRect().width) : 0;
+        const measuredMoreWidth = moreEl ? moreEl.getBoundingClientRect().width : 0;
         const effectiveMoreWidth = measuredMoreWidth > 0 ? measuredMoreWidth : moreButtonWidth;
 
-        const widths = itemEls.map((el) => Math.ceil(el.getBoundingClientRect().width));
+        const widths = itemEls.map((el) => el.getBoundingClientRect().width);
         visibleCount.value = computePriorityNavSplit(widths, available, {
             gap,
             moreButtonWidth: effectiveMoreWidth
