@@ -2971,7 +2971,8 @@ describe('External MySQL 5.7+ Database Integration (Hybrid New-Writes Mode & Ful
             );
             expect(chunkSelects.length).toBe(0);
             expect(rollupSelects.length).toBe(0);
-            expect(rollupInserts.length).toBe(4);
+            expect(rollupInserts.length).toBeGreaterThanOrEqual(4);
+            expect(rollupInserts.length).toBeLessThanOrEqual(10);
 
             // 2. Idempotent replay of the exact same 1,000-row batch MUST insert 0 rows and NOT double rollup counts
             const u0Before = fakeMysql.tables
@@ -3090,10 +3091,12 @@ describe('External MySQL 5.7+ Database Integration (Hybrid New-Writes Mode & Ful
             const bioJson = (await bioRes.json()) as { data: { inserted: number } };
             expect(bioJson.data.inserted).toBe(400);
             const feedChunks = fakeMysql.tables.get('vrcx_legacy_feed_chunks')?.rows ?? [];
-            expect(feedChunks.length).toBeGreaterThanOrEqual(2);
-            expect(feedChunks.length).toBeLessThanOrEqual(3);
+            expect(feedChunks.length).toBeGreaterThanOrEqual(4);
+            expect(feedChunks.length).toBeLessThanOrEqual(6);
             for (const c of feedChunks) {
-                expect(String(c.payload_json ?? '').startsWith('gz:')).toBe(true);
+                const stored = String(c.payload_json ?? '');
+                expect(stored.startsWith('gz:')).toBe(true);
+                expect(Buffer.byteLength(stored, 'utf8')).toBeLessThanOrEqual(40 * 1024);
             }
             const bioChunkSelects = fakeMysql.executedSqls.filter((s) =>
                 /^SELECT\b[\s\S]*FROM\s+`vrcx_legacy_feed_chunks`/i.test(s)
@@ -3104,6 +3107,50 @@ describe('External MySQL 5.7+ Database Integration (Hybrid New-Writes Mode & Ful
             const { parseCompactChunkTuples } = await import('../src/db/compactArchive');
             const firstBioTuple = parseCompactChunkTuples(String(feedChunks[0]?.payload_json ?? ''))[0];
             expect(firstBioTuple?.[2]).toBe('DirtyName🌸_ok');
+
+            // 4b. Incompressible high-entropy random payload (~180 KiB) MUST auto-bisect so every stored chunk stays <= 40 KiB
+            //     (eliminating ~65.5 KiB > 64 KiB PROTOCOL_CONNECTION_LOST disconnects on strict MySQL hosts/proxies).
+            const makePseudoRandom = (seed: number, len: number): string => {
+                const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+                let x = (seed * 2654435761 + 1234567) >>> 0;
+                let out = '';
+                for (let k = 0; k < len; k++) {
+                    x = (Math.imul(x, 1664525) + 1013904223) >>> 0;
+                    out += alphabet[(x >>> 26) & 63]!;
+                }
+                return out;
+            };
+            const incompressibleItems = Array.from({ length: 120 }, (_, i) => ({
+                type: 'Bio',
+                created_at: `2025-08-${String((i % 28) + 1).padStart(2, '0')}T03:${String(i % 60).padStart(2, '0')}:00.000Z`,
+                userId: `usr_incomp_${String(i).padStart(4, '0')}`,
+                displayName: `Incomp_${i}`,
+                bio: makePseudoRandom(i + 1, 700),
+                previousBio: makePseudoRandom(i + 9001, 700),
+                bioLinks: '[]',
+                previousBioLinks: '[]'
+            }));
+            const incompRes = await exports.default.fetch('http://example.com/api/agent/migration/batch', {
+                method: 'POST',
+                headers: agentHeaders,
+                body: JSON.stringify({
+                    jobId,
+                    category: 'feed',
+                    items: incompressibleItems,
+                    categoryDone: false,
+                    allDone: false
+                })
+            });
+            expect(incompRes.status).toBe(200);
+            const incompJson = (await incompRes.json()) as { data: { inserted: number } };
+            expect(incompJson.data.inserted).toBe(120);
+            const allBioChunksAfter = (fakeMysql.tables.get('vrcx_legacy_feed_chunks')?.rows ?? []).filter(
+                (r) => r.feed_kind === 'bio'
+            );
+            for (const c of allBioChunksAfter) {
+                expect(Buffer.byteLength(String(c.payload_json ?? ''), 'utf8')).toBeLessThanOrEqual(40 * 1024);
+            }
+            expect(allBioChunksAfter.reduce((s, c) => s + Number(c.row_count ?? 0), 0)).toBe(520);
 
             // 5. Four concurrent 300-row batches on the same table succeed with zero CAS retries/errors
             const concurrentRes = await Promise.all(

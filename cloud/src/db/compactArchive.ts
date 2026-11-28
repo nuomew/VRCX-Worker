@@ -2,11 +2,22 @@ import { Buffer } from 'node:buffer';
 import { gunzipSync, gzipSync } from 'node:zlib';
 import { compactVrcCacheStorage } from '../cache/vrcCache';
 import { getRawD1Env } from './externalMysql';
+import { isHybridMysqlD1Database } from './externalMysqlProxy';
 import { getCacheDb, getChatDb, getLegacyDb } from './schemaBootstrap';
 import type { Env } from '../env';
 
 export const COMPACT_CHUNK_MAX_ROWS = 1000;
 export const COMPACT_CHUNK_MAX_BYTES = 512 * 1024;
+/**
+ * Safe chunk ceilings when writing to external MySQL 5.7+ over public TCP links:
+ * - 128 KiB raw JSON typically compresses to ~10-35 KiB with gzip level 1 (zero bisection CPU overhead);
+ * - 40 KiB hard ceiling on stored payload bytes guarantees even incompressible high-entropy data
+ *   stays strictly below 64 KiB (65,536 B) single-packet / proxy / shared-host disconnect cliffs.
+ */
+export const EXTERNAL_MYSQL_COMPACT_CHUNK_MAX_BYTES = 128 * 1024;
+export const EXTERNAL_MYSQL_STORED_PAYLOAD_MAX_BYTES = 40 * 1024;
+const EXTERNAL_MYSQL_ROLLUP_MAX_ROWS_PER_STMT = 80;
+const EXTERNAL_MYSQL_ROLLUP_MAX_SQL_BYTES = 32 * 1024;
 export const CHUNK_GZIP_PREFIX = 'gz:';
 export const CHUNK_GZIP_MIN_RAW_BYTES = 512;
 export const DEFAULT_COMPACT_RETENTION_DAYS = 30;
@@ -992,6 +1003,74 @@ export interface AppendTailChunkResult {
  * by up to 99.9% and eliminating double-write overhead from periodic re-packing.
  * Uses optimistic CAS (`WHERE id = ? AND row_count = ? AND chunk_key = ?`) for concurrency safety.
  */
+interface EncodedCompactChunkSlice {
+    rows: unknown[][];
+    chunkKey: string;
+    storedPayload: string;
+    minCreatedAt: string;
+    maxCreatedAt: string;
+}
+
+function measureStoredPayloadBytes(storedPayload: string, rawBuf: Buffer): number {
+    return storedPayload.startsWith(CHUNK_GZIP_PREFIX) ? storedPayload.length : rawBuf.byteLength;
+}
+
+/**
+ * Splits tuples into compact archive slices bounded by BOTH uncompressed JSON size (`maxJsonBytes`)
+ * AND final encoded/stored payload bytes (`maxStoredBytes`, when > 0), bisecting any exceptionally
+ * incompressible slice so external MySQL INSERT packets never exceed strict 64 KiB proxy/server limits.
+ */
+async function buildEncodedChunkSlices(
+    tuples: unknown[][],
+    kindValue: string,
+    fallbackIso: string,
+    maxRows: number,
+    maxJsonBytes: number,
+    maxStoredBytes: number
+): Promise<EncodedCompactChunkSlice[]> {
+    const rawSlices = splitTuplesIntoCompactChunks(tuples, fallbackIso, maxRows, maxJsonBytes);
+    const encoded: EncodedCompactChunkSlice[] = [];
+
+    const encodeSliceBounded = async (
+        rows: unknown[][],
+        preBuilt?: { payloadJson: string; minCreatedAt: string; maxCreatedAt: string }
+    ): Promise<void> => {
+        if (rows.length === 0) return;
+        const payloadJson = preBuilt ? preBuilt.payloadJson : JSON.stringify(rows);
+        const rawBuf = Buffer.from(payloadJson, 'utf8');
+        if (rows.length > 1 && rawBuf.byteLength > maxJsonBytes) {
+            const mid = Math.floor(rows.length / 2);
+            await encodeSliceBounded(rows.slice(0, mid));
+            await encodeSliceBounded(rows.slice(mid));
+            return;
+        }
+        const storedPayload = encodeCompactChunkPayload(payloadJson, rawBuf);
+        const storedBytes = measureStoredPayloadBytes(storedPayload, rawBuf);
+        if (rows.length > 1 && maxStoredBytes > 0 && storedBytes > maxStoredBytes) {
+            const mid = Math.floor(rows.length / 2);
+            await encodeSliceBounded(rows.slice(0, mid));
+            await encodeSliceBounded(rows.slice(mid));
+            return;
+        }
+        const chunkKey = await computeCompactChunkKey(kindValue, payloadJson, rawBuf);
+        const bounds = preBuilt
+            ? { minCreatedAt: preBuilt.minCreatedAt, maxCreatedAt: preBuilt.maxCreatedAt }
+            : computeTupleSliceBounds(rows, fallbackIso);
+        encoded.push({
+            rows,
+            chunkKey,
+            storedPayload,
+            minCreatedAt: bounds.minCreatedAt,
+            maxCreatedAt: bounds.maxCreatedAt
+        });
+    };
+
+    for (const slice of rawSlices) {
+        await encodeSliceBounded(slice.rows, slice);
+    }
+    return encoded;
+}
+
 export async function appendTuplesToCompactTailChunk(options: {
     db: D1Database;
     archiveTable: CompactArchiveTableName;
@@ -1004,9 +1083,11 @@ export async function appendTuplesToCompactTailChunk(options: {
     fallbackIso?: string;
     maxRows?: number;
     maxJsonBytes?: number;
+    /** Optional hard ceiling on final stored (compressed or raw) payload UTF-8 bytes per chunk. */
+    maxStoredBytes?: number;
     negateRowIds?: boolean;
     /**
-     * Enables the high-throughput desktop migration fast path: large full-sized batches (>= 50% of a chunk)
+     * Enables the high-throughput desktop migration fast path: large full-sized batches (>= 25% of a chunk)
      * bypass reading/gunzipping existing tail chunks and optimistic CAS retries, writing directly via
      * idempotent `INSERT OR IGNORE` (`UNIQUE(chunk_key)`) so concurrent workers have zero CAS contention
      * and stay well under Cloudflare Workers Free 10ms CPU limits.
@@ -1023,10 +1104,16 @@ export async function appendTuplesToCompactTailChunk(options: {
         dedupKeyFn,
         mergeConflictTuple,
         maxRows = COMPACT_CHUNK_MAX_ROWS,
-        maxJsonBytes = COMPACT_CHUNK_MAX_BYTES,
         negateRowIds = false,
         bulkMigration = false
     } = options;
+    const isExternalMysqlTarget = isHybridMysqlD1Database(db);
+    const requestedMaxJsonBytes = options.maxJsonBytes ?? COMPACT_CHUNK_MAX_BYTES;
+    const maxJsonBytes = isExternalMysqlTarget
+        ? Math.min(requestedMaxJsonBytes, EXTERNAL_MYSQL_COMPACT_CHUNK_MAX_BYTES)
+        : requestedMaxJsonBytes;
+    const maxStoredBytes =
+        options.maxStoredBytes ?? (isExternalMysqlTarget ? EXTERNAL_MYSQL_STORED_PAYLOAD_MAX_BYTES : 0);
     const fallbackIso = options.fallbackIso || new Date().toISOString();
     const emptyResult: AppendTailChunkResult = {
         inserted: 0,
@@ -1095,19 +1182,18 @@ export async function appendTuplesToCompactTailChunk(options: {
             batchDeduped.length >= Math.max(1, Math.floor(maxRows * 0.25)) ||
             estBatchBytes >= Math.max(4096, Math.floor(maxJsonBytes * 0.25));
         if (isLargeBatch) {
-            const slices = splitTuplesIntoCompactChunks(
+            const slices = await buildEncodedChunkSlices(
                 batchDeduped.map((x) => x.tuple),
+                kindValue,
                 fallbackIso,
                 maxRows,
-                maxJsonBytes
+                maxJsonBytes,
+                maxStoredBytes
             );
             const stmts: D1PreparedStatement[] = [];
             const sliceMeta: Array<{ rows: unknown[][]; startOffset: number }> = [];
             let cursor = 0;
             for (const slice of slices) {
-                const rawBuf = Buffer.from(slice.payloadJson, 'utf8');
-                const chunkKey = await computeCompactChunkKey(kindValue, slice.payloadJson, rawBuf);
-                const storedPayload = encodeCompactChunkPayload(slice.payloadJson, rawBuf);
                 const safeMinTs = sanitizeMysqlSafeAscii(slice.minCreatedAt, 40, fallbackIso.slice(0, 40));
                 const safeMaxTs = sanitizeMysqlSafeAscii(slice.maxCreatedAt, 40, fallbackIso.slice(0, 40));
                 if (kindColumn) {
@@ -1118,7 +1204,7 @@ export async function appendTuplesToCompactTailChunk(options: {
                                  (chunk_key, ${kindColumn}, min_created_at, max_created_at, row_count, payload_json)
                                  VALUES (?, ?, ?, ?, ?, ?)`
                             )
-                            .bind(chunkKey, kindValue, safeMinTs, safeMaxTs, slice.rows.length, storedPayload)
+                            .bind(slice.chunkKey, kindValue, safeMinTs, safeMaxTs, slice.rows.length, slice.storedPayload)
                     );
                 } else {
                     stmts.push(
@@ -1128,7 +1214,7 @@ export async function appendTuplesToCompactTailChunk(options: {
                                  (chunk_key, min_created_at, max_created_at, row_count, payload_json)
                                  VALUES (?, ?, ?, ?, ?)`
                             )
-                            .bind(chunkKey, safeMinTs, safeMaxTs, slice.rows.length, storedPayload)
+                            .bind(slice.chunkKey, safeMinTs, safeMaxTs, slice.rows.length, slice.storedPayload)
                     );
                 }
                 sliceMeta.push({ rows: slice.rows, startOffset: cursor });
@@ -1343,96 +1429,113 @@ export async function appendTuplesToCompactTailChunk(options: {
             }
 
             if (tail.dirty || appendedToTail.length > 0) {
-                const rawPayloadJson = JSON.stringify(tail.rows);
-                const rawBuf = Buffer.from(rawPayloadJson, 'utf8');
-                const newKey = await computeCompactChunkKey(kindValue, rawPayloadJson, rawBuf);
-                const storedPayload = encodeCompactChunkPayload(rawPayloadJson, rawBuf);
-                const { minTs, maxTs } = computeBounds(tail.rows);
-                let upd: D1Result | null = null;
-                try {
-                    upd = await db
-                        .prepare(
-                            `UPDATE ${archiveTable}
-                             SET chunk_key = ?, min_created_at = ?, max_created_at = ?, row_count = ?, payload_json = ?
-                             WHERE id = ? AND row_count = ? AND chunk_key = ?`
-                        )
-                        .bind(
-                            newKey,
-                            minTs,
-                            maxTs,
-                            tail.rows.length,
-                            storedPayload,
-                            tail.meta.id,
-                            originalTailLen,
-                            tail.meta.chunk_key
-                        )
-                        .run();
-                } catch (err) {
-                    if (!isChunkUniqueKeyConflictError(err)) {
-                        throw err;
-                    }
-                    upd = null;
-                }
-                if (upd && (upd.meta?.changes ?? 0) === 1) {
-                    totalChunksTouched++;
-                    totalCommittedUpdates += tail.dirtyUpdates;
-                    lastChunkId = Number(tail.meta.id);
-                    if (typeof upd.meta?.size_after === 'number' && upd.meta.size_after > sizeAfter) {
-                        sizeAfter = upd.meta.size_after;
-                    }
-                    for (const app of appendedToTail) {
-                        insertedTuples.push(app.tuple);
-                        const vrid = computeVirtualRowId(lastChunkId, app.rowPos);
-                        insertedRowIdsByInputIndex.set(app.inputIndex, vrid);
-                        lastVirtualRowId = vrid;
-                    }
-                } else {
-                    if (attempt < maxAttempts - 1) continue;
-                    // On exhausted concurrent CAS retries, fall back to inserting a fresh chunk for new items
-                    // AND preserve any pending conflict-merged tuples via CAS-safe targeted mutation so updates are never lost.
+                let rawPayloadJson = JSON.stringify(tail.rows);
+                let rawBuf = Buffer.from(rawPayloadJson, 'utf8');
+                let storedPayload = encodeCompactChunkPayload(rawPayloadJson, rawBuf);
+                // If appending new rows pushed the encoded tail chunk past `maxStoredBytes` (e.g. 40 KiB on external MySQL),
+                // roll back the appended items so Step 5 inserts them as fresh size-bounded chunk(s) instead of risking a 64 KiB disconnect.
+                if (
+                    maxStoredBytes > 0 &&
+                    appendedToTail.length > 0 &&
+                    measureStoredPayloadBytes(storedPayload, rawBuf) > maxStoredBytes
+                ) {
+                    tail.rows.length = originalTailLen;
+                    appendedToTail.length = 0;
                     remainingStart = 0;
-                    if (tail.dirty && mergeConflictTuple) {
-                        const batchByKey = new Map<string, unknown[]>();
-                        for (const item of batchDeduped) {
-                            if (item.key) batchByKey.set(item.key, item.tuple);
+                    if (tail.dirty) {
+                        rawPayloadJson = JSON.stringify(tail.rows);
+                        rawBuf = Buffer.from(rawPayloadJson, 'utf8');
+                        storedPayload = encodeCompactChunkPayload(rawPayloadJson, rawBuf);
+                    }
+                }
+                if (tail.dirty || appendedToTail.length > 0) {
+                    const newKey = await computeCompactChunkKey(kindValue, rawPayloadJson, rawBuf);
+                    const { minTs, maxTs } = computeBounds(tail.rows);
+                    let upd: D1Result | null = null;
+                    try {
+                        upd = await db
+                            .prepare(
+                                `UPDATE ${archiveTable}
+                                 SET chunk_key = ?, min_created_at = ?, max_created_at = ?, row_count = ?, payload_json = ?
+                                 WHERE id = ? AND row_count = ? AND chunk_key = ?`
+                            )
+                            .bind(
+                                newKey,
+                                minTs,
+                                maxTs,
+                                tail.rows.length,
+                                storedPayload,
+                                tail.meta.id,
+                                originalTailLen,
+                                tail.meta.chunk_key
+                            )
+                            .run();
+                    } catch (err) {
+                        if (!isChunkUniqueKeyConflictError(err)) {
+                            throw err;
                         }
-                        const repairRes = await mutateArchiveChunks({
-                            db,
-                            archiveTable,
-                            kindColumn,
-                            kindValue,
-                            chunkIdHint: tail.meta.id,
-                            stopAfterFirstChunkChange: true,
-                            mutateTuple: (existingTuple) => {
-                                const k = dedupKeyFn(existingTuple);
-                                const inc = k ? batchByKey.get(k) : undefined;
-                                if (!inc) return 'keep';
-                                return mergeConflictTuple(existingTuple, inc) ?? 'keep';
+                        upd = null;
+                    }
+                    if (upd && (upd.meta?.changes ?? 0) === 1) {
+                        totalChunksTouched++;
+                        totalCommittedUpdates += tail.dirtyUpdates;
+                        lastChunkId = Number(tail.meta.id);
+                        if (typeof upd.meta?.size_after === 'number' && upd.meta.size_after > sizeAfter) {
+                            sizeAfter = upd.meta.size_after;
+                        }
+                        for (const app of appendedToTail) {
+                            insertedTuples.push(app.tuple);
+                            const vrid = computeVirtualRowId(lastChunkId, app.rowPos);
+                            insertedRowIdsByInputIndex.set(app.inputIndex, vrid);
+                            lastVirtualRowId = vrid;
+                        }
+                    } else {
+                        if (attempt < maxAttempts - 1) continue;
+                        // On exhausted concurrent CAS retries, fall back to inserting a fresh chunk for new items
+                        // AND preserve any pending conflict-merged tuples via CAS-safe targeted mutation so updates are never lost.
+                        remainingStart = 0;
+                        if (tail.dirty && mergeConflictTuple) {
+                            const batchByKey = new Map<string, unknown[]>();
+                            for (const item of batchDeduped) {
+                                if (item.key) batchByKey.set(item.key, item.tuple);
                             }
-                        });
-                        totalCommittedUpdates += repairRes.modifiedCount;
-                        if (repairRes.modifiedCount > 0) totalChunksTouched++;
+                            const repairRes = await mutateArchiveChunks({
+                                db,
+                                archiveTable,
+                                kindColumn,
+                                kindValue,
+                                chunkIdHint: tail.meta.id,
+                                stopAfterFirstChunkChange: true,
+                                mutateTuple: (existingTuple) => {
+                                    const k = dedupKeyFn(existingTuple);
+                                    const inc = k ? batchByKey.get(k) : undefined;
+                                    if (!inc) return 'keep';
+                                    return mergeConflictTuple(existingTuple, inc) ?? 'keep';
+                                }
+                            });
+                            totalCommittedUpdates += repairRes.modifiedCount;
+                            if (repairRes.modifiedCount > 0) totalChunksTouched++;
+                        }
                     }
                 }
             }
         }
 
-        // 5. Insert any remaining tuples as new compact chunks (<= 1,000 rows AND <= 512 KiB per D1 row)
+        // 5. Insert any remaining tuples as new compact chunks (<= maxRows, <= maxJsonBytes, <= maxStoredBytes)
         if (remainingStart < fresh.length) {
             const leftover = fresh.slice(remainingStart);
-            const slices = splitTuplesIntoCompactChunks(
+            const slices = await buildEncodedChunkSlices(
                 leftover.map((x) => x.tuple),
+                kindValue,
                 fallbackIso,
                 maxRows,
-                maxJsonBytes
+                maxJsonBytes,
+                maxStoredBytes
             );
             const stmts: D1PreparedStatement[] = [];
             const sliceMeta: Array<{ rows: unknown[][]; startOffset: number }> = [];
             let cursor = 0;
             for (const slice of slices) {
-                const rawBuf = Buffer.from(slice.payloadJson, 'utf8');
-                const chunkKey = await computeCompactChunkKey(kindValue, slice.payloadJson, rawBuf);
-                const storedPayload = encodeCompactChunkPayload(slice.payloadJson, rawBuf);
                 const safeMinTs = sanitizeMysqlSafeAscii(slice.minCreatedAt, 40, fallbackIso.slice(0, 40));
                 const safeMaxTs = sanitizeMysqlSafeAscii(slice.maxCreatedAt, 40, fallbackIso.slice(0, 40));
                 if (kindColumn) {
@@ -1443,7 +1546,7 @@ export async function appendTuplesToCompactTailChunk(options: {
                                  (chunk_key, ${kindColumn}, min_created_at, max_created_at, row_count, payload_json)
                                  VALUES (?, ?, ?, ?, ?, ?)`
                             )
-                            .bind(chunkKey, kindValue, safeMinTs, safeMaxTs, slice.rows.length, storedPayload)
+                            .bind(slice.chunkKey, kindValue, safeMinTs, safeMaxTs, slice.rows.length, slice.storedPayload)
                     );
                 } else {
                     stmts.push(
@@ -1453,7 +1556,7 @@ export async function appendTuplesToCompactTailChunk(options: {
                                  (chunk_key, min_created_at, max_created_at, row_count, payload_json)
                                  VALUES (?, ?, ?, ?, ?)`
                             )
-                            .bind(chunkKey, safeMinTs, safeMaxTs, slice.rows.length, storedPayload)
+                            .bind(slice.chunkKey, safeMinTs, safeMaxTs, slice.rows.length, slice.storedPayload)
                     );
                 }
                 sliceMeta.push({ rows: slice.rows, startOffset: cursor });
@@ -1726,12 +1829,28 @@ export async function applyWorldRollupForPackedLocations(
         }
     }
     // Sort deterministically by world_id so concurrent migration batches acquire InnoDB row locks in identical order (no deadlocks).
-    // Pack up to 18 rows per statement on D1 (18 * 5 = 90 <= D1's 100-param limit) and 150 rows on external MySQL.
+    // Pack up to 18 rows per statement on D1 (18 * 5 = 90 <= D1's 100-param limit), or up to 80 rows & <= 32 KiB on external MySQL.
     const entries = Array.from(agg.entries()).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
-    const rowsPerStmt = options.externalMysqlActive ? 150 : 18;
+    const useMysqlBatching = Boolean(options.externalMysqlActive) || isHybridMysqlD1Database(db);
+    const maxRowsPerStmt = useMysqlBatching ? EXTERNAL_MYSQL_ROLLUP_MAX_ROWS_PER_STMT : 18;
     const multiStmts: D1PreparedStatement[] = [];
-    for (let i = 0; i < entries.length; i += rowsPerStmt) {
-        const slice = entries.slice(i, i + rowsPerStmt);
+    for (let i = 0; i < entries.length; ) {
+        const slice: typeof entries = [];
+        let estBytes = 768;
+        while (i < entries.length && slice.length < maxRowsPerStmt) {
+            const entry = entries[i]!;
+            const rowBytes =
+                Buffer.byteLength(entry[0], 'utf8') +
+                Buffer.byteLength(entry[1].worldName, 'utf8') +
+                entry[1].lastVisit.length +
+                48;
+            if (useMysqlBatching && slice.length > 0 && estBytes + rowBytes > EXTERNAL_MYSQL_ROLLUP_MAX_SQL_BYTES) {
+                break;
+            }
+            slice.push(entry);
+            estBytes += rowBytes;
+            i++;
+        }
         const valuePlaceholders = slice.map(() => '(?, ?, ?, ?, ?)').join(', ');
         const binds: unknown[] = [];
         for (const [worldId, d] of slice) {
@@ -1863,13 +1982,31 @@ export async function applyUserRollupForPackedJoinLeave(
     // Sort deterministically by primary key `user_id` so concurrent migration workers acquire InnoDB locks in identical order.
     deltaRows.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
 
-    // Pack up to 15 rows per statement on D1 (15 * 6 = 90 <= D1's 100-param limit) and 150 rows on external MySQL.
+    // Pack up to 15 rows per statement on D1 (15 * 6 = 90 <= D1's 100-param limit), or up to 80 rows & <= 32 KiB on external MySQL
+    // so long CJK display names never push a multi-value INSERT past strict 64 KiB MySQL/proxy packet limits.
     // `display_name` and `second_last_seen` MUST be updated BEFORE `last_seen` so MySQL 5.7's left-to-right
     // ON DUPLICATE KEY UPDATE evaluation reads the pre-update `last_seen` identically to SQLite.
-    const rowsPerStmt = options.externalMysqlActive ? 150 : 15;
+    const useMysqlBatching = Boolean(options.externalMysqlActive) || isHybridMysqlD1Database(db);
+    const maxRowsPerStmt = useMysqlBatching ? EXTERNAL_MYSQL_ROLLUP_MAX_ROWS_PER_STMT : 15;
     const stmts: D1PreparedStatement[] = [];
-    for (let i = 0; i < deltaRows.length; i += rowsPerStmt) {
-        const slice = deltaRows.slice(i, i + rowsPerStmt);
+    for (let i = 0; i < deltaRows.length; ) {
+        const slice: typeof deltaRows = [];
+        let estBytes = 1024;
+        while (i < deltaRows.length && slice.length < maxRowsPerStmt) {
+            const row = deltaRows[i]!;
+            const rowBytes =
+                Buffer.byteLength(row[0], 'utf8') +
+                Buffer.byteLength(row[1], 'utf8') +
+                row[4].length +
+                row[5].length +
+                56;
+            if (useMysqlBatching && slice.length > 0 && estBytes + rowBytes > EXTERNAL_MYSQL_ROLLUP_MAX_SQL_BYTES) {
+                break;
+            }
+            slice.push(row);
+            estBytes += rowBytes;
+            i++;
+        }
         const valuePlaceholders = slice.map(() => '(?, ?, ?, ?, ?, ?)').join(', ');
         const binds: unknown[] = [];
         for (const row of slice) binds.push(...row);

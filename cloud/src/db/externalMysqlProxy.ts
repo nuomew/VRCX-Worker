@@ -15,6 +15,7 @@ import {
 import { classifyStorageWriteDegradation, withStorageDegradedHeader } from './storageResilience';
 
 const WRITE_TARGET_ONLY_HINT = '/* vrcx:write-target */';
+const HYBRID_MYSQL_DB_SYMBOL = Symbol.for('vrcx.hybridMysqlD1');
 const MANAGED_TABLE_REGEX_CACHE = new Map<ManagedMysqlTableName, RegExp>();
 
 function getManagedTableRegex(table: ManagedMysqlTableName): RegExp {
@@ -1185,7 +1186,12 @@ export function createHybridMysqlD1Database(
             return rawD1.withSession(constraintOrBookmark);
         }
     };
+    (hybrid as Record<symbol, boolean>)[HYBRID_MYSQL_DB_SYMBOL] = true;
     return hybrid as D1Database;
+}
+
+export function isHybridMysqlD1Database(db: D1Database | null | undefined): boolean {
+    return Boolean(db && (db as unknown as Record<symbol, boolean | undefined>)[HYBRID_MYSQL_DB_SYMBOL]);
 }
 
 export function isExternalMysqlActiveOnEnv(env: Env): boolean {

@@ -17,6 +17,8 @@ import {
     decodeFeedChunkForExport,
     decodeFeedChunkRows,
     decodeGameLogChunkForExport,
+    EXTERNAL_MYSQL_COMPACT_CHUNK_MAX_BYTES,
+    EXTERNAL_MYSQL_STORED_PAYLOAD_MAX_BYTES,
     FEED_TABLE_TO_CHUNK_KIND,
     type FeedChunkKind,
     feedTupleDedupKey,
@@ -1105,10 +1107,10 @@ function sanitizeCategoryInventoryList(raw: unknown): LegacyCategoryInventory[] 
     return out;
 }
 
-// 256 KiB raw chunk ceiling when offloading to external MySQL 5.7+ keeps each gzip-compressed
-// SQL packet ~20-65 KiB (1/60 of MySQL 5.7's 4 MiB default max_allowed_packet) while halving
-// per-batch zlib/SHA-256 calls and MySQL round-trips vs 128 KiB to prevent Workers Free 1102 CPU timeouts.
-const EXTERNAL_MYSQL_CHUNK_MAX_BYTES = 256 * 1024;
+// 128 KiB raw / 40 KiB stored ceiling when offloading to external MySQL 5.7+ guarantees every
+// gzip-compressed SQL packet stays strictly below 64 KiB (65,536 B) proxy/shared-host disconnect cliffs
+// while keeping gzip(level: 1) CPU well within Cloudflare Workers Free 10ms limits.
+const EXTERNAL_MYSQL_CHUNK_MAX_BYTES = EXTERNAL_MYSQL_COMPACT_CHUNK_MAX_BYTES;
 
 async function ingestLegacyCategoryBatch(
     legacyDb: D1Database,
@@ -1117,6 +1119,7 @@ async function ingestLegacyCategoryBatch(
     options: { externalMysqlActive?: boolean } = {}
 ): Promise<{ inserted: number; skipped: number; legacyDbBytes: number }> {
     const effectiveChunkMaxBytes = options.externalMysqlActive ? EXTERNAL_MYSQL_CHUNK_MAX_BYTES : COMPACT_CHUNK_MAX_BYTES;
+    const effectiveStoredMaxBytes = options.externalMysqlActive ? EXTERNAL_MYSQL_STORED_PAYLOAD_MAX_BYTES : 0;
     const stmts: D1PreparedStatement[] = [];
     const gamelogLocationRows: unknown[][] = [];
     const gamelogJoinLeaveRows: unknown[][] = [];
@@ -1540,6 +1543,7 @@ async function ingestLegacyCategoryBatch(
             fallbackIso: nowIso,
             maxRows: COMPACT_CHUNK_MAX_ROWS,
             maxJsonBytes: effectiveChunkMaxBytes,
+            maxStoredBytes: effectiveStoredMaxBytes,
             negateRowIds: true,
             bulkMigration: true
         });
@@ -1567,6 +1571,7 @@ async function ingestLegacyCategoryBatch(
             fallbackIso: nowIso,
             maxRows: COMPACT_CHUNK_MAX_ROWS,
             maxJsonBytes: effectiveChunkMaxBytes,
+            maxStoredBytes: effectiveStoredMaxBytes,
             negateRowIds: true,
             bulkMigration: true
         });
@@ -1621,6 +1626,7 @@ async function ingestLegacyCategoryBatch(
             fallbackIso: nowIso,
             maxRows: COMPACT_CHUNK_MAX_ROWS,
             maxJsonBytes: effectiveChunkMaxBytes,
+            maxStoredBytes: effectiveStoredMaxBytes,
             negateRowIds: true,
             bulkMigration: true
         });

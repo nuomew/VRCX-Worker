@@ -1423,7 +1423,16 @@ async function openRealMysqlConnection(params: ResolvedMysqlConnectionParams): P
                         const sock = this.socket;
                         const writer = sock.writable.getWriter();
                         try {
-                            await writer.write(copy);
+                            const MAX_TLS_WRITE_CHUNK = 16 * 1024;
+                            if (copy.byteLength <= MAX_TLS_WRITE_CHUNK) {
+                                await writer.write(copy);
+                            } else {
+                                for (let off = 0; off < copy.byteLength; off += MAX_TLS_WRITE_CHUNK) {
+                                    await writer.write(
+                                        copy.subarray(off, Math.min(off + MAX_TLS_WRITE_CHUNK, copy.byteLength))
+                                    );
+                                }
+                            }
                         } finally {
                             writer.releaseLock();
                         }
