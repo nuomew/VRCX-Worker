@@ -1,0 +1,491 @@
+/* ==========================================================================
+ * Azure Archive Theme (晴空档案风 · Inspired by Blue Archive Official Website)
+ * Zero-pink crisp sky-blue, pure white, blueprint hairlines & skewX(-12deg).
+ * Strictly scoped to :root[data-theme='archive'] so existing themes stay 100% untouched.
+ * ========================================================================== */
+
+:root[data-theme='archive'] {
+    color-scheme: light;
+    accent-color: #0077b6;
+
+    --arc-sky-bg: #eef7fd;
+    --arc-azure: #009fe8;
+    --arc-azure-deep: #0077b6;
+    --arc-gold: #ffc42e;
+    --arc-ink: #142238;
+    --arc-muted: #47607e;
+    --arc-border: #c6e3f8;
+    --arc-ease: cubic-bezier(0.22, 1, 0.36, 1);
+
+    /* Semantic Tokens (all WCAG AA >= 4.5:1) */
+    --radius: 0.625rem;
+    --background: #eef7fd;
+    --foreground: #142238;
+    --card: rgb(255 255 255 / 0.97);
+    --card-foreground: #142238;
+    --profile-card: #f4faff;
+    --popover: #ffffff;
+    --popover-foreground: #142238;
+    --primary: #0077b6;
+    --primary-foreground: #ffffff;
+    --secondary: #e1f4ff;
+    --secondary-foreground: #0c4a6e;
+    --muted: #edf6fc;
+    --muted-foreground: #47607e;
+    --accent: #e5f5ff;
+    --accent-foreground: #0c4a6e;
+    --destructive: #c42b45;
+    --destructive-foreground: #ffffff;
+    --border: #c6e3f8;
+    --input: #a6d4f4;
+    --ring: #009fe8;
+
+    --chart-1: #0088cc;
+    --chart-2: #0ea5e9;
+    --chart-3: #e5a800;
+    --chart-4: #10b981;
+    --chart-5: #4f46e5;
+
+    --sidebar: #ffffff;
+    --sidebar-foreground: #142238;
+    --sidebar-primary: #0077b6;
+    --sidebar-primary-foreground: #ffffff;
+    --sidebar-accent: #e1f4ff;
+    --sidebar-accent-foreground: #0c4a6e;
+    --sidebar-border: #c6e3f8;
+    --sidebar-ring: #009fe8;
+}
+
+/* 8 Accent Variants preserving Azure Archive crispness & >= 4.5:1 contrast */
+:root[data-theme='archive'][data-theme-color='blue'] {
+    accent-color: #006fb3;
+    --primary: #006fb3;
+    --secondary: #dff2ff;
+    --secondary-foreground: #0c4266;
+    --ring: #009fe8;
+}
+:root[data-theme='archive'][data-theme-color='green'] {
+    accent-color: #167a50;
+    --primary: #167a50;
+    --secondary: #e0f6ec;
+    --secondary-foreground: #114b32;
+    --ring: #167a50;
+}
+:root[data-theme='archive'][data-theme-color='orange'] {
+    accent-color: #b84b1c;
+    --primary: #b84b1c;
+    --secondary: #fdebe2;
+    --secondary-foreground: #6b290e;
+    --ring: #b84b1c;
+}
+:root[data-theme='archive'][data-theme-color='red'] {
+    accent-color: #c22b45;
+    --primary: #c22b45;
+    --secondary: #fde5ea;
+    --secondary-foreground: #701728;
+    --ring: #c22b45;
+}
+:root[data-theme='archive'][data-theme-color='rose'] {
+    accent-color: #b62e66;
+    --primary: #b62e66;
+    --secondary: #fde5ef;
+    --secondary-foreground: #6b1a3b;
+    --ring: #b62e66;
+}
+:root[data-theme='archive'][data-theme-color='violet'] {
+    accent-color: #5b43bf;
+    --primary: #5b43bf;
+    --secondary: #ece8fe;
+    --secondary-foreground: #362575;
+    --ring: #5b43bf;
+}
+:root[data-theme='archive'][data-theme-color='yellow'] {
+    accent-color: #8c5e05;
+    --primary: #8c5e05;
+    --secondary: #fdf2d2;
+    --secondary-foreground: #543803;
+    --ring: #8c5e05;
+}
+
+:root[data-theme='archive'] ::selection {
+    background-color: #bae6fd;
+    color: #142238;
+}
+
+:root[data-theme='archive'] * {
+    scrollbar-color: #7cc6f2 transparent;
+}
+
+:root[data-theme='archive'] ::-webkit-scrollbar-thumb {
+    background-color: rgb(94 176 226 / 0.7);
+    border-radius: 9999px;
+    border: 2px solid transparent;
+    background-clip: content-box;
+}
+
+/* Blueprint Architectural Grid Sky Canvas */
+:root[data-theme='archive'] body,
+:root[data-theme='archive'] .arc-stage {
+    background-color: var(--arc-sky-bg);
+    background-image:
+        linear-gradient(to right, rgb(0 159 232 / 0.065) 1px, transparent 1px),
+        linear-gradient(to bottom, rgb(0 159 232 / 0.065) 1px, transparent 1px),
+        radial-gradient(50% 44% at 95% 4%, rgb(0 174 239 / 0.18) 0%, transparent 66%);
+    background-size:
+        28px 28px,
+        28px 28px,
+        100% 100%;
+    background-attachment: fixed;
+    color: var(--foreground);
+}
+
+:root[data-theme='archive'] .arc-halo-ornament {
+    opacity: 0.44;
+}
+
+/* Signature Blue Archive skewX(-12deg) Geometric Vocabulary */
+:root[data-theme='archive'] .arc-skew {
+    transform: skewX(-12deg);
+    border-radius: 5px;
+}
+
+:root[data-theme='archive'] .arc-skew > span {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    transform: skewX(12deg);
+}
+
+/* Topbar */
+:root[data-theme='archive'] .arc-topbar {
+    background: rgb(255 255 255 / 0.94);
+    backdrop-filter: blur(12px);
+    border-bottom: 1px solid var(--arc-border);
+    box-shadow: 0 4px 16px rgb(14 118 186 / 0.06);
+}
+
+:root[data-theme='archive'] .arc-brand-badge {
+    background: var(--primary);
+    color: #ffffff;
+    box-shadow: 0 3px 10px rgb(0 119 182 / 0.25);
+}
+
+:root[data-theme='archive'] .arc-nav-tab {
+    color: #355070;
+    font-weight: 700;
+    background: transparent;
+    transition:
+        background-color 0.15s var(--arc-ease),
+        color 0.15s var(--arc-ease);
+}
+
+:root[data-theme='archive'] .arc-nav-tab:hover {
+    background: #e5f5ff;
+    color: var(--arc-ink);
+}
+
+:root[data-theme='archive'] .arc-nav-tab[data-active='true'] {
+    background: var(--primary);
+    color: #ffffff;
+    box-shadow: 0 3px 10px rgb(0 119 182 / 0.24);
+}
+
+:root[data-theme='archive'] .arc-notify-dot {
+    position: absolute;
+    top: 3px;
+    right: 4px;
+    width: 6px;
+    height: 6px;
+    border-radius: 9999px;
+    background-color: #ef4444;
+    font-style: normal;
+}
+
+:root[data-theme='archive'] .arc-icon-btn {
+    background: #f4faff;
+    border: 1px solid var(--arc-border);
+    color: #25405f;
+    transition:
+        background-color 0.15s var(--arc-ease),
+        border-color 0.15s var(--arc-ease),
+        color 0.15s var(--arc-ease);
+}
+
+:root[data-theme='archive'] .arc-icon-btn:hover {
+    background: #e1f4ff;
+    border-color: var(--arc-azure);
+    color: var(--primary);
+}
+
+:root[data-theme='archive'] .arc-icon-btn[data-active='true'] {
+    background: var(--primary);
+    border-color: var(--primary);
+    color: #ffffff;
+}
+
+/* Signature Sunny-Gold ONLINE Pill */
+:root[data-theme='archive'] .arc-gold-pill {
+    background: var(--arc-gold);
+    color: var(--arc-ink);
+    border: 1px solid #e6ad14;
+    box-shadow: 0 2px 8px rgb(245 184 0 / 0.26);
+    transition: filter 0.15s var(--arc-ease);
+}
+
+:root[data-theme='archive'] .arc-gold-pill:hover {
+    filter: brightness(1.04);
+}
+
+:root[data-theme='archive'] .arc-gold-pill[data-active='false'] {
+    background: #f3faff;
+    color: #355070;
+    border-color: var(--arc-border);
+    box-shadow: none;
+}
+
+:root[data-theme='archive'] .arc-swatch-dot {
+    border: 1.5px solid #ffffff;
+    box-shadow: 0 1px 4px rgb(20 34 56 / 0.24);
+}
+
+:root[data-theme='archive'] .arc-swatch-dot[data-active='true'] {
+    box-shadow:
+        0 0 0 2px #ffffff,
+        0 0 0 3.5px var(--primary);
+}
+
+/* Online Friends Horizontal Halo Strip */
+:root[data-theme='archive'] .arc-strip-card,
+:root[data-theme='archive'] .arc-main-stage,
+:root[data-theme='archive'] .arc-friends-panel {
+    background: rgb(255 255 255 / 0.96);
+    border: 1px solid var(--arc-border);
+    border-radius: 12px;
+    box-shadow: 0 8px 24px rgb(14 118 186 / 0.07);
+}
+
+:root[data-theme='archive'] .arc-halo-friend {
+    background: #f4faff;
+    border: 1px solid #d5ebfa;
+    color: var(--arc-ink);
+    transition:
+        background-color 0.15s var(--arc-ease),
+        border-color 0.15s var(--arc-ease);
+}
+
+:root[data-theme='archive'] .arc-halo-friend:hover {
+    background: #e1f4ff;
+    border-color: var(--arc-azure);
+}
+
+:root[data-theme='archive'] .arc-status-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 3px 9px;
+    border-radius: 9999px;
+    background: #f3faff;
+    border: 1px solid #d2eafb;
+    color: #2c4766;
+}
+
+:root[data-theme='archive'] .arc-main-stage .x-container {
+    background: transparent;
+    border: none;
+    box-shadow: none;
+    border-radius: 0;
+    margin: 0;
+    height: 100%;
+    padding: 12px 14px;
+}
+
+:root[data-theme='archive'] .x-container {
+    background: #ffffff;
+    border: 1px solid var(--arc-border);
+    border-radius: 12px;
+    box-shadow: 0 8px 24px rgb(14 118 186 / 0.07);
+}
+
+:root[data-theme='archive'] .arc-friends-panel .x-aside-container {
+    background: transparent;
+}
+
+:root[data-theme='archive'] .arc-statusbar > div {
+    background: rgb(255 255 255 / 0.94);
+    border-top: 1px solid var(--arc-border);
+}
+
+/* Crisp Left-Accented Tactical Data Table Rows */
+:root[data-theme='archive'] .data-table > div.rounded-md.border {
+    border-radius: 10px;
+    border: 1px solid var(--arc-border);
+    background: #f7fbff;
+    padding: 4px 6px;
+}
+
+:root[data-theme='archive'] [data-slot='table'] {
+    border-collapse: separate;
+    border-spacing: 0 5px;
+}
+
+:root[data-theme='archive'] [data-slot='table-head'] {
+    background-color: #e3f4ff !important;
+    color: #143252;
+    font-weight: 800;
+    border-bottom: 2px solid #8fd1f8;
+}
+
+:root[data-theme='archive'] [data-slot='table-head']:first-child {
+    border-top-left-radius: 7px;
+    border-bottom-left-radius: 7px;
+}
+
+:root[data-theme='archive'] [data-slot='table-head']:last-child {
+    border-top-right-radius: 7px;
+    border-bottom-right-radius: 7px;
+}
+
+:root[data-theme='archive'] [data-slot='table-body'] [data-slot='table-row'] {
+    border-bottom: none;
+}
+
+:root[data-theme='archive'] [data-slot='table-body'] [data-slot='table-row'] > [data-slot='table-cell'] {
+    background-color: #ffffff;
+    border-top: 1px solid #d6ecfb;
+    border-bottom: 1px solid #d6ecfb;
+}
+
+:root[data-theme='archive'] [data-slot='table-body'] [data-slot='table-row'] > [data-slot='table-cell']:first-child {
+    border-left: 4px solid var(--arc-azure);
+    border-top-left-radius: 6px;
+    border-bottom-left-radius: 6px;
+}
+
+:root[data-theme='archive'] [data-slot='table-body'] [data-slot='table-row'] > [data-slot='table-cell']:last-child {
+    border-right: 1px solid #d6ecfb;
+    border-top-right-radius: 6px;
+    border-bottom-right-radius: 6px;
+}
+
+:root[data-theme='archive'] [data-slot='table-body'] [data-slot='table-row']:hover > [data-slot='table-cell'] {
+    background-color: #f0f9ff;
+    border-top-color: #7cc9f7;
+    border-bottom-color: #7cc9f7;
+}
+
+/* Tactical Filter Chips & Badges */
+:root[data-theme='archive'] [data-slot='toggle-group'] {
+    gap: 5px;
+    flex-wrap: wrap;
+}
+
+:root[data-theme='archive'] [data-slot='toggle-group-item'],
+:root[data-theme='archive'] [data-slot='toggle'] {
+    border-radius: 6px !important;
+    border: 1px solid var(--arc-border) !important;
+    background-color: #f3faff;
+    color: #355070;
+    font-weight: 700;
+}
+
+:root[data-theme='archive'] [data-slot='toggle-group-item']:hover,
+:root[data-theme='archive'] [data-slot='toggle']:hover {
+    border-color: var(--arc-azure) !important;
+    color: var(--arc-ink);
+}
+
+:root[data-theme='archive'] [data-slot='toggle-group-item'][data-state='on'] {
+    background-color: var(--primary);
+    color: #ffffff;
+    border-color: var(--primary) !important;
+}
+
+:root[data-theme='archive'] [data-slot='toggle'][data-state='on'] {
+    background-color: var(--arc-gold);
+    color: var(--arc-ink);
+    border-color: #e6ad14 !important;
+}
+
+:root[data-theme='archive'] [data-slot='table-cell'] [data-slot='badge'] {
+    background-color: var(--secondary);
+    color: var(--secondary-foreground);
+    border-color: #93d5fa;
+    border-radius: 5px;
+    font-weight: 700;
+}
+
+:root[data-theme='archive'] [data-slot='input'],
+:root[data-theme='archive'] [data-slot='select-trigger'],
+:root[data-theme='archive'] [data-slot='input-group'] {
+    background-color: #f5fbff;
+    border-color: var(--arc-border);
+    border-radius: 7px;
+}
+
+/* Cards, Dialogs & Popovers */
+:root[data-theme='archive'] [data-slot='card'] {
+    background: #ffffff;
+    border-radius: 12px;
+    border: 1px solid var(--arc-border);
+    box-shadow: 0 8px 22px rgb(14 118 186 / 0.06);
+}
+
+:root[data-theme='archive'] [data-slot='dialog-overlay'],
+:root[data-theme='archive'] [data-slot='alert-dialog-overlay'] {
+    background-color: rgb(20 34 56 / 0.36);
+    backdrop-filter: blur(4px);
+}
+
+:root[data-theme='archive'] [data-slot='dialog-content'],
+:root[data-theme='archive'] [data-slot='alert-dialog-content'] {
+    background: #ffffff;
+    border-radius: 14px;
+    border: 1px solid #8fd1f8;
+    box-shadow:
+        inset 0 3px 0 0 var(--arc-azure),
+        0 20px 46px rgb(14 118 186 / 0.18);
+}
+
+:root[data-theme='archive'] [data-slot='popover-content'],
+:root[data-theme='archive'] [data-slot='dropdown-menu-content'],
+:root[data-theme='archive'] [data-slot='dropdown-menu-sub-content'],
+:root[data-theme='archive'] [data-slot='select-content'],
+:root[data-theme='archive'] [data-slot='context-menu-content'],
+:root[data-theme='archive'] [data-slot='hover-card-content'] {
+    background: #ffffff;
+    border-radius: 10px;
+    border: 1px solid var(--arc-border);
+    box-shadow: 0 12px 28px rgb(14 118 186 / 0.14);
+}
+
+:root[data-theme='archive'] [data-slot='avatar'] {
+    box-shadow: 0 0 0 2px #ffffff, 0 2px 6px rgb(14 118 186 / 0.18);
+}
+
+@media (prefers-reduced-motion: no-preference) {
+    :root[data-theme='archive'] .arc-halo-friend:hover {
+        transform: translateY(-1px);
+    }
+}
+
+@media (forced-colors: active) {
+    :root[data-theme='archive'] body,
+    :root[data-theme='archive'] .arc-stage {
+        background-image: none;
+        background-color: Canvas;
+        color: CanvasText;
+    }
+
+    :root[data-theme='archive'] .arc-halo-ornament {
+        display: none;
+    }
+
+    :root[data-theme='archive'] .arc-strip-card,
+    :root[data-theme='archive'] .arc-main-stage,
+    :root[data-theme='archive'] .arc-friends-panel,
+    :root[data-theme='archive'] [data-slot='dialog-content'] {
+        background: Canvas;
+        border: 1px solid CanvasText;
+        box-shadow: none;
+    }
+}

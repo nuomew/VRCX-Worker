@@ -16,10 +16,15 @@ export const THEME_CONFIG = {
         name: 'Midnight',
         file: 'midnight.css'
     },
-    kawaii: {
+    lookbook: {
         isDark: false,
-        name: 'Kawaii Pastel',
-        file: 'kawaii.css'
+        name: 'Lookbook Editorial',
+        file: 'lookbook.css'
+    },
+    archive: {
+        isDark: false,
+        name: 'Azure Archive',
+        file: 'archive.css'
     }
 };
 

@@ -1,6 +1,7 @@
 <template>
     <template v-if="watchState.isLoggedIn">
-        <KawaiiLayout v-if="isKawaiiTheme" />
+        <LookbookLayout v-if="themeMode === 'lookbook'" />
+        <ArchiveLayout v-else-if="themeMode === 'archive'" />
         <div v-else class="flex flex-col flex-1 h-full min-h-0 min-w-0 overflow-hidden">
             <SidebarProvider
                 :open="sidebarOpen"
@@ -181,9 +182,10 @@
     import GlobalToolsDialogs from '../Tools/components/GlobalToolsDialogs.vue';
     import GroupEditDialog from '../../components/dialogs/GroupDialog/GroupEditDialog.vue';
     import GroupEventEditDialog from '../../components/dialogs/GroupDialog/GroupEventEditDialog.vue';
+    import ArchiveLayout from './ArchiveLayout.vue';
     import InventoryBundleDialog from '../../components/dialogs/InventoryBundleDialog.vue';
     import InviteGroupDialog from '../../components/dialogs/InviteGroupDialog.vue';
-    import KawaiiLayout from './KawaiiLayout.vue';
+    import LookbookLayout from './LookbookLayout.vue';
     import LaunchDialog from '../../components/dialogs/LaunchDialog.vue';
     import LaunchOptionsDialog from '../Settings/dialogs/LaunchOptionsDialog.vue';
     import MainDialogContainer from '../../components/dialogs/MainDialogContainer.vue';
@@ -204,7 +206,6 @@
     const appearanceSettingsStore = useAppearanceSettingsStore();
     const { navWidth, isNavCollapsed, themeMode } = storeToRefs(appearanceSettingsStore);
 
-    const isKawaiiTheme = computed(() => themeMode.value === 'kawaii');
     const sidebarOpen = computed(() => !isNavCollapsed.value);
 
     const handleSidebarOpenChange = (open) => {

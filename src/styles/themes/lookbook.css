@@ -1,0 +1,453 @@
+/* ==========================================================================
+ * Lookbook Editorial Theme (高定画册风 · Inspired by Infinity Nikki Website)
+ * Strictly scoped to :root[data-theme='lookbook'] so existing themes stay 100% untouched.
+ * ========================================================================== */
+
+:root[data-theme='lookbook'] {
+    color-scheme: light;
+    accent-color: #ad4468;
+
+    --lb-cream: #fbf7f2;
+    --lb-gold: #c4a066;
+    --lb-gold-ink: #82622b;
+    --lb-rose: #ad4468;
+    --lb-rose-soft: #faebf0;
+    --lb-ink: #2d2228;
+    --lb-muted: #6c5561;
+    --lb-ease: cubic-bezier(0.22, 1, 0.36, 1);
+
+    /* Semantic Tokens (all WCAG AA >= 4.5:1) */
+    --radius: 0.9rem;
+    --background: #fbf7f2;
+    --foreground: #2d2228;
+    --card: rgb(255 253 250 / 0.92);
+    --card-foreground: #2d2228;
+    --profile-card: rgb(252 245 240 / 0.9);
+    --popover: rgb(255 253 250 / 0.97);
+    --popover-foreground: #2d2228;
+    --primary: #ad4468;
+    --primary-foreground: #ffffff;
+    --secondary: #faebf0;
+    --secondary-foreground: #6e223d;
+    --muted: #f5ede7;
+    --muted-foreground: #6c5561;
+    --accent: #f8ece6;
+    --accent-foreground: #4c2334;
+    --destructive: #bd2d4b;
+    --destructive-foreground: #ffffff;
+    --border: rgb(196 160 102 / 0.38);
+    --input: rgb(196 160 102 / 0.52);
+    --ring: #ad4468;
+
+    --chart-1: #ad4468;
+    --chart-2: #b08a4e;
+    --chart-3: #4f7cac;
+    --chart-4: #7e68a8;
+    --chart-5: #2c8c6c;
+
+    --sidebar: rgb(255 253 250 / 0.9);
+    --sidebar-foreground: #2d2228;
+    --sidebar-primary: #ad4468;
+    --sidebar-primary-foreground: #ffffff;
+    --sidebar-accent: #faebf0;
+    --sidebar-accent-foreground: #6e223d;
+    --sidebar-border: rgb(196 160 102 / 0.38);
+    --sidebar-ring: #ad4468;
+}
+
+/* 8 Accent Variants preserving Lookbook Cream/Gold elegance & >= 4.5:1 contrast */
+:root[data-theme='lookbook'][data-theme-color='blue'] {
+    accent-color: #1f6fa8;
+    --primary: #1f6fa8;
+    --secondary: #e7f3fc;
+    --secondary-foreground: #17466b;
+    --ring: #1f6fa8;
+}
+:root[data-theme='lookbook'][data-theme-color='green'] {
+    accent-color: #1c7a52;
+    --primary: #1c7a52;
+    --secondary: #e5f6ee;
+    --secondary-foreground: #144d34;
+    --ring: #1c7a52;
+}
+:root[data-theme='lookbook'][data-theme-color='orange'] {
+    accent-color: #b44a1d;
+    --primary: #b44a1d;
+    --secondary: #fcece3;
+    --secondary-foreground: #6b2a0f;
+    --ring: #b44a1d;
+}
+:root[data-theme='lookbook'][data-theme-color='red'] {
+    accent-color: #bd2d48;
+    --primary: #bd2d48;
+    --secondary: #fce6eb;
+    --secondary-foreground: #6e182a;
+    --ring: #bd2d48;
+}
+:root[data-theme='lookbook'][data-theme-color='rose'] {
+    accent-color: #ad3b67;
+    --primary: #ad3b67;
+    --secondary: #fae9f0;
+    --secondary-foreground: #681e3b;
+    --ring: #ad3b67;
+}
+:root[data-theme='lookbook'][data-theme-color='violet'] {
+    accent-color: #6445b5;
+    --primary: #6445b5;
+    --secondary: #f0e9fc;
+    --secondary-foreground: #3b2473;
+    --ring: #6445b5;
+}
+:root[data-theme='lookbook'][data-theme-color='yellow'] {
+    accent-color: #8c5c06;
+    --primary: #8c5c06;
+    --secondary: #fbf2d8;
+    --secondary-foreground: #543704;
+    --ring: #8c5c06;
+}
+
+:root[data-theme='lookbook'] ::selection {
+    background-color: #f3cddb;
+    color: #2d2228;
+}
+
+:root[data-theme='lookbook'] * {
+    scrollbar-color: rgb(196 160 102 / 0.65) transparent;
+}
+
+:root[data-theme='lookbook'] ::-webkit-scrollbar-thumb {
+    background-color: rgb(196 160 102 / 0.58);
+    border-radius: 9999px;
+    border: 2px solid transparent;
+    background-clip: content-box;
+}
+
+:root[data-theme='lookbook'] body,
+:root[data-theme='lookbook'] .lb-stage {
+    background-color: var(--lb-cream);
+    background-image:
+        radial-gradient(56% 44% at 10% 8%, rgb(244 198 214 / 0.4) 0%, transparent 68%),
+        radial-gradient(48% 42% at 92% 14%, rgb(235 211 168 / 0.4) 0%, transparent 66%),
+        radial-gradient(50% 45% at 74% 92%, rgb(226 210 242 / 0.3) 0%, transparent 70%);
+    background-attachment: fixed;
+    color: var(--foreground);
+}
+
+:root[data-theme='lookbook'] .lb-serif {
+    font-family: 'Songti SC', 'STSong', Georgia, 'Times New Roman', serif;
+}
+
+:root[data-theme='lookbook'] .lb-gold-text {
+    color: var(--lb-gold-ink);
+}
+
+:root[data-theme='lookbook'] .lb-ornament {
+    opacity: 0.42;
+}
+
+/* Borderless Editorial Topbar */
+:root[data-theme='lookbook'] .lb-topbar {
+    background: rgb(251 247 242 / 0.8);
+    backdrop-filter: blur(14px);
+    border-bottom: 1px solid rgb(196 160 102 / 0.32);
+}
+
+:root[data-theme='lookbook'] .lb-brand-btn {
+    color: var(--lb-ink);
+}
+
+:root[data-theme='lookbook'] .lb-nav-link {
+    color: var(--lb-muted);
+    font-weight: 500;
+    border-bottom: 2px solid transparent;
+    transition:
+        color 0.16s var(--lb-ease),
+        border-color 0.16s var(--lb-ease);
+}
+
+:root[data-theme='lookbook'] .lb-nav-link:hover {
+    color: var(--lb-ink);
+}
+
+:root[data-theme='lookbook'] .lb-nav-link[data-active='true'] {
+    color: var(--primary);
+    font-weight: 700;
+    border-bottom-color: var(--lb-gold);
+}
+
+:root[data-theme='lookbook'] .lb-notify-dot {
+    position: absolute;
+    top: 6px;
+    right: 4px;
+    width: 6px;
+    height: 6px;
+    border-radius: 9999px;
+    background-color: #d93860;
+}
+
+:root[data-theme='lookbook'] .lb-icon-btn,
+:root[data-theme='lookbook'] .lb-salon-pill {
+    background: rgb(255 253 250 / 0.88);
+    border: 1px solid rgb(196 160 102 / 0.5);
+    color: var(--lb-ink);
+    transition:
+        background-color 0.16s var(--lb-ease),
+        border-color 0.16s var(--lb-ease),
+        color 0.16s var(--lb-ease);
+}
+
+:root[data-theme='lookbook'] .lb-icon-btn:hover,
+:root[data-theme='lookbook'] .lb-salon-pill:hover {
+    background: #faf0e4;
+    border-color: var(--primary);
+    color: var(--primary);
+}
+
+:root[data-theme='lookbook'] .lb-salon-pill[data-active='true'],
+:root[data-theme='lookbook'] .lb-icon-btn[data-active='true'] {
+    background: var(--primary);
+    border-color: var(--primary);
+    color: #ffffff;
+}
+
+/* Double-Gold-Hairline Editorial Folio Cards & Stage */
+:root[data-theme='lookbook'] .lb-folio-card,
+:root[data-theme='lookbook'] .lb-main-stage {
+    background: rgb(255 253 250 / 0.9);
+    border: 1px solid rgb(196 160 102 / 0.44);
+    border-radius: 18px;
+    box-shadow:
+        0 16px 40px rgb(173 128 138 / 0.09),
+        inset 0 0 0 4px rgb(255 255 255 / 0.88),
+        inset 0 0 0 5px rgb(196 160 102 / 0.2);
+    backdrop-filter: blur(12px);
+}
+
+:root[data-theme='lookbook'] .lb-cover-art {
+    background: linear-gradient(135deg, #fce4ec 0%, #f7eae0 52%, #e8eef9 100%);
+    border: 1px solid rgb(196 160 102 / 0.36);
+}
+
+:root[data-theme='lookbook'] .lb-metrics-grid {
+    border-top: 1px solid rgb(196 160 102 / 0.28);
+    border-bottom: 1px solid rgb(196 160 102 / 0.28);
+}
+
+:root[data-theme='lookbook'] .lb-metrics-grid > * + * {
+    border-left: 1px solid rgb(196 160 102 / 0.24);
+}
+
+:root[data-theme='lookbook'] .lb-mini-friend {
+    background: rgb(255 255 255 / 0.82);
+    border: 1px solid rgb(196 160 102 / 0.26);
+    transition:
+        border-color 0.16s var(--lb-ease),
+        background-color 0.16s var(--lb-ease);
+}
+
+:root[data-theme='lookbook'] .lb-mini-friend:hover {
+    border-color: var(--primary);
+    background: #fff8fa;
+}
+
+:root[data-theme='lookbook'] .lb-swatch-dot {
+    border: 1.5px solid #ffffff;
+    box-shadow: 0 1px 4px rgb(45 34 40 / 0.22);
+    transition: transform 0.16s var(--lb-ease);
+}
+
+:root[data-theme='lookbook'] .lb-swatch-dot[data-active='true'] {
+    transform: scale(1.2);
+    box-shadow:
+        0 0 0 2px #ffffff,
+        0 0 0 3.5px var(--primary);
+}
+
+:root[data-theme='lookbook'] .lb-create-btn {
+    background: var(--primary);
+    color: #ffffff;
+    transition: opacity 0.16s var(--lb-ease);
+}
+
+:root[data-theme='lookbook'] .lb-create-btn:hover {
+    opacity: 0.92;
+}
+
+:root[data-theme='lookbook'] .lb-main-stage .x-container {
+    background: transparent;
+    border: none;
+    box-shadow: none;
+    border-radius: 0;
+    margin: 0;
+    height: 100%;
+    padding: 14px 18px;
+}
+
+:root[data-theme='lookbook'] .x-container {
+    background: rgb(255 253 250 / 0.92);
+    border: 1px solid rgb(196 160 102 / 0.44);
+    border-radius: 18px;
+    box-shadow: 0 16px 40px rgb(173 128 138 / 0.1);
+}
+
+:root[data-theme='lookbook'] .lb-salon-drawer {
+    background: #fbf7f2;
+    border-left: 1px solid rgb(196 160 102 / 0.48);
+    box-shadow: -12px 0 40px rgb(45 34 40 / 0.14);
+}
+
+:root[data-theme='lookbook'] .lb-salon-drawer .x-aside-container {
+    background: transparent;
+}
+
+:root[data-theme='lookbook'] .lb-statusbar > div {
+    background: rgb(251 247 242 / 0.9);
+    border-top: 1px solid rgb(196 160 102 / 0.3);
+}
+
+/* Editorial Tables: Champagne-Gold Hairline Chronicle Rows */
+:root[data-theme='lookbook'] .data-table > div.rounded-md.border {
+    border-radius: 14px;
+    border: 1px solid rgb(196 160 102 / 0.36);
+    background: rgb(255 255 255 / 0.62);
+}
+
+:root[data-theme='lookbook'] [data-slot='table-head'] {
+    background-color: #f8efe8 !important;
+    color: #5e444f;
+    font-weight: 700;
+    border-bottom: 1px solid rgb(196 160 102 / 0.4);
+}
+
+:root[data-theme='lookbook'] [data-slot='table-row'] {
+    border-color: rgb(196 160 102 / 0.22);
+}
+
+:root[data-theme='lookbook'] [data-slot='table-body'] [data-slot='table-row']:hover {
+    background-color: rgb(250 232 239 / 0.56);
+}
+
+/* Rounded Editorial Filter Pills & Buttons */
+:root[data-theme='lookbook'] [data-slot='toggle-group'] {
+    gap: 5px;
+    flex-wrap: wrap;
+}
+
+:root[data-theme='lookbook'] [data-slot='toggle-group-item'],
+:root[data-theme='lookbook'] [data-slot='toggle'] {
+    border-radius: 9999px !important;
+    border: 1px solid rgb(196 160 102 / 0.42) !important;
+    background-color: rgb(255 255 255 / 0.82);
+    color: var(--lb-muted);
+}
+
+:root[data-theme='lookbook'] [data-slot='toggle-group-item']:hover,
+:root[data-theme='lookbook'] [data-slot='toggle']:hover {
+    border-color: var(--primary) !important;
+    color: var(--lb-ink);
+}
+
+:root[data-theme='lookbook'] [data-slot='toggle-group-item'][data-state='on'] {
+    background-color: var(--primary);
+    color: #ffffff;
+    border-color: var(--primary) !important;
+    font-weight: 600;
+}
+
+:root[data-theme='lookbook'] [data-slot='toggle'][data-state='on'] {
+    background-color: #c4a066;
+    color: #ffffff;
+    border-color: #c4a066 !important;
+}
+
+:root[data-theme='lookbook'] [data-slot='badge'] {
+    border-radius: 9999px;
+}
+
+:root[data-theme='lookbook'] [data-slot='table-cell'] [data-slot='badge'] {
+    background-color: var(--secondary);
+    color: var(--secondary-foreground);
+    border-color: rgb(184 87 120 / 0.28);
+}
+
+:root[data-theme='lookbook'] [data-slot='button'] {
+    border-radius: 9999px;
+}
+
+:root[data-theme='lookbook'] [data-slot='input'],
+:root[data-theme='lookbook'] [data-slot='select-trigger'],
+:root[data-theme='lookbook'] [data-slot='input-group'] {
+    background-color: rgb(255 255 255 / 0.9);
+    border-color: rgb(196 160 102 / 0.48);
+    border-radius: 10px;
+}
+
+/* Dialogs, Cards & Popovers */
+:root[data-theme='lookbook'] [data-slot='card'] {
+    background: rgb(255 253 250 / 0.94);
+    border-radius: 16px;
+    border: 1px solid rgb(196 160 102 / 0.36);
+    box-shadow: 0 10px 26px rgb(173 128 138 / 0.08);
+}
+
+:root[data-theme='lookbook'] [data-slot='dialog-overlay'],
+:root[data-theme='lookbook'] [data-slot='alert-dialog-overlay'] {
+    background-color: rgb(45 34 40 / 0.34);
+    backdrop-filter: blur(5px);
+}
+
+:root[data-theme='lookbook'] [data-slot='dialog-content'],
+:root[data-theme='lookbook'] [data-slot='alert-dialog-content'] {
+    background: rgb(255 253 250 / 0.98);
+    border-radius: 20px;
+    border: 1px solid rgb(196 160 102 / 0.56);
+    box-shadow:
+        0 24px 54px rgb(45 34 40 / 0.2),
+        inset 0 0 0 4px rgb(255 255 255 / 0.9),
+        inset 0 0 0 5px rgb(196 160 102 / 0.24);
+}
+
+:root[data-theme='lookbook'] [data-slot='popover-content'],
+:root[data-theme='lookbook'] [data-slot='dropdown-menu-content'],
+:root[data-theme='lookbook'] [data-slot='dropdown-menu-sub-content'],
+:root[data-theme='lookbook'] [data-slot='select-content'],
+:root[data-theme='lookbook'] [data-slot='context-menu-content'],
+:root[data-theme='lookbook'] [data-slot='hover-card-content'] {
+    background: rgb(255 253 250 / 0.98);
+    border-radius: 14px;
+    border: 1px solid rgb(196 160 102 / 0.45);
+    box-shadow: 0 14px 32px rgb(45 34 40 / 0.14);
+}
+
+:root[data-theme='lookbook'] [data-slot='avatar'] {
+    box-shadow: 0 0 0 2px #ffffff, 0 2px 6px rgb(173 128 138 / 0.2);
+}
+
+@media (prefers-reduced-motion: no-preference) {
+    :root[data-theme='lookbook'] .lb-mini-friend:hover,
+    :root[data-theme='lookbook'] .lb-salon-pill:hover {
+        transform: translateY(-1px);
+    }
+}
+
+@media (forced-colors: active) {
+    :root[data-theme='lookbook'] body,
+    :root[data-theme='lookbook'] .lb-stage {
+        background-image: none;
+        background-color: Canvas;
+        color: CanvasText;
+    }
+
+    :root[data-theme='lookbook'] .lb-ornament {
+        display: none;
+    }
+
+    :root[data-theme='lookbook'] .lb-folio-card,
+    :root[data-theme='lookbook'] .lb-main-stage,
+    :root[data-theme='lookbook'] .lb-salon-drawer,
+    :root[data-theme='lookbook'] [data-slot='dialog-content'] {
+        background: Canvas;
+        border: 1px solid CanvasText;
+        box-shadow: none;
+    }
+}

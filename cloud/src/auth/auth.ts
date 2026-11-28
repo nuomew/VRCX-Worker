@@ -27,7 +27,7 @@ const STATE_KEY_CLOUD_TOTP = 'cloud_totp_config';
 const STATE_KEY_CLOUD_TOTP_PENDING = 'cloud_totp_pending';
 const STATE_KEY_CLOUD_STATIC_PASSCODE = 'cloud_static_passcode_config';
 const MAX_REVOKED_SESSIONS = 50;
-const ALLOWED_PUBLIC_THEME_MODES = new Set(['system', 'light', 'dark', 'midnight', 'kawaii']);
+const ALLOWED_PUBLIC_THEME_MODES = new Set(['system', 'light', 'dark', 'midnight', 'lookbook', 'archive']);
 const ALLOWED_PUBLIC_THEME_COLORS = new Set([
     'default',
     'blue',

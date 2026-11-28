@@ -127,8 +127,20 @@ function applyThemeFonts(themeKey, fontLinks = []) {
     });
 }
 
+const LEGACY_THEME_MODE_ALIASES = Object.freeze({
+    kawaii: 'lookbook'
+});
+
+function normalizeThemeModeKey(themeMode) {
+    if (typeof themeMode !== 'string') {
+        return themeMode;
+    }
+    return LEGACY_THEME_MODE_ALIASES[themeMode] || themeMode;
+}
+
 function applyThemeModeStyle(themeMode) {
-    const themeConfig = THEME_CONFIG[themeMode];
+    const resolvedMode = normalizeThemeModeKey(themeMode);
+    const themeConfig = THEME_CONFIG[resolvedMode];
     const themeFile = themeConfig?.file;
     let styleEl = document.getElementById(THEME_MODE_STYLE_ID);
 
@@ -249,6 +261,7 @@ function changeAppThemeStyle(themeMode) {
         themeMode = systemIsDarkMode() ? 'dark' : 'light';
     }
 
+    themeMode = normalizeThemeModeKey(themeMode);
     let themeConfig = THEME_CONFIG[themeMode];
     if (!themeConfig) {
         // fallback to system
@@ -446,7 +459,8 @@ function changeHtmlLangAttribute(language) {
 }
 
 async function getThemeMode(configRepository) {
-    const initThemeMode = await configRepository.getString('VRCX_ThemeMode', 'system');
+    const rawThemeMode = await configRepository.getString('VRCX_ThemeMode', 'system');
+    const initThemeMode = normalizeThemeModeKey(rawThemeMode);
 
     let isDarkMode;
     if (initThemeMode === 'system') {
