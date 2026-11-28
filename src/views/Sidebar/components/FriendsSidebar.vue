@@ -206,7 +206,7 @@
             </div>
         </div>
         <BackToTop :virtualizer="virtualizer" :target="scrollViewportRef" :tooltip="false" />
-        <EditProfileDialog :edit-profile-dialog="editProfileDialog" />
+        <EditProfileDialog v-if="renderEditProfileDialog" :edit-profile-dialog="editProfileDialog" />
     </div>
 </template>
 
@@ -260,6 +260,17 @@
 
     import '@/styles/status-icon.css';
     import { showUserDialog } from '../../../coordinators/userCoordinator';
+
+    const props = defineProps({
+        hideMe: {
+            type: Boolean,
+            default: false
+        },
+        renderEditProfileDialog: {
+            type: Boolean,
+            default: true
+        }
+    });
 
     const { t } = useI18n();
 
@@ -491,18 +502,20 @@
     const virtualRows = computed(() => {
         const rows = [];
 
-        rows.push(
-            buildToggleRow({
-                key: 'me-header',
-                label: t('side_panel.me'),
-                expanded: isFriendsGroupMe.value,
-                headerPadding: '0 0 5px',
-                onClick: toggleFriendsGroupMe
-            })
-        );
+        if (!props.hideMe) {
+            rows.push(
+                buildToggleRow({
+                    key: 'me-header',
+                    label: t('side_panel.me'),
+                    expanded: isFriendsGroupMe.value,
+                    headerPadding: '0 0 5px',
+                    onClick: toggleFriendsGroupMe
+                })
+            );
 
-        if (isFriendsGroupMe.value) {
-            rows.push({ type: 'me-item', key: `me:${currentUser.value?.id ?? 'me'}` });
+            if (isFriendsGroupMe.value) {
+                rows.push({ type: 'me-item', key: `me:${currentUser.value?.id ?? 'me'}` });
+            }
         }
 
         if (isSameInstanceAboveFavorites.value) {
@@ -565,6 +578,10 @@
             offlineFriends.value.forEach((friend, idx) => {
                 rows.push(buildFriendRow(friend, `offline:${friend?.id ?? idx}`));
             });
+        }
+
+        if (props.hideMe && rows[0]?.type === 'toggle-header' && !rows[0].headerPadding) {
+            rows[0] = { ...rows[0], headerPadding: '2px 0 6px' };
         }
 
         return rows;

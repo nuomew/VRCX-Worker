@@ -329,19 +329,6 @@
     border-left: 1px solid rgb(196 160 102 / 0.24);
 }
 
-:root[data-theme='lookbook'] .lb-mini-friend {
-    background: rgb(255 255 255 / 0.82);
-    border: 1px solid rgb(196 160 102 / 0.26);
-    transition:
-        border-color 0.16s var(--lb-ease),
-        background-color 0.16s var(--lb-ease);
-}
-
-:root[data-theme='lookbook'] .lb-mini-friend:hover {
-    border-color: var(--primary);
-    background: #fff8fa;
-}
-
 :root[data-theme='lookbook'] .lb-swatch-dot {
     border: 1.5px solid #ffffff;
     box-shadow: 0 1px 4px rgb(45 34 40 / 0.22);

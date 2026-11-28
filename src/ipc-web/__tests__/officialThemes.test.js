@@ -206,10 +206,15 @@ describe('Official Anime-Site Dual Themes (Lookbook & Azure Archive) registratio
 
         expect(lookbookSrc).toContain('lb-brightness-dimmer');
         expect(archiveSrc).toContain('arc-brightness-dimmer');
-        // Lookbook left cover card renders all online + other friends inside an internal scroll container
-        expect(lookbookSrc).toContain('otherFolioFriends');
+        // Lookbook left cover card reuses native categorized FriendsSidebar (favorites/subgroups, online, active, offline + virtual scroll)
+        expect(lookbookSrc).toContain('<FriendsSidebar hide-me :render-edit-profile-dialog="false"');
         expect(lookbookSrc).toContain('lb-folio-friends-scroll');
-        expect(lookbookSrc).toContain('overflow-y-auto');
+        const friendsSidebarSrc = fs.readFileSync(
+            path.resolve(process.cwd(), 'src/views/Sidebar/components/FriendsSidebar.vue'),
+            'utf-8'
+        );
+        expect(friendsSidebarSrc).toContain('hideMe');
+        expect(friendsSidebarSrc).toContain('renderEditProfileDialog');
     });
 
     it('clamps theme brightness and computes viewport dimmer opacity accurately', () => {
