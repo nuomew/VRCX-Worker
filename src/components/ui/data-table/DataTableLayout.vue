@@ -298,6 +298,7 @@
                     </template>
                     <Button
                         v-if="onLoadMore && canLoadMore && isOnLastPage"
+                        type="button"
                         variant="ghost"
                         size="default"
                         class="text-[13px] gap-1 px-2.5 sm:pr-2.5"
@@ -317,6 +318,7 @@
             <div class="dt-pagination-spacer flex-1 flex items-center justify-start">
                 <Button
                     v-if="onLoadMore && (canLoadMore || loadingMore)"
+                    type="button"
                     variant="outline"
                     size="sm"
                     class="h-8 gap-1.5 text-xs"
@@ -664,18 +666,28 @@
         }
     });
 
-    const pageCount = computed(() => Math.max(1, props.table?.getPageCount?.() ?? 1));
+    const pageCount = computed(() => {
+        const size = pageSizeProxy.value || 1;
+        const fromTotal = props.totalItems > 0 ? Math.ceil(props.totalItems / size) : 0;
+        const fromTable = props.table?.getPageCount?.() ?? 0;
+        return Math.max(1, fromTable, fromTotal);
+    });
     const isOnLastPage = computed(() => currentPage.value >= pageCount.value);
 
     const handleLoadMore = async () => {
         if (!props.onLoadMore || props.loadingMore || props.loading) return;
-        const prevPageCount = props.table?.getPageCount?.() ?? 0;
-        const wasOnLastPage = currentPage.value >= Math.max(1, prevPageCount);
+        const prevPage = Math.max(1, currentPage.value);
+        const prevPageCount = pageCount.value;
+        const wasOnLastPage = prevPage >= prevPageCount;
         await props.onLoadMore();
         await nextTick();
-        const nextPageCount = props.table?.getPageCount?.() ?? 0;
+        await nextTick();
+        const nextPageCount = pageCount.value;
         if (wasOnLastPage && nextPageCount > prevPageCount) {
-            currentPage.value = prevPageCount + 1;
+            currentPage.value = Math.max(prevPage + 1, prevPageCount + 1);
+        } else if (currentPage.value < prevPage && nextPageCount >= prevPage) {
+            // Never allow an incremental history append to jump backwards to page 1.
+            currentPage.value = prevPage;
         }
     };
 
@@ -688,14 +700,15 @@
     });
 
     // When the total page count shrinks below the current page
-    // jump to the last available page
+    // jump to the last available page (never while a lookup or load-more request is in flight)
     watch(
         () => props.table.getPageCount?.(),
-        (pageCount) => {
-            if (pageCount == null || pageCount <= 0) return;
+        (tablePageCount) => {
+            if (props.loading || props.loadingMore) return;
+            if (tablePageCount == null || tablePageCount <= 0) return;
             const pageIndex = props.table.atoms?.pagination?.get()?.pageIndex ?? 0;
-            if (pageIndex >= pageCount) {
-                props.table.setPageIndex(pageCount - 1);
+            if (pageIndex >= tablePageCount) {
+                props.table.setPageIndex(tablePageCount - 1);
             }
         }
     );

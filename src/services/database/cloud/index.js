@@ -1214,7 +1214,9 @@ export function createCloudDatabase(dbVars) {
                     params.set('beforeInclusive', '1');
                 }
             }
-            const rows = await cloudFetch(`/api/friend-log/history?${params.toString()}`).catch(() => []);
+            const req = cloudFetch(`/api/friend-log/history?${params.toString()}`);
+            const rows = options?.throwOnError ? await req : await req.catch(() => []);
+            if (!Array.isArray(rows)) return [];
             return rows.map((r) => ({
                 rowId: r.id,
                 created_at: r.created_at,
@@ -1295,7 +1297,8 @@ export function createCloudDatabase(dbVars) {
                     params.set('beforeInclusive', '1');
                 }
             }
-            const rows = await cloudFetch(`/api/notifications?${params.toString()}`).catch(() => []);
+            const req = cloudFetch(`/api/notifications?${params.toString()}`);
+            const rows = options?.throwOnError ? await req : await req.catch(() => []);
             if (!Array.isArray(rows)) return [];
             return rows.map((r) => ({
                 id: r.id || '',
@@ -1376,7 +1379,8 @@ export function createCloudDatabase(dbVars) {
                     params.set('beforeInclusive', '1');
                 }
             }
-            const rows = await cloudFetch(`/api/notifications?${params.toString()}`).catch(() => []);
+            const req = cloudFetch(`/api/notifications?${params.toString()}`);
+            const rows = options?.throwOnError ? await req : await req.catch(() => []);
             if (!Array.isArray(rows)) return [];
             const parseJson = (raw, fallback) => {
                 if (raw && typeof raw === 'object') return raw;
@@ -1460,7 +1464,7 @@ export function createCloudDatabase(dbVars) {
             const dateFrom = String(options?.dateFrom || '').trim();
             const dateTo = String(options?.dateTo || '').trim();
             if (hasFilters || hasVip || beforeCreatedAt || dateFrom || dateTo) {
-                const rows = await cloudFetch('/api/gamelog/query', {
+                const req = cloudFetch('/api/gamelog/query', {
                     method: 'POST',
                     json: {
                         types: hasFilters ? filters : [],
@@ -1471,10 +1475,12 @@ export function createCloudDatabase(dbVars) {
                         beforeCreatedAt: beforeCreatedAt || undefined,
                         beforeInclusive: beforeCreatedAt ? beforeInclusive : undefined
                     }
-                }).catch(() => []);
+                });
+                const rows = options?.throwOnError ? await req : await req.catch(() => []);
                 return Array.isArray(rows) ? rows : [];
             }
-            const rows = await cloudFetch(`/api/gamelog?limit=${limit}`).catch(() => []);
+            const req = cloudFetch(`/api/gamelog?limit=${limit}`);
+            const rows = options?.throwOnError ? await req : await req.catch(() => []);
             return Array.isArray(rows) ? rows : [];
         },
         async searchGameLogDatabase(search, filters, vipList, maxEntries = 50) {
@@ -2188,7 +2194,7 @@ export function createCloudDatabase(dbVars) {
             const beforeCreatedAt = String(options?.beforeCreatedAt || '').trim();
             const beforeInclusive = Boolean(options?.beforeInclusive);
             if (hasFilters || hasVip || cleanDateFrom || cleanDateTo || beforeCreatedAt) {
-                const rows = await cloudFetch('/api/feed/query', {
+                const req = cloudFetch('/api/feed/query', {
                     method: 'POST',
                     json: {
                         types: hasFilters ? filters : [],
@@ -2199,10 +2205,12 @@ export function createCloudDatabase(dbVars) {
                         beforeCreatedAt: beforeCreatedAt || undefined,
                         beforeInclusive: beforeCreatedAt ? beforeInclusive : undefined
                     }
-                }).catch(() => []);
+                });
+                const rows = options?.throwOnError ? await req : await req.catch(() => []);
                 return Array.isArray(rows) ? rows : [];
             }
-            const rows = await cloudFetch(`/api/feed?limit=${limit}`).catch(() => []);
+            const req = cloudFetch(`/api/feed?limit=${limit}`);
+            const rows = options?.throwOnError ? await req : await req.catch(() => []);
             return Array.isArray(rows) ? rows : [];
         },
         async searchFeedDatabase(search, filters, vipList, maxEntries = 50, dateFrom = '', dateTo = '') {

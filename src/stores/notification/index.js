@@ -1219,18 +1219,20 @@ export const useNotificationStore = defineStore('Notification', () => {
                           database.getNotificationsV2({
                               limit: requestLimit,
                               beforeCreatedAt: oldest,
-                              beforeInclusive: true
+                              beforeInclusive: true,
+                              throwOnError: true
                           })
-                      ).catch(() => [])
+                      )
                     : Promise.resolve([]),
                 notifHasMoreV1
                     ? Promise.resolve(
                           database.getNotifications({
                               limit: requestLimit,
                               beforeCreatedAt: oldest,
-                              beforeInclusive: true
+                              beforeInclusive: true,
+                              throwOnError: true
                           })
-                      ).catch(() => [])
+                      )
                     : Promise.resolve([])
             ]);
             if (epoch !== notifLoadEpoch) return 0;
@@ -1255,18 +1257,20 @@ export const useNotificationStore = defineStore('Notification', () => {
                               database.getNotificationsV2({
                                   limit: NOTIFICATION_CLOUD_PAGE_BATCH,
                                   beforeCreatedAt: oldest,
-                                  beforeInclusive: false
+                                  beforeInclusive: false,
+                                  throwOnError: true
                               })
-                          ).catch(() => [])
+                          )
                         : Promise.resolve([]),
                     notifHasMoreV1
                         ? Promise.resolve(
                               database.getNotifications({
                                   limit: NOTIFICATION_CLOUD_PAGE_BATCH,
                                   beforeCreatedAt: oldest,
-                                  beforeInclusive: false
+                                  beforeInclusive: false,
+                                  throwOnError: true
                               })
-                          ).catch(() => [])
+                          )
                         : Promise.resolve([])
                 ]);
                 if (epoch !== notifLoadEpoch) return 0;
@@ -1295,6 +1299,9 @@ export const useNotificationStore = defineStore('Notification', () => {
             }
 
             notificationTable.value.hasMore = false;
+            return 0;
+        } catch (err) {
+            console.warn('[notification] Failed to load older notifications:', err);
             return 0;
         } finally {
             if (epoch === notifLoadEpoch) {

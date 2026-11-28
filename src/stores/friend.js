@@ -270,7 +270,8 @@ export const useFriendStore = defineStore('Friend', () => {
         pageSizeLinked: true,
         loading: false,
         loadingMore: false,
-        hasMore: false
+        hasMore: false,
+        historyExpanded: false
     });
 
     watch(
@@ -999,6 +1000,7 @@ export const useFriendStore = defineStore('Friend', () => {
         const epoch = ++friendLogLoadEpoch;
         friendLogTable.value.loading = true;
         friendLogTable.value.loadingMore = false;
+        friendLogTable.value.historyExpanded = false;
         try {
             const supportsCursor = Boolean(database.supportsHistoryCursorPagination);
             const rows = supportsCursor
@@ -1012,6 +1014,32 @@ export const useFriendStore = defineStore('Friend', () => {
             if (epoch === friendLogLoadEpoch) {
                 friendLogTable.value.loading = false;
             }
+        }
+    }
+
+    async function refreshRecentFriendLogHistory() {
+        if (!database.supportsHistoryCursorPagination) {
+            return initFriendLogHistoryTable();
+        }
+        const epoch = friendLogLoadEpoch;
+        try {
+            const recent = await database.getFriendLogHistory({ limit: 50 });
+            if (epoch !== friendLogLoadEpoch || !Array.isArray(recent) || recent.length === 0) return;
+            const friendLogKey = (r) =>
+                `${String(r?.created_at ?? '')}|${String(r?.type ?? '')}|${String(r?.userId ?? '')}|${String(r?.displayName ?? '')}`;
+            const existingKeys = new Set(friendLogTable.value.data.map(friendLogKey));
+            const additions = [];
+            for (const row of recent) {
+                const key = friendLogKey(row);
+                if (existingKeys.has(key)) continue;
+                existingKeys.add(key);
+                additions.push(row);
+            }
+            if (additions.length > 0) {
+                friendLogTable.value.data = [...additions, ...friendLogTable.value.data];
+            }
+        } catch (err) {
+            console.warn('[friend] Failed to merge recent friend log history:', err);
         }
     }
 
@@ -1051,7 +1079,8 @@ export const useFriendStore = defineStore('Friend', () => {
             let fetched = await database.getFriendLogHistory({
                 limit: requestLimit,
                 beforeCreatedAt: oldest,
-                beforeInclusive: true
+                beforeInclusive: true,
+                throwOnError: true
             });
             if (epoch !== friendLogLoadEpoch) return 0;
 
@@ -1068,7 +1097,8 @@ export const useFriendStore = defineStore('Friend', () => {
                 fetched = await database.getFriendLogHistory({
                     limit: requestLimit,
                     beforeCreatedAt: oldest,
-                    beforeInclusive: false
+                    beforeInclusive: false,
+                    throwOnError: true
                 });
                 if (epoch !== friendLogLoadEpoch) return 0;
                 for (const row of Array.isArray(fetched) ? fetched : []) {
@@ -1081,11 +1111,15 @@ export const useFriendStore = defineStore('Friend', () => {
 
             if (newRows.length > 0) {
                 friendLogTable.value.data = [...friendLogTable.value.data, ...newRows];
+                friendLogTable.value.historyExpanded = true;
                 friendLogTable.value.hasMore = Array.isArray(fetched) && fetched.length >= requestLimit;
                 return newRows.length;
             }
 
             friendLogTable.value.hasMore = false;
+            return 0;
+        } catch (err) {
+            console.warn('[friend] Failed to load older friend log history:', err);
             return 0;
         } finally {
             if (epoch === friendLogLoadEpoch) {
@@ -1452,6 +1486,7 @@ export const useFriendStore = defineStore('Friend', () => {
         resetDerivedDebugCounters,
         getDerivedDebugCounters,
         initFriendLogHistoryTable,
+        refreshRecentFriendLogHistory,
         loadMoreFriendLogHistory,
         setIsRefreshFriendsLoading
     };

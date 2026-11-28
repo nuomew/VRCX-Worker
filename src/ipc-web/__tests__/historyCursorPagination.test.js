@@ -1,5 +1,17 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createPinia, setActivePinia } from 'pinia';
+import { mount } from '@vue/test-utils';
+import { defineComponent, nextTick, ref, shallowRef } from 'vue';
+
+vi.mock('vue-i18n', () => ({
+    useI18n: () => ({ t: (k) => k })
+}));
+
+vi.mock('@/stores/', () => ({
+    useAppearanceSettingsStore: () => ({
+        isDataTableStriped: ref(false)
+    })
+}));
 
 vi.mock('../appApiWeb.js', () => ({
     appApiWeb: {}
@@ -223,5 +235,199 @@ describe('Cloud history cursor pagination (adapter + Feed store)', () => {
         });
         expect(feedStore.feedTableData.length).toBe(236);
         expect(feedStore.feedTableData[0].displayName).toBe('LiveFriend');
+    });
+
+    it('keeps current page intact and advances cleanly across repeated Load older clicks in DataTableLayout + useVrcxVueTable', async () => {
+        const { useVrcxVueTable } = await import('../../lib/table/useVrcxVueTable.js');
+        const DataTableLayout = (await import('../../components/ui/data-table/DataTableLayout.vue')).default;
+
+        const rowsData = shallowRef(
+            Array.from({ length: 100 }, (_, i) => ({
+                rowId: -(1000 - i),
+                type: 'GPS',
+                created_at: `2026-01-01T00:00:${String(i).padStart(2, '0')}.000Z`,
+                name: `Row ${i}`
+            }))
+        );
+        const hasMore = ref(true);
+        const loadingMore = ref(false);
+        let batchNo = 1;
+
+        const onLoadMore = async () => {
+            loadingMore.value = true;
+            await Promise.resolve();
+            batchNo++;
+            const start = rowsData.value.length;
+            const nextBatch = Array.from({ length: 100 }, (_, i) => ({
+                rowId: -(10000 * batchNo - i),
+                type: 'GPS',
+                created_at: `2025-0${Math.max(1, 9 - batchNo)}-01T00:00:${String(i).padStart(2, '0')}.000Z`,
+                name: `Row ${start + i}`
+            }));
+            rowsData.value = [...rowsData.value, ...nextBatch];
+            loadingMore.value = false;
+        };
+
+        const Host = defineComponent({
+            components: { DataTableLayout },
+            setup() {
+                const { table, pagination } = useVrcxVueTable({
+                    persistKey: 'test-feed-cursor',
+                    get data() {
+                        return rowsData.value;
+                    },
+                    columns: [
+                        { accessorKey: 'created_at', id: 'created_at', header: 'Date' },
+                        { accessorKey: 'name', id: 'name', header: 'Name' }
+                    ],
+                    getRowId: (row) => `row:${row.rowId}:${row.type}`,
+                    initialSorting: [{ id: 'created_at', desc: true }],
+                    initialPagination: { pageIndex: 0, pageSize: 20 },
+                    tableOptions: { autoResetExpanded: false, autoResetPageIndex: false }
+                });
+                return { table, pagination, rowsData, hasMore, loadingMore, onLoadMore };
+            },
+            template: `
+                <DataTableLayout
+                    :table="table"
+                    :total-items="rowsData.length"
+                    :page-sizes="[20, 50]"
+                    :can-load-more="hasMore"
+                    :loading-more="loadingMore"
+                    :on-load-more="onLoadMore" />
+            `
+        });
+
+        const wrapper = mount(Host, {
+            global: {
+                mocks: { $t: (k) => k }
+            }
+        });
+        const vm = wrapper.vm;
+
+        // 1) Click page 5 via actual PaginationItem DOM button
+        const page5Btn = wrapper.findAll('[data-type="page"]').find((b) => b.text().trim() === '5');
+        expect(page5Btn).toBeTruthy();
+        await page5Btn.trigger('click');
+        await nextTick();
+        expect(vm.pagination.pageIndex).toBe(4);
+
+        const trace = [];
+        for (let step = 1; step <= 6; step++) {
+            // Alternate clicking last-page Next button and right-side Load older button
+            const btnText = step % 2 === 1 ? 'table.pagination.next' : 'table.pagination.load_more';
+            const btn = wrapper.findAll('button').find((b) => b.text().includes(btnText));
+            expect(btn).toBeTruthy();
+            await btn.trigger('click');
+            await nextTick();
+            await nextTick();
+            trace.push({
+                step,
+                btnText,
+                rows: rowsData.value.length,
+                pageCount: vm.table.getPageCount(),
+                pageIndex: vm.pagination.pageIndex,
+                renderedPages: wrapper.findAll('[data-type="page"]').map((n) => n.text().trim())
+            });
+            // Click the last page number via real PaginationItem button before next step
+            const lastPageText = String(vm.table.getPageCount());
+            const lastBtn = wrapper.findAll('[data-type="page"]').find((b) => b.text().trim() === lastPageText);
+            expect(lastBtn).toBeTruthy();
+            await lastBtn.trigger('click');
+            await nextTick();
+            expect(vm.pagination.pageIndex).toBe(vm.table.getPageCount() - 1);
+        }
+
+        // Also click Load older 3 times while staying on a middle page (page 12) and verify we stay on page 12
+        const page12Index = 11;
+        vm.table.setPageIndex(page12Index);
+        await nextTick();
+        for (let k = 0; k < 3; k++) {
+            const loadBtn = wrapper.findAll('button').find((b) => b.text().includes('table.pagination.load_more'));
+            await loadBtn.trigger('click');
+            await nextTick();
+            await nextTick();
+            expect(vm.pagination.pageIndex).toBe(page12Index);
+        }
+
+        expect(trace[0].pageIndex).toBe(5);
+        expect(trace[1].pageIndex).toBe(10);
+        expect(trace[2].pageIndex).toBe(15);
+        expect(trace[3].pageIndex).toBe(20);
+        expect(trace[4].pageIndex).toBe(25);
+        expect(trace[5].pageIndex).toBe(30);
+    });
+
+    it('preserves expanded Feed history on transient 503 loadMore error and on background cloudRssSync updates', async () => {
+        const makeRow = (i, baseMs) => ({
+            rowId: -(2000 - i),
+            created_at: new Date(baseMs - i * 60_000).toISOString(),
+            type: 'GPS',
+            userId: `usr_${i % 4}`,
+            displayName: `Friend_${i}`,
+            location: `wrld_${i}:1`,
+            worldName: `World_${i}`
+        });
+        const page1 = Array.from({ length: 100 }, (_, i) => makeRow(i, Date.UTC(2026, 5, 1)));
+        const page2 = Array.from({ length: 101 }, (_, i) => makeRow(99 + i, Date.UTC(2026, 5, 1)));
+
+        let callCount = 0;
+        mockDb.lookupFeedDatabase.mockImplementation(async () => {
+            callCount++;
+            if (callCount === 1) return page1;
+            if (callCount === 2) return page2;
+            if (callCount === 3) throw new Error('HTTP 503');
+            return [];
+        });
+
+        const feedStore = useFeedStore();
+        await feedStore.feedTableLookup();
+        expect(feedStore.feedTableData.length).toBe(100);
+
+        // Expand page 2
+        const added = await feedStore.loadMoreFeedHistory();
+        expect(added).toBe(100);
+        expect(feedStore.feedTableData.length).toBe(200);
+        expect(feedStore.feedTable.historyExpanded).toBe(true);
+        expect(feedStore.feedTable.hasMore).toBe(true);
+
+        // Transient 503 error must NOT lose loaded rows or permanently disable hasMore
+        const addedOnErr = await feedStore.loadMoreFeedHistory();
+        expect(addedOnErr).toBe(0);
+        expect(feedStore.feedTableData.length).toBe(200);
+        expect(feedStore.feedTable.hasMore).toBe(true);
+
+        // Background RSS sync while historyExpanded === true must incrementally merge instead of calling feedTableLookup
+        const { applyCloudRssSnapshot } = await import('../cloudRssSync.js');
+        const lookupSpy = vi.spyOn(feedStore, 'feedTableLookup');
+        applyCloudRssSnapshot(
+            {
+                changed: true,
+                syncedAt: '2026-11-28T17:00:00.000Z',
+                recentFeeds: [
+                    {
+                        rowId: 7777,
+                        created_at: '2026-11-28T16:59:00.000Z',
+                        type: 'GPS',
+                        userId: 'usr_live_rss',
+                        displayName: 'RssFriend',
+                        location: 'wrld_rss:1',
+                        worldName: 'RssWorld'
+                    }
+                ]
+            },
+            {
+                friendStore: { friends: new Map(), runInSortedFriendsBatch: (fn) => fn() },
+                userStore: { currentUser: { id: 'usr_me' } },
+                feedStore,
+                notificationStore: { notificationTable: { data: [] }, unseenNotifications: [] },
+                applyUser: () => {}
+            }
+        );
+
+        expect(lookupSpy).not.toHaveBeenCalled();
+        expect(feedStore.feedTable.historyExpanded).toBe(true);
+        expect(feedStore.feedTableData.length).toBe(201);
+        expect(feedStore.feedTableData[0].displayName).toBe('RssFriend');
     });
 });

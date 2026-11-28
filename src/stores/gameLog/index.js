@@ -454,7 +454,8 @@ export const useGameLogStore = defineStore('GameLog', () => {
                 rows = await database.lookupGameLogDatabase(
                     gameLogTable.value.filter,
                     vipList,
-                    GAMELOG_CLOUD_PAGE_BATCH
+                    GAMELOG_CLOUD_PAGE_BATCH,
+                    { throwOnError: true }
                 );
             } else {
                 rows = await database.lookupGameLogDatabase(gameLogTable.value.filter, vipList);
@@ -467,6 +468,8 @@ export const useGameLogStore = defineStore('GameLog', () => {
             }
             gameLogTableData.value = rows;
             gameLogTable.value.hasMore = Boolean(supportsCursor && !search && rows.length >= GAMELOG_CLOUD_PAGE_BATCH);
+        } catch (err) {
+            console.warn('[gameLog] Failed to lookup GameLog table:', err);
         } finally {
             if (epoch === gameLogLookupEpoch) {
                 gameLogTable.value.loading = false;
@@ -503,7 +506,8 @@ export const useGameLogStore = defineStore('GameLog', () => {
             );
             let fetched = await database.lookupGameLogDatabase(gameLogTable.value.filter, vipList, requestLimit, {
                 beforeCreatedAt: oldest,
-                beforeInclusive: true
+                beforeInclusive: true,
+                throwOnError: true
             });
             if (epoch !== gameLogLookupEpoch) return 0;
 
@@ -521,7 +525,8 @@ export const useGameLogStore = defineStore('GameLog', () => {
                 requestLimit = GAMELOG_CLOUD_PAGE_BATCH;
                 fetched = await database.lookupGameLogDatabase(gameLogTable.value.filter, vipList, requestLimit, {
                     beforeCreatedAt: oldest,
-                    beforeInclusive: false
+                    beforeInclusive: false,
+                    throwOnError: true
                 });
                 if (epoch !== gameLogLookupEpoch) return 0;
                 for (const row of Array.isArray(fetched) ? fetched : []) {
@@ -543,6 +548,9 @@ export const useGameLogStore = defineStore('GameLog', () => {
             }
 
             gameLogTable.value.hasMore = false;
+            return 0;
+        } catch (err) {
+            console.warn('[gameLog] Failed to load older GameLog history:', err);
             return 0;
         } finally {
             if (epoch === gameLogLookupEpoch) {

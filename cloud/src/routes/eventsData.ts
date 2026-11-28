@@ -169,7 +169,7 @@ async function fetchBoundedArchiveChunks(
                      FROM ${archiveTable}
                      WHERE ${straddleConds.join(' AND ')}
                      ORDER BY max_created_at DESC, id DESC
-                     LIMIT 2`
+                     LIMIT 1`
                 )
                 .bind(...straddleBinds)
         );
@@ -1436,7 +1436,13 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
             if (chunkKinds.length > 0) {
                 const archiveTable = negateRowIds ? 'legacy_gamelog_chunks' : 'gamelog_archive_chunks';
                 try {
-                    const perKindLimit = hasVip ? 8 : chunkKinds.length <= 2 ? 8 : 4;
+                    const perKindLimit = hasVip
+                        ? 5
+                        : chunkKinds.length <= 2
+                          ? 6
+                          : upperBound
+                            ? 2
+                            : 3;
                     const chunks = await fetchBoundedArchiveChunks(
                         db,
                         archiveTable,
@@ -4181,7 +4187,13 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
             if (chunkKinds.length > 0) {
                 const archiveTable = negateRowIds ? 'legacy_feed_chunks' : 'feed_archive_chunks';
                 try {
-                    const perKindLimit = hasVip ? 8 : chunkKinds.length <= 2 ? 8 : 4;
+                    const perKindLimit = hasVip
+                        ? 5
+                        : chunkKinds.length <= 2
+                          ? 6
+                          : upperBound
+                            ? 2
+                            : 3;
                     const chunks = await fetchBoundedArchiveChunks(
                         db,
                         archiveTable,

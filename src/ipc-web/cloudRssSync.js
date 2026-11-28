@@ -162,10 +162,19 @@ export function applyCloudRssSnapshot(data, storeOverrides = null) {
                 });
             }
         }
-        feedStore.feedTableLookup();
+        if (feedStore.feedTable?.historyExpanded && typeof feedStore.mergeRecentFeeds === 'function') {
+            feedStore.mergeRecentFeeds(data.recentFeeds);
+        } else {
+            feedStore.feedTableLookup();
+        }
     }
     if (Number(data.friendLogInserted || 0) > 0) {
-        if (typeof friendStore.initFriendLogHistoryTable === 'function') {
+        if (
+            friendStore.friendLogTable?.historyExpanded &&
+            typeof friendStore.refreshRecentFriendLogHistory === 'function'
+        ) {
+            friendStore.refreshRecentFriendLogHistory();
+        } else if (typeof friendStore.initFriendLogHistoryTable === 'function') {
             friendStore.initFriendLogHistoryTable();
         }
         // Reconcile only explicit recent Unfriend events recorded by server Cron so newly added local friends

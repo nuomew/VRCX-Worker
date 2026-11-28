@@ -201,7 +201,8 @@ export const useFeedStore = defineStore('Feed', () => {
                             vipList,
                             FEED_CLOUD_PAGE_BATCH,
                             dateFrom,
-                            dateTo
+                            dateTo,
+                            { throwOnError: true }
                         )
                       : await database.lookupFeedDatabase(feedTable.value.filter, vipList);
             if (epoch !== feedLookupEpoch) return;
@@ -209,6 +210,8 @@ export const useFeedStore = defineStore('Feed', () => {
             feedTable.value.hasMore = Boolean(
                 supportsCursor && !search && feedTableData.value.length >= FEED_CLOUD_PAGE_BATCH
             );
+        } catch (err) {
+            console.warn('[feed] Failed to lookup feed table:', err);
         } finally {
             if (epoch === feedLookupEpoch) {
                 feedTable.value.loading = false;
@@ -250,7 +253,7 @@ export const useFeedStore = defineStore('Feed', () => {
                 requestLimit,
                 dateFrom,
                 dateTo,
-                { beforeCreatedAt: oldest, beforeInclusive: true }
+                { beforeCreatedAt: oldest, beforeInclusive: true, throwOnError: true }
             );
             if (epoch !== feedLookupEpoch) return 0;
 
@@ -271,7 +274,7 @@ export const useFeedStore = defineStore('Feed', () => {
                     requestLimit,
                     dateFrom,
                     dateTo,
-                    { beforeCreatedAt: oldest, beforeInclusive: false }
+                    { beforeCreatedAt: oldest, beforeInclusive: false, throwOnError: true }
                 );
                 if (epoch !== feedLookupEpoch) return 0;
                 for (const row of Array.isArray(fetched) ? fetched : []) {
@@ -292,11 +295,54 @@ export const useFeedStore = defineStore('Feed', () => {
 
             feedTable.value.hasMore = false;
             return 0;
+        } catch (err) {
+            // Preserve `hasMore` on transient network / 503 errors so the user can retry without losing loaded pages.
+            console.warn('[feed] Failed to load older feed history:', err);
+            return 0;
         } finally {
             if (epoch === feedLookupEpoch) {
                 feedTable.value.loadingMore = false;
             }
         }
+    }
+
+    /**
+     * Incrementally merges newly synced cloud RSS feed rows at the top of the table without wiping
+     * already-expanded older history pages or resetting pagination.
+     *
+     * @param {Array<object>} recentFeeds
+     */
+    function mergeRecentFeeds(recentFeeds) {
+        if (!Array.isArray(recentFeeds) || recentFeeds.length === 0) return;
+        const existingKeys = new Set(feedTableData.value.map(feedRowDedupKey));
+        const additions = [];
+        for (const feed of recentFeeds) {
+            if (!feed || typeof feed !== 'object') continue;
+            if (feedTable.value.filter.length > 0 && !feedTable.value.filter.includes(feed.type)) {
+                continue;
+            }
+            if (feedTable.value.vip && !friendStore.localFavoriteFriends.has(feed.userId)) {
+                continue;
+            }
+            if (!feedSearch(feed)) {
+                continue;
+            }
+            if (feedTable.value.dateFrom && feed.created_at < feedTable.value.dateFrom) {
+                continue;
+            }
+            if (feedTable.value.dateTo && feed.created_at > feedTable.value.dateTo) {
+                continue;
+            }
+            const key = feedRowDedupKey(feed);
+            if (existingKeys.has(key)) continue;
+            existingKeys.add(key);
+            additions.push(feed);
+        }
+        if (additions.length === 0) return;
+        additions.sort((a, b) => String(b.created_at ?? '').localeCompare(String(a.created_at ?? '')));
+        feedTableData.value = [...additions, ...feedTableData.value];
+        feedHistoryCapacity = Math.max(feedHistoryCapacity, feedTableData.value.length);
+        sweepFeed();
     }
 
     /**
@@ -345,6 +391,7 @@ export const useFeedStore = defineStore('Feed', () => {
         initFeedTable,
         feedTableLookup,
         loadMoreFeedHistory,
+        mergeRecentFeeds,
         addFeedEntry
     };
 });
