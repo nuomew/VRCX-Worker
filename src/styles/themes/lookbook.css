@@ -8,6 +8,14 @@
     accent-color: #ad4468;
 
     --lb-cream: #fbf7f2;
+    --lb-glow-1: rgb(244 198 214 / 0.4);
+    --lb-glow-2: rgb(235 211 168 / 0.4);
+    --lb-glow-3: rgb(226 210 242 / 0.3);
+    --lb-topbar-bg: rgb(251 247 242 / 0.84);
+    --lb-surface-bg: rgb(255 253 250 / 0.92);
+    --lb-cover-bg: linear-gradient(135deg, #fce4ec 0%, #f7eae0 52%, #e8eef9 100%);
+    --lb-table-head-bg: #f8efe8;
+    --lb-drawer-bg: #fbf7f2;
     --lb-gold: #c4a066;
     --lb-gold-ink: #82622b;
     --lb-rose: #ad4468;
@@ -18,9 +26,9 @@
 
     /* Semantic Tokens (all WCAG AA >= 4.5:1) */
     --radius: 0.9rem;
-    --background: #fbf7f2;
+    --background: var(--lb-cream);
     --foreground: #2d2228;
-    --card: rgb(255 253 250 / 0.92);
+    --card: var(--lb-surface-bg);
     --card-foreground: #2d2228;
     --profile-card: rgb(252 245 240 / 0.9);
     --popover: rgb(255 253 250 / 0.97);
@@ -45,7 +53,7 @@
     --chart-4: #7e68a8;
     --chart-5: #2c8c6c;
 
-    --sidebar: rgb(255 253 250 / 0.9);
+    --sidebar: var(--lb-surface-bg);
     --sidebar-foreground: #2d2228;
     --sidebar-primary: #ad4468;
     --sidebar-primary-foreground: #ffffff;
@@ -55,9 +63,21 @@
     --sidebar-ring: #ad4468;
 }
 
-/* 8 Accent Variants preserving Lookbook Cream/Gold elegance & >= 4.5:1 contrast */
+/* 8 Background Color Palettes preserving Lookbook Editorial elegance & >= 4.5:1 contrast */
 :root[data-theme='lookbook'][data-theme-color='blue'] {
     accent-color: #1f6fa8;
+    --lb-cream: #dceeff;
+    --lb-glow-1: rgb(118 186 248 / 0.45);
+    --lb-glow-2: rgb(168 214 255 / 0.42);
+    --lb-glow-3: rgb(192 204 250 / 0.36);
+    --lb-topbar-bg: rgb(224 240 255 / 0.88);
+    --lb-surface-bg: rgb(248 252 255 / 0.92);
+    --lb-cover-bg: linear-gradient(135deg, #d6ebff 0%, #edf6ff 52%, #e0eaff 100%);
+    --lb-table-head-bg: #e2f1ff;
+    --lb-drawer-bg: #e6f3ff;
+    --background: #dceeff;
+    --muted: #e6f2fc;
+    --accent: #e1effb;
     --primary: #1f6fa8;
     --secondary: #e7f3fc;
     --secondary-foreground: #17466b;
@@ -65,6 +85,18 @@
 }
 :root[data-theme='lookbook'][data-theme-color='green'] {
     accent-color: #1c7a52;
+    --lb-cream: #dcf4e6;
+    --lb-glow-1: rgb(120 212 166 / 0.42);
+    --lb-glow-2: rgb(176 232 198 / 0.4);
+    --lb-glow-3: rgb(196 232 222 / 0.35);
+    --lb-topbar-bg: rgb(224 247 234 / 0.88);
+    --lb-surface-bg: rgb(248 254 250 / 0.92);
+    --lb-cover-bg: linear-gradient(135deg, #d4f2e1 0%, #eefaf2 52%, #e0f5ee 100%);
+    --lb-table-head-bg: #e2f5ea;
+    --lb-drawer-bg: #e5f7ed;
+    --background: #dcf4e6;
+    --muted: #e5f5ec;
+    --accent: #dff2e8;
     --primary: #1c7a52;
     --secondary: #e5f6ee;
     --secondary-foreground: #144d34;
@@ -72,6 +104,18 @@
 }
 :root[data-theme='lookbook'][data-theme-color='orange'] {
     accent-color: #b44a1d;
+    --lb-cream: #fde7d6;
+    --lb-glow-1: rgb(252 174 118 / 0.45);
+    --lb-glow-2: rgb(255 206 154 / 0.42);
+    --lb-glow-3: rgb(248 192 178 / 0.35);
+    --lb-topbar-bg: rgb(253 235 220 / 0.88);
+    --lb-surface-bg: rgb(255 251 247 / 0.92);
+    --lb-cover-bg: linear-gradient(135deg, #fddbc2 0%, #fef1e6 52%, #fce4da 100%);
+    --lb-table-head-bg: #fce8d9;
+    --lb-drawer-bg: #feefe2;
+    --background: #fde7d6;
+    --muted: #faeadd;
+    --accent: #f9e4d5;
     --primary: #b44a1d;
     --secondary: #fcece3;
     --secondary-foreground: #6b2a0f;
@@ -79,6 +123,18 @@
 }
 :root[data-theme='lookbook'][data-theme-color='red'] {
     accent-color: #bd2d48;
+    --lb-cream: #fde0e4;
+    --lb-glow-1: rgb(246 142 158 / 0.44);
+    --lb-glow-2: rgb(252 184 190 / 0.4);
+    --lb-glow-3: rgb(244 176 202 / 0.35);
+    --lb-topbar-bg: rgb(253 228 232 / 0.88);
+    --lb-surface-bg: rgb(255 249 250 / 0.92);
+    --lb-cover-bg: linear-gradient(135deg, #fbd2d9 0%, #fef0f2 52%, #fae0e8 100%);
+    --lb-table-head-bg: #fce2e7;
+    --lb-drawer-bg: #fee9ec;
+    --background: #fde0e4;
+    --muted: #fae5e9;
+    --accent: #f8dfe4;
     --primary: #bd2d48;
     --secondary: #fce6eb;
     --secondary-foreground: #6e182a;
@@ -86,6 +142,18 @@
 }
 :root[data-theme='lookbook'][data-theme-color='rose'] {
     accent-color: #ad3b67;
+    --lb-cream: #fce0ee;
+    --lb-glow-1: rgb(244 148 196 / 0.45);
+    --lb-glow-2: rgb(250 186 216 / 0.42);
+    --lb-glow-3: rgb(232 184 242 / 0.35);
+    --lb-topbar-bg: rgb(252 228 240 / 0.88);
+    --lb-surface-bg: rgb(255 249 253 / 0.92);
+    --lb-cover-bg: linear-gradient(135deg, #fad3e8 0%, #fef0f7 52%, #f5e2fa 100%);
+    --lb-table-head-bg: #fce2f0;
+    --lb-drawer-bg: #fdeaf3;
+    --background: #fce0ee;
+    --muted: #f9e5ef;
+    --accent: #f7dfec;
     --primary: #ad3b67;
     --secondary: #fae9f0;
     --secondary-foreground: #681e3b;
@@ -93,6 +161,18 @@
 }
 :root[data-theme='lookbook'][data-theme-color='violet'] {
     accent-color: #6445b5;
+    --lb-cream: #e8e0fc;
+    --lb-glow-1: rgb(168 142 246 / 0.44);
+    --lb-glow-2: rgb(200 184 252 / 0.42);
+    --lb-glow-3: rgb(220 186 248 / 0.36);
+    --lb-topbar-bg: rgb(234 226 253 / 0.88);
+    --lb-surface-bg: rgb(251 249 255 / 0.92);
+    --lb-cover-bg: linear-gradient(135deg, #e2d6fc 0%, #f4f0fe 52%, #ebe3fc 100%);
+    --lb-table-head-bg: #ebe4fd;
+    --lb-drawer-bg: #efe9fd;
+    --background: #e8e0fc;
+    --muted: #ede7fb;
+    --accent: #e7dffb;
     --primary: #6445b5;
     --secondary: #f0e9fc;
     --secondary-foreground: #3b2473;
@@ -100,6 +180,18 @@
 }
 :root[data-theme='lookbook'][data-theme-color='yellow'] {
     accent-color: #8c5c06;
+    --lb-cream: #fcf1cf;
+    --lb-glow-1: rgb(248 210 106 / 0.45);
+    --lb-glow-2: rgb(252 228 148 / 0.42);
+    --lb-glow-3: rgb(248 214 166 / 0.35);
+    --lb-topbar-bg: rgb(253 243 214 / 0.88);
+    --lb-surface-bg: rgb(255 253 246 / 0.92);
+    --lb-cover-bg: linear-gradient(135deg, #fbe8b4 0%, #fef8e4 52%, #faf0d4 100%);
+    --lb-table-head-bg: #fbf0cf;
+    --lb-drawer-bg: #fdf5dc;
+    --background: #fcf1cf;
+    --muted: #f8f0d8;
+    --accent: #f6ebcd;
     --primary: #8c5c06;
     --secondary: #fbf2d8;
     --secondary-foreground: #543704;
@@ -126,9 +218,9 @@
 :root[data-theme='lookbook'] .lb-stage {
     background-color: var(--lb-cream);
     background-image:
-        radial-gradient(56% 44% at 10% 8%, rgb(244 198 214 / 0.4) 0%, transparent 68%),
-        radial-gradient(48% 42% at 92% 14%, rgb(235 211 168 / 0.4) 0%, transparent 66%),
-        radial-gradient(50% 45% at 74% 92%, rgb(226 210 242 / 0.3) 0%, transparent 70%);
+        radial-gradient(56% 44% at 10% 8%, var(--lb-glow-1) 0%, transparent 68%),
+        radial-gradient(48% 42% at 92% 14%, var(--lb-glow-2) 0%, transparent 66%),
+        radial-gradient(50% 45% at 74% 92%, var(--lb-glow-3) 0%, transparent 70%);
     background-attachment: fixed;
     color: var(--foreground);
 }
@@ -147,7 +239,7 @@
 
 /* Borderless Editorial Topbar */
 :root[data-theme='lookbook'] .lb-topbar {
-    background: rgb(251 247 242 / 0.8);
+    background: var(--lb-topbar-bg);
     backdrop-filter: blur(14px);
     border-bottom: 1px solid rgb(196 160 102 / 0.32);
 }
@@ -213,7 +305,7 @@
 /* Double-Gold-Hairline Editorial Folio Cards & Stage */
 :root[data-theme='lookbook'] .lb-folio-card,
 :root[data-theme='lookbook'] .lb-main-stage {
-    background: rgb(255 253 250 / 0.9);
+    background: var(--lb-surface-bg);
     border: 1px solid rgb(196 160 102 / 0.44);
     border-radius: 18px;
     box-shadow:
@@ -224,7 +316,7 @@
 }
 
 :root[data-theme='lookbook'] .lb-cover-art {
-    background: linear-gradient(135deg, #fce4ec 0%, #f7eae0 52%, #e8eef9 100%);
+    background: var(--lb-cover-bg);
     border: 1px solid rgb(196 160 102 / 0.36);
 }
 
@@ -291,7 +383,7 @@
 }
 
 :root[data-theme='lookbook'] .lb-salon-drawer {
-    background: #fbf7f2;
+    background: var(--lb-drawer-bg);
     border-left: 1px solid rgb(196 160 102 / 0.48);
     box-shadow: -12px 0 40px rgb(45 34 40 / 0.14);
 }
@@ -301,7 +393,7 @@
 }
 
 :root[data-theme='lookbook'] .lb-statusbar > div {
-    background: rgb(251 247 242 / 0.9);
+    background: var(--lb-topbar-bg);
     border-top: 1px solid rgb(196 160 102 / 0.3);
 }
 
@@ -313,7 +405,7 @@
 }
 
 :root[data-theme='lookbook'] [data-slot='table-head'] {
-    background-color: #f8efe8 !important;
+    background-color: var(--lb-table-head-bg) !important;
     color: #5e444f;
     font-weight: 700;
     border-bottom: 1px solid rgb(196 160 102 / 0.4);

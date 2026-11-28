@@ -145,6 +145,7 @@ describe('Official Anime-Site Dual Themes (Lookbook & Azure Archive) registratio
             'editorial_lookbook_salon',
             'editorial_lookbook_toggle_cover',
             'editorial_lookbook_online_now',
+            'editorial_lookbook_other_friends',
             'editorial_lookbook_open_salon',
             'editorial_lookbook_tagline',
             'editorial_archive_subtitle',
@@ -205,6 +206,10 @@ describe('Official Anime-Site Dual Themes (Lookbook & Azure Archive) registratio
 
         expect(lookbookSrc).toContain('lb-brightness-dimmer');
         expect(archiveSrc).toContain('arc-brightness-dimmer');
+        // Lookbook left cover card renders all online + other friends inside an internal scroll container
+        expect(lookbookSrc).toContain('otherFolioFriends');
+        expect(lookbookSrc).toContain('lb-folio-friends-scroll');
+        expect(lookbookSrc).toContain('overflow-y-auto');
     });
 
     it('clamps theme brightness and computes viewport dimmer opacity accurately', () => {
@@ -299,8 +304,17 @@ describe('Official Anime-Site Dual Themes (Lookbook & Azure Archive) registratio
         wrapper.unmount();
     });
 
-    it('strictly scopes every CSS selector in lookbook.css and archive.css to its own data-theme', () => {
+    it('strictly scopes every CSS selector in lookbook.css and archive.css to its own data-theme and updates backgrounds for all 7 color palettes', () => {
         assertCssStrictlyScoped('src/styles/themes/lookbook.css', ":root[data-theme='lookbook']");
         assertCssStrictlyScoped('src/styles/themes/archive.css', ":root[data-theme='archive']");
+
+        const lookbookCss = fs.readFileSync(path.resolve(process.cwd(), 'src/styles/themes/lookbook.css'), 'utf-8');
+        const archiveCss = fs.readFileSync(path.resolve(process.cwd(), 'src/styles/themes/archive.css'), 'utf-8');
+        for (const colorKey of ['blue', 'green', 'orange', 'red', 'rose', 'violet', 'yellow']) {
+            expect(lookbookCss).toContain(`:root[data-theme='lookbook'][data-theme-color='${colorKey}']`);
+            expect(archiveCss).toContain(`:root[data-theme='archive'][data-theme-color='${colorKey}']`);
+        }
+        expect((lookbookCss.match(/--lb-cream:/g) ?? []).length).toBeGreaterThanOrEqual(8);
+        expect((archiveCss.match(/--arc-sky-bg:/g) ?? []).length).toBeGreaterThanOrEqual(8);
     });
 });

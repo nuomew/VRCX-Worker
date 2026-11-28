@@ -460,9 +460,9 @@
                 <!-- Left Collapsible Lookbook Cover & Profile Folio -->
                 <aside
                     v-if="coverOpen && !isCompactViewport"
-                    class="lb-cover-rail w-[274px] shrink-0 min-h-0 overflow-y-auto scrollbar-hidden flex flex-col gap-3">
-                    <div class="lb-folio-card p-5 flex flex-col gap-4 shrink-0">
-                        <div class="flex items-center justify-between text-[10px] font-semibold tracking-[0.22em] uppercase lb-gold-text">
+                    class="lb-cover-rail w-[274px] shrink-0 h-full min-h-0 flex flex-col">
+                    <div class="lb-folio-card flex-1 min-h-0 p-4 sm:p-5 flex flex-col gap-3.5 overflow-hidden">
+                        <div class="flex items-center justify-between text-[10px] font-semibold tracking-[0.22em] uppercase lb-gold-text shrink-0">
                             <span>{{ issueLabel }}</span>
                             <span>✦ ONLINE</span>
                         </div>
@@ -470,7 +470,7 @@
                         <!-- Editorial Cover Atmospheric Frame -->
                         <button
                             type="button"
-                            class="lb-cover-art relative rounded-xl p-4 text-left overflow-hidden cursor-pointer"
+                            class="lb-cover-art relative rounded-xl p-4 text-left overflow-hidden cursor-pointer shrink-0"
                             @click="openCurrentUserProfile">
                             <svg
                                 class="pointer-events-none absolute -right-5 -top-5 w-36 h-36 opacity-55"
@@ -509,7 +509,7 @@
                         </button>
 
                         <!-- 3-Column Editorial Metrics Strip -->
-                        <div class="lb-metrics-grid grid grid-cols-3 text-center py-2.5">
+                        <div class="lb-metrics-grid grid grid-cols-3 text-center py-2.5 shrink-0">
                             <button
                                 type="button"
                                 class="cursor-pointer px-1"
@@ -552,9 +552,9 @@
                             </button>
                         </div>
 
-                        <!-- Online Friends Quick Preview Grid -->
-                        <div v-if="isSideBarTabShow" class="flex flex-col gap-2">
-                            <div class="flex items-center justify-between text-xs">
+                        <!-- Scrollable Full Friends Roster inside Cover Folio (Online + Other Friends) -->
+                        <div v-if="isSideBarTabShow" class="flex-1 min-h-0 flex flex-col gap-2 overflow-hidden">
+                            <div class="flex items-center justify-between text-xs shrink-0">
                                 <span class="font-semibold">
                                     {{ t('view.settings.appearance.appearance.editorial_lookbook_online_now') }}
                                 </span>
@@ -565,25 +565,58 @@
                                     {{ t('view.settings.appearance.appearance.editorial_lookbook_open_salon') }} →
                                 </button>
                             </div>
-                            <div v-if="featuredOnlineFriends.length" class="grid grid-cols-2 gap-1.5">
-                                <button
-                                    v-for="friend in featuredOnlineFriends"
-                                    :key="friend.id"
-                                    type="button"
-                                    class="lb-mini-friend flex items-center gap-2 p-1.5 rounded-lg text-left cursor-pointer"
-                                    @click="showUserDialog(friend.id)">
-                                    <div class="relative size-7 shrink-0" :class="userStatusClass(friend.ref)">
-                                        <Avatar class="size-full rounded-full">
-                                            <AvatarImage :src="userImage(friend.ref, true)" class="object-cover" />
-                                            <AvatarFallback>
-                                                <User class="size-3.5 text-muted-foreground" />
-                                            </AvatarFallback>
-                                        </Avatar>
+                            <div
+                                v-if="featuredOnlineFriends.length || otherFolioFriends.length"
+                                class="lb-folio-friends-scroll flex-1 min-h-0 overflow-y-auto pr-1 space-y-2.5">
+                                <div v-if="featuredOnlineFriends.length" class="grid grid-cols-2 gap-1.5">
+                                    <button
+                                        v-for="friend in featuredOnlineFriends"
+                                        :key="friend.id"
+                                        type="button"
+                                        class="lb-mini-friend flex items-center gap-2 p-1.5 rounded-lg text-left cursor-pointer"
+                                        :title="friend.ref?.displayName || friend.name"
+                                        @click="showUserDialog(friend.id)">
+                                        <div class="relative size-7 shrink-0" :class="userStatusClass(friend.ref)">
+                                            <Avatar class="size-full rounded-full">
+                                                <AvatarImage :src="userImage(friend.ref, true)" class="object-cover" />
+                                                <AvatarFallback>
+                                                    <User class="size-3.5 text-muted-foreground" />
+                                                </AvatarFallback>
+                                            </Avatar>
+                                        </div>
+                                        <span class="text-[11.5px] font-semibold truncate min-w-0 flex-1">
+                                            {{ friend.ref?.displayName || friend.name }}
+                                        </span>
+                                    </button>
+                                </div>
+                                <div v-if="otherFolioFriends.length" class="space-y-1.5">
+                                    <div
+                                        class="flex items-center justify-between text-[11px] font-semibold text-muted-foreground pt-1 border-t border-border/50">
+                                        <span>{{ t('view.settings.appearance.appearance.editorial_lookbook_other_friends') }}</span>
+                                        <span class="tabular-nums">{{ otherFolioFriends.length }}</span>
                                     </div>
-                                    <span class="text-[11.5px] font-semibold truncate min-w-0 flex-1">
-                                        {{ friend.ref?.displayName || friend.name }}
-                                    </span>
-                                </button>
+                                    <div class="grid grid-cols-2 gap-1.5">
+                                        <button
+                                            v-for="friend in otherFolioFriends"
+                                            :key="friend.id"
+                                            type="button"
+                                            class="lb-mini-friend flex items-center gap-2 p-1.5 rounded-lg text-left opacity-80 hover:opacity-100 cursor-pointer"
+                                            :title="friend.ref?.displayName || friend.name"
+                                            @click="showUserDialog(friend.id)">
+                                            <div class="relative size-7 shrink-0" :class="userStatusClass(friend.ref)">
+                                                <Avatar class="size-full rounded-full">
+                                                    <AvatarImage :src="userImage(friend.ref, true)" class="object-cover" />
+                                                    <AvatarFallback>
+                                                        <User class="size-3.5 text-muted-foreground" />
+                                                    </AvatarFallback>
+                                                </Avatar>
+                                            </div>
+                                            <span class="text-[11.5px] font-medium truncate min-w-0 flex-1">
+                                                {{ friend.ref?.displayName || friend.name }}
+                                            </span>
+                                        </button>
+                                    </div>
+                                </div>
                             </div>
                             <div v-else class="text-[11px] text-muted-foreground py-1">
                                 {{ onlineFriendCount }} / {{ friends.size }}
@@ -591,7 +624,7 @@
                         </div>
 
                         <!-- Quick New Dashboard Action -->
-                        <div v-if="showNewDashboardButton" class="pt-2 border-t border-border/70">
+                        <div v-if="showNewDashboardButton" class="pt-2 border-t border-border/70 shrink-0">
                             <button
                                 type="button"
                                 class="lb-create-btn flex items-center justify-center gap-1.5 h-8 w-full rounded-full text-xs font-semibold cursor-pointer"
@@ -787,7 +820,8 @@
     const { clearAllNotifications } = uiStore;
 
     const friendStore = useFriendStore();
-    const { friends, onlineFriends, vipFriends, onlineFriendCount } = storeToRefs(friendStore);
+    const { friends, onlineFriends, vipFriends, activeFriends, offlineFriends, onlineFriendCount } =
+        storeToRefs(friendStore);
 
     const userStore = useUserStore();
     const { currentUser } = storeToRefs(userStore);
@@ -886,8 +920,26 @@
                 if (!f?.id || seen.has(f.id) || f.state !== 'online') continue;
                 seen.add(f.id);
                 merged.push(f);
-                if (merged.length >= 4) return merged;
             }
+        }
+        return merged;
+    });
+
+    const otherFolioFriends = computed(() => {
+        const seen = new Set(featuredOnlineFriends.value.map((f) => f.id));
+        const merged = [];
+        const append = (list) => {
+            if (!list) return;
+            for (const f of list) {
+                if (!f?.id || seen.has(f.id)) continue;
+                seen.add(f.id);
+                merged.push(f);
+            }
+        };
+        append(activeFriends.value);
+        append(offlineFriends.value);
+        if (friends.value && typeof friends.value.values === 'function') {
+            append(friends.value.values());
         }
         return merged;
     });

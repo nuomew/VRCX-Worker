@@ -9,6 +9,11 @@
     accent-color: #0077b6;
 
     --arc-sky-bg: #eef7fd;
+    --arc-grid-color: rgb(14 148 226 / 0.08);
+    --arc-glow-color: rgb(125 211 252 / 0.32);
+    --arc-topbar-bg: rgb(255 255 255 / 0.92);
+    --arc-surface-bg: rgb(255 255 255 / 0.96);
+    --arc-table-head-bg: #e3f4ff;
     --arc-azure: #009fe8;
     --arc-azure-deep: #0077b6;
     --arc-gold: #ffc42e;
@@ -19,7 +24,7 @@
 
     /* Semantic Tokens (all WCAG AA >= 4.5:1) */
     --radius: 0.625rem;
-    --background: #eef7fd;
+    --background: var(--arc-sky-bg);
     --foreground: #142238;
     --card: rgb(255 255 255 / 0.97);
     --card-foreground: #142238;
@@ -36,7 +41,7 @@
     --accent-foreground: #0c4a6e;
     --destructive: #c42b45;
     --destructive-foreground: #ffffff;
-    --border: #c6e3f8;
+    --border: var(--arc-border);
     --input: #a6d4f4;
     --ring: #009fe8;
 
@@ -52,13 +57,23 @@
     --sidebar-primary-foreground: #ffffff;
     --sidebar-accent: #e1f4ff;
     --sidebar-accent-foreground: #0c4a6e;
-    --sidebar-border: #c6e3f8;
+    --sidebar-border: var(--arc-border);
     --sidebar-ring: #009fe8;
 }
 
-/* 8 Accent Variants preserving Azure Archive crispness & >= 4.5:1 contrast */
+/* 8 Background Color Palettes preserving Azure Archive crispness & >= 4.5:1 contrast */
 :root[data-theme='archive'][data-theme-color='blue'] {
     accent-color: #006fb3;
+    --arc-sky-bg: #d8eeff;
+    --arc-grid-color: rgb(0 119 182 / 0.1);
+    --arc-glow-color: rgb(96 184 250 / 0.36);
+    --arc-topbar-bg: rgb(228 244 255 / 0.92);
+    --arc-surface-bg: rgb(245 251 255 / 0.93);
+    --arc-table-head-bg: #d9f0ff;
+    --arc-border: #aad8fa;
+    --background: #d8eeff;
+    --muted: #e3f2fd;
+    --accent: #d9eefc;
     --primary: #006fb3;
     --secondary: #dff2ff;
     --secondary-foreground: #0c4266;
@@ -66,6 +81,16 @@
 }
 :root[data-theme='archive'][data-theme-color='green'] {
     accent-color: #167a50;
+    --arc-sky-bg: #dcf4e7;
+    --arc-grid-color: rgb(22 122 80 / 0.09);
+    --arc-glow-color: rgb(110 214 166 / 0.34);
+    --arc-topbar-bg: rgb(232 249 240 / 0.92);
+    --arc-surface-bg: rgb(245 253 249 / 0.93);
+    --arc-table-head-bg: #daf4e6;
+    --arc-border: #a8dec3;
+    --background: #dcf4e7;
+    --muted: #e4f6ec;
+    --accent: #dcf2e6;
     --primary: #167a50;
     --secondary: #e0f6ec;
     --secondary-foreground: #114b32;
@@ -73,6 +98,16 @@
 }
 :root[data-theme='archive'][data-theme-color='orange'] {
     accent-color: #b84b1c;
+    --arc-sky-bg: #fde7d6;
+    --arc-grid-color: rgb(184 75 28 / 0.09);
+    --arc-glow-color: rgb(252 178 124 / 0.36);
+    --arc-topbar-bg: rgb(254 240 228 / 0.92);
+    --arc-surface-bg: rgb(255 250 245 / 0.93);
+    --arc-table-head-bg: #fce6d5;
+    --arc-border: #f3c4a2;
+    --background: #fde7d6;
+    --muted: #faeadd;
+    --accent: #f8e3d2;
     --primary: #b84b1c;
     --secondary: #fdebe2;
     --secondary-foreground: #6b290e;
@@ -80,6 +115,16 @@
 }
 :root[data-theme='archive'][data-theme-color='red'] {
     accent-color: #c22b45;
+    --arc-sky-bg: #fde1e6;
+    --arc-grid-color: rgb(194 43 69 / 0.09);
+    --arc-glow-color: rgb(248 152 168 / 0.36);
+    --arc-topbar-bg: rgb(254 236 239 / 0.92);
+    --arc-surface-bg: rgb(255 248 249 / 0.93);
+    --arc-table-head-bg: #fce0e5;
+    --arc-border: #f2b8c3;
+    --background: #fde1e6;
+    --muted: #fae6e9;
+    --accent: #f8dfe4;
     --primary: #c22b45;
     --secondary: #fde5ea;
     --secondary-foreground: #701728;
@@ -87,6 +132,16 @@
 }
 :root[data-theme='archive'][data-theme-color='rose'] {
     accent-color: #b62e66;
+    --arc-sky-bg: #fce1ef;
+    --arc-grid-color: rgb(182 46 102 / 0.09);
+    --arc-glow-color: rgb(244 156 202 / 0.36);
+    --arc-topbar-bg: rgb(253 236 245 / 0.92);
+    --arc-surface-bg: rgb(255 248 252 / 0.93);
+    --arc-table-head-bg: #fbe0ee;
+    --arc-border: #f0b8d6;
+    --background: #fce1ef;
+    --muted: #f9e6f0;
+    --accent: #f7dfec;
     --primary: #b62e66;
     --secondary: #fde5ef;
     --secondary-foreground: #6b1a3b;
@@ -94,6 +149,16 @@
 }
 :root[data-theme='archive'][data-theme-color='violet'] {
     accent-color: #5b43bf;
+    --arc-sky-bg: #e9e2fd;
+    --arc-grid-color: rgb(91 67 191 / 0.09);
+    --arc-glow-color: rgb(172 150 248 / 0.36);
+    --arc-topbar-bg: rgb(241 236 254 / 0.92);
+    --arc-surface-bg: rgb(250 248 255 / 0.93);
+    --arc-table-head-bg: #eae3fd;
+    --arc-border: #c8bbf6;
+    --background: #e9e2fd;
+    --muted: #eee8fc;
+    --accent: #e7dffb;
     --primary: #5b43bf;
     --secondary: #ece8fe;
     --secondary-foreground: #362575;
@@ -101,6 +166,16 @@
 }
 :root[data-theme='archive'][data-theme-color='yellow'] {
     accent-color: #8c5e05;
+    --arc-sky-bg: #fcf1d0;
+    --arc-grid-color: rgb(140 94 5 / 0.09);
+    --arc-glow-color: rgb(250 214 114 / 0.36);
+    --arc-topbar-bg: rgb(254 247 224 / 0.92);
+    --arc-surface-bg: rgb(255 253 245 / 0.93);
+    --arc-table-head-bg: #fbf0cf;
+    --arc-border: #ebd18a;
+    --background: #fcf1d0;
+    --muted: #f8f0d8;
+    --accent: #f6ebcd;
     --primary: #8c5e05;
     --secondary: #fdf2d2;
     --secondary-foreground: #543803;
@@ -128,9 +203,9 @@
 :root[data-theme='archive'] .arc-stage {
     background-color: var(--arc-sky-bg);
     background-image:
-        linear-gradient(to right, rgb(0 159 232 / 0.065) 1px, transparent 1px),
-        linear-gradient(to bottom, rgb(0 159 232 / 0.065) 1px, transparent 1px),
-        radial-gradient(50% 44% at 95% 4%, rgb(0 174 239 / 0.18) 0%, transparent 66%);
+        linear-gradient(to right, var(--arc-grid-color) 1px, transparent 1px),
+        linear-gradient(to bottom, var(--arc-grid-color) 1px, transparent 1px),
+        radial-gradient(50% 44% at 95% 4%, var(--arc-glow-color) 0%, transparent 66%);
     background-size:
         28px 28px,
         28px 28px,
@@ -158,7 +233,7 @@
 
 /* Topbar */
 :root[data-theme='archive'] .arc-topbar {
-    background: rgb(255 255 255 / 0.94);
+    background: var(--arc-topbar-bg);
     backdrop-filter: blur(12px);
     border-bottom: 1px solid var(--arc-border);
     box-shadow: 0 4px 16px rgb(14 118 186 / 0.06);
@@ -258,7 +333,7 @@
 :root[data-theme='archive'] .arc-strip-card,
 :root[data-theme='archive'] .arc-main-stage,
 :root[data-theme='archive'] .arc-friends-panel {
-    background: rgb(255 255 255 / 0.96);
+    background: var(--arc-surface-bg);
     border: 1px solid var(--arc-border);
     border-radius: 12px;
     box-shadow: 0 8px 24px rgb(14 118 186 / 0.07);
@@ -311,7 +386,7 @@
 }
 
 :root[data-theme='archive'] .arc-statusbar > div {
-    background: rgb(255 255 255 / 0.94);
+    background: var(--arc-topbar-bg);
     border-top: 1px solid var(--arc-border);
 }
 
@@ -329,7 +404,7 @@
 }
 
 :root[data-theme='archive'] [data-slot='table-head'] {
-    background-color: #e3f4ff !important;
+    background-color: var(--arc-table-head-bg) !important;
     color: #143252;
     font-weight: 800;
     border-bottom: 2px solid #8fd1f8;
