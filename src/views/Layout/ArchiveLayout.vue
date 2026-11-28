@@ -15,7 +15,7 @@
 
         <!-- Crisp White & Azure Slanted Official-Site Topbar -->
         <header class="arc-topbar relative z-20 shrink-0 px-3 sm:px-5">
-            <div class="max-w-[1440px] mx-auto h-13 flex items-center justify-between gap-3">
+            <div class="max-w-[1720px] mx-auto h-13 flex items-center justify-between gap-2.5">
                 <!-- Left Slanted Brand Badge + Online Strip Toggle -->
                 <TooltipWrapper side="bottom" :content="t('view.settings.appearance.appearance.editorial_archive_toggle_strip')">
                     <button
@@ -25,21 +25,49 @@
                         :aria-label="t('view.settings.appearance.appearance.editorial_archive_toggle_strip')"
                         @click="toggleOnlineStrip">
                         <span class="font-black text-xs sm:text-[13px] tracking-wider">
-                            VRCX // {{ t('view.settings.appearance.appearance.editorial_archive_subtitle') }}
+                            VRCX
+                            <span class="hidden 2xl:inline">
+                                // {{ t('view.settings.appearance.appearance.editorial_archive_subtitle') }}
+                            </span>
                         </span>
                     </button>
                 </TooltipWrapper>
 
-                <!-- Center Slanted Navigation Rail -->
+                <!-- Center Slanted Navigation Rail (Priority+ Zero-Clipping) -->
                 <ContextMenu>
                     <ContextMenuTrigger as-child>
                         <nav
-                            ref="navRailRef"
-                            class="flex items-center gap-1 flex-1 min-w-0 overflow-x-auto scrollbar-hidden px-1.5 py-1"
-                            :aria-label="t('nav_menu.custom_nav.header')"
-                            @wheel="handleNavRailWheel">
+                            ref="navContainerRef"
+                            class="relative flex items-center gap-1.5 flex-1 min-w-0 overflow-hidden px-2 py-1"
+                            :aria-label="t('nav_menu.custom_nav.header')">
+                            <!-- Off-flow measurement mirror so whole skewed tabs move into More cleanly -->
+                            <div
+                                ref="navMeasureRef"
+                                class="pointer-events-none invisible fixed -top-[9999px] left-0 flex items-center gap-1.5"
+                                aria-hidden="true">
+                                <span
+                                    v-for="item in menuItems"
+                                    :key="`m-${item.index}`"
+                                    data-priority-item
+                                    class="arc-nav-tab arc-skew inline-flex items-center h-8 px-3 text-xs whitespace-nowrap shrink-0">
+                                    <span>
+                                        <i :class="item.icon" class="text-[14px] leading-none shrink-0" />
+                                        <span>{{ getItemLabel(item) }}</span>
+                                        <ChevronDown v-if="item.children?.length" class="size-3.5 shrink-0" />
+                                    </span>
+                                </span>
+                                <span
+                                    data-priority-more
+                                    class="arc-nav-tab arc-skew inline-flex items-center h-8 px-3 text-xs whitespace-nowrap shrink-0">
+                                    <span>
+                                        <span>{{ t('view.settings.appearance.appearance.editorial_nav_more') }}</span>
+                                        <ChevronDown class="size-3.5 shrink-0" />
+                                    </span>
+                                </span>
+                            </div>
+
                             <template v-if="navLayoutReady">
-                                <template v-for="item in menuItems" :key="item.index">
+                                <template v-for="item in visibleMenuItems" :key="item.index">
                                     <ContextMenu v-if="!item.children?.length">
                                         <ContextMenuTrigger as-child>
                                             <button
@@ -127,6 +155,64 @@
                                         </DropdownMenuContent>
                                     </DropdownMenu>
                                 </template>
+
+                                <!-- Overflow "More" Slanted Dropdown -->
+                                <DropdownMenu v-if="overflowMenuItems.length">
+                                    <DropdownMenuTrigger as-child>
+                                        <button
+                                            type="button"
+                                            class="arc-nav-tab arc-skew relative h-8 px-3 text-xs whitespace-nowrap shrink-0 cursor-pointer"
+                                            :data-active="hasActiveOverflow"
+                                            :title="t('view.settings.appearance.appearance.editorial_nav_more')">
+                                            <span>
+                                                <span>{{ t('view.settings.appearance.appearance.editorial_nav_more') }}</span>
+                                                <ChevronDown class="size-3.5 opacity-75 shrink-0" />
+                                            </span>
+                                            <em
+                                                v-if="hasNotifiedOverflow"
+                                                class="arc-notify-dot"
+                                                aria-hidden="true" />
+                                        </button>
+                                    </DropdownMenuTrigger>
+                                    <DropdownMenuContent side="bottom" align="end" class="w-56">
+                                        <template v-for="item in overflowMenuItems" :key="`ov-${item.index}`">
+                                            <DropdownMenuItem
+                                                v-if="!item.children?.length"
+                                                :class="
+                                                    activeMenuIndex === item.index
+                                                        ? 'bg-secondary text-secondary-foreground font-semibold'
+                                                        : ''
+                                                "
+                                                @select="handleMenuItemClick(item)">
+                                                <i :class="item.icon" class="inline-flex size-4 items-center justify-center text-base" />
+                                                <span>{{ getItemLabel(item) }}</span>
+                                            </DropdownMenuItem>
+                                            <DropdownMenuSub v-else>
+                                                <DropdownMenuSubTrigger>
+                                                    <i :class="item.icon" class="inline-flex size-4 items-center justify-center text-base mr-1.5" />
+                                                    <span>{{ getItemLabel(item) }}</span>
+                                                </DropdownMenuSubTrigger>
+                                                <DropdownMenuSubContent side="left" align="start" class="w-52">
+                                                    <DropdownMenuItem
+                                                        v-for="entry in item.children"
+                                                        :key="entry.index"
+                                                        :class="
+                                                            activeMenuIndex === entry.index
+                                                                ? 'bg-secondary text-secondary-foreground font-semibold'
+                                                                : ''
+                                                        "
+                                                        @select="handleSubmenuClick(entry)">
+                                                        <i
+                                                            v-if="entry.icon"
+                                                            :class="entry.icon"
+                                                            class="inline-flex size-4 items-center justify-center text-base" />
+                                                        <span>{{ entry.titleIsCustom ? entry.label : t(entry.label) }}</span>
+                                                    </DropdownMenuItem>
+                                                </DropdownMenuSubContent>
+                                            </DropdownMenuSub>
+                                        </template>
+                                    </DropdownMenuContent>
+                                </DropdownMenu>
                             </template>
                         </nav>
                     </ContextMenuTrigger>
@@ -531,6 +617,7 @@
 
     import { useNavLayout } from '../../components/nav-menu/composables/useNavLayout';
     import { useNavTheme } from '../../components/nav-menu/composables/useNavTheme';
+    import { usePriorityNav } from './composables/usePriorityNav';
     import { isEntryNotified as checkEntryNotified } from '../../components/nav-menu/navMenuUtils';
     import { useToolActions } from '../../composables/useToolActions';
     import { useToolNavPinning } from '../../composables/useToolNavPinning';
@@ -637,7 +724,6 @@
         triggerTool
     });
 
-    const navRailRef = ref(null);
     const customNavDialogVisible = ref(false);
     const viewportWidth = ref(typeof window !== 'undefined' ? window.innerWidth : 1440);
     const isMobileViewport = computed(() => viewportWidth.value <= 900);
@@ -692,14 +778,22 @@
     const isDashboardItem = (item) => item?.index?.startsWith(DASHBOARD_NAV_KEY_PREFIX);
     const isToolItem = (item) => item?.index?.startsWith('tool-');
 
-    const handleNavRailWheel = (event) => {
-        const el = navRailRef.value;
-        if (!el || el.scrollWidth <= el.clientWidth) return;
-        if (Math.abs(event.deltaY) > Math.abs(event.deltaX)) {
-            event.preventDefault();
-            el.scrollLeft += event.deltaY;
-        }
-    };
+    const {
+        navContainerRef,
+        navMeasureRef,
+        visibleMenuItems,
+        overflowMenuItems,
+        hasActiveOverflow,
+        hasNotifiedOverflow,
+        scheduleRecalc
+    } = usePriorityNav({
+        menuItems,
+        activeMenuIndex,
+        isNavItemNotified,
+        locale,
+        gap: 6,
+        moreButtonWidth: 88
+    });
 
     const toggleOnlineStrip = () => {
         onlineStripOpen.value = !onlineStripOpen.value;
@@ -829,6 +923,7 @@
         await initThemeColor();
         await dashboardStore.loadDashboards();
         await loadNavMenuConfig();
+        await scheduleRecalc();
     });
 
     onUnmounted(() => {

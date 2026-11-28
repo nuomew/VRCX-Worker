@@ -20,6 +20,7 @@ vi.mock('../../services/config.js', () => ({
 import { THEME_CONFIG } from '../../shared/constants/themes';
 import { changeAppThemeStyle, getThemeMode } from '../../shared/utils/base/ui';
 import { normalizePublicUiPreferences } from '../cloudState';
+import { computePriorityNavSplit } from '../../views/Layout/composables/usePriorityNav';
 import {
     DropdownMenu,
     DropdownMenuCheckboxItem,
@@ -147,6 +148,7 @@ describe('Official Anime-Site Dual Themes (Lookbook & Azure Archive) registratio
             'editorial_archive_toggle_panel',
             'editorial_quick_theme',
             'editorial_accent_colors',
+            'editorial_nav_more',
             'editorial_stat_friends',
             'editorial_stat_game',
             'editorial_stat_servers',
@@ -178,9 +180,37 @@ describe('Official Anime-Site Dual Themes (Lookbook & Azure Archive) registratio
             expect(src).toContain('loadNavMenuConfig()');
             expect(src).toContain('<Sidebar />');
             expect(src).toContain('<StatusBar />');
+            expect(src).toContain('usePriorityNav');
+            expect(src).toContain('overflowMenuItems');
+            expect(src).toContain('data-priority-item');
+            expect(src).toContain('data-priority-more');
             // Regression guard: never wrap DropdownMenuTrigger inside TooltipWrapper (breaks Reka UI pointerdown)
             expect(src).not.toMatch(/<TooltipWrapper[\s\S]{0,200}<DropdownMenuTrigger/);
+            // Regression guard: top nav rail must never use horizontal overflow-x-auto that slices labels mid-character
+            expect(src).not.toMatch(/<nav[\s\S]{0,220}overflow-x-auto/);
         }
+    });
+
+    it('splits priority-plus nav items cleanly on whole-item boundaries with zero mid-character clipping', () => {
+        const widths = [72, 86, 86, 86, 72, 72, 72, 86, 86, 72, 72, 98];
+
+        // Wide container fits all 12 items without needing the More dropdown
+        expect(computePriorityNavSplit(widths, 1100, { gap: 4, moreButtonWidth: 78 })).toBe(12);
+
+        // Constrained container fits only whole leading items plus the More button strictly within containerWidth
+        const visible = computePriorityNavSplit(widths, 760, { gap: 4, moreButtonWidth: 78 });
+        expect(visible).toBeGreaterThan(0);
+        expect(visible).toBeLessThan(widths.length);
+        const visibleTotal = widths
+            .slice(0, visible)
+            .reduce((sum, w, idx) => sum + w + (idx > 0 ? 4 : 0), 0);
+        expect(visibleTotal + 4 + 78).toBeLessThanOrEqual(760);
+        // Adding one more item would overflow, proving the split is optimal
+        expect(visibleTotal + 4 + widths[visible] + 4 + 78).toBeGreaterThan(760);
+
+        // Ultra-narrow container collapses all items into More safely
+        expect(computePriorityNavSplit(widths, 90, { gap: 4, moreButtonWidth: 78 })).toBe(0);
+        expect(computePriorityNavSplit([], 500)).toBe(0);
     });
 
     it('opens the theme switcher dropdown on click and switches themes via DropdownMenuTrigger', async () => {

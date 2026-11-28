@@ -16,38 +16,59 @@
         </svg>
 
         <!-- Borderless High-Fashion Editorial Topbar -->
-        <header class="lb-topbar relative z-20 shrink-0 px-4 sm:px-6">
-            <div class="max-w-[1440px] mx-auto h-14 flex items-center justify-between gap-3">
+        <header class="lb-topbar relative z-20 shrink-0 px-3 sm:px-5">
+            <div class="max-w-[1720px] mx-auto h-14 flex items-center justify-between gap-2.5">
                 <!-- Left Serif Brand + Cover Toggle -->
                 <TooltipWrapper side="bottom" :content="t('view.settings.appearance.appearance.editorial_lookbook_toggle_cover')">
                     <button
                         type="button"
-                        class="lb-brand-btn flex items-baseline gap-2.5 shrink-0 cursor-pointer"
+                        class="lb-brand-btn flex items-baseline gap-2 shrink-0 cursor-pointer"
                         :aria-pressed="coverOpen"
                         :aria-label="t('view.settings.appearance.appearance.editorial_lookbook_toggle_cover')"
                         @click="toggleCover">
                         <span class="lb-serif text-[21px] font-bold tracking-[0.14em] leading-none">VRCX</span>
-                        <span class="hidden md:inline text-[10px] font-semibold tracking-[0.22em] uppercase lb-gold-text">
+                        <span class="hidden 2xl:inline text-[10px] font-semibold tracking-[0.22em] uppercase lb-gold-text">
                             {{ t('view.settings.appearance.appearance.editorial_lookbook_subtitle') }}
                         </span>
                     </button>
                 </TooltipWrapper>
 
-                <!-- Center Underline Editorial Navigation Rail -->
+                <!-- Center Underline Editorial Navigation Rail (Priority+ Zero-Clipping) -->
                 <ContextMenu>
                     <ContextMenuTrigger as-child>
                         <nav
-                            ref="navRailRef"
-                            class="flex items-center gap-1 flex-1 min-w-0 overflow-x-auto scrollbar-hidden px-2"
-                            :aria-label="t('nav_menu.custom_nav.header')"
-                            @wheel="handleNavRailWheel">
+                            ref="navContainerRef"
+                            class="relative flex items-center gap-1 flex-1 min-w-0 overflow-hidden px-1"
+                            :aria-label="t('nav_menu.custom_nav.header')">
+                            <!-- Off-flow measurement mirror so whole items move into More without mid-character slicing -->
+                            <div
+                                ref="navMeasureRef"
+                                class="pointer-events-none invisible fixed -top-[9999px] left-0 flex items-center gap-1"
+                                aria-hidden="true">
+                                <span
+                                    v-for="item in menuItems"
+                                    :key="`m-${item.index}`"
+                                    data-priority-item
+                                    class="inline-flex items-center gap-1.5 h-9 px-2.5 text-[13px] font-bold whitespace-nowrap shrink-0">
+                                    <i :class="item.icon" class="text-[14px] leading-none shrink-0" />
+                                    <span>{{ getItemLabel(item) }}</span>
+                                    <ChevronDown v-if="item.children?.length" class="size-3.5 shrink-0" />
+                                </span>
+                                <span
+                                    data-priority-more
+                                    class="inline-flex items-center gap-1 h-9 px-2.5 text-[13px] font-bold whitespace-nowrap shrink-0">
+                                    <span>{{ t('view.settings.appearance.appearance.editorial_nav_more') }}</span>
+                                    <ChevronDown class="size-3.5 shrink-0" />
+                                </span>
+                            </div>
+
                             <template v-if="navLayoutReady">
-                                <template v-for="item in menuItems" :key="item.index">
+                                <template v-for="item in visibleMenuItems" :key="item.index">
                                     <ContextMenu v-if="!item.children?.length">
                                         <ContextMenuTrigger as-child>
                                             <button
                                                 type="button"
-                                                class="lb-nav-link relative inline-flex items-center gap-1.5 h-9 px-3 text-[13px] whitespace-nowrap shrink-0 cursor-pointer"
+                                                class="lb-nav-link relative inline-flex items-center gap-1.5 h-9 px-2.5 text-[13px] whitespace-nowrap shrink-0 cursor-pointer"
                                                 :data-active="activeMenuIndex === item.index"
                                                 :title="getItemLabel(item)"
                                                 @click="handleMenuItemClick(item)">
@@ -91,7 +112,7 @@
                                         <DropdownMenuTrigger as-child>
                                             <button
                                                 type="button"
-                                                class="lb-nav-link relative inline-flex items-center gap-1.5 h-9 px-3 text-[13px] whitespace-nowrap shrink-0 cursor-pointer"
+                                                class="lb-nav-link relative inline-flex items-center gap-1.5 h-9 px-2.5 text-[13px] whitespace-nowrap shrink-0 cursor-pointer"
                                                 :data-active="isFolderActive(item)"
                                                 :title="getItemLabel(item)">
                                                 <i :class="item.icon" class="text-[14px] leading-none opacity-80 shrink-0" />
@@ -131,6 +152,62 @@
                                         </DropdownMenuContent>
                                     </DropdownMenu>
                                 </template>
+
+                                <!-- Overflow "More" Dropdown -->
+                                <DropdownMenu v-if="overflowMenuItems.length">
+                                    <DropdownMenuTrigger as-child>
+                                        <button
+                                            type="button"
+                                            class="lb-nav-link relative inline-flex items-center gap-1 h-9 px-2.5 text-[13px] whitespace-nowrap shrink-0 cursor-pointer"
+                                            :data-active="hasActiveOverflow"
+                                            :title="t('view.settings.appearance.appearance.editorial_nav_more')">
+                                            <span>{{ t('view.settings.appearance.appearance.editorial_nav_more') }}</span>
+                                            <ChevronDown class="size-3.5 opacity-70 shrink-0" />
+                                            <span
+                                                v-if="hasNotifiedOverflow"
+                                                class="lb-notify-dot"
+                                                aria-hidden="true" />
+                                        </button>
+                                    </DropdownMenuTrigger>
+                                    <DropdownMenuContent side="bottom" align="end" class="w-56">
+                                        <template v-for="item in overflowMenuItems" :key="`ov-${item.index}`">
+                                            <DropdownMenuItem
+                                                v-if="!item.children?.length"
+                                                :class="
+                                                    activeMenuIndex === item.index
+                                                        ? 'bg-secondary text-secondary-foreground font-semibold'
+                                                        : ''
+                                                "
+                                                @select="handleMenuItemClick(item)">
+                                                <i :class="item.icon" class="inline-flex size-4 items-center justify-center text-base" />
+                                                <span>{{ getItemLabel(item) }}</span>
+                                            </DropdownMenuItem>
+                                            <DropdownMenuSub v-else>
+                                                <DropdownMenuSubTrigger>
+                                                    <i :class="item.icon" class="inline-flex size-4 items-center justify-center text-base mr-1.5" />
+                                                    <span>{{ getItemLabel(item) }}</span>
+                                                </DropdownMenuSubTrigger>
+                                                <DropdownMenuSubContent side="left" align="start" class="w-52">
+                                                    <DropdownMenuItem
+                                                        v-for="entry in item.children"
+                                                        :key="entry.index"
+                                                        :class="
+                                                            activeMenuIndex === entry.index
+                                                                ? 'bg-secondary text-secondary-foreground font-semibold'
+                                                                : ''
+                                                        "
+                                                        @select="handleSubmenuClick(entry)">
+                                                        <i
+                                                            v-if="entry.icon"
+                                                            :class="entry.icon"
+                                                            class="inline-flex size-4 items-center justify-center text-base" />
+                                                        <span>{{ entry.titleIsCustom ? entry.label : t(entry.label) }}</span>
+                                                    </DropdownMenuItem>
+                                                </DropdownMenuSubContent>
+                                            </DropdownMenuSub>
+                                        </template>
+                                    </DropdownMenuContent>
+                                </DropdownMenu>
                             </template>
                         </nav>
                     </ContextMenuTrigger>
@@ -624,6 +701,7 @@
 
     import { useNavLayout } from '../../components/nav-menu/composables/useNavLayout';
     import { useNavTheme } from '../../components/nav-menu/composables/useNavTheme';
+    import { usePriorityNav } from './composables/usePriorityNav';
     import { isEntryNotified as checkEntryNotified } from '../../components/nav-menu/navMenuUtils';
     import { useToolActions } from '../../composables/useToolActions';
     import { useToolNavPinning } from '../../composables/useToolNavPinning';
@@ -729,7 +807,6 @@
         triggerTool
     });
 
-    const navRailRef = ref(null);
     const customNavDialogVisible = ref(false);
     const salonDrawerOpen = ref(false);
     const viewportWidth = ref(typeof window !== 'undefined' ? window.innerWidth : 1440);
@@ -790,14 +867,22 @@
     const isDashboardItem = (item) => item?.index?.startsWith(DASHBOARD_NAV_KEY_PREFIX);
     const isToolItem = (item) => item?.index?.startsWith('tool-');
 
-    const handleNavRailWheel = (event) => {
-        const el = navRailRef.value;
-        if (!el || el.scrollWidth <= el.clientWidth) return;
-        if (Math.abs(event.deltaY) > Math.abs(event.deltaX)) {
-            event.preventDefault();
-            el.scrollLeft += event.deltaY;
-        }
-    };
+    const {
+        navContainerRef,
+        navMeasureRef,
+        visibleMenuItems,
+        overflowMenuItems,
+        hasActiveOverflow,
+        hasNotifiedOverflow,
+        scheduleRecalc
+    } = usePriorityNav({
+        menuItems,
+        activeMenuIndex,
+        isNavItemNotified,
+        locale,
+        gap: 4,
+        moreButtonWidth: 78
+    });
 
     const toggleCover = () => {
         coverOpen.value = !coverOpen.value;
@@ -911,6 +996,7 @@
         await initThemeColor();
         await dashboardStore.loadDashboards();
         await loadNavMenuConfig();
+        await scheduleRecalc();
     });
 
     onUnmounted(() => {
