@@ -11286,6 +11286,23 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
             )
             .run();
 
+        // Seed a bogus far-future legacy chunk (e.g. desktop clock skewed to 2056-05-05)
+        // which MUST be ignored by /api/history/dates so it never hijacks default date selection
+        await env.DB_LEGACY!.prepare(
+            `INSERT INTO legacy_feed_chunks (chunk_key, feed_kind, min_created_at, max_created_at, row_count, payload_json)
+             VALUES (?, 'oo', ?, ?, 2, ?)`
+        )
+            .bind(
+                'legacy_hist_dates_bogus_2056',
+                '2056-05-04T17:22:00.000Z',
+                '2056-05-04T17:22:01.000Z',
+                JSON.stringify([
+                    ['2056-05-04T17:22:00.000Z', 'usr_bad1', 'Bad1', 'Online', '', '', 0, ''],
+                    ['2056-05-04T17:22:01.000Z', 'usr_bad2', 'Bad2', 'Online', '', '', 0, '']
+                ])
+            )
+            .run();
+
         // 1. Overview query for feed (UTC+8)
         const feedOverviewRes = await exports.default.fetch(
             'http://example.com/api/history/dates?scope=feed&tzOffsetMinutes=-480'
@@ -11304,6 +11321,8 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
         const feedMonthKeys = feedOverview.data.months.map((m) => m.month);
         expect(feedMonthKeys).toContain('2025-05');
         expect(feedMonthKeys).toContain('2024-06');
+        expect(feedMonthKeys).not.toContain('2056-05');
+        expect(feedOverview.data.latestDay).not.toBe('2056-05-05');
 
         // 2. Month drill-down for 2025-05 (UTC+8) verifies timezone shift (05-01T17:30Z -> 2025-05-02)
         const mayRes = await exports.default.fetch(

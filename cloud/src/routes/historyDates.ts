@@ -11,10 +11,12 @@ const VALID_SCOPES: ReadonlySet<string> = new Set<HistoryDateScope>([
     'notifications'
 ]);
 
-const MAX_OVERVIEW_CHUNKS = 2500;
+const MAX_OVERVIEW_CHUNKS = 4000;
 const MAX_MONTH_CHUNKS_METADATA = 250;
 const MAX_CHUNKS_TO_DECODE_PER_REQUEST = 6;
 const MAX_GAP_MONTHS_PER_CHUNK = 12;
+const MIN_VALID_HISTORY_YEAR = 2014;
+const FUTURE_CLOCK_SKEW_BUFFER_MS = 86_400_000; // Allow +24h for timezone / slight clock drift, reject bogus future years like 2056
 
 interface ChunkMetaRow {
     id: number;
@@ -102,18 +104,25 @@ function pad2(n: number): string {
 /**
  * Converts a UTC ISO timestamp to a local calendar date (`YYYY-MM-DD`) using the browser's
  * `Date.prototype.getTimezoneOffset()` convention (`localMs = utcMs - tzOffsetMinutes * 60_000`).
+ * Rejects bogus pre-VRChat or far-future clock-skew timestamps (e.g. `2056-05-05`).
  */
-export function utcIsoToLocalDay(iso: string, tzOffsetMinutes: number): string {
+export function utcIsoToLocalDay(
+    iso: string,
+    tzOffsetMinutes: number,
+    maxAllowedUtcMs = Date.now() + FUTURE_CLOCK_SKEW_BUFFER_MS
+): string {
     const trimmed = typeof iso === 'string' ? iso.trim() : '';
     if (!trimmed) return '';
     const utcMs = Date.parse(trimmed);
     if (!Number.isFinite(utcMs)) {
-        // Fallback for non-standard date strings starting with YYYY-MM-DD
-        return /^\d{4}-\d{2}-\d{2}/.test(trimmed) ? trimmed.slice(0, 10) : '';
+        return '';
+    }
+    if (utcMs > maxAllowedUtcMs) {
+        return '';
     }
     const local = new Date(utcMs - tzOffsetMinutes * 60_000);
     const y = local.getUTCFullYear();
-    if (y < 2000 || y > 2100) return '';
+    if (y < MIN_VALID_HISTORY_YEAR || y > 2100) return '';
     return `${y}-${pad2(local.getUTCMonth() + 1)}-${pad2(local.getUTCDate())}`;
 }
 
@@ -270,7 +279,8 @@ async function queryHotTableDaysInWindow(
 async function resolveExactDaysForMonth(
     targetMonth: string,
     tzOffsetMinutes: number,
-    sources: Array<{ db: D1Database; archiveTable: string; chunks: ChunkMetaRow[]; hotTables: readonly string[] }>
+    sources: Array<{ db: D1Database; archiveTable: string; chunks: ChunkMetaRow[]; hotTables: readonly string[] }>,
+    maxAllowedUtcMs: number
 ): Promise<string[]> {
     const bounds = localMonthToUtcBounds(targetMonth, tzOffsetMinutes);
     if (!bounds) return [];
@@ -278,7 +288,7 @@ async function resolveExactDaysForMonth(
     const totalDaysInMonth = getDaysInMonth(targetMonth);
     const confirmedDays = new Set<string>();
     const addLocalDayIfInMonth = (iso: string) => {
-        const localDay = utcIsoToLocalDay(iso, tzOffsetMinutes);
+        const localDay = utcIsoToLocalDay(iso, tzOffsetMinutes, maxAllowedUtcMs);
         if (localDay && localDay.startsWith(targetMonth)) {
             confirmedDays.add(localDay);
         }
@@ -308,12 +318,11 @@ async function resolveExactDaysForMonth(
             if (!minTs || !maxTs) continue;
             if (minTs > bounds.endIso || maxTs < bounds.startIso) continue;
 
-            const minDay = utcIsoToLocalDay(minTs, tzOffsetMinutes);
-            const maxDay = utcIsoToLocalDay(maxTs, tzOffsetMinutes);
-            if (!minDay || !maxDay) continue;
+            const minDay = utcIsoToLocalDay(minTs, tzOffsetMinutes, maxAllowedUtcMs);
+            const maxDay = utcIsoToLocalDay(maxTs, tzOffsetMinutes, maxAllowedUtcMs);
 
-            const minInMonth = minDay.startsWith(targetMonth);
-            const maxInMonth = maxDay.startsWith(targetMonth);
+            const minInMonth = Boolean(minDay && minDay.startsWith(targetMonth));
+            const maxInMonth = Boolean(maxDay && maxDay.startsWith(targetMonth));
             if (minInMonth) confirmedDays.add(minDay);
             if (maxInMonth) confirmedDays.add(maxDay);
 
@@ -409,6 +418,7 @@ export async function handleHistoryDatesRoutes(request: Request, env: Env, url: 
     const scope = rawScope as HistoryDateScope;
     const tzOffsetMinutes = clampTzOffsetMinutes(url.searchParams.get('tzOffsetMinutes'));
     const requestedMonth = (url.searchParams.get('month') ?? '').trim();
+    const maxAllowedUtcMs = Date.now() + FUTURE_CLOCK_SKEW_BUFFER_MS;
 
     const cfg = resolveScopeConfig(env, scope);
     const legacyDb = getLegacyDb(env);
@@ -445,7 +455,7 @@ export async function handleHistoryDatesRoutes(request: Request, env: Env, url: 
                 hotTables: cfg.hotTables
             });
         }
-        const days = await resolveExactDaysForMonth(requestedMonth, tzOffsetMinutes, sources);
+        const days = await resolveExactDaysForMonth(requestedMonth, tzOffsetMinutes, sources, maxAllowedUtcMs);
         return Response.json({
             ok: true,
             data: {
@@ -457,7 +467,7 @@ export async function handleHistoryDatesRoutes(request: Request, env: Env, url: 
     }
 
     // Overview path: gather metadata across active + legacy shards with zero payload decompression,
-    // then resolve exact days for the newest month in the same response.
+    // then resolve exact days for the newest valid (non-future) month in the same response.
     const [activeChunks, legacyChunks, activeHotMonths, legacyHotMonths] = await Promise.all([
         queryChunkMetadata(cfg.activeDb, cfg.activeArchiveTable, cfg.kindColumn, cfg.kindValues),
         legacyDb
@@ -478,8 +488,8 @@ export async function handleHistoryDatesRoutes(request: Request, env: Env, url: 
     };
 
     const addSpanToMonths = (minIso: string, maxIso: string, rowCount: number) => {
-        const minDay = utcIsoToLocalDay(minIso, tzOffsetMinutes);
-        const maxDay = utcIsoToLocalDay(maxIso, tzOffsetMinutes);
+        const minDay = utcIsoToLocalDay(minIso, tzOffsetMinutes, maxAllowedUtcMs);
+        const maxDay = utcIsoToLocalDay(maxIso, tzOffsetMinutes, maxAllowedUtcMs);
         if (!minDay && !maxDay) return;
         const startDay = minDay || maxDay;
         const endDay = maxDay || minDay;
@@ -540,7 +550,7 @@ export async function handleHistoryDatesRoutes(request: Request, env: Env, url: 
                 hotTables: cfg.hotTables
             });
         }
-        days = await resolveExactDaysForMonth(activeMonth, tzOffsetMinutes, sources);
+        days = await resolveExactDaysForMonth(activeMonth, tzOffsetMinutes, sources, maxAllowedUtcMs);
         if (days.length > 0) {
             const newestResolved = days[days.length - 1]!;
             if (!latestDay || newestResolved > latestDay) latestDay = newestResolved;

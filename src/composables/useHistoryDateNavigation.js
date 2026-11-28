@@ -149,6 +149,28 @@ export function createHistoryDateController(scope, onSelectionChange) {
         monthInflight.clear();
     }
 
+    function getMaxAllowedDayStr() {
+        return dayjs().add(1, 'day').format('YYYY-MM-DD');
+    }
+
+    function isValidRecordedDay(dayStr) {
+        return (
+            typeof dayStr === 'string' &&
+            /^\d{4}-\d{2}-\d{2}$/.test(dayStr) &&
+            dayStr >= '2014-01-01' &&
+            dayStr <= getMaxAllowedDayStr()
+        );
+    }
+
+    function isValidRecordedMonth(monthStr) {
+        return (
+            typeof monthStr === 'string' &&
+            /^\d{4}-\d{2}$/.test(monthStr) &&
+            monthStr >= '2014-01' &&
+            monthStr <= getMaxAllowedDayStr().slice(0, 7)
+        );
+    }
+
     /**
      * Records a newly arrived local event timestamp so today's date appears immediately without re-fetching index.
      *
@@ -159,6 +181,7 @@ export function createHistoryDateController(scope, onSelectionChange) {
         const d = dayjs(isoTs);
         if (!d.isValid()) return;
         const day = d.format('YYYY-MM-DD');
+        if (!isValidRecordedDay(day)) return;
         const ym = day.slice(0, 7);
         if (!latestDay.value || day > latestDay.value) latestDay.value = day;
         if (!earliestDay.value || day < earliestDay.value) earliestDay.value = day;
@@ -198,31 +221,56 @@ export function createHistoryDateController(scope, onSelectionChange) {
                 }
                 const nextMonths = Array.isArray(res.months)
                     ? res.months
-                          .filter((m) => m && typeof m.month === 'string' && /^\d{4}-\d{2}$/.test(m.month))
+                          .filter((m) => m && isValidRecordedMonth(m.month))
                           .sort((a, b) => b.month.localeCompare(a.month))
                     : [];
                 months.value = nextMonths;
+                const rawMinMonth = String(res.minMonth || '');
+                const rawMaxMonth = String(res.maxMonth || '');
                 minMonth.value =
-                    String(res.minMonth || '') ||
+                    (isValidRecordedMonth(rawMinMonth) ? rawMinMonth : '') ||
                     (nextMonths.length > 0 ? nextMonths[nextMonths.length - 1].month : '');
-                maxMonth.value = String(res.maxMonth || '') || (nextMonths.length > 0 ? nextMonths[0].month : '');
-                earliestDay.value = String(res.earliestDay || '');
-                latestDay.value = String(res.latestDay || '');
+                maxMonth.value =
+                    (isValidRecordedMonth(rawMaxMonth) ? rawMaxMonth : '') ||
+                    (nextMonths.length > 0 ? nextMonths[0].month : '');
+                const rawEarliest = String(res.earliestDay || '');
+                const rawLatest = String(res.latestDay || '');
+                earliestDay.value = isValidRecordedDay(rawEarliest) ? rawEarliest : '';
+                latestDay.value = isValidRecordedDay(rawLatest) ? rawLatest : '';
 
-                const activeYm = String(res.activeMonth || maxMonth.value || '');
-                const resolvedDays = Array.isArray(res.days)
-                    ? res.days.filter((d) => typeof d === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(d)).sort()
+                const rawActiveYm = String(res.activeMonth || '');
+                const activeYm = (isValidRecordedMonth(rawActiveYm) ? rawActiveYm : '') || maxMonth.value || '';
+                let resolvedDays = Array.isArray(res.days)
+                    ? res.days.filter((d) => isValidRecordedDay(d)).sort()
                     : [];
+                if (activeYm && rawActiveYm !== activeYm) {
+                    // Server's activeMonth was a bogus future month; fetch exact days for the newest valid month instead.
+                    const monthRes = await database
+                        .getHistoryDates(scope, {
+                            tzOffsetMinutes: new Date().getTimezoneOffset(),
+                            month: activeYm
+                        })
+                        .catch(() => null);
+                    resolvedDays = Array.isArray(monthRes?.days)
+                        ? monthRes.days.filter((d) => isValidRecordedDay(d)).sort()
+                        : [];
+                }
                 if (activeYm) {
                     daysByMonth.value = {
                         ...daysByMonth.value,
                         [activeYm]: resolvedDays
                     };
                 }
+                const todayStr = dayjs().format('YYYY-MM-DD');
+                const nonFutureDays = resolvedDays.filter((d) => d <= todayStr);
                 const pickedDay =
-                    resolvedDays.length > 0
-                        ? resolvedDays[resolvedDays.length - 1]
-                        : latestDay.value || '';
+                    (nonFutureDays.length > 0 ? nonFutureDays[nonFutureDays.length - 1] : '') ||
+                    (resolvedDays.length > 0 ? resolvedDays[resolvedDays.length - 1] : '') ||
+                    latestDay.value ||
+                    '';
+                if (pickedDay && (!latestDay.value || pickedDay > latestDay.value)) {
+                    latestDay.value = pickedDay;
+                }
                 if (!selectedDate.value && pickedDay) {
                     selectedDate.value = pickedDay;
                 }
@@ -246,7 +294,7 @@ export function createHistoryDateController(scope, onSelectionChange) {
     async function ensureMonthDays(monthStr, force = false) {
         if (!enabled.value) return [];
         const clean = String(monthStr || '').trim();
-        if (!/^\d{4}-\d{2}$/.test(clean)) return [];
+        if (!isValidRecordedMonth(clean)) return [];
         if (!force && Array.isArray(daysByMonth.value[clean])) {
             return daysByMonth.value[clean];
         }
@@ -262,7 +310,7 @@ export function createHistoryDateController(scope, onSelectionChange) {
                     month: clean
                 });
                 const days = Array.isArray(res?.days)
-                    ? res.days.filter((d) => typeof d === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(d)).sort()
+                    ? res.days.filter((d) => isValidRecordedDay(d)).sort()
                     : [];
                 daysByMonth.value = {
                     ...daysByMonth.value,

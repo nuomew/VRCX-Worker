@@ -561,15 +561,28 @@ describe('Cloud history cursor pagination (adapter + Feed store)', () => {
         const DataTableLayout = (await import('../../components/ui/data-table/DataTableLayout.vue')).default;
 
         mockDb.supportsHistoryDateNavigation = true;
-        mockDb.getHistoryDates.mockResolvedValue({
-            scope: 'feed',
-            months: [{ month: '2026-05', approxRows: 500 }],
-            minMonth: '2026-05',
-            maxMonth: '2026-05',
-            activeMonth: '2026-05',
-            days: ['2026-05-04', '2026-05-05'],
-            latestDay: '2026-05-05',
-            earliestDay: '2026-05-04'
+        mockDb.getHistoryDates.mockImplementation(async (_scope, opts = {}) => {
+            if (opts?.month === '2026-05') {
+                return {
+                    scope: 'feed',
+                    activeMonth: '2026-05',
+                    days: ['2026-05-04', '2026-05-05']
+                };
+            }
+            // Simulate a server response still containing a bogus future month 2056-05
+            return {
+                scope: 'feed',
+                months: [
+                    { month: '2056-05', approxRows: 2 },
+                    { month: '2026-05', approxRows: 500 }
+                ],
+                minMonth: '2026-05',
+                maxMonth: '2056-05',
+                activeMonth: '2056-05',
+                days: ['2056-05-05'],
+                latestDay: '2056-05-05',
+                earliestDay: '2026-05-04'
+            };
         });
         mockDb.lookupFeedDatabase.mockImplementation(async (_filters, _vip, _limit, dateFrom = '', dateTo = '') => {
             if (dateFrom.includes('2026-05-04') && dateTo.includes('2026-05-05')) {
