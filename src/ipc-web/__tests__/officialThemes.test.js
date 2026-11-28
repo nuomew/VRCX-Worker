@@ -209,6 +209,13 @@ describe('Official Anime-Site Dual Themes (Lookbook & Azure Archive) registratio
         // Brightness dimmer must sit above all modals (10000+), dropdowns (12000), cloud overlays (20000), and toasts (999999999)
         expect(lookbookSrc).toContain('z-[2147483647]');
         expect(archiveSrc).toContain('z-[2147483647]');
+        // Early pre-paint brightness recovery in index.html hands off cleanly when layout mounts
+        const indexHtmlSrc = fs.readFileSync(path.resolve(process.cwd(), 'src/index.html'), 'utf-8');
+        expect(indexHtmlSrc).toContain('vrcx-early-dim-style');
+        expect(indexHtmlSrc).toContain('vrcx-editorial-theme-brightness');
+        expect(indexHtmlSrc).toContain('vrcx-last-theme-mode');
+        expect(lookbookSrc).toContain("handoffEarlyBrightnessOverlay('lookbook')");
+        expect(archiveSrc).toContain("handoffEarlyBrightnessOverlay('archive')");
         // Lookbook left cover card reuses native categorized FriendsSidebar (favorites/subgroups, online, active, offline + virtual scroll)
         expect(lookbookSrc).toContain('<FriendsSidebar hide-me :render-edit-profile-dialog="false"');
         expect(lookbookSrc).toContain('lb-folio-friends-scroll');

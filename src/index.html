@@ -12,6 +12,36 @@
         <link rel="preconnect" href="https://files.vrchat.cloud" />
         <link rel="preconnect" href="https://d348imysud55la.cloudfront.net" />
         <link rel="dns-prefetch" href="https://assets.vrchat.com" />
+        <style id="vrcx-early-dim-style">
+            html[data-vrcx-dim='1']::after {
+                content: '';
+                position: fixed;
+                inset: 0;
+                pointer-events: none;
+                z-index: 2147483647;
+                background: var(--vrcx-editorial-dim-bg, transparent);
+            }
+        </style>
+        <script>
+            (function () {
+                try {
+                    var mode = localStorage.getItem('vrcx-last-theme-mode');
+                    if (mode !== 'lookbook' && mode !== 'archive') return;
+                    var raw = localStorage.getItem('vrcx-editorial-theme-brightness');
+                    if (raw === null || raw === '') raw = localStorage.getItem('vrcx-lookbook-brightness');
+                    if (raw === null || raw === '') return;
+                    var b = Math.round(Number(raw));
+                    if (!isFinite(b)) return;
+                    b = Math.min(100, Math.max(50, b));
+                    if (b >= 100) return;
+                    var op = (((100 - b) / 100) * 0.85).toFixed(3);
+                    var rgb = mode === 'archive' ? '14,24,38' : '22,16,20';
+                    var root = document.documentElement;
+                    root.style.setProperty('--vrcx-editorial-dim-bg', 'rgba(' + rgb + ',' + op + ')');
+                    root.setAttribute('data-vrcx-dim', '1');
+                } catch (e) {}
+            })();
+        </script>
     </head>
     <body>
         <div id="root"></div>

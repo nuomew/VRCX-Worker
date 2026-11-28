@@ -3,7 +3,28 @@ import { computed, ref } from 'vue';
 export const MIN_THEME_BRIGHTNESS = 50;
 export const MAX_THEME_BRIGHTNESS = 100;
 export const THEME_BRIGHTNESS_STORAGE_KEY = 'vrcx-editorial-theme-brightness';
+export const LAST_THEME_MODE_STORAGE_KEY = 'vrcx-last-theme-mode';
 const LEGACY_BRIGHTNESS_STORAGE_KEY = 'vrcx-lookbook-brightness';
+
+/**
+ * Hands off from the index.html pre-paint brightness dimmer to the mounted Vue layout overlay
+ * in the same frame so there is neither an initial bright flash nor double-darkening.
+ *
+ * @param {'lookbook' | 'archive'} [themeMode]
+ */
+export function handoffEarlyBrightnessOverlay(themeMode) {
+    if (themeMode) {
+        try {
+            localStorage.setItem(LAST_THEME_MODE_STORAGE_KEY, themeMode);
+        } catch {
+            // ignore storage errors
+        }
+    }
+    if (typeof document !== 'undefined') {
+        document.documentElement.removeAttribute('data-vrcx-dim');
+        document.documentElement.style.removeProperty('--vrcx-editorial-dim-bg');
+    }
+}
 
 /**
  * Clamps a brightness percentage into the readable [50, 100] range.

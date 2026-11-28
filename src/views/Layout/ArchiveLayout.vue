@@ -672,7 +672,7 @@
     import { useNavLayout } from '../../components/nav-menu/composables/useNavLayout';
     import { useNavTheme } from '../../components/nav-menu/composables/useNavTheme';
     import { usePriorityNav } from './composables/usePriorityNav';
-    import { useThemeBrightness } from './composables/useThemeBrightness';
+    import { handoffEarlyBrightnessOverlay, useThemeBrightness } from './composables/useThemeBrightness';
     import { isEntryNotified as checkEntryNotified } from '../../components/nav-menu/navMenuUtils';
     import { useToolActions } from '../../composables/useToolActions';
     import { useToolNavPinning } from '../../composables/useToolNavPinning';
@@ -981,6 +981,7 @@
     });
 
     onMounted(async () => {
+        handoffEarlyBrightnessOverlay('archive');
         handleResize();
         if (typeof window !== 'undefined') {
             window.addEventListener('resize', handleResize);

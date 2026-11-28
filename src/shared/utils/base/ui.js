@@ -292,6 +292,15 @@ function changeAppThemeStyle(themeMode) {
     applyThemeModeStyle(themeMode);
 
     document.documentElement.setAttribute('data-theme', themeMode);
+    try {
+        localStorage.setItem('vrcx-last-theme-mode', themeMode);
+    } catch {
+        // ignore storage errors
+    }
+    if (themeMode !== 'lookbook' && themeMode !== 'archive') {
+        document.documentElement.removeAttribute('data-vrcx-dim');
+        document.documentElement.style.removeProperty('--vrcx-editorial-dim-bg');
+    }
 
     const shouldUseDarkClass = Boolean(themeConfig.isDark);
     if (shouldUseDarkClass) {
