@@ -9,7 +9,8 @@
             :on-page-size-change="handlePageSizeChange"
             :can-load-more="feedTable.hasMore"
             :loading-more="feedTable.loadingMore"
-            :on-load-more="loadMoreFeedHistory">
+            :on-load-more="loadMoreFeedHistory"
+            :history-date-nav="feedDateNav">
             <template #toolbar>
                 <div class="mt-0 mx-0 mb-2" style="display: flex; align-items: center">
                     <div style="flex: none; display: flex; align-items: center" class="mr-2">
@@ -112,8 +113,9 @@
     import { columns as baseColumns } from './columns.jsx';
     import { useVrcxVueTable } from '../../lib/table/useVrcxVueTable';
 
-    const { feedTable, feedTableData } = storeToRefs(useFeedStore());
-    const { feedTableLookup, loadMoreFeedHistory } = useFeedStore();
+    const feedStore = useFeedStore();
+    const { feedTable, feedTableData } = storeToRefs(feedStore);
+    const { feedTableLookup, loadMoreFeedHistory, feedDateNav } = feedStore;
     const appearanceSettingsStore = useAppearanceSettingsStore();
     const { weekStartsOn } = storeToRefs(appearanceSettingsStore);
     const vrcxStore = useVrcxStore();
@@ -124,10 +126,14 @@
     const popoverOpen = ref(false);
     const todayDate = today(getLocalTimeZone());
     const dateRange = ref(undefined);
-    const hasDateFilter = computed(() => !!(feedTable.value.dateFrom || feedTable.value.dateTo));
+    const hasDateFilter = computed(() =>
+        Boolean(feedTable.value.customDateRange && (feedTable.value.dateFrom || feedTable.value.dateTo))
+    );
     const activeFilterCount = computed(() => (hasDateFilter.value ? 1 : 0));
 
     function applyDateFilter() {
+        const hasCustom = Boolean(dateRange.value?.start || dateRange.value?.end);
+        feedTable.value.customDateRange = hasCustom;
         if (dateRange.value?.start) {
             const s = dateRange.value.start;
             feedTable.value.dateFrom = dayjs(`${s.year}-${s.month}-${s.day}`).startOf('day').toISOString();
@@ -146,6 +152,7 @@
 
     function clearDateFilter() {
         dateRange.value = undefined;
+        feedTable.value.customDateRange = false;
         feedTable.value.dateFrom = '';
         feedTable.value.dateTo = '';
         popoverOpen.value = false;

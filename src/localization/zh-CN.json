@@ -3536,7 +3536,18 @@
             "last": "最后一页",
             "more_pages": "更多页面",
             "load_more": "加载更早记录",
-            "loading_more": "正在加载..."
+            "loading_more": "正在加载...",
+            "date_mode_day": "按天",
+            "date_mode_month": "按月",
+            "date_prev": "上一个有记录日期",
+            "date_next": "下一个有记录日期",
+            "date_select": "选择记录日期",
+            "date_latest": "最新",
+            "date_recorded_months": "有记录的月份",
+            "date_month_days_count": "本月 {count} 天有记录",
+            "date_no_records_month": "本月无记录",
+            "date_no_records": "暂无历史记录",
+            "date_loading": "正在读取日期..."
         },
         "feed": {
             "date": "时间",

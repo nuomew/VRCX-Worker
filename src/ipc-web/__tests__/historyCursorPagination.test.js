@@ -4,12 +4,13 @@ import { mount } from '@vue/test-utils';
 import { defineComponent, nextTick, ref, shallowRef } from 'vue';
 
 vi.mock('vue-i18n', () => ({
-    useI18n: () => ({ t: (k) => k })
+    useI18n: () => ({ t: (k) => k, locale: ref('zh-CN') })
 }));
 
 vi.mock('@/stores/', () => ({
     useAppearanceSettingsStore: () => ({
-        isDataTableStriped: ref(false)
+        isDataTableStriped: ref(false),
+        weekStartsOn: ref(0)
     })
 }));
 
@@ -33,6 +34,8 @@ const { mockDb } = vi.hoisted(() => {
     return {
         mockDb: {
             supportsHistoryCursorPagination: true,
+            supportsHistoryDateNavigation: false,
+            getHistoryDates: vi.fn(),
             lookupFeedDatabase: vi.fn(),
             searchFeedDatabase: vi.fn(),
             lookupGameLogDatabase: vi.fn(),
@@ -148,13 +151,13 @@ describe('Cloud history cursor pagination (adapter + Feed store)', () => {
         expect(requests[3].url).toContain('beforeCreatedAt=2025-05-01T00%3A00%3A00.000Z');
     });
 
-    it('loads multiple older Feed pages beyond 100 rows, deduplicates boundary timestamps, and protects expanded history from sweepFeed', async () => {
-        // 235 total historical rows sorted newest-first, with 3 rows sharing the exact timestamp across page 1 -> 2 boundary
+    it('loads multiple older Feed pages beyond 200 rows, deduplicates boundary timestamps, and protects expanded history from sweepFeed', async () => {
+        // 435 total historical rows sorted newest-first, with 3 rows sharing the exact timestamp across page 1 -> 2 boundary
         const allRows = [];
         const boundaryTs = '2025-05-01T12:00:00.000Z';
-        for (let i = 0; i < 99; i++) {
+        for (let i = 0; i < 199; i++) {
             allRows.push({
-                rowId: -(1000 - i),
+                rowId: -(2000 - i),
                 created_at: new Date(Date.UTC(2025, 6, 1) - i * 60_000).toISOString(),
                 type: 'GPS',
                 userId: `usr_${i % 5}`,
@@ -165,7 +168,7 @@ describe('Cloud history cursor pagination (adapter + Feed store)', () => {
         }
         for (let b = 0; b < 3; b++) {
             allRows.push({
-                rowId: -(500 - b),
+                rowId: -(1500 - b),
                 created_at: boundaryTs,
                 type: 'GPS',
                 userId: `usr_burst_${b}`,
@@ -174,9 +177,9 @@ describe('Cloud history cursor pagination (adapter + Feed store)', () => {
                 worldName: `BurstWorld_${b}`
             });
         }
-        for (let i = 0; i < 133; i++) {
+        for (let i = 0; i < 233; i++) {
             allRows.push({
-                rowId: -(400 - i),
+                rowId: -(1000 - i),
                 created_at: new Date(Date.UTC(2025, 3, 1) - i * 60_000).toISOString(),
                 type: 'GPS',
                 userId: `usr_old_${i % 5}`,
@@ -186,7 +189,7 @@ describe('Cloud history cursor pagination (adapter + Feed store)', () => {
             });
         }
 
-        mockDb.lookupFeedDatabase.mockImplementation(async (_filters, _vip, maxEntries = 100, _df, _dt, opts = {}) => {
+        mockDb.lookupFeedDatabase.mockImplementation(async (_filters, _vip, maxEntries = 200, _df, _dt, opts = {}) => {
             const before = opts?.beforeCreatedAt || '';
             const inclusive = Boolean(opts?.beforeInclusive);
             const filtered = before
@@ -198,32 +201,31 @@ describe('Cloud history cursor pagination (adapter + Feed store)', () => {
         const feedStore = useFeedStore();
         await feedStore.feedTableLookup();
 
-        // Initial page: 100 rows, hasMore = true
-        expect(feedStore.feedTableData.length).toBe(100);
-        expect(feedStore.feedTable.hasMore).toBe(true);
-        expect(feedStore.feedTable.historyExpanded).toBe(false);
-
-        // Load page 2 -> recovers remaining 2 same-timestamp Burst rows + 98 older rows
-        const added2 = await feedStore.loadMoreFeedHistory();
-        expect(added2).toBe(100);
+        // Initial page: 200 rows, hasMore = true
         expect(feedStore.feedTableData.length).toBe(200);
+        expect(feedStore.feedTable.hasMore).toBe(true);
+
+        // Load page 2 -> recovers remaining 2 same-timestamp Burst rows + 197 older rows (200 requested incl. 1 dup = 199 new)
+        const added2 = await feedStore.loadMoreFeedHistory();
+        expect(added2).toBe(199);
+        expect(feedStore.feedTableData.length).toBe(399);
         expect(feedStore.feedTable.hasMore).toBe(true);
         expect(feedStore.feedTable.historyExpanded).toBe(true);
 
-        // Load page 3 -> remaining 35 rows and cleanly stops (hasMore = false)
+        // Load page 3 -> remaining 36 rows and cleanly stops (hasMore = false)
         const added3 = await feedStore.loadMoreFeedHistory();
-        expect(added3).toBe(35);
-        expect(feedStore.feedTableData.length).toBe(235);
+        expect(added3).toBe(36);
+        expect(feedStore.feedTableData.length).toBe(435);
         expect(feedStore.feedTable.hasMore).toBe(false);
 
         // Verify all 3 Burst rows preserved without duplicates
         const names = new Set(feedStore.feedTableData.map((r) => r.displayName));
-        expect(names.size).toBe(235);
+        expect(names.size).toBe(435);
         expect(names.has('Burst_0')).toBe(true);
         expect(names.has('Burst_1')).toBe(true);
         expect(names.has('Burst_2')).toBe(true);
 
-        // Live feed entry arriving when 235 > maxTableSize(120) must NOT trim expanded history
+        // Live feed entry arriving when 435 > maxTableSize(120) must NOT trim expanded history
         feedStore.addFeedEntry({
             rowId: 99999,
             created_at: '2026-11-28T16:00:00.000Z',
@@ -233,7 +235,7 @@ describe('Cloud history cursor pagination (adapter + Feed store)', () => {
             location: 'wrld_live:1',
             worldName: 'LiveWorld'
         });
-        expect(feedStore.feedTableData.length).toBe(236);
+        expect(feedStore.feedTableData.length).toBe(436);
         expect(feedStore.feedTableData[0].displayName).toBe('LiveFriend');
     });
 
@@ -368,8 +370,8 @@ describe('Cloud history cursor pagination (adapter + Feed store)', () => {
             location: `wrld_${i}:1`,
             worldName: `World_${i}`
         });
-        const page1 = Array.from({ length: 100 }, (_, i) => makeRow(i, Date.UTC(2026, 5, 1)));
-        const page2 = Array.from({ length: 101 }, (_, i) => makeRow(99 + i, Date.UTC(2026, 5, 1)));
+        const page1 = Array.from({ length: 200 }, (_, i) => makeRow(i, Date.UTC(2026, 5, 1)));
+        const page2 = Array.from({ length: 200 }, (_, i) => makeRow(199 + i, Date.UTC(2026, 5, 1)));
 
         let callCount = 0;
         mockDb.lookupFeedDatabase.mockImplementation(async () => {
@@ -382,19 +384,19 @@ describe('Cloud history cursor pagination (adapter + Feed store)', () => {
 
         const feedStore = useFeedStore();
         await feedStore.feedTableLookup();
-        expect(feedStore.feedTableData.length).toBe(100);
-
-        // Expand page 2
-        const added = await feedStore.loadMoreFeedHistory();
-        expect(added).toBe(100);
         expect(feedStore.feedTableData.length).toBe(200);
+
+        // Expand page 2 (199 new rows + 1 boundary overlap)
+        const added = await feedStore.loadMoreFeedHistory();
+        expect(added).toBe(199);
+        expect(feedStore.feedTableData.length).toBe(399);
         expect(feedStore.feedTable.historyExpanded).toBe(true);
         expect(feedStore.feedTable.hasMore).toBe(true);
 
         // Transient 503 error must NOT lose loaded rows or permanently disable hasMore
         const addedOnErr = await feedStore.loadMoreFeedHistory();
         expect(addedOnErr).toBe(0);
-        expect(feedStore.feedTableData.length).toBe(200);
+        expect(feedStore.feedTableData.length).toBe(399);
         expect(feedStore.feedTable.hasMore).toBe(true);
 
         // Background RSS sync while historyExpanded === true must incrementally merge instead of calling feedTableLookup
@@ -427,7 +429,130 @@ describe('Cloud history cursor pagination (adapter + Feed store)', () => {
 
         expect(lookupSpy).not.toHaveBeenCalled();
         expect(feedStore.feedTable.historyExpanded).toBe(true);
-        expect(feedStore.feedTableData.length).toBe(201);
+        expect(feedStore.feedTableData.length).toBe(400);
         expect(feedStore.feedTableData[0].displayName).toBe('RssFriend');
+    });
+
+    it('replaces Load older with recorded-date navigator supporting prev/next across months, month mode, and page reset', async () => {
+        const { createHistoryDateController } = await import('../../composables/useHistoryDateNavigation.js');
+        const { useVrcxVueTable } = await import('../../lib/table/useVrcxVueTable.js');
+        const DataTableLayout = (await import('../../components/ui/data-table/DataTableLayout.vue')).default;
+
+        mockDb.supportsHistoryDateNavigation = true;
+        mockDb.getHistoryDates.mockImplementation(async (_scope, opts = {}) => {
+            if (opts?.month === '2026-10') {
+                return {
+                    scope: 'feed',
+                    activeMonth: '2026-10',
+                    days: ['2026-10-05', '2026-10-29']
+                };
+            }
+            if (opts?.month === '2026-11') {
+                return {
+                    scope: 'feed',
+                    activeMonth: '2026-11',
+                    days: ['2026-11-02', '2026-11-28']
+                };
+            }
+            return {
+                scope: 'feed',
+                months: [
+                    { month: '2026-11', approxRows: 240 },
+                    { month: '2026-10', approxRows: 180 }
+                ],
+                minMonth: '2026-10',
+                maxMonth: '2026-11',
+                activeMonth: '2026-11',
+                days: ['2026-11-02', '2026-11-28'],
+                latestDay: '2026-11-28',
+                earliestDay: '2026-10-05'
+            };
+        });
+
+        const selections = [];
+        const nav = createHistoryDateController('feed', async (sel) => {
+            selections.push(sel);
+        });
+        await nav.ensureInitialized();
+        expect(nav.selectedDate.value).toBe('2026-11-28');
+        expect(nav.isDayRecorded('2026-11-28')).toBe(true);
+        expect(nav.isDayRecorded('2026-11-27')).toBe(false);
+        expect(nav.canGoOlder.value).toBe(true);
+        expect(nav.canGoNewer.value).toBe(false);
+
+        const rowsData = shallowRef(
+            Array.from({ length: 60 }, (_, i) => ({
+                rowId: i + 1,
+                type: 'GPS',
+                created_at: `2026-11-28T00:00:${String(i).padStart(2, '0')}.000Z`,
+                name: `Row ${i}`
+            }))
+        );
+
+        const Host = defineComponent({
+            components: { DataTableLayout },
+            setup() {
+                const { table, pagination } = useVrcxVueTable({
+                    persistKey: 'test-date-nav',
+                    get data() {
+                        return rowsData.value;
+                    },
+                    columns: [{ accessorKey: 'name', id: 'name', header: 'Name' }],
+                    getRowId: (row) => `row:${row.rowId}`,
+                    initialSorting: [],
+                    initialPagination: { pageIndex: 2, pageSize: 20 },
+                    tableOptions: { autoResetPageIndex: false }
+                });
+                return { table, pagination, rowsData, nav };
+            },
+            template: `
+                <DataTableLayout
+                    :table="table"
+                    :total-items="rowsData.length"
+                    :page-sizes="[20, 100]"
+                    :can-load-more="true"
+                    :on-load-more="() => {}"
+                    :history-date-nav="nav" />
+            `
+        });
+
+        const wrapper = mount(Host, {
+            global: { mocks: { $t: (k) => k } }
+        });
+
+        // "Load older" button must be completely replaced by the recorded-date navigator
+        const loadOlderBtn = wrapper.findAll('button').find((b) => b.text().includes('table.pagination.load_more'));
+        expect(loadOlderBtn).toBeUndefined();
+        expect(wrapper.find('[data-testid="history-date-navigator"]').exists()).toBe(true);
+        expect(wrapper.find('[data-testid="history-date-trigger"]').text()).toContain('2026-11-28');
+        expect(wrapper.vm.pagination.pageIndex).toBe(2);
+
+        // Click previous recorded date -> skips empty days straight to 2026-11-02 and resets table to page 1
+        await wrapper.find('[data-testid="history-date-prev"]').trigger('click');
+        await nextTick();
+        await nextTick();
+        expect(nav.selectedDate.value).toBe('2026-11-02');
+        expect(wrapper.vm.pagination.pageIndex).toBe(0);
+
+        // Click previous again -> crosses into 2026-10 and jumps straight to 2026-10-29
+        await wrapper.find('[data-testid="history-date-prev"]').trigger('click');
+        await nextTick();
+        await nextTick();
+        expect(nav.selectedDate.value).toBe('2026-10-29');
+
+        // Switch to month mode -> selects 2026-10, then goNewer -> 2026-11
+        await nav.setMode('month');
+        expect(nav.mode.value).toBe('month');
+        expect(nav.selectedMonth.value).toBe('2026-10');
+        await nav.goNewer();
+        expect(nav.selectedMonth.value).toBe('2026-11');
+        expect(selections.map((s) => `${s.mode}:${s.value}`)).toEqual([
+            'day:2026-11-02',
+            'day:2026-10-29',
+            'month:2026-10',
+            'month:2026-11'
+        ]);
+
+        mockDb.supportsHistoryDateNavigation = false;
     });
 });

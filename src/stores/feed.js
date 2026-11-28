@@ -1,6 +1,7 @@
 import { ref, shallowRef, watch } from 'vue';
 import { defineStore } from 'pinia';
 
+import { createHistoryDateController } from '../composables/useHistoryDateNavigation';
 import { database } from '../services/database';
 import { useFriendStore } from './friend';
 import { useVrcxStore } from './vrcx';
@@ -12,14 +13,16 @@ export const useFeedStore = defineStore('Feed', () => {
     const friendStore = useFriendStore();
     const vrcxStore = useVrcxStore();
 
-    const FEED_CLOUD_PAGE_BATCH = 100;
+    const FEED_CLOUD_PAGE_BATCH = 200;
     const FEED_CLOUD_MAX_REQUEST_LIMIT = 200;
+    const FEED_DAY_AUTO_MAX_BATCHES = 5;
 
     const feedTableData = shallowRef([]);
     const feedTable = ref({
         search: '',
         dateFrom: '',
         dateTo: '',
+        customDateRange: false,
         vip: false,
         loading: false,
         loadingMore: false,
@@ -31,6 +34,13 @@ export const useFeedStore = defineStore('Feed', () => {
     });
     let feedLookupEpoch = 0;
     let feedHistoryCapacity = 0;
+
+    const feedDateNav = createHistoryDateController('feed', async ({ dateFrom, dateTo }) => {
+        feedTable.value.customDateRange = false;
+        feedTable.value.dateFrom = dateFrom;
+        feedTable.value.dateTo = dateTo;
+        await feedTableLookup();
+    });
 
     function feedRowDedupKey(r) {
         const type = String(r?.type ?? '');
@@ -73,6 +83,10 @@ export const useFeedStore = defineStore('Feed', () => {
             feedTable.value.hasMore = false;
             feedTable.value.loadingMore = false;
             feedTable.value.historyExpanded = false;
+            feedTable.value.customDateRange = false;
+            feedTable.value.dateFrom = '';
+            feedTable.value.dateTo = '';
+            feedDateNav.reset();
             if (isLoggedIn) {
                 initFeedTable();
             }
@@ -183,8 +197,19 @@ export const useFeedStore = defineStore('Feed', () => {
                 vipList = Array.from(friendStore.localFavoriteFriends.values());
             }
             const search = feedTable.value.search.trim();
-            const { dateFrom, dateTo } = feedTable.value;
             const supportsCursor = Boolean(database.supportsHistoryCursorPagination);
+            const supportsDateNav = Boolean(feedDateNav.enabled.value);
+
+            if (supportsDateNav && !search && !feedTable.value.customDateRange) {
+                const bounds = await feedDateNav.ensureInitialized();
+                if (epoch !== feedLookupEpoch) return;
+                if (bounds) {
+                    feedTable.value.dateFrom = bounds.dateFrom;
+                    feedTable.value.dateTo = bounds.dateTo;
+                }
+            }
+
+            const { dateFrom, dateTo } = feedTable.value;
             const rows =
                 search || (!supportsCursor && (dateFrom || dateTo))
                     ? await database.searchFeedDatabase(
@@ -192,8 +217,8 @@ export const useFeedStore = defineStore('Feed', () => {
                           feedTable.value.filter,
                           vipList,
                           vrcxStore.searchLimit,
-                          dateFrom,
-                          dateTo
+                          search && !feedTable.value.customDateRange ? '' : dateFrom,
+                          search && !feedTable.value.customDateRange ? '' : dateTo
                       )
                     : supportsCursor
                       ? await database.lookupFeedDatabase(
@@ -206,10 +231,79 @@ export const useFeedStore = defineStore('Feed', () => {
                         )
                       : await database.lookupFeedDatabase(feedTable.value.filter, vipList);
             if (epoch !== feedLookupEpoch) return;
-            feedTableData.value = Array.isArray(rows) ? [...rows] : [];
-            feedTable.value.hasMore = Boolean(
-                supportsCursor && !search && feedTableData.value.length >= FEED_CLOUD_PAGE_BATCH
+            let list = Array.isArray(rows) ? [...rows] : [];
+            let hasMore = Boolean(supportsCursor && !search && list.length >= FEED_CLOUD_PAGE_BATCH);
+
+            // In Day mode, automatically fetch remaining batches for the selected day (each <=200 rows, safely within 10ms CPU)
+            // so the user sees the complete day's pages immediately without clicking "Load older".
+            if (
+                hasMore &&
+                supportsDateNav &&
+                !feedTable.value.customDateRange &&
+                feedDateNav.mode.value === 'day' &&
+                dateFrom &&
+                dateTo
+            ) {
+                const existingKeys = new Set(list.map(feedRowDedupKey));
+                for (let batch = 1; batch < FEED_DAY_AUTO_MAX_BATCHES && hasMore; batch++) {
+                    const { oldest, sameTsCount } = getOldestCreatedAtCursor(list);
+                    if (!oldest || oldest <= dateFrom) {
+                        hasMore = false;
+                        break;
+                    }
+                    let reqLimit = Math.min(
+                        FEED_CLOUD_MAX_REQUEST_LIMIT,
+                        FEED_CLOUD_PAGE_BATCH + Math.min(sameTsCount, 80)
+                    );
+                    let fetched = await database.lookupFeedDatabase(
+                        feedTable.value.filter,
+                        vipList,
+                        reqLimit,
+                        dateFrom,
+                        dateTo,
+                        { beforeCreatedAt: oldest, beforeInclusive: true, throwOnError: true }
+                    );
+                    if (epoch !== feedLookupEpoch) return;
+                    const batchNew = [];
+                    for (const row of Array.isArray(fetched) ? fetched : []) {
+                        const key = feedRowDedupKey(row);
+                        if (existingKeys.has(key)) continue;
+                        existingKeys.add(key);
+                        batchNew.push(row);
+                    }
+                    if (batchNew.length === 0 && Array.isArray(fetched) && fetched.length >= reqLimit) {
+                        reqLimit = FEED_CLOUD_PAGE_BATCH;
+                        fetched = await database.lookupFeedDatabase(
+                            feedTable.value.filter,
+                            vipList,
+                            reqLimit,
+                            dateFrom,
+                            dateTo,
+                            { beforeCreatedAt: oldest, beforeInclusive: false, throwOnError: true }
+                        );
+                        if (epoch !== feedLookupEpoch) return;
+                        for (const row of Array.isArray(fetched) ? fetched : []) {
+                            const key = feedRowDedupKey(row);
+                            if (existingKeys.has(key)) continue;
+                            existingKeys.add(key);
+                            batchNew.push(row);
+                        }
+                    }
+                    if (batchNew.length === 0) {
+                        hasMore = false;
+                        break;
+                    }
+                    list = [...list, ...batchNew];
+                    hasMore = Array.isArray(fetched) && fetched.length >= reqLimit;
+                }
+            }
+
+            feedTableData.value = list;
+            feedHistoryCapacity = Math.max(feedHistoryCapacity, list.length);
+            feedTable.value.historyExpanded = Boolean(
+                (supportsDateNav && !search && (dateFrom || dateTo)) || list.length > vrcxStore.maxTableSize
             );
+            feedTable.value.hasMore = hasMore;
         } catch (err) {
             console.warn('[feed] Failed to lookup feed table:', err);
         } finally {
@@ -318,6 +412,9 @@ export const useFeedStore = defineStore('Feed', () => {
         const additions = [];
         for (const feed of recentFeeds) {
             if (!feed || typeof feed !== 'object') continue;
+            if (feed.created_at) {
+                feedDateNav.registerRecordedTimestamp(feed.created_at);
+            }
             if (feedTable.value.filter.length > 0 && !feedTable.value.filter.includes(feed.type)) {
                 continue;
             }
@@ -352,6 +449,9 @@ export const useFeedStore = defineStore('Feed', () => {
      * @param {object} feed The feed entry to add.
      */
     function addFeedEntry(feed) {
+        if (feed?.created_at) {
+            feedDateNav.registerRecordedTimestamp(feed.created_at);
+        }
         if (feedTable.value.filter.length > 0 && !feedTable.value.filter.includes(feed.type)) {
             return;
         }
@@ -388,6 +488,7 @@ export const useFeedStore = defineStore('Feed', () => {
     return {
         feedTable,
         feedTableData,
+        feedDateNav,
         initFeedTable,
         feedTableLookup,
         loadMoreFeedHistory,

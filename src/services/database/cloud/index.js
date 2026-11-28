@@ -592,6 +592,24 @@ if (typeof window !== 'undefined' && typeof window.addEventListener === 'functio
 export function createCloudDatabase(dbVars) {
     return {
         supportsHistoryCursorPagination: true,
+        supportsHistoryDateNavigation: true,
+        async getHistoryDates(scope, options = {}) {
+            const cleanScope = String(scope || '').trim().toLowerCase();
+            if (!cleanScope) return null;
+            const tzOffsetMinutes = Number.isFinite(Number(options?.tzOffsetMinutes))
+                ? Math.trunc(Number(options.tzOffsetMinutes))
+                : new Date().getTimezoneOffset();
+            const params = new URLSearchParams({
+                scope: cleanScope,
+                tzOffsetMinutes: String(tzOffsetMinutes)
+            });
+            const month = String(options?.month || '').trim();
+            if (month) {
+                params.set('month', month);
+            }
+            const req = cloudFetch(`/api/history/dates?${params.toString()}`);
+            return options?.throwOnError ? await req : await req.catch(() => null);
+        },
         setMaxTableSize(limit) {
             dbVars.maxTableSize = limit;
         },
@@ -1207,6 +1225,14 @@ export function createCloudDatabase(dbVars) {
         async getFriendLogHistory(options = {}) {
             const limit = Math.min(Math.max(Number(options?.limit) || 300, 1), 500);
             const params = new URLSearchParams({ limit: String(limit) });
+            const dateFrom = String(options?.dateFrom || '').trim();
+            const dateTo = String(options?.dateTo || '').trim();
+            if (dateFrom) {
+                params.set('dateFrom', dateFrom);
+            }
+            if (dateTo) {
+                params.set('dateTo', dateTo);
+            }
             const beforeCreatedAt = String(options?.beforeCreatedAt || '').trim();
             if (beforeCreatedAt) {
                 params.set('beforeCreatedAt', beforeCreatedAt);
@@ -1290,6 +1316,14 @@ export function createCloudDatabase(dbVars) {
         async getNotifications(options = {}) {
             const limit = Math.min(Math.max(Number(options?.limit) || 150, 1), 200);
             const params = new URLSearchParams({ v: '1', limit: String(limit) });
+            const dateFrom = String(options?.dateFrom || '').trim();
+            const dateTo = String(options?.dateTo || '').trim();
+            if (dateFrom) {
+                params.set('dateFrom', dateFrom);
+            }
+            if (dateTo) {
+                params.set('dateTo', dateTo);
+            }
             const beforeCreatedAt = String(options?.beforeCreatedAt || '').trim();
             if (beforeCreatedAt) {
                 params.set('beforeCreatedAt', beforeCreatedAt);
@@ -1372,6 +1406,14 @@ export function createCloudDatabase(dbVars) {
         async getNotificationsV2(options = {}) {
             const limit = Math.min(Math.max(Number(options?.limit) || 150, 1), 200);
             const params = new URLSearchParams({ v: '2', limit: String(limit) });
+            const dateFrom = String(options?.dateFrom || '').trim();
+            const dateTo = String(options?.dateTo || '').trim();
+            if (dateFrom) {
+                params.set('dateFrom', dateFrom);
+            }
+            if (dateTo) {
+                params.set('dateTo', dateTo);
+            }
             const beforeCreatedAt = String(options?.beforeCreatedAt || '').trim();
             if (beforeCreatedAt) {
                 params.set('beforeCreatedAt', beforeCreatedAt);

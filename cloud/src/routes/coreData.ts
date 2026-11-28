@@ -2103,13 +2103,37 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
         if (request.method === 'GET') {
             const userId = url.searchParams.get('userId');
             const limit = clampQueryLimit(url.searchParams.get('limit'), 200, 500);
+            const dateFrom = (url.searchParams.get('dateFrom') ?? '').trim();
+            const dateTo = (url.searchParams.get('dateTo') ?? '').trim();
             const beforeCreatedAt = (url.searchParams.get('beforeCreatedAt') ?? '').trim();
             const beforeInclusiveRaw = (url.searchParams.get('beforeInclusive') ?? '').trim().toLowerCase();
             const beforeInclusive = beforeInclusiveRaw === '1' || beforeInclusiveRaw === 'true';
-            const upperOp = beforeInclusive ? '<=' : '<';
-            const matchesBefore = (createdAt: string): boolean => {
-                if (!beforeCreatedAt) return true;
-                return beforeInclusive ? createdAt <= beforeCreatedAt : createdAt < beforeCreatedAt;
+            let upperValue = '';
+            let upperInclusive = true;
+            if (dateTo && beforeCreatedAt) {
+                if (beforeCreatedAt < dateTo) {
+                    upperValue = beforeCreatedAt;
+                    upperInclusive = beforeInclusive;
+                } else if (dateTo < beforeCreatedAt) {
+                    upperValue = dateTo;
+                    upperInclusive = true;
+                } else {
+                    upperValue = beforeCreatedAt;
+                    upperInclusive = beforeInclusive;
+                }
+            } else if (beforeCreatedAt) {
+                upperValue = beforeCreatedAt;
+                upperInclusive = beforeInclusive;
+            } else if (dateTo) {
+                upperValue = dateTo;
+                upperInclusive = true;
+            }
+            const upperOp = upperInclusive ? '<=' : '<';
+            const hasDateBound = Boolean(dateFrom || upperValue);
+            const matchesBounds = (createdAt: string): boolean => {
+                if (dateFrom && createdAt < dateFrom) return false;
+                if (upperValue && (upperInclusive ? createdAt > upperValue : createdAt >= upperValue)) return false;
+                return true;
             };
             const legacyDb = getLegacyDb(env);
             const legacyStats = legacyDb ? await getLegacyImportedStats(env) : null;
@@ -2124,13 +2148,17 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
                     conds.push('user_id = ?');
                     binds.push(userId);
                 }
-                if (beforeCreatedAt) {
+                if (dateFrom) {
+                    conds.push('created_at >= ?');
+                    binds.push(dateFrom);
+                }
+                if (upperValue) {
                     conds.push(`created_at ${upperOp} ?`);
-                    binds.push(beforeCreatedAt);
+                    binds.push(upperValue);
                 }
                 const whereSql = conds.length > 0 ? `WHERE ${conds.join(' AND ')}` : '';
                 const orderSql =
-                    isLegacy || beforeCreatedAt ? 'ORDER BY created_at DESC, id DESC' : 'ORDER BY id DESC';
+                    isLegacy || hasDateBound ? 'ORDER BY created_at DESC, id DESC' : 'ORDER BY id DESC';
                 return db
                     .prepare(`SELECT ${cols} FROM friend_log_history ${whereSql} ${orderSql} LIMIT ?`)
                     .bind(...binds, limit)
@@ -2143,38 +2171,65 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
             ): Promise<Array<Record<string, unknown>>> => {
                 try {
                     const chunkLimit = userId ? 12 : 8;
-                    const stmts: D1PreparedStatement[] = beforeCreatedAt
-                        ? [
-                              db
-                                  .prepare(
-                                      `SELECT id, max_created_at, payload_json
-                                       FROM ${archiveTable}
-                                       WHERE core_kind = 'friend_log' AND max_created_at <= ?
-                                       ORDER BY max_created_at DESC, id DESC
-                                       LIMIT ?`
-                                  )
-                                  .bind(beforeCreatedAt, chunkLimit),
-                              db
-                                  .prepare(
-                                      `SELECT id, max_created_at, payload_json
-                                       FROM ${archiveTable}
-                                       WHERE core_kind = 'friend_log' AND min_created_at <= ? AND max_created_at > ?
-                                       ORDER BY max_created_at DESC, id DESC
-                                       LIMIT 2`
-                                  )
-                                  .bind(beforeCreatedAt, beforeCreatedAt)
-                          ]
-                        : [
-                              db
-                                  .prepare(
-                                      `SELECT id, max_created_at, payload_json
-                                       FROM ${archiveTable}
-                                       WHERE core_kind = 'friend_log'
-                                       ORDER BY max_created_at DESC, id DESC
-                                       LIMIT ?`
-                                  )
-                                  .bind(chunkLimit)
-                          ];
+                    const stmts: D1PreparedStatement[] = [];
+                    if (upperValue) {
+                        const olderConds = ["core_kind = 'friend_log'", 'max_created_at <= ?'];
+                        const olderBinds: unknown[] = [upperValue];
+                        if (dateFrom) {
+                            olderConds.push('max_created_at >= ?');
+                            olderBinds.push(dateFrom);
+                        }
+                        stmts.push(
+                            db
+                                .prepare(
+                                    `SELECT id, max_created_at, payload_json
+                                     FROM ${archiveTable}
+                                     WHERE ${olderConds.join(' AND ')}
+                                     ORDER BY max_created_at DESC, id DESC
+                                     LIMIT ?`
+                                )
+                                .bind(...olderBinds, chunkLimit)
+                        );
+                        const straddleConds = [
+                            "core_kind = 'friend_log'",
+                            'min_created_at <= ?',
+                            'max_created_at > ?'
+                        ];
+                        const straddleBinds: unknown[] = [upperValue, upperValue];
+                        if (dateFrom) {
+                            straddleConds.push('max_created_at >= ?');
+                            straddleBinds.push(dateFrom);
+                        }
+                        stmts.push(
+                            db
+                                .prepare(
+                                    `SELECT id, max_created_at, payload_json
+                                     FROM ${archiveTable}
+                                     WHERE ${straddleConds.join(' AND ')}
+                                     ORDER BY max_created_at ASC, id ASC
+                                     LIMIT 2`
+                                )
+                                .bind(...straddleBinds)
+                        );
+                    } else {
+                        const conds = ["core_kind = 'friend_log'"];
+                        const binds: unknown[] = [];
+                        if (dateFrom) {
+                            conds.push('max_created_at >= ?');
+                            binds.push(dateFrom);
+                        }
+                        stmts.push(
+                            db
+                                .prepare(
+                                    `SELECT id, max_created_at, payload_json
+                                     FROM ${archiveTable}
+                                     WHERE ${conds.join(' AND ')}
+                                     ORDER BY max_created_at DESC, id DESC
+                                     LIMIT ?`
+                                )
+                                .bind(...binds, chunkLimit)
+                        );
+                    }
                     const batchRes = (await db.batch(stmts)) as D1Result<{
                         id: number;
                         max_created_at: string;
@@ -2206,7 +2261,7 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
                         const unpacked = decodeCoreChunkRows(c.id, 'friend_log', c.payload_json, { negateRowIds });
                         for (const entry of unpacked) {
                             if (userId && String(entry.user_id ?? '') !== userId) continue;
-                            if (!matchesBefore(String(entry.created_at ?? ''))) continue;
+                            if (!matchesBounds(String(entry.created_at ?? ''))) continue;
                             out.push(entry);
                         }
                     }
@@ -2229,7 +2284,7 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
             const friendLogKey = (r: Record<string, unknown>) =>
                 `${String(r.created_at ?? '')}|${String(r.type ?? '')}|${String(r.user_id ?? '')}|${String(r.display_name ?? '')}`;
             const primaryMerged = mergePrimaryAndLegacy(primaryRows, activeArchiveRows, friendLogKey);
-            if (!hasLegacyFriendLog && legacyDb && (primaryMerged.length < limit || Boolean(beforeCreatedAt))) {
+            if (!hasLegacyFriendLog && legacyDb && (primaryMerged.length < limit || hasDateBound)) {
                 const [fallbackRes, fallbackChunks] = await Promise.all([
                     buildFriendLogSelect(legacyDb, true),
                     readFriendLogChunks(legacyDb, 'legacy_core_chunks', true)
@@ -2376,13 +2431,37 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
         if (request.method === 'GET') {
             const version = url.searchParams.get('v') === '2' ? 2 : 1;
             const limit = clampQueryLimit(url.searchParams.get('limit'), 100, 200);
+            const dateFrom = (url.searchParams.get('dateFrom') ?? '').trim();
+            const dateTo = (url.searchParams.get('dateTo') ?? '').trim();
             const beforeCreatedAt = (url.searchParams.get('beforeCreatedAt') ?? '').trim();
             const beforeInclusiveRaw = (url.searchParams.get('beforeInclusive') ?? '').trim().toLowerCase();
             const beforeInclusive = beforeInclusiveRaw === '1' || beforeInclusiveRaw === 'true';
-            const upperOp = beforeInclusive ? '<=' : '<';
-            const matchesBefore = (createdAt: string): boolean => {
-                if (!beforeCreatedAt) return true;
-                return beforeInclusive ? createdAt <= beforeCreatedAt : createdAt < beforeCreatedAt;
+            let upperValue = '';
+            let upperInclusive = true;
+            if (dateTo && beforeCreatedAt) {
+                if (beforeCreatedAt < dateTo) {
+                    upperValue = beforeCreatedAt;
+                    upperInclusive = beforeInclusive;
+                } else if (dateTo < beforeCreatedAt) {
+                    upperValue = dateTo;
+                    upperInclusive = true;
+                } else {
+                    upperValue = beforeCreatedAt;
+                    upperInclusive = beforeInclusive;
+                }
+            } else if (beforeCreatedAt) {
+                upperValue = beforeCreatedAt;
+                upperInclusive = beforeInclusive;
+            } else if (dateTo) {
+                upperValue = dateTo;
+                upperInclusive = true;
+            }
+            const upperOp = upperInclusive ? '<=' : '<';
+            const hasDateBound = Boolean(dateFrom || upperValue);
+            const matchesBounds = (createdAt: string): boolean => {
+                if (dateFrom && createdAt < dateFrom) return false;
+                if (upperValue && (upperInclusive ? createdAt > upperValue : createdAt >= upperValue)) return false;
+                return true;
             };
             const table = version === 2 ? 'notifications_v2' : 'notifications';
             const coreKind = version === 2 ? 'notif_v2' : 'notif_v1';
@@ -2390,15 +2469,20 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
             const legacyStats = legacyDb ? await getLegacyImportedStats(env) : null;
             const hasLegacyNotif = Boolean(legacyDb && (legacyStats?.notifications ?? 0) > 0);
             const buildNotifSelect = (db: D1Database) => {
-                if (beforeCreatedAt) {
-                    return db
-                        .prepare(`SELECT * FROM ${table} WHERE created_at ${upperOp} ? ORDER BY created_at DESC LIMIT ?`)
-                        .bind(beforeCreatedAt, limit)
-                        .all<Record<string, unknown>>();
+                const conds: string[] = [];
+                const binds: unknown[] = [];
+                if (dateFrom) {
+                    conds.push('created_at >= ?');
+                    binds.push(dateFrom);
                 }
+                if (upperValue) {
+                    conds.push(`created_at ${upperOp} ?`);
+                    binds.push(upperValue);
+                }
+                const whereSql = conds.length > 0 ? `WHERE ${conds.join(' AND ')}` : '';
                 return db
-                    .prepare(`SELECT * FROM ${table} ORDER BY created_at DESC LIMIT ?`)
-                    .bind(limit)
+                    .prepare(`SELECT * FROM ${table} ${whereSql} ORDER BY created_at DESC LIMIT ?`)
+                    .bind(...binds, limit)
                     .all<Record<string, unknown>>();
             };
             const readNotifChunks = async (
@@ -2407,38 +2491,61 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
                 negateRowIds: boolean
             ): Promise<Array<Record<string, unknown>>> => {
                 try {
-                    const stmts: D1PreparedStatement[] = beforeCreatedAt
-                        ? [
-                              db
-                                  .prepare(
-                                      `SELECT id, max_created_at, payload_json
-                                       FROM ${archiveTable}
-                                       WHERE core_kind = ? AND max_created_at <= ?
-                                       ORDER BY max_created_at DESC, id DESC
-                                       LIMIT 8`
-                                  )
-                                  .bind(coreKind, beforeCreatedAt),
-                              db
-                                  .prepare(
-                                      `SELECT id, max_created_at, payload_json
-                                       FROM ${archiveTable}
-                                       WHERE core_kind = ? AND min_created_at <= ? AND max_created_at > ?
-                                       ORDER BY max_created_at DESC, id DESC
-                                       LIMIT 2`
-                                  )
-                                  .bind(coreKind, beforeCreatedAt, beforeCreatedAt)
-                          ]
-                        : [
-                              db
-                                  .prepare(
-                                      `SELECT id, max_created_at, payload_json
-                                       FROM ${archiveTable}
-                                       WHERE core_kind = ?
-                                       ORDER BY max_created_at DESC, id DESC
-                                       LIMIT 8`
-                                  )
-                                  .bind(coreKind)
-                          ];
+                    const stmts: D1PreparedStatement[] = [];
+                    if (upperValue) {
+                        const olderConds = ['core_kind = ?', 'max_created_at <= ?'];
+                        const olderBinds: unknown[] = [coreKind, upperValue];
+                        if (dateFrom) {
+                            olderConds.push('max_created_at >= ?');
+                            olderBinds.push(dateFrom);
+                        }
+                        stmts.push(
+                            db
+                                .prepare(
+                                    `SELECT id, max_created_at, payload_json
+                                     FROM ${archiveTable}
+                                     WHERE ${olderConds.join(' AND ')}
+                                     ORDER BY max_created_at DESC, id DESC
+                                     LIMIT 8`
+                                )
+                                .bind(...olderBinds)
+                        );
+                        const straddleConds = ['core_kind = ?', 'min_created_at <= ?', 'max_created_at > ?'];
+                        const straddleBinds: unknown[] = [coreKind, upperValue, upperValue];
+                        if (dateFrom) {
+                            straddleConds.push('max_created_at >= ?');
+                            straddleBinds.push(dateFrom);
+                        }
+                        stmts.push(
+                            db
+                                .prepare(
+                                    `SELECT id, max_created_at, payload_json
+                                     FROM ${archiveTable}
+                                     WHERE ${straddleConds.join(' AND ')}
+                                     ORDER BY max_created_at ASC, id ASC
+                                     LIMIT 2`
+                                )
+                                .bind(...straddleBinds)
+                        );
+                    } else {
+                        const conds = ['core_kind = ?'];
+                        const binds: unknown[] = [coreKind];
+                        if (dateFrom) {
+                            conds.push('max_created_at >= ?');
+                            binds.push(dateFrom);
+                        }
+                        stmts.push(
+                            db
+                                .prepare(
+                                    `SELECT id, max_created_at, payload_json
+                                     FROM ${archiveTable}
+                                     WHERE ${conds.join(' AND ')}
+                                     ORDER BY max_created_at DESC, id DESC
+                                     LIMIT 8`
+                                )
+                                .bind(...binds)
+                        );
+                    }
                     const batchRes = (await db.batch(stmts)) as D1Result<{
                         id: number;
                         max_created_at: string;
@@ -2469,7 +2576,7 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
                         }
                         const unpacked = decodeCoreChunkRows(c.id, coreKind, c.payload_json, { negateRowIds });
                         for (const entry of unpacked) {
-                            if (!matchesBefore(String(entry.created_at ?? ''))) continue;
+                            if (!matchesBounds(String(entry.created_at ?? ''))) continue;
                             out.push(entry);
                         }
                     }
@@ -2490,7 +2597,7 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
             let legacyRows: Array<Record<string, unknown>> = [...(legacyRes?.results ?? [])];
             let finalLegacyArchiveRows = legacyArchiveRows;
             const primaryMerged = mergePrimaryAndLegacy(primaryRows, activeArchiveRows, (r) => String(r.id ?? ''));
-            if (!hasLegacyNotif && legacyDb && (primaryMerged.length < limit || Boolean(beforeCreatedAt))) {
+            if (!hasLegacyNotif && legacyDb && (primaryMerged.length < limit || hasDateBound)) {
                 const [fallbackRes, fallbackChunks] = await Promise.all([
                     buildNotifSelect(legacyDb),
                     readNotifChunks(legacyDb, 'legacy_core_chunks', true)

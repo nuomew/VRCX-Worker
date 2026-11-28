@@ -16,6 +16,7 @@ import { handleCoreDataRoutes } from './routes/coreData';
 import { handleDbCleanupRoutes } from './routes/dbCleanup';
 import { handleEventsDataRoutes } from './routes/eventsData';
 import { handleExternalMysqlRoutes } from './routes/externalMysqlRoutes';
+import { handleHistoryDatesRoutes } from './routes/historyDates';
 import { handleLegacyMigrationAgentRoutes, handleLegacyMigrationWebRoutes } from './routes/legacyMigration';
 import { handleStorageRoutes } from './routes/storageRoutes';
 import { handleVrcProxyRoutes } from './routes/vrcProxy';
@@ -254,6 +255,9 @@ export default {
 
                 const eventsResp = await handleEventsDataRoutes(request, activeEnv, url);
                 if (eventsResp) return eventsResp;
+
+                const historyDatesResp = await handleHistoryDatesRoutes(request, activeEnv, url);
+                if (historyDatesResp) return historyDatesResp;
 
                 const agentWebResp = await handleAgentWebRoutes(request, activeEnv, url);
                 if (agentWebResp) return agentWebResp;

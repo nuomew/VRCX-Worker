@@ -2,14 +2,15 @@
     <div class="x-container x-container--auto-height" ref="notificationsRef">
         <DataTableLayout
             :table="table"
-            :loading="isNotificationsLoading"
+            :loading="isNotificationsLoading || notificationTable.loading"
             auto-height
             :page-sizes="pageSizes"
             :total-items="totalItems"
             :on-page-size-change="handlePageSizeChange"
             :can-load-more="notificationTable.hasMore"
             :loading-more="notificationTable.loadingMore"
-            :on-load-more="loadMoreNotifications">
+            :on-load-more="loadMoreNotifications"
+            :history-date-nav="notificationDateNav">
             <template #toolbar>
                 <div class="mb-2 flex justify-between items-center gap-2">
                     <Select
@@ -121,8 +122,10 @@
 
     const { refreshInviteMessageTableData } = useInviteStore();
     const { clearInviteImageUpload } = useGalleryStore();
-    const { notificationTable, isNotificationsLoading } = storeToRefs(useNotificationStore());
+    const notificationStore = useNotificationStore();
+    const { notificationTable, isNotificationsLoading } = storeToRefs(notificationStore);
     const {
+        notificationDateNav,
         refreshNotifications,
         loadMoreNotifications,
         acceptFriendRequestNotification,
@@ -134,7 +137,7 @@
         deleteNotificationLogPrompt,
         openNotificationLink,
         markAllAsSeen
-    } = useNotificationStore();
+    } = notificationStore;
     const { showFullscreenImageDialog } = useGalleryStore();
     const appearanceSettingsStore = useAppearanceSettingsStore();
     const vrcxStore = useVrcxStore();

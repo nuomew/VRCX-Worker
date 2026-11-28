@@ -9,7 +9,8 @@
             :on-page-size-change="handlePageSizeChange"
             :can-load-more="friendLogTable.hasMore"
             :loading-more="friendLogTable.loadingMore"
-            :on-load-more="loadMoreFriendLogHistory">
+            :on-load-more="loadMoreFriendLogHistory"
+            :history-date-nav="friendLogDateNav">
             <template #toolbar>
                 <div class="mt-0 mx-0 mb-2" style="display: flex; align-items: center">
                     <Select
@@ -81,7 +82,7 @@
     const { hideUnfriends } = storeToRefs(appearanceSettingsStore);
     const friendStore = useFriendStore();
     const { friendLogTable } = storeToRefs(friendStore);
-    const { loadMoreFriendLogHistory } = friendStore;
+    const { loadMoreFriendLogHistory, friendLogDateNav } = friendStore;
 
     const friendLogRef = ref(null);
 

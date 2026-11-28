@@ -11228,4 +11228,169 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
         ]);
         expect(afterCoolRes.inserted).toBe(1);
     });
+
+    it('returns recorded history months/days via /api/history/dates with timezone awareness and filters friend-log & notifications by date range', async () => {
+        const headers = { 'Content-Type': 'application/json', Origin: 'http://example.com' };
+
+        // Seed multi-month active + legacy data across feed, gamelog, friendlog, notifications
+        await exports.default.fetch('http://example.com/api/feed', {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({
+                items: [
+                    // 2025-05-01T17:30Z -> UTC+8 (tzOffsetMinutes=-480) local day is 2025-05-02
+                    {
+                        type: 'GPS',
+                        created_at: '2025-05-01T17:30:00.000Z',
+                        userId: 'usr_hd_1',
+                        displayName: 'DateUser1',
+                        location: 'wrld_hd_1:1',
+                        worldName: 'Date World 1'
+                    },
+                    // 2025-05-10T08:00Z -> UTC+8 local day is 2025-05-10
+                    {
+                        type: 'GPS',
+                        created_at: '2025-05-10T08:00:00.000Z',
+                        userId: 'usr_hd_1',
+                        displayName: 'DateUser1',
+                        location: 'wrld_hd_2:1',
+                        worldName: 'Date World 2'
+                    },
+                    // 2025-05-20T09:00Z -> UTC+8 local day is 2025-05-20
+                    {
+                        type: 'GPS',
+                        created_at: '2025-05-20T09:00:00.000Z',
+                        userId: 'usr_hd_1',
+                        displayName: 'DateUser1',
+                        location: 'wrld_hd_3:1',
+                        worldName: 'Date World 3'
+                    }
+                ]
+            })
+        });
+
+        // Seed an older legacy feed chunk in 2024-06 spanning 3 non-adjacent days (06-03, 06-11, 06-25)
+        await env.DB_LEGACY!.prepare(
+            `INSERT INTO legacy_feed_chunks (chunk_key, feed_kind, min_created_at, max_created_at, row_count, payload_json)
+             VALUES (?, 'gps', ?, ?, 3, ?)`
+        )
+            .bind(
+                'legacy_hist_dates_202406',
+                '2024-06-03T04:00:00.000Z',
+                '2024-06-25T04:00:00.000Z',
+                JSON.stringify([
+                    ['2024-06-03T04:00:00.000Z', 'usr_old', 'OldUser', 'wrld_old:1', 'OldWorld', '', 0, ''],
+                    ['2024-06-11T04:00:00.000Z', 'usr_old', 'OldUser', 'wrld_old:2', 'OldWorld', '', 0, ''],
+                    ['2024-06-25T04:00:00.000Z', 'usr_old', 'OldUser', 'wrld_old:3', 'OldWorld', '', 0, '']
+                ])
+            )
+            .run();
+
+        // 1. Overview query for feed (UTC+8)
+        const feedOverviewRes = await exports.default.fetch(
+            'http://example.com/api/history/dates?scope=feed&tzOffsetMinutes=-480'
+        );
+        expect(feedOverviewRes.status).toBe(200);
+        const feedOverview = (await feedOverviewRes.json()) as {
+            ok: boolean;
+            data: {
+                months: Array<{ month: string; approxRows: number }>;
+                activeMonth: string;
+                days: string[];
+                latestDay: string;
+            };
+        };
+        expect(feedOverview.ok).toBe(true);
+        const feedMonthKeys = feedOverview.data.months.map((m) => m.month);
+        expect(feedMonthKeys).toContain('2025-05');
+        expect(feedMonthKeys).toContain('2024-06');
+
+        // 2. Month drill-down for 2025-05 (UTC+8) verifies timezone shift (05-01T17:30Z -> 2025-05-02)
+        const mayRes = await exports.default.fetch(
+            'http://example.com/api/history/dates?scope=feed&tzOffsetMinutes=-480&month=2025-05'
+        );
+        expect(mayRes.status).toBe(200);
+        const mayJson = (await mayRes.json()) as { ok: boolean; data: { days: string[] } };
+        expect(mayJson.data.days).toContain('2025-05-02');
+        expect(mayJson.data.days).toContain('2025-05-10');
+        expect(mayJson.data.days).toContain('2025-05-20');
+        expect(mayJson.data.days).not.toContain('2025-05-01');
+        expect(mayJson.data.days).not.toContain('2025-05-15');
+
+        // 3. Month drill-down for legacy 2024-06 unpacks interior spanning chunk day 2024-06-11 cleanly
+        const juneRes = await exports.default.fetch(
+            'http://example.com/api/history/dates?scope=feed&tzOffsetMinutes=-480&month=2024-06'
+        );
+        expect(juneRes.status).toBe(200);
+        const juneJson = (await juneRes.json()) as { ok: boolean; data: { days: string[] } };
+        expect(juneJson.data.days).toEqual(['2024-06-03', '2024-06-11', '2024-06-25']);
+
+        // 4. FriendLog & Notifications dateFrom/dateTo filtering + /api/history/dates coverage
+        await exports.default.fetch('http://example.com/api/friend-log/history', {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({
+                entries: [
+                    {
+                        created_at: '2024-08-05T10:00:00.000Z',
+                        type: 'Friend',
+                        user_id: 'usr_fl_a',
+                        display_name: 'FriendAug'
+                    },
+                    {
+                        created_at: '2024-09-12T10:00:00.000Z',
+                        type: 'Friend',
+                        user_id: 'usr_fl_b',
+                        display_name: 'FriendSep'
+                    }
+                ]
+            })
+        });
+        const flFilteredRes = await exports.default.fetch(
+            'http://example.com/api/friend-log/history?dateFrom=2024-08-05T00:00:00.000Z&dateTo=2024-08-05T23:59:59.999Z&limit=50'
+        );
+        expect(flFilteredRes.status).toBe(200);
+        const flFilteredJson = (await flFilteredRes.json()) as { ok: boolean; data: Array<{ display_name: string }> };
+        expect(flFilteredJson.data.map((r) => r.display_name)).toEqual(['FriendAug']);
+
+        await exports.default.fetch('http://example.com/api/notifications', {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({
+                version: 1,
+                entries: [
+                    {
+                        id: 'not_hd_aug',
+                        created_at: '2024-08-06T12:00:00.000Z',
+                        type: 'invite',
+                        senderUserId: 'usr_n1',
+                        senderUsername: 'NotifAug'
+                    },
+                    {
+                        id: 'not_hd_sep',
+                        created_at: '2024-09-14T12:00:00.000Z',
+                        type: 'invite',
+                        senderUserId: 'usr_n2',
+                        senderUsername: 'NotifSep'
+                    }
+                ]
+            })
+        });
+        const notifFilteredRes = await exports.default.fetch(
+            'http://example.com/api/notifications?v=1&dateFrom=2024-08-06T00:00:00.000Z&dateTo=2024-08-06T23:59:59.999Z&limit=50'
+        );
+        expect(notifFilteredRes.status).toBe(200);
+        const notifFilteredJson = (await notifFilteredRes.json()) as { ok: boolean; data: Array<{ id: string }> };
+        expect(notifFilteredJson.data.map((r) => r.id)).toEqual(['not_hd_aug']);
+
+        const notifDatesRes = await exports.default.fetch(
+            'http://example.com/api/history/dates?scope=notifications&tzOffsetMinutes=0&month=2024-08'
+        );
+        expect(notifDatesRes.status).toBe(200);
+        const notifDatesJson = (await notifDatesRes.json()) as { ok: boolean; data: { days: string[] } };
+        expect(notifDatesJson.data.days).toContain('2024-08-06');
+
+        const badScopeRes = await exports.default.fetch('http://example.com/api/history/dates?scope=unknown');
+        expect(badScopeRes.status).toBe(400);
+    });
 });

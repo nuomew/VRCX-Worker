@@ -42,7 +42,8 @@
                 :on-page-size-change="handlePageSizeChange"
                 :can-load-more="gameLogTable.hasMore"
                 :loading-more="gameLogTable.loadingMore"
-                :on-load-more="loadMoreGameLogHistory">
+                :on-load-more="loadMoreGameLogHistory"
+                :history-date-nav="gameLogDateNav">
                 <template #toolbar>
                     <div class="mt-0 mx-0 mb-2" style="display: flex; align-items: center">
                         <div class="mr-2" style="flex: none; display: flex; align-items: center">
@@ -151,8 +152,9 @@
     import { useVrcxVueTable } from '../../lib/table/useVrcxVueTable';
     import GameLogSessions from './components/GameLogSessions.vue';
 
-    const { gameLogTableLookup, loadMoreGameLogHistory, setSessionsViewMode } = useGameLogStore();
-    const { gameLogTable, gameLogTableData, sessionsViewMode } = storeToRefs(useGameLogStore());
+    const gameLogStore = useGameLogStore();
+    const { gameLogTableLookup, loadMoreGameLogHistory, setSessionsViewMode, gameLogDateNav } = gameLogStore;
+    const { gameLogTable, gameLogTableData, sessionsViewMode } = storeToRefs(gameLogStore);
     const appearanceSettingsStore = useAppearanceSettingsStore();
     const vrcxStore = useVrcxStore();
     const modalStore = useModalStore();

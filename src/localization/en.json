@@ -3538,7 +3538,18 @@
             "last": "Last",
             "more_pages": "More pages",
             "load_more": "Load older",
-            "loading_more": "Loading..."
+            "loading_more": "Loading...",
+            "date_mode_day": "Day",
+            "date_mode_month": "Month",
+            "date_prev": "Previous recorded date",
+            "date_next": "Next recorded date",
+            "date_select": "Select recorded date",
+            "date_latest": "Latest",
+            "date_recorded_months": "Recorded months",
+            "date_month_days_count": "{count} recorded days",
+            "date_no_records_month": "No records in this month",
+            "date_no_records": "No recorded dates",
+            "date_loading": "Loading dates..."
         },
         "feed": {
             "date": "Date",

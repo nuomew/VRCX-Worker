@@ -33,6 +33,7 @@ import {
     getUserIdFromNoty as getUserIdFromNotyBase,
     toNotificationText
 } from '../../shared/utils/notificationMessage';
+import { createHistoryDateController } from '../../composables/useHistoryDateNavigation';
 import { database, dbVars } from '../../services/database';
 import { getNotificationCategory, getNotificationTs } from '../../shared/utils/notificationCategory';
 import { AppDebug } from '../../services/appConfig';
@@ -74,12 +75,16 @@ export const useNotificationStore = defineStore('Notification', () => {
     const instanceStore = useInstanceStore();
     const modalStore = useModalStore();
 
-    const NOTIFICATION_CLOUD_PAGE_BATCH = 150;
+    const NOTIFICATION_CLOUD_PAGE_BATCH = 200;
     const NOTIFICATION_CLOUD_MAX_REQUEST_LIMIT = 200;
+    const NOTIFICATION_DAY_AUTO_MAX_BATCHES = 5;
 
     const notificationInitStatus = ref(false);
     const notificationTable = ref({
         data: [],
+        dateFrom: '',
+        dateTo: '',
+        loading: false,
         loadingMore: false,
         hasMore: false,
         historyExpanded: false,
@@ -102,6 +107,12 @@ export const useNotificationStore = defineStore('Notification', () => {
     let notifHasMoreV1 = false;
     let notifHasMoreV2 = false;
     let notifLoadEpoch = 0;
+
+    const notificationDateNav = createHistoryDateController('notifications', async ({ dateFrom, dateTo }) => {
+        notificationTable.value.dateFrom = dateFrom;
+        notificationTable.value.dateTo = dateTo;
+        await loadNotificationsForDateRange({ refreshLive: false });
+    });
     const unseenNotifications = ref([]);
     const isNotificationsLoading = ref(false);
     const isNotificationCenterOpen = ref(false);
@@ -158,8 +169,16 @@ export const useNotificationStore = defineStore('Notification', () => {
     watch(
         () => watchState.isLoggedIn,
         (isLoggedIn) => {
+            notifLoadEpoch++;
             isNotificationsLoading.value = false;
             notificationTable.value.data = [];
+            notificationTable.value.dateFrom = '';
+            notificationTable.value.dateTo = '';
+            notificationTable.value.loading = false;
+            notificationTable.value.loadingMore = false;
+            notificationTable.value.hasMore = false;
+            notificationTable.value.historyExpanded = false;
+            notificationDateNav.reset();
             inventoryBundleDialog.value.visible = false;
             freeStoreItemDialog.value.visible = false;
             if (isLoggedIn) {
@@ -247,7 +266,17 @@ export const useNotificationStore = defineStore('Notification', () => {
                 uiStore.notifyMenu('notification');
             }
         }
-        notificationTable.value.data.push(ref);
+        const refCreatedAt = String(ref?.created_at || ref?.createdAt || '');
+        if (refCreatedAt) {
+            notificationDateNav.registerRecordedTimestamp(refCreatedAt);
+        }
+        const { dateFrom, dateTo } = notificationTable.value;
+        const outsideSelectedDate =
+            Boolean(dateFrom && refCreatedAt && refCreatedAt < dateFrom) ||
+            Boolean(dateTo && refCreatedAt && refCreatedAt > dateTo);
+        if (!outsideSelectedDate) {
+            notificationTable.value.data.push(ref);
+        }
         const D = userStore.userDialog;
         if (D.visible === false || ref.type !== 'friendRequest' || ref.senderUserId !== D.id) {
             return;
@@ -624,7 +653,17 @@ export const useNotificationStore = defineStore('Notification', () => {
             uiStore.notifyMenu('notification');
         }
         database.addNotificationV2ToDatabase(ref);
-        notificationTable.value.data.push(ref);
+        const refCreatedAt = String(ref?.created_at || ref?.createdAt || '');
+        if (refCreatedAt) {
+            notificationDateNav.registerRecordedTimestamp(refCreatedAt);
+        }
+        const { dateFrom, dateTo } = notificationTable.value;
+        const outsideSelectedDate =
+            Boolean(dateFrom && refCreatedAt && refCreatedAt < dateFrom) ||
+            Boolean(dateTo && refCreatedAt && refCreatedAt > dateTo);
+        if (!outsideSelectedDate) {
+            notificationTable.value.data.push(ref);
+        }
         queueNotificationNoty(ref);
         sharedFeedStore.addEntry(ref);
     }
@@ -1141,24 +1180,48 @@ export const useNotificationStore = defineStore('Notification', () => {
         }
     }
 
-    async function initNotifications() {
+    async function loadNotificationsForDateRange({ refreshLive = false } = {}) {
         const epoch = ++notifLoadEpoch;
-        notificationInitStatus.value = false;
+        if (refreshLive) {
+            notificationInitStatus.value = false;
+        }
+        notificationTable.value.loading = true;
         notificationTable.value.loadingMore = false;
         notificationTable.value.historyExpanded = false;
         notifHasMoreV1 = false;
         notifHasMoreV2 = false;
+        const getNotifCreatedAt = (row) => String(row?.created_at || row?.createdAt || '').trim();
         try {
             const supportsCursor = Boolean(database.supportsHistoryCursorPagination);
+            const supportsDateNav = Boolean(notificationDateNav.enabled.value);
+            if (supportsDateNav && refreshLive) {
+                const bounds = await notificationDateNav.ensureInitialized();
+                if (epoch !== notifLoadEpoch) return;
+                if (bounds) {
+                    notificationTable.value.dateFrom = bounds.dateFrom;
+                    notificationTable.value.dateTo = bounds.dateTo;
+                }
+            }
+            const { dateFrom, dateTo } = notificationTable.value;
             const [v2Rows, v1Rows] = await Promise.all([
                 Promise.resolve(
                     supportsCursor
-                        ? database.getNotificationsV2({ limit: NOTIFICATION_CLOUD_PAGE_BATCH })
+                        ? database.getNotificationsV2({
+                              limit: NOTIFICATION_CLOUD_PAGE_BATCH,
+                              dateFrom,
+                              dateTo,
+                              throwOnError: true
+                          })
                         : database.getNotificationsV2()
                 ).catch(() => []),
                 Promise.resolve(
                     supportsCursor
-                        ? database.getNotifications({ limit: NOTIFICATION_CLOUD_PAGE_BATCH })
+                        ? database.getNotifications({
+                              limit: NOTIFICATION_CLOUD_PAGE_BATCH,
+                              dateFrom,
+                              dateTo,
+                              throwOnError: true
+                          })
                         : database.getNotifications()
                 ).catch(() => [])
             ]);
@@ -1167,24 +1230,113 @@ export const useNotificationStore = defineStore('Notification', () => {
             const listV1 = Array.isArray(v1Rows) ? v1Rows : [];
             let tableData = [...listV2];
             tableData = tableData.concat(listV1.filter((n) => !tableData.some((t) => t.id === n.id)));
+            notifHasMoreV2 = supportsCursor && listV2.length >= NOTIFICATION_CLOUD_PAGE_BATCH;
+            notifHasMoreV1 = supportsCursor && listV1.length >= NOTIFICATION_CLOUD_PAGE_BATCH;
+
+            if (
+                (notifHasMoreV1 || notifHasMoreV2) &&
+                supportsDateNav &&
+                notificationDateNav.mode.value === 'day' &&
+                dateFrom &&
+                dateTo
+            ) {
+                const existingIds = new Set(tableData.map((r) => String(r?.id ?? '')));
+                for (let batch = 1; batch < NOTIFICATION_DAY_AUTO_MAX_BATCHES && (notifHasMoreV1 || notifHasMoreV2); batch++) {
+                    let oldest = '';
+                    for (const row of tableData) {
+                        const ts = getNotifCreatedAt(row);
+                        if (ts && (!oldest || ts < oldest)) oldest = ts;
+                    }
+                    if (!oldest || oldest <= dateFrom) {
+                        notifHasMoreV1 = false;
+                        notifHasMoreV2 = false;
+                        break;
+                    }
+                    let sameTsCount = 0;
+                    for (const row of tableData) {
+                        if (getNotifCreatedAt(row) === oldest) sameTsCount++;
+                    }
+                    const reqLimit = Math.min(
+                        NOTIFICATION_CLOUD_MAX_REQUEST_LIMIT,
+                        NOTIFICATION_CLOUD_PAGE_BATCH + Math.min(sameTsCount, 50)
+                    );
+                    const [v2Next, v1Next] = await Promise.all([
+                        notifHasMoreV2
+                            ? Promise.resolve(
+                                  database.getNotificationsV2({
+                                      limit: reqLimit,
+                                      dateFrom,
+                                      dateTo,
+                                      beforeCreatedAt: oldest,
+                                      beforeInclusive: true,
+                                      throwOnError: true
+                                  })
+                              )
+                            : Promise.resolve([]),
+                        notifHasMoreV1
+                            ? Promise.resolve(
+                                  database.getNotifications({
+                                      limit: reqLimit,
+                                      dateFrom,
+                                      dateTo,
+                                      beforeCreatedAt: oldest,
+                                      beforeInclusive: true,
+                                      throwOnError: true
+                                  })
+                              )
+                            : Promise.resolve([])
+                    ]);
+                    if (epoch !== notifLoadEpoch) return;
+                    const n2 = Array.isArray(v2Next) ? v2Next : [];
+                    const n1 = Array.isArray(v1Next) ? v1Next : [];
+                    let added = 0;
+                    for (const row of [...n2, ...n1]) {
+                        const key = String(row?.id ?? '');
+                        if (key && existingIds.has(key)) continue;
+                        if (key) existingIds.add(key);
+                        tableData.push(row);
+                        added++;
+                    }
+                    notifHasMoreV2 = notifHasMoreV2 && n2.length >= reqLimit;
+                    notifHasMoreV1 = notifHasMoreV1 && n1.length >= reqLimit;
+                    if (added === 0) {
+                        notifHasMoreV1 = false;
+                        notifHasMoreV2 = false;
+                        break;
+                    }
+                }
+            }
+
             tableData.sort(
                 (a, b) => Date.parse(b.created_at || b.createdAt || '') - Date.parse(a.created_at || a.createdAt || '')
             );
-            tableData.splice(dbVars.maxTableSize);
+            if (!supportsDateNav) {
+                tableData.splice(dbVars.maxTableSize);
+            }
             notificationTable.value.data = tableData;
-            notifHasMoreV2 = supportsCursor && listV2.length >= NOTIFICATION_CLOUD_PAGE_BATCH;
-            notifHasMoreV1 = supportsCursor && listV1.length >= NOTIFICATION_CLOUD_PAGE_BATCH;
+            notificationTable.value.historyExpanded = Boolean(supportsDateNav && (dateFrom || dateTo));
             notificationTable.value.hasMore = notifHasMoreV1 || notifHasMoreV2;
         } catch (err) {
             console.error('Failed to hydrate notifications from database:', err);
+        } finally {
+            if (epoch === notifLoadEpoch) {
+                notificationTable.value.loading = false;
+            }
         }
-        refreshNotifications();
+        if (refreshLive) {
+            refreshNotifications();
+        }
+    }
+
+    async function initNotifications() {
+        await loadNotificationsForDateRange({ refreshLive: true });
     }
 
     async function loadMoreNotifications() {
         if (
             !database.supportsHistoryCursorPagination ||
             isNotificationsLoading.value ||
+            notificationTable.value.loading ||
             notificationTable.value.loadingMore ||
             !notificationTable.value.hasMore
         ) {
@@ -1208,6 +1360,7 @@ export const useNotificationStore = defineStore('Notification', () => {
         const epoch = notifLoadEpoch;
         notificationTable.value.loadingMore = true;
         try {
+            const { dateFrom, dateTo } = notificationTable.value;
             const existingIds = new Set(notificationTable.value.data.map((r) => String(r?.id ?? '')));
             const requestLimit = Math.min(
                 NOTIFICATION_CLOUD_MAX_REQUEST_LIMIT,
@@ -1218,6 +1371,8 @@ export const useNotificationStore = defineStore('Notification', () => {
                     ? Promise.resolve(
                           database.getNotificationsV2({
                               limit: requestLimit,
+                              dateFrom,
+                              dateTo,
                               beforeCreatedAt: oldest,
                               beforeInclusive: true,
                               throwOnError: true
@@ -1228,6 +1383,8 @@ export const useNotificationStore = defineStore('Notification', () => {
                     ? Promise.resolve(
                           database.getNotifications({
                               limit: requestLimit,
+                              dateFrom,
+                              dateTo,
                               beforeCreatedAt: oldest,
                               beforeInclusive: true,
                               throwOnError: true
@@ -1256,6 +1413,8 @@ export const useNotificationStore = defineStore('Notification', () => {
                         ? Promise.resolve(
                               database.getNotificationsV2({
                                   limit: NOTIFICATION_CLOUD_PAGE_BATCH,
+                                  dateFrom,
+                                  dateTo,
                                   beforeCreatedAt: oldest,
                                   beforeInclusive: false,
                                   throwOnError: true
@@ -1266,6 +1425,8 @@ export const useNotificationStore = defineStore('Notification', () => {
                         ? Promise.resolve(
                               database.getNotifications({
                                   limit: NOTIFICATION_CLOUD_PAGE_BATCH,
+                                  dateFrom,
+                                  dateTo,
                                   beforeCreatedAt: oldest,
                                   beforeInclusive: false,
                                   throwOnError: true
@@ -1683,6 +1844,7 @@ export const useNotificationStore = defineStore('Notification', () => {
     return {
         notificationInitStatus,
         notificationTable,
+        notificationDateNav,
         unseenNotifications,
         isNotificationsLoading,
         inventoryBundleDialog,

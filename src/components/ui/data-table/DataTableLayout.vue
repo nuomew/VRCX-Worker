@@ -316,8 +316,12 @@
                 </PaginationContent>
             </Pagination>
             <div class="dt-pagination-spacer flex-1 flex items-center justify-start">
+                <HistoryDateNavigator
+                    v-if="historyDateNav?.enabled?.value"
+                    :nav="historyDateNav"
+                    :disabled="loading || loadingMore" />
                 <Button
-                    v-if="onLoadMore && (canLoadMore || loadingMore)"
+                    v-else-if="onLoadMore && (canLoadMore || loadingMore)"
                     type="button"
                     variant="outline"
                     size="sm"
@@ -371,6 +375,7 @@
     } from './dataTableHelpers.js';
 
     import DataTableEmpty from './DataTableEmpty.vue';
+    import HistoryDateNavigator from './HistoryDateNavigator.vue';
     import SortableTableHead from './SortableTableHead.vue';
 
     const appearanceSettingsStore = useAppearanceSettingsStore();
@@ -447,6 +452,10 @@
         },
         onLoadMore: {
             type: Function,
+            default: null
+        },
+        historyDateNav: {
+            type: Object,
             default: null
         }
     });
@@ -709,6 +718,21 @@
             const pageIndex = props.table.atoms?.pagination?.get()?.pageIndex ?? 0;
             if (pageIndex >= tablePageCount) {
                 props.table.setPageIndex(tablePageCount - 1);
+            }
+        }
+    );
+
+    watch(
+        () => [
+            props.historyDateNav?.mode?.value,
+            props.historyDateNav?.selectedDate?.value,
+            props.historyDateNav?.selectedMonth?.value
+        ],
+        ([mode, day, month], [prevMode, prevDay, prevMonth]) => {
+            if (!props.historyDateNav?.enabled?.value) return;
+            if (!prevDay && !prevMonth) return;
+            if (mode !== prevMode || day !== prevDay || month !== prevMonth) {
+                props.table?.setPageIndex?.(0);
             }
         }
     );

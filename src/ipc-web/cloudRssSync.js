@@ -162,17 +162,22 @@ export function applyCloudRssSnapshot(data, storeOverrides = null) {
                 });
             }
         }
-        if (feedStore.feedTable?.historyExpanded && typeof feedStore.mergeRecentFeeds === 'function') {
+        const keepCurrentFeedView = Boolean(
+            feedStore.feedTable?.historyExpanded || feedStore.feedTable?.dateFrom || feedStore.feedTable?.dateTo
+        );
+        if (keepCurrentFeedView && typeof feedStore.mergeRecentFeeds === 'function') {
             feedStore.mergeRecentFeeds(data.recentFeeds);
         } else {
             feedStore.feedTableLookup();
         }
     }
     if (Number(data.friendLogInserted || 0) > 0) {
-        if (
-            friendStore.friendLogTable?.historyExpanded &&
-            typeof friendStore.refreshRecentFriendLogHistory === 'function'
-        ) {
+        const keepCurrentFriendLogView = Boolean(
+            friendStore.friendLogTable?.historyExpanded ||
+                friendStore.friendLogTable?.dateFrom ||
+                friendStore.friendLogTable?.dateTo
+        );
+        if (keepCurrentFriendLogView && typeof friendStore.refreshRecentFriendLogHistory === 'function') {
             friendStore.refreshRecentFriendLogHistory();
         } else if (typeof friendStore.initFriendLogHistoryTable === 'function') {
             friendStore.initFriendLogHistoryTable();

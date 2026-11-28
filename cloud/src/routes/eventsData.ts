@@ -155,23 +155,26 @@ async function fetchBoundedArchiveChunks(
                 .bind(...olderBinds, perKindLimit)
         );
 
-        // 2) Chunks straddling the cursor boundary (min_created_at <= upperBound AND max_created_at > upperBound)
+        // 2) Chunks straddling the cursor boundary (min_created_at <= upperBound AND max_created_at > upperBound).
+        // Order by `max_created_at ASC` so the chunk closest to `upperBound` is always selected first and a wide-span
+        // chunk ending much later can never shadow older historical days.
         const straddleConds = [`${kindColumn} = ?`, 'min_created_at <= ?', 'max_created_at > ?'];
         const straddleBinds: unknown[] = [kind, upperBound.value, upperBound.value];
         if (dateFrom) {
             straddleConds.push('max_created_at >= ?');
             straddleBinds.push(dateFrom);
         }
+        const straddleLimit = dateFrom ? 2 : 1;
         stmts.push(
             db
                 .prepare(
                     `SELECT id, ${kindColumn} AS chunk_kind, min_created_at, max_created_at, payload_json
                      FROM ${archiveTable}
                      WHERE ${straddleConds.join(' AND ')}
-                     ORDER BY max_created_at DESC, id DESC
-                     LIMIT 1`
+                     ORDER BY max_created_at ASC, id ASC
+                     LIMIT ?`
                 )
-                .bind(...straddleBinds)
+                .bind(...straddleBinds, straddleLimit)
         );
     }
 

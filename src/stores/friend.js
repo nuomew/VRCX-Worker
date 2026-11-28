@@ -17,6 +17,7 @@ import { runPendingOfflineTickFlow, runUpdateFriendFlow } from '../coordinators/
 import { updateFriendship, runUpdateFriendshipsFlow } from '../coordinators/friendRelationshipCoordinator';
 import { applyUser } from '../coordinators/userCoordinator';
 import { AppDebug } from '../services/appConfig';
+import { createHistoryDateController } from '../composables/useHistoryDateNavigation';
 import { database } from '../services/database';
 import { useAppearanceSettingsStore } from './settings/appearance';
 import { useFavoriteStore } from './favorite';
@@ -245,9 +246,10 @@ export const useFriendStore = defineStore('Friend', () => {
     let pendingOfflineWorker = null;
     const pendingOfflineMap = new Map();
 
-    const FRIENDLOG_CLOUD_INIT_BATCH = 300;
+    const FRIENDLOG_CLOUD_INIT_BATCH = 200;
     const FRIENDLOG_CLOUD_PAGE_BATCH = 200;
     const FRIENDLOG_CLOUD_MAX_REQUEST_LIMIT = 500;
+    const FRIENDLOG_DAY_AUTO_MAX_BATCHES = 5;
     let friendLogLoadEpoch = 0;
 
     const friendLogTable = ref({
@@ -268,10 +270,18 @@ export const useFriendStore = defineStore('Friend', () => {
             }
         ]),
         pageSizeLinked: true,
+        dateFrom: '',
+        dateTo: '',
         loading: false,
         loadingMore: false,
         hasMore: false,
         historyExpanded: false
+    });
+
+    const friendLogDateNav = createHistoryDateController('friendlog', async ({ dateFrom, dateTo }) => {
+        friendLogTable.value.dateFrom = dateFrom;
+        friendLogTable.value.dateTo = dateTo;
+        await initFriendLogHistoryTable();
     });
 
     watch(
@@ -282,6 +292,17 @@ export const useFriendStore = defineStore('Friend', () => {
             () => watchState.isFriendsLoaded
         ],
         ([value, , isLoggedIn]) => {
+            if (!isLoggedIn) {
+                friendLogLoadEpoch++;
+                friendLogTable.value.data = [];
+                friendLogTable.value.dateFrom = '';
+                friendLogTable.value.dateTo = '';
+                friendLogTable.value.hasMore = false;
+                friendLogTable.value.loadingMore = false;
+                friendLogTable.value.historyExpanded = false;
+                friendLogDateNav.reset();
+                return;
+            }
             const isDashboardPanel =
                 value.name === 'dashboard' && dashboardStore.getDashboard(value.params.id, 'friend-log');
             if ((value.name === 'friend-log' || isDashboardPanel) && isLoggedIn) {
@@ -1003,13 +1024,98 @@ export const useFriendStore = defineStore('Friend', () => {
         friendLogTable.value.historyExpanded = false;
         try {
             const supportsCursor = Boolean(database.supportsHistoryCursorPagination);
+            const supportsDateNav = Boolean(friendLogDateNav.enabled.value);
+            if (supportsDateNav) {
+                const bounds = await friendLogDateNav.ensureInitialized();
+                if (epoch !== friendLogLoadEpoch) return;
+                if (bounds) {
+                    friendLogTable.value.dateFrom = bounds.dateFrom;
+                    friendLogTable.value.dateTo = bounds.dateTo;
+                }
+            }
+            const { dateFrom, dateTo } = friendLogTable.value;
             const rows = supportsCursor
-                ? await database.getFriendLogHistory({ limit: FRIENDLOG_CLOUD_INIT_BATCH })
+                ? await database.getFriendLogHistory({
+                      limit: FRIENDLOG_CLOUD_INIT_BATCH,
+                      dateFrom,
+                      dateTo,
+                      throwOnError: true
+                  })
                 : await database.getFriendLogHistory();
             if (epoch !== friendLogLoadEpoch) return;
-            const list = Array.isArray(rows) ? rows : [];
+            let list = Array.isArray(rows) ? [...rows] : [];
+            let hasMore = Boolean(supportsCursor && list.length >= FRIENDLOG_CLOUD_INIT_BATCH);
+
+            if (hasMore && supportsDateNav && friendLogDateNav.mode.value === 'day' && dateFrom && dateTo) {
+                const friendLogKey = (r) =>
+                    `${String(r?.created_at ?? '')}|${String(r?.type ?? '')}|${String(r?.userId ?? '')}|${String(r?.displayName ?? '')}`;
+                const existingKeys = new Set(list.map(friendLogKey));
+                for (let batch = 1; batch < FRIENDLOG_DAY_AUTO_MAX_BATCHES && hasMore; batch++) {
+                    let oldest = '';
+                    for (const r of list) {
+                        const ts = String(r?.created_at ?? '').trim();
+                        if (ts && (!oldest || ts < oldest)) oldest = ts;
+                    }
+                    if (!oldest || oldest <= dateFrom) {
+                        hasMore = false;
+                        break;
+                    }
+                    let sameTsCount = 0;
+                    for (const r of list) {
+                        if (String(r?.created_at ?? '').trim() === oldest) sameTsCount++;
+                    }
+                    let reqLimit = Math.min(
+                        FRIENDLOG_CLOUD_MAX_REQUEST_LIMIT,
+                        FRIENDLOG_CLOUD_PAGE_BATCH + Math.min(sameTsCount, 100)
+                    );
+                    let fetched = await database.getFriendLogHistory({
+                        limit: reqLimit,
+                        dateFrom,
+                        dateTo,
+                        beforeCreatedAt: oldest,
+                        beforeInclusive: true,
+                        throwOnError: true
+                    });
+                    if (epoch !== friendLogLoadEpoch) return;
+                    const batchNew = [];
+                    for (const row of Array.isArray(fetched) ? fetched : []) {
+                        const key = friendLogKey(row);
+                        if (existingKeys.has(key)) continue;
+                        existingKeys.add(key);
+                        batchNew.push(row);
+                    }
+                    if (batchNew.length === 0 && Array.isArray(fetched) && fetched.length >= reqLimit) {
+                        reqLimit = FRIENDLOG_CLOUD_PAGE_BATCH;
+                        fetched = await database.getFriendLogHistory({
+                            limit: reqLimit,
+                            dateFrom,
+                            dateTo,
+                            beforeCreatedAt: oldest,
+                            beforeInclusive: false,
+                            throwOnError: true
+                        });
+                        if (epoch !== friendLogLoadEpoch) return;
+                        for (const row of Array.isArray(fetched) ? fetched : []) {
+                            const key = friendLogKey(row);
+                            if (existingKeys.has(key)) continue;
+                            existingKeys.add(key);
+                            batchNew.push(row);
+                        }
+                    }
+                    if (batchNew.length === 0) {
+                        hasMore = false;
+                        break;
+                    }
+                    list = [...list, ...batchNew];
+                    hasMore = Array.isArray(fetched) && fetched.length >= reqLimit;
+                }
+            }
+
             friendLogTable.value.data = list;
-            friendLogTable.value.hasMore = Boolean(supportsCursor && list.length >= FRIENDLOG_CLOUD_INIT_BATCH);
+            friendLogTable.value.historyExpanded = Boolean(supportsDateNav && (dateFrom || dateTo));
+            friendLogTable.value.hasMore = hasMore;
+        } catch (err) {
+            console.warn('[friend] Failed to init friend log history table:', err);
         } finally {
             if (epoch === friendLogLoadEpoch) {
                 friendLogTable.value.loading = false;
@@ -1025,11 +1131,17 @@ export const useFriendStore = defineStore('Friend', () => {
         try {
             const recent = await database.getFriendLogHistory({ limit: 50 });
             if (epoch !== friendLogLoadEpoch || !Array.isArray(recent) || recent.length === 0) return;
+            const { dateFrom, dateTo } = friendLogTable.value;
             const friendLogKey = (r) =>
                 `${String(r?.created_at ?? '')}|${String(r?.type ?? '')}|${String(r?.userId ?? '')}|${String(r?.displayName ?? '')}`;
             const existingKeys = new Set(friendLogTable.value.data.map(friendLogKey));
             const additions = [];
             for (const row of recent) {
+                if (row?.created_at) {
+                    friendLogDateNav.registerRecordedTimestamp(row.created_at);
+                }
+                if (dateFrom && row?.created_at && row.created_at < dateFrom) continue;
+                if (dateTo && row?.created_at && row.created_at > dateTo) continue;
                 const key = friendLogKey(row);
                 if (existingKeys.has(key)) continue;
                 existingKeys.add(key);
@@ -1071,6 +1183,7 @@ export const useFriendStore = defineStore('Friend', () => {
         const epoch = friendLogLoadEpoch;
         friendLogTable.value.loadingMore = true;
         try {
+            const { dateFrom, dateTo } = friendLogTable.value;
             const existingKeys = new Set(friendLogTable.value.data.map(friendLogKey));
             let requestLimit = Math.min(
                 FRIENDLOG_CLOUD_MAX_REQUEST_LIMIT,
@@ -1078,6 +1191,8 @@ export const useFriendStore = defineStore('Friend', () => {
             );
             let fetched = await database.getFriendLogHistory({
                 limit: requestLimit,
+                dateFrom,
+                dateTo,
                 beforeCreatedAt: oldest,
                 beforeInclusive: true,
                 throwOnError: true
@@ -1096,6 +1211,8 @@ export const useFriendStore = defineStore('Friend', () => {
                 requestLimit = FRIENDLOG_CLOUD_PAGE_BATCH;
                 fetched = await database.getFriendLogHistory({
                     limit: requestLimit,
+                    dateFrom,
+                    dateTo,
                     beforeCreatedAt: oldest,
                     beforeInclusive: false,
                     throwOnError: true
@@ -1462,6 +1579,7 @@ export const useFriendStore = defineStore('Friend', () => {
         onlineFriendCount,
         friendLog,
         friendLogTable,
+        friendLogDateNav,
         pendingOfflineMap,
         pendingOfflineDelay,
 
