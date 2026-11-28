@@ -2807,7 +2807,7 @@ INSERT INTO {acctPrefix}_friend_log_history (created_at, type, user_id, display_
                 ["concurrency"] = 9
             }).Ok);
 
-            // 7. Concurrent migration (concurrency=4) packs Feed up to 1000 rows/batch, uploads in parallel, retries transient 503 once, and finalizes categoryDone after drain
+            // 7. Concurrent migration (concurrency=4) packs Feed up to 180 rows/batch (<=96 KiB for Workers 10ms CPU cap), uploads in parallel, retries transient 503 once, and finalizes categoryDone after drain
             using (var connBulk = new SqliteConnection($"Data Source={dbPath};Pooling=False"))
             {
                 connBulk.Open();
@@ -2886,7 +2886,7 @@ INSERT INTO {acctPrefix}_friend_log_history (created_at, type, user_id, display_
                 CancellationToken.None,
                 concurrency: 4);
             Assert.True(completedConc);
-            Assert.Equal(3, concBatches); // 2501 rows packed at 1000 rows/batch = 3 batches (1000 + 1000 + 501)
+            Assert.Equal(14, concBatches); // 2501 rows packed at 180 rows/batch = 14 batches (13 * 180 + 161)
             Assert.True(maxInFlight >= 2, $"Expected parallel in-flight batches >= 2, observed {maxInFlight}");
             Assert.Equal(1, categoryDoneCount);
             Assert.Equal(2501, totalConcurrentItems);
