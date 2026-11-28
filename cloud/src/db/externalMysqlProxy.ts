@@ -194,16 +194,22 @@ export function rewriteManagedSqlForMysql(
         };
     }
 
-    // Rewrite SQLite conflict & case-collation clauses into MySQL 5.7 equivalents
-    sql = sql.replace(/\bINSERT\s+OR\s+IGNORE\s+INTO\b/gi, 'INSERT IGNORE INTO');
-    sql = sql.replace(/\bINSERT\s+OR\s+REPLACE\s+INTO\b/gi, 'REPLACE INTO');
-    sql = sql.replace(/\bUPDATE\s+OR\s+IGNORE\b/gi, 'UPDATE IGNORE');
-    sql = sql.replace(/\bCOLLATE\s+NOCASE\b/gi, '');
+    // Rewrite SQLite conflict & case-collation clauses into MySQL 5.7 equivalents (fast-path skips untouched regexes)
+    if (sql.includes('OR ') || sql.includes('or ')) {
+        sql = sql.replace(/\bINSERT\s+OR\s+IGNORE\s+INTO\b/gi, 'INSERT IGNORE INTO');
+        sql = sql.replace(/\bINSERT\s+OR\s+REPLACE\s+INTO\b/gi, 'REPLACE INTO');
+        sql = sql.replace(/\bUPDATE\s+OR\s+IGNORE\b/gi, 'UPDATE IGNORE');
+    }
+    if (sql.includes('COLLATE') || sql.includes('collate')) {
+        sql = sql.replace(/\bCOLLATE\s+NOCASE\b/gi, '');
+    }
 
     // SQLite 2-arg scalar `MAX(0, expr)` is `GREATEST(0, expr)` in MySQL 5.7 (MySQL MAX() is aggregate-only).
-    sql = sql.replace(/\bMAX\s*\(\s*0\s*,/gi, 'GREATEST(0,');
+    if (sql.includes('MAX(') || sql.includes('max(') || sql.includes('MAX (')) {
+        sql = sql.replace(/\bMAX\s*\(\s*0\s*,/gi, 'GREATEST(0,');
+    }
 
-    if (/\bON\s+CONFLICT\s*\([^)]+\)\s*DO\s+UPDATE\s+SET\b/i.test(sql)) {
+    if ((sql.includes('CONFLICT') || sql.includes('conflict')) && /\bON\s+CONFLICT\s*\([^)]+\)\s*DO\s+UPDATE\s+SET\b/i.test(sql)) {
         sql = sql.replace(
             /\bON\s+CONFLICT\s*\([^)]+\)\s*DO\s+UPDATE\s+SET\b([\s\S]*)$/i,
             (_full, setClause: string) => {

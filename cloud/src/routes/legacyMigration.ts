@@ -1623,6 +1623,58 @@ function sanitizeCategoryInventoryList(raw: unknown): LegacyCategoryInventory[] 
 // while keeping gzip(level: 1) CPU well within Cloudflare Workers Free 10ms limits.
 const EXTERNAL_MYSQL_CHUNK_MAX_BYTES = EXTERNAL_MYSQL_COMPACT_CHUNK_MAX_BYTES;
 
+/**
+ * Packs same-table `INSERT OR IGNORE` business rows into bounded multi-value statements
+ * (<= 40 rows & <= 32 KiB on external MySQL, or <= 95 bound params on D1) so a 240-row batch
+ * executes in ~6 queries instead of 240 serial SQL rewrites and MySQL RTTs.
+ */
+function buildPackedInsertIgnoreStmts(
+    db: D1Database,
+    table: string,
+    columns: readonly string[],
+    rows: unknown[][],
+    externalMysqlActive: boolean
+): D1PreparedStatement[] {
+    if (rows.length === 0) return [];
+    const colCount = columns.length;
+    const maxRowsPerStmt = externalMysqlActive ? 40 : Math.max(1, Math.floor(95 / colCount));
+    const maxEstBytes = externalMysqlActive ? 30 * 1024 : 64 * 1024;
+    const colList = columns.join(', ');
+    const singlePlaceholder = `(${columns.map(() => '?').join(', ')})`;
+    const out: D1PreparedStatement[] = [];
+
+    for (let i = 0; i < rows.length; ) {
+        const slice: unknown[][] = [];
+        let estBytes = 128;
+        while (i < rows.length && slice.length < maxRowsPerStmt) {
+            const row = rows[i]!;
+            let rowBytes = colCount * 6 + 16;
+            for (let c = 0; c < row.length; c++) {
+                const v = row[c];
+                if (typeof v === 'string') {
+                    // Conservative UTF-8 upper bound without per-field Buffer allocation
+                    rowBytes += v.length * 3 + 4;
+                } else {
+                    rowBytes += 12;
+                }
+            }
+            if (slice.length > 0 && estBytes + rowBytes > maxEstBytes) {
+                break;
+            }
+            slice.push(row);
+            estBytes += rowBytes;
+            i++;
+        }
+        const placeholders = slice.length === 1 ? singlePlaceholder : new Array(slice.length).fill(singlePlaceholder).join(', ');
+        const binds: unknown[] = [];
+        for (const r of slice) {
+            for (let c = 0; c < r.length; c++) binds.push(r[c]);
+        }
+        out.push(db.prepare(`INSERT OR IGNORE INTO ${table} (${colList}) VALUES ${placeholders}`).bind(...binds));
+    }
+    return out;
+}
+
 async function ingestLegacyCategoryBatch(
     legacyDb: D1Database,
     category: LegacyCategory,
@@ -1631,7 +1683,15 @@ async function ingestLegacyCategoryBatch(
 ): Promise<{ inserted: number; skipped: number; legacyDbBytes: number }> {
     const effectiveChunkMaxBytes = options.externalMysqlActive ? EXTERNAL_MYSQL_CHUNK_MAX_BYTES : COMPACT_CHUNK_MAX_BYTES;
     const effectiveStoredMaxBytes = options.externalMysqlActive ? EXTERNAL_MYSQL_STORED_PAYLOAD_MAX_BYTES : 0;
-    const stmts: D1PreparedStatement[] = [];
+    const businessInsertBuckets = new Map<string, { columns: readonly string[]; rows: unknown[][] }>();
+    const queueBusinessRow = (table: string, columns: readonly string[], row: unknown[]): void => {
+        let bucket = businessInsertBuckets.get(table);
+        if (!bucket) {
+            bucket = { columns, rows: [] };
+            businessInsertBuckets.set(table, bucket);
+        }
+        bucket.rows.push(row);
+    };
     const gamelogLocationRows: unknown[][] = [];
     const gamelogJoinLeaveRows: unknown[][] = [];
     const gamelogPortalRows: unknown[][] = [];
@@ -1667,43 +1727,37 @@ async function ingestLegacyCategoryBatch(
             if (kind === 'memo') {
                 const userId = asStr(raw.userId ?? raw.user_id, 128).trim();
                 if (!userId) continue;
-                stmts.push(
-                    legacyDb
-                        .prepare('INSERT OR IGNORE INTO memos (user_id, edited_at, memo) VALUES (?, ?, ?)')
-                        .bind(userId, asStr(raw.editedAt ?? raw.edited_at, 64) || nowIso, asStr(raw.memo, 16_384))
-                );
+                queueBusinessRow('memos', ['user_id', 'edited_at', 'memo'], [
+                    userId,
+                    asStr(raw.editedAt ?? raw.edited_at, 64) || nowIso,
+                    asStr(raw.memo, 16_384)
+                ]);
             } else if (kind === 'world_memo') {
                 const worldId = asStr(raw.worldId ?? raw.world_id, 128).trim();
                 if (!worldId) continue;
-                stmts.push(
-                    legacyDb
-                        .prepare('INSERT OR IGNORE INTO world_memos (world_id, edited_at, memo) VALUES (?, ?, ?)')
-                        .bind(worldId, asStr(raw.editedAt ?? raw.edited_at, 64) || nowIso, asStr(raw.memo, 16_384))
-                );
+                queueBusinessRow('world_memos', ['world_id', 'edited_at', 'memo'], [
+                    worldId,
+                    asStr(raw.editedAt ?? raw.edited_at, 64) || nowIso,
+                    asStr(raw.memo, 16_384)
+                ]);
             } else if (kind === 'avatar_memo') {
                 const avatarId = asStr(raw.avatarId ?? raw.avatar_id, 128).trim();
                 if (!avatarId) continue;
-                stmts.push(
-                    legacyDb
-                        .prepare('INSERT OR IGNORE INTO avatar_memos (avatar_id, edited_at, memo) VALUES (?, ?, ?)')
-                        .bind(avatarId, asStr(raw.editedAt ?? raw.edited_at, 64) || nowIso, asStr(raw.memo, 16_384))
-                );
+                queueBusinessRow('avatar_memos', ['avatar_id', 'edited_at', 'memo'], [
+                    avatarId,
+                    asStr(raw.editedAt ?? raw.edited_at, 64) || nowIso,
+                    asStr(raw.memo, 16_384)
+                ]);
             } else if (kind === 'note') {
                 const userId = asStr(raw.userId ?? raw.user_id, 128).trim();
                 if (!userId) continue;
                 const displayName = asStr(raw.displayName ?? raw.display_name, 256);
-                stmts.push(
-                    legacyDb
-                        .prepare(
-                            'INSERT OR IGNORE INTO notes (user_id, display_name, note, created_at) VALUES (?, ?, ?, ?)'
-                        )
-                        .bind(
-                            userId,
-                            displayName,
-                            asStr(raw.note, 8192),
-                            asStr(raw.createdAt ?? raw.created_at, 64) || nowIso
-                        )
-                );
+                queueBusinessRow('notes', ['user_id', 'display_name', 'note', 'created_at'], [
+                    userId,
+                    displayName,
+                    asStr(raw.note, 8192),
+                    asStr(raw.createdAt ?? raw.created_at, 64) || nowIso
+                ]);
                 if (displayName) userEntities.set(userId, displayName);
             }
         } else if (category === 'favorites') {
@@ -1711,83 +1765,62 @@ async function ingestLegacyCategoryBatch(
                 const userId = asStr(raw.userId ?? raw.user_id, 128).trim();
                 const groupName = asStr(raw.groupName ?? raw.group_name, 256).trim();
                 if (!userId || !groupName) continue;
-                stmts.push(
-                    legacyDb
-                        .prepare(
-                            'INSERT OR IGNORE INTO favorite_friend (created_at, user_id, group_name) VALUES (?, ?, ?)'
-                        )
-                        .bind(asStr(raw.createdAt ?? raw.created_at, 64) || nowIso, userId, groupName)
-                );
+                queueBusinessRow('favorite_friend', ['created_at', 'user_id', 'group_name'], [
+                    asStr(raw.createdAt ?? raw.created_at, 64) || nowIso,
+                    userId,
+                    groupName
+                ]);
             } else if (kind === 'favorite_world') {
                 const worldId = asStr(raw.worldId ?? raw.world_id, 128).trim();
                 const groupName = asStr(raw.groupName ?? raw.group_name, 256).trim();
                 if (!worldId || !groupName) continue;
-                stmts.push(
-                    legacyDb
-                        .prepare(
-                            'INSERT OR IGNORE INTO favorite_world (created_at, world_id, group_name) VALUES (?, ?, ?)'
-                        )
-                        .bind(asStr(raw.createdAt ?? raw.created_at, 64) || nowIso, worldId, groupName)
-                );
+                queueBusinessRow('favorite_world', ['created_at', 'world_id', 'group_name'], [
+                    asStr(raw.createdAt ?? raw.created_at, 64) || nowIso,
+                    worldId,
+                    groupName
+                ]);
             } else if (kind === 'favorite_avatar') {
                 const avatarId = asStr(raw.avatarId ?? raw.avatar_id, 128).trim();
                 const groupName = asStr(raw.groupName ?? raw.group_name, 256).trim();
                 if (!avatarId || !groupName) continue;
-                stmts.push(
-                    legacyDb
-                        .prepare(
-                            'INSERT OR IGNORE INTO favorite_avatar (created_at, avatar_id, group_name) VALUES (?, ?, ?)'
-                        )
-                        .bind(asStr(raw.createdAt ?? raw.created_at, 64) || nowIso, avatarId, groupName)
-                );
+                queueBusinessRow('favorite_avatar', ['created_at', 'avatar_id', 'group_name'], [
+                    asStr(raw.createdAt ?? raw.created_at, 64) || nowIso,
+                    avatarId,
+                    groupName
+                ]);
             } else if (kind === 'favorite_print') {
                 const printId = asStr(raw.printId ?? raw.print_id, 128).trim();
                 if (!printId) continue;
-                stmts.push(
-                    legacyDb
-                        .prepare('INSERT OR IGNORE INTO favorite_print (print_id, created_at) VALUES (?, ?)')
-                        .bind(printId, asStr(raw.createdAt ?? raw.created_at, 64) || nowIso)
-                );
+                queueBusinessRow('favorite_print', ['print_id', 'created_at'], [
+                    printId,
+                    asStr(raw.createdAt ?? raw.created_at, 64) || nowIso
+                ]);
             } else if (kind === 'avatar_tag') {
                 const avatarId = asStr(raw.avatarId ?? raw.avatar_id, 128).trim();
                 const tag = asStr(raw.tag, 128).trim();
                 if (!avatarId || !tag) continue;
                 const color = raw.color == null ? null : asStr(raw.color, 64);
-                stmts.push(
-                    legacyDb
-                        .prepare('INSERT OR IGNORE INTO avatar_tags (avatar_id, tag, color) VALUES (?, ?, ?)')
-                        .bind(avatarId, tag, color)
-                );
+                queueBusinessRow('avatar_tags', ['avatar_id', 'tag', 'color'], [avatarId, tag, color]);
             }
         } else if (category === 'avatar_history') {
             const avatarId = asStr(raw.avatarId ?? raw.avatar_id, 128).trim();
             if (!avatarId) continue;
-            stmts.push(
-                legacyDb
-                    .prepare('INSERT OR IGNORE INTO avatar_history (avatar_id, created_at, time) VALUES (?, ?, ?)')
-                    .bind(
-                        avatarId,
-                        asStr(raw.createdAt ?? raw.created_at, 64) || nowIso,
-                        Math.max(0, asFiniteInt(raw.time, 0))
-                    )
-            );
+            queueBusinessRow('avatar_history', ['avatar_id', 'created_at', 'time'], [
+                avatarId,
+                asStr(raw.createdAt ?? raw.created_at, 64) || nowIso,
+                Math.max(0, asFiniteInt(raw.time, 0))
+            ]);
         } else if (category === 'friend_log') {
             if (kind === 'friend_log_current') {
                 const userId = asStr(raw.userId ?? raw.user_id, 128).trim();
                 if (!userId) continue;
                 const displayName = asStr(raw.displayName ?? raw.display_name, 256);
-                stmts.push(
-                    legacyDb
-                        .prepare(
-                            'INSERT OR IGNORE INTO friend_log_current (user_id, display_name, trust_level, friend_number) VALUES (?, ?, ?, ?)'
-                        )
-                        .bind(
-                            userId,
-                            displayName,
-                            asStr(raw.trustLevel ?? raw.trust_level, 64),
-                            Math.max(0, asFiniteInt(raw.friendNumber ?? raw.friend_number, 0))
-                        )
-                );
+                queueBusinessRow('friend_log_current', ['user_id', 'display_name', 'trust_level', 'friend_number'], [
+                    userId,
+                    displayName,
+                    asStr(raw.trustLevel ?? raw.trust_level, 64),
+                    Math.max(0, asFiniteInt(raw.friendNumber ?? raw.friend_number, 0))
+                ]);
                 if (displayName) userEntities.set(userId, displayName);
             } else {
                 const userId = asStr(raw.userId ?? raw.user_id, 128).trim();
@@ -1856,39 +1889,27 @@ async function ingestLegacyCategoryBatch(
             if (kind === 'user_profile') {
                 const userId = asStr(raw.userId ?? raw.user_id, 128).trim();
                 if (!userId) continue;
-                stmts.push(
-                    legacyDb
-                        .prepare(
-                            'INSERT OR IGNORE INTO user_profile (user_id, bio, bio_links, updated_at) VALUES (?, ?, ?, ?)'
-                        )
-                        .bind(
-                            userId,
-                            asStr(raw.bio, 4096),
-                            typeof raw.bioLinks === 'string'
-                                ? raw.bioLinks.slice(0, 4096)
-                                : typeof raw.bio_links === 'string'
-                                  ? raw.bio_links.slice(0, 4096)
-                                  : JSON.stringify(raw.bioLinks ?? []),
-                            asStr(raw.updatedAt ?? raw.updated_at, 64) || nowIso
-                        )
-                );
+                queueBusinessRow('user_profile', ['user_id', 'bio', 'bio_links', 'updated_at'], [
+                    userId,
+                    asStr(raw.bio, 4096),
+                    typeof raw.bioLinks === 'string'
+                        ? raw.bioLinks.slice(0, 4096)
+                        : typeof raw.bio_links === 'string'
+                          ? raw.bio_links.slice(0, 4096)
+                          : JSON.stringify(raw.bioLinks ?? []),
+                    asStr(raw.updatedAt ?? raw.updated_at, 64) || nowIso
+                ]);
             } else {
                 const userId = asStr(raw.userId ?? raw.user_id, 128).trim();
                 if (!userId) continue;
                 const displayName = asStr(raw.displayName ?? raw.display_name, 256);
-                stmts.push(
-                    legacyDb
-                        .prepare(
-                            'INSERT OR IGNORE INTO moderation (user_id, updated_at, display_name, block, mute) VALUES (?, ?, ?, ?, ?)'
-                        )
-                        .bind(
-                            userId,
-                            asStr(raw.updatedAt ?? raw.updated_at, 64) || nowIso,
-                            displayName,
-                            raw.block ? 1 : 0,
-                            raw.mute ? 1 : 0
-                        )
-                );
+                queueBusinessRow('moderation', ['user_id', 'updated_at', 'display_name', 'block', 'mute'], [
+                    userId,
+                    asStr(raw.updatedAt ?? raw.updated_at, 64) || nowIso,
+                    displayName,
+                    raw.block ? 1 : 0,
+                    raw.mute ? 1 : 0
+                ]);
                 if (displayName) userEntities.set(userId, displayName);
             }
         } else if (category === 'gamelog') {
@@ -2088,12 +2109,26 @@ async function ingestLegacyCategoryBatch(
         }
         inserted += newlyInsertedConfigs;
     }
-    for (let i = 0; i < stmts.length; i += 50) {
-        const res = await legacyDb.batch(stmts.slice(i, i + 50));
-        for (const r of res) {
-            inserted += r.meta?.changes ?? 0;
-            if (typeof r.meta?.size_after === 'number' && r.meta.size_after > legacyDbBytes) {
-                legacyDbBytes = r.meta.size_after;
+    if (businessInsertBuckets.size > 0) {
+        const stmts: D1PreparedStatement[] = [];
+        for (const [table, bucket] of businessInsertBuckets.entries()) {
+            stmts.push(
+                ...buildPackedInsertIgnoreStmts(
+                    legacyDb,
+                    table,
+                    bucket.columns,
+                    bucket.rows,
+                    Boolean(options.externalMysqlActive)
+                )
+            );
+        }
+        for (let i = 0; i < stmts.length; i += 25) {
+            const res = await legacyDb.batch(stmts.slice(i, i + 25));
+            for (const r of res) {
+                inserted += r.meta?.changes ?? 0;
+                if (typeof r.meta?.size_after === 'number' && r.meta.size_after > legacyDbBytes) {
+                    legacyDbBytes = r.meta.size_after;
+                }
             }
         }
     }
@@ -2216,7 +2251,7 @@ async function ingestLegacyCategoryBatch(
         await upsertEntityWorldsBatch(legacyDb, worldEntities, 50);
     }
 
-    if (legacyDbBytes === 0) {
+    if (legacyDbBytes === 0 && !(options.externalMysqlActive && MYSQL_OFFLOADED_LEGACY_CATEGORIES.has(category))) {
         const probe = await legacyDb.prepare('SELECT 1 AS ok').all();
         legacyDbBytes = probe.meta?.size_after ?? 0;
     }
@@ -2471,38 +2506,39 @@ export async function handleLegacyMigrationAgentRoutes(
                 );
             }
             const externalMysqlActive = isExternalMysqlActiveOnEnv(env);
-            const effectiveStopBytes =
-                externalMysqlActive && MYSQL_OFFLOADED_LEGACY_CATEGORIES.has(category)
-                    ? LEGACY_DB_HARD_CEILING_BYTES
-                    : LEGACY_DB_SOFT_STOP_BYTES;
-            const preProbe = await legacyDb.prepare('SELECT 1 AS ok').all();
-            const currentSize = preProbe.meta?.size_after ?? 0;
-            if (currentSize >= effectiveStopBytes && rawItems.length > 0) {
-                const stoppedJob: LegacyMigrationJob = {
-                    ...existingJob,
-                    status: 'stopped_quota_limit',
-                    updatedAt: nowIso,
-                    finishedAt: nowIso,
-                    errorMessage: 'Legacy database reached 480 MB safety limit (500 MB Free-tier ceiling).'
-                };
-                await writeLegacyState(legacyDb, STATE_KEY_JOB, stoppedJob, nowIso);
-                return Response.json({
-                    ok: true,
-                    data: {
-                        inserted: 0,
-                        skipped: rawItems.length,
-                        legacyDbBytes: currentSize,
-                        shouldStop: true,
-                        reason: 'LEGACY_DB_QUOTA_NEAR_LIMIT'
-                    }
-                });
+            const offloadedToMysql = externalMysqlActive && MYSQL_OFFLOADED_LEGACY_CATEGORIES.has(category);
+            const effectiveStopBytes = offloadedToMysql ? LEGACY_DB_HARD_CEILING_BYTES : LEGACY_DB_SOFT_STOP_BYTES;
+            let currentSize = 0;
+            if (!offloadedToMysql) {
+                const preProbe = await legacyDb.prepare('SELECT 1 AS ok').all();
+                currentSize = preProbe.meta?.size_after ?? 0;
+                if (currentSize >= effectiveStopBytes && rawItems.length > 0) {
+                    const stoppedJob: LegacyMigrationJob = {
+                        ...existingJob,
+                        status: 'stopped_quota_limit',
+                        updatedAt: nowIso,
+                        finishedAt: nowIso,
+                        errorMessage: 'Legacy database reached 480 MB safety limit (500 MB Free-tier ceiling).'
+                    };
+                    await writeLegacyState(legacyDb, STATE_KEY_JOB, stoppedJob, nowIso);
+                    return Response.json({
+                        ok: true,
+                        data: {
+                            inserted: 0,
+                            skipped: rawItems.length,
+                            legacyDbBytes: currentSize,
+                            shouldStop: true,
+                            reason: 'LEGACY_DB_QUOTA_NEAR_LIMIT'
+                        }
+                    });
+                }
             }
 
             try {
                 const result = await ingestLegacyCategoryBatch(
                     legacyDb,
                     category,
-                    rawItems.filter(isPlainObject),
+                    rawItems as Array<Record<string, unknown>>,
                     { externalMysqlActive }
                 );
                 inserted = result.inserted;

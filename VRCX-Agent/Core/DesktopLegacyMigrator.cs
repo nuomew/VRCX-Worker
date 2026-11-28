@@ -137,10 +137,11 @@ public static class DesktopLegacyMigrator
     public const int DefaultConcurrency = 2;
     private const int BatchRowsLimit = 240;
     private const int MaxBatchPayloadBytes = 180 * 1024;
-    // Logical tables whose cloud ingest writes directly into <=1,000-row / <=512 KiB D1 chunks,
-    // cutting D1 rows_written by >99.5% (single-row tables like friend_log_current keep 240-row batches).
-    private const int CompactBatchRowsLimit = 1000;
-    private const int CompactMaxBatchPayloadBytes = 512 * 1024;
+    // Keep each HTTP batch strictly bounded so Cloudflare Workers Free (10ms CPU limit) stays well
+    // below Error 1102 even under 4x concurrency and high-entropy CJK payloads (bio/join_leave).
+    private const int CompactBatchRowsLimit = 350;
+    private const int CompactMaxBatchPayloadBytes = 180 * 1024;
+    private const int MinAdaptiveSplitBatchRows = 25;
     private static readonly HashSet<string> CompactChunkLogicalTables = new(StringComparer.Ordinal)
     {
         "feed_gps",
@@ -766,6 +767,15 @@ public static class DesktopLegacyMigrator
         }
     }
 
+    private static bool IsWorkerCpuLimitError(Exception ex)
+    {
+        string msg = ex.Message ?? string.Empty;
+        return msg.Contains("(503)", StringComparison.OrdinalIgnoreCase) &&
+               (msg.Contains("1102", StringComparison.OrdinalIgnoreCase) ||
+                msg.Contains("CPU", StringComparison.OrdinalIgnoreCase) ||
+                msg.Contains("exceeded", StringComparison.OrdinalIgnoreCase));
+    }
+
     private static async Task<LegacyMigrationBatchResponse> PostMigrationBatchWithRetryAsync(
         HttpSyncClient syncClient,
         AgentConfig config,
@@ -785,6 +795,38 @@ public static class DesktopLegacyMigrator
                 return await syncClient
                     .PostMigrationBatchAsync(config, jobId, category, items, categoryDone, allDone, errorMessage, ct, cursorUpdate)
                     .ConfigureAwait(false);
+            }
+            catch (Exception ex) when (items.Count > MinAdaptiveSplitBatchRows && IsWorkerCpuLimitError(ex) && !ct.IsCancellationRequested)
+            {
+                // Auto-split oversized batches in half on Cloudflare Worker 503/1102 CPU limit so
+                // high-entropy or unusually heavy row clusters self-heal without failing the job.
+                int mid = items.Count / 2;
+                var left = new List<Dictionary<string, object?>>(mid);
+                var right = new List<Dictionary<string, object?>>(items.Count - mid);
+                for (int i = 0; i < mid; i++) left.Add(items[i]);
+                for (int i = mid; i < items.Count; i++) right.Add(items[i]);
+
+                Log.Warn(ex, "Worker CPU limit (503/1102) on {JobId}/{Category} ({Count} rows); splitting batch into {Left}+{Right}.",
+                    jobId, category, items.Count, left.Count, right.Count);
+
+                LegacyMigrationBatchResponse leftRes = await PostMigrationBatchWithRetryAsync(
+                    syncClient, config, jobId, category, left,
+                    categoryDone: false, allDone: false, errorMessage: null, ct: ct, cursorUpdate: null).ConfigureAwait(false);
+                if (leftRes.ShouldStop)
+                {
+                    return leftRes;
+                }
+                LegacyMigrationBatchResponse rightRes = await PostMigrationBatchWithRetryAsync(
+                    syncClient, config, jobId, category, right,
+                    categoryDone: categoryDone, allDone: allDone, errorMessage: errorMessage, ct: ct, cursorUpdate: cursorUpdate).ConfigureAwait(false);
+                return new LegacyMigrationBatchResponse
+                {
+                    Inserted = leftRes.Inserted + rightRes.Inserted,
+                    Skipped = leftRes.Skipped + rightRes.Skipped,
+                    LegacyDbBytes = Math.Max(leftRes.LegacyDbBytes, rightRes.LegacyDbBytes),
+                    ShouldStop = rightRes.ShouldStop,
+                    Reason = rightRes.Reason
+                };
             }
             catch (Exception ex) when (attempt < MaxBatchRetryAttempts && IsTransientBatchError(ex, ct))
             {

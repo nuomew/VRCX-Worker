@@ -1,5 +1,9 @@
+import { createHash, createHmac } from 'node:crypto';
+
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
+const derivedAesKeyCache = new Map<string, CryptoKey>();
+const MAX_DERIVED_AES_KEYS = 8;
 
 function bytesToHex(bytes: Uint8Array): string {
     return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
@@ -42,26 +46,29 @@ export function timingSafeEqual(a: string, b: string): boolean {
 }
 
 export async function sha256Hex(input: string | Uint8Array): Promise<string> {
-    const data = typeof input === 'string' ? encoder.encode(input) : input;
-    const digest = await crypto.subtle.digest('SHA-256', data as BufferSource);
-    return bytesToHex(new Uint8Array(digest));
+    return createHash('sha256').update(input).digest('hex');
 }
 
 export async function hmacSha256Hex(secret: string, message: string): Promise<string> {
-    const key = await crypto.subtle.importKey(
-        'raw',
-        encoder.encode(secret),
-        { name: 'HMAC', hash: 'SHA-256' },
-        false,
-        ['sign']
-    );
-    const sig = await crypto.subtle.sign('HMAC', key, encoder.encode(message));
-    return bytesToHex(new Uint8Array(sig));
+    return createHmac('sha256', secret).update(message).digest('hex');
 }
 
 async function deriveAesKey(masterSecret: string): Promise<CryptoKey> {
-    const rawHash = await crypto.subtle.digest('SHA-256', encoder.encode(masterSecret));
-    return crypto.subtle.importKey('raw', rawHash, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
+    const cached = derivedAesKeyCache.get(masterSecret);
+    if (cached) return cached;
+    const rawHash = createHash('sha256').update(masterSecret).digest();
+    const key = await crypto.subtle.importKey(
+        'raw',
+        rawHash as BufferSource,
+        { name: 'AES-GCM' },
+        false,
+        ['encrypt', 'decrypt']
+    );
+    if (derivedAesKeyCache.size >= MAX_DERIVED_AES_KEYS) {
+        derivedAesKeyCache.clear();
+    }
+    derivedAesKeyCache.set(masterSecret, key);
+    return key;
 }
 
 export async function encryptAesGcm(

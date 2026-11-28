@@ -4255,4 +4255,219 @@ describe('External MySQL 5.7+ Database Integration (Hybrid New-Writes Mode & Ful
             clearMysqlSchemaReadyCache();
         }
     });
+
+    it('keeps high-entropy bio batches, trailing small batches, and business-table batches within strict CPU & 40 KiB packet budgets (anti-1102)', async () => {
+        await ensureSchemaReady(env);
+        const legacyDb = env.DB_LEGACY!;
+        const fakeMysql = new FakeMysql57Server();
+        const executedSqls: Array<{ sql: string; params: unknown[] }> = [];
+        setMysqlConnectionFactoryForTests(async () => {
+            const inner = fakeMysql.createConnection();
+            return {
+                async execute(sql: string, params: unknown[] = []) {
+                    executedSqls.push({ sql, params });
+                    return inner.execute(sql, params);
+                },
+                close: () => inner.close()
+            };
+        });
+        clearMysqlSchemaReadyCache();
+        invalidateExternalDbConfigCache();
+
+        const webHeaders = { 'Content-Type': 'application/json', Origin: 'http://example.com' };
+        let deviceId = '';
+        try {
+            const saveRes = await exports.default.fetch('http://example.com/api/storage/mysql/config', {
+                method: 'PUT',
+                headers: webHeaders,
+                body: JSON.stringify({
+                    enabled: true,
+                    mode: 'new_writes_only',
+                    connectionType: 'direct',
+                    host: 'mysql-cpu1102.example.com',
+                    port: 3306,
+                    database: 'vrcx_cpu1102',
+                    username: 'vrcx_user',
+                    password: 'secret-cpu1102-pw',
+                    sslMode: 'disabled',
+                    tablePrefix: 'vrcx_'
+                })
+            });
+            expect(saveRes.status).toBe(200);
+
+            const keyRes = await exports.default.fetch('http://example.com/api/agent/sync-key', {
+                method: 'POST',
+                headers: webHeaders,
+                body: JSON.stringify({ deviceName: 'CpuBudget-PC' })
+            });
+            expect(keyRes.status).toBe(200);
+            const keyJson = (await keyRes.json()) as { data: { deviceId: string; syncKey: string } };
+            deviceId = keyJson.data.deviceId;
+            const agentHeaders = {
+                'Content-Type': 'application/json',
+                Authorization: `Bearer ${keyJson.data.syncKey}`,
+                'X-Device-Id': deviceId
+            };
+            const accountPrefix = 'usrcpu11020000000000000000000001';
+
+            await exports.default.fetch('http://example.com/api/agent/migration/inventory', {
+                method: 'POST',
+                headers: agentHeaders,
+                body: JSON.stringify({
+                    dbFound: true,
+                    dbFileName: 'VRCX.sqlite3',
+                    dbFileBytes: 2 * 1024 * 1024,
+                    sharedCategories: [
+                        { key: 'memos_notes', rowCount: 120, rawBytes: 24_000, estimatedDbBytes: 32_000, tables: ['memos'] }
+                    ],
+                    accounts: [
+                        {
+                            prefix: accountPrefix,
+                            label: 'CpuBudgetAccount',
+                            categories: [
+                                { key: 'feed', rowCount: 135, rawBytes: 220_000, estimatedDbBytes: 260_000, tables: ['feed_bio', 'feed_gps'] }
+                            ]
+                        }
+                    ]
+                })
+            });
+
+            const startRes = await exports.default.fetch('http://example.com/api/migration/start', {
+                method: 'POST',
+                headers: webHeaders,
+                body: JSON.stringify({
+                    deviceId,
+                    accountPrefix,
+                    categories: ['memos_notes', 'feed'],
+                    concurrency: 4,
+                    resume: false
+                })
+            });
+            expect(startRes.status).toBe(200);
+            const jobId = ((await startRes.json()) as { data: { job: { jobId: string } } }).data.job.jobId;
+
+            // 1. High-entropy CJK bio batch (~180 KiB raw JSON): must stay strictly <= 40 KiB per chunk,
+            //    fall back to raw JSON once high-entropy budget triggers, and persist all 120 rows losslessly.
+            const bioItems = Array.from({ length: 120 }, (_, i) => ({
+                type: 'Bio',
+                created_at: `2026-10-01T00:${String(Math.floor(i / 60)).padStart(2, '0')}:${String(i % 60).padStart(2, '0')}.000Z`,
+                userId: `usr_bio_${i}`,
+                displayName: `BioUser_${i}`,
+                bio: Array.from({ length: 180 }, (__, j) => String.fromCharCode(0x4e00 + ((i * 131 + j * 17) % 10000))).join(''),
+                previousBio: Array.from({ length: 180 }, (__, j) => String.fromCharCode(0x4e00 + ((i * 97 + j * 29) % 10000))).join(''),
+                bioLinks: '[]',
+                previousBioLinks: '[]'
+            }));
+            executedSqls.length = 0;
+            const bioRes = await exports.default.fetch('http://example.com/api/agent/migration/batch', {
+                method: 'POST',
+                headers: agentHeaders,
+                body: JSON.stringify({
+                    jobId,
+                    category: 'feed',
+                    items: bioItems,
+                    categoryDone: false,
+                    allDone: false
+                })
+            });
+            expect(bioRes.status).toBe(200);
+            expect(((await bioRes.json()) as { data: { inserted: number } }).data.inserted).toBe(120);
+
+            const bioInserts = executedSqls.filter((q) => /INSERT\s+IGNORE\s+INTO\s+`vrcx_legacy_feed_chunks`/i.test(q.sql));
+            expect(bioInserts.length).toBeGreaterThanOrEqual(3);
+            let sawRawFallbackSlice = false;
+            for (const ins of bioInserts) {
+                const payload = String(ins.params[5] ?? '');
+                expect(Buffer.byteLength(payload, 'utf8')).toBeLessThanOrEqual(40 * 1024);
+                if (!payload.startsWith('gz:')) sawRawFallbackSlice = true;
+            }
+            expect(sawRawFallbackSlice).toBe(true);
+            // Zero tail-chunk SELECTs during bulkMigration
+            expect(
+                executedSqls.filter((q) => /SELECT[\s\S]*FROM\s+`vrcx_legacy_feed_chunks`/i.test(q.sql))
+            ).toHaveLength(0);
+
+            // 2. Trailing small batch (< 25% of chunk, 15 GPS rows): must ALSO stay on direct-insert fast path
+            //    with ZERO tail-chunk SELECT / gunzipSync overhead.
+            const smallGpsItems = Array.from({ length: 15 }, (_, i) => ({
+                type: 'GPS',
+                created_at: `2026-10-02T01:00:${String(i).padStart(2, '0')}.000Z`,
+                userId: `usr_tail_${i}`,
+                displayName: `TailUser_${i}`,
+                location: `wrld_tail_${i}:100`,
+                worldName: `Tail World ${i}`,
+                previousLocation: 'private',
+                time: 60000,
+                groupName: ''
+            }));
+            executedSqls.length = 0;
+            const smallRes = await exports.default.fetch('http://example.com/api/agent/migration/batch', {
+                method: 'POST',
+                headers: agentHeaders,
+                body: JSON.stringify({
+                    jobId,
+                    category: 'feed',
+                    items: smallGpsItems,
+                    categoryDone: true,
+                    allDone: false
+                })
+            });
+            expect(smallRes.status).toBe(200);
+            expect(((await smallRes.json()) as { data: { inserted: number } }).data.inserted).toBe(15);
+            expect(
+                executedSqls.filter((q) => /SELECT[\s\S]*FROM\s+`vrcx_legacy_feed_chunks`/i.test(q.sql))
+            ).toHaveLength(0);
+
+            // 3. Business-table multi-value batching: 120 memos must execute in <= 4 multi-value INSERTs
+            //    instead of 120 serial MySQL queries.
+            const memoItems = Array.from({ length: 120 }, (_, i) => ({
+                kind: 'memo',
+                userId: `usr_memo_${String(i).padStart(4, '0')}`,
+                editedAt: '2026-10-01T00:00:00.000Z',
+                memo: `Memo note content #${i}`
+            }));
+            executedSqls.length = 0;
+            const memoRes = await exports.default.fetch('http://example.com/api/agent/migration/batch', {
+                method: 'POST',
+                headers: agentHeaders,
+                body: JSON.stringify({
+                    jobId,
+                    category: 'memos_notes',
+                    items: memoItems,
+                    categoryDone: true,
+                    allDone: true
+                })
+            });
+            expect(memoRes.status).toBe(200);
+            expect(((await memoRes.json()) as { data: { inserted: number } }).data.inserted).toBe(120);
+            const memoInserts = executedSqls.filter((q) => /INSERT\s+IGNORE\s+INTO\s+`vrcx_legacy_memos`/i.test(q.sql));
+            expect(memoInserts.length).toBeGreaterThanOrEqual(1);
+            expect(memoInserts.length).toBeLessThanOrEqual(4);
+
+            // 4. Final reconciled state confirms exact 120 memos + 135 feed rows and `completed` status
+            const stateRes = await exports.default.fetch('http://example.com/api/migration/state');
+            expect(stateRes.status).toBe(200);
+            const stateJson = (await stateRes.json()) as {
+                data: { importedStats: Record<string, number>; job: { status: string } };
+            };
+            expect(stateJson.data.importedStats).toMatchObject({ memos_notes: 120, feed: 135 });
+            expect(stateJson.data.job.status).toBe('completed');
+        } finally {
+            setMysqlConnectionFactoryForTests(null);
+            await legacyDb.batch([
+                legacyDb.prepare('DELETE FROM legacy_configs'),
+                legacyDb.prepare('DELETE FROM legacy_migration_state')
+            ]).catch(() => {});
+            if (deviceId) {
+                await env.DB_CORE.batch([
+                    env.DB_CORE.prepare('DELETE FROM cloud_devices WHERE device_id = ?').bind(deviceId),
+                    env.DB_CORE.prepare('DELETE FROM cloud_commands WHERE device_id = ?').bind(deviceId)
+                ]).catch(() => {});
+            }
+            await saveExternalDbConfig(env, defaultExternalDbConfig());
+            await saveExternalDbMigrationState(env, defaultExternalDbMigrationState());
+            invalidateExternalDbConfigCache();
+            clearMysqlSchemaReadyCache();
+        }
+    });
 });

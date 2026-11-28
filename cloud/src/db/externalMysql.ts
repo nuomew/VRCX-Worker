@@ -511,7 +511,7 @@ export function getRawD1Env(env: Env): Env {
     return (env as unknown as Record<symbol, Env | undefined>)[RAW_D1_ENV_SYMBOL] ?? env;
 }
 
-// Short-lived in-memory cache per isolate to avoid extra DB_CORE reads on every hot request when disabled.
+// Short-lived in-memory cache per isolate to avoid extra DB_CORE reads & repeated AES-GCM password decryption on hot paths.
 const CONFIG_CACHE_TTL_MS = 10_000;
 let cachedConfigEntry: {
     config: StoredExternalDbConfig;
@@ -519,9 +519,15 @@ let cachedConfigEntry: {
     expiresAt: number;
     dbRef: D1Database;
 } | null = null;
+let cachedDecryptedMysqlPassword: {
+    cacheKey: string;
+    password: string;
+    expiresAt: number;
+} | null = null;
 
 export function invalidateExternalDbConfigCache(): void {
     cachedConfigEntry = null;
+    cachedDecryptedMysqlPassword = null;
 }
 
 export function defaultExternalDbConfig(): StoredExternalDbConfig {
@@ -777,7 +783,22 @@ export async function decryptMysqlPassword(env: Env, encoded: string): Promise<s
     }
     try {
         const masterKey = await getMasterKey(getRawD1Env(env));
-        return await decryptAesGcm(masterKey, parts[2]!, parts[1]!);
+        const now = Date.now();
+        const cacheKey = `${masterKey}\0${encoded}`;
+        if (
+            cachedDecryptedMysqlPassword &&
+            cachedDecryptedMysqlPassword.cacheKey === cacheKey &&
+            cachedDecryptedMysqlPassword.expiresAt > now
+        ) {
+            return cachedDecryptedMysqlPassword.password;
+        }
+        const password = await decryptAesGcm(masterKey, parts[2]!, parts[1]!);
+        cachedDecryptedMysqlPassword = {
+            cacheKey,
+            password,
+            expiresAt: now + CONFIG_CACHE_TTL_MS
+        };
+        return password;
     } catch {
         return '';
     }

@@ -1040,6 +1040,10 @@ export async function preAuthenticateAgent(request: Request, env: Env): Promise<
     };
 }
 
+const AGENT_HMAC_SECRET_CACHE_TTL_MS = 60_000;
+const MAX_AGENT_HMAC_CACHE_ENTRIES = 32;
+const decryptedAgentHmacCache = new Map<string, { secret: string; expiresAt: number }>();
+
 /**
  * Completes HMAC-SHA256 body verification for a pre-authenticated agent request.
  */
@@ -1057,15 +1061,31 @@ export async function verifyAgentBodyHmac(
     }
     const sigHeader = request.headers.get('X-Signature')?.trim() ?? '';
     const tsHeader = request.headers.get('X-Timestamp')?.trim() ?? '';
-    const [ivB64, cipherB64] = (preAuth.hmacSecretEnc ?? '').split(':');
+    const rawHmacEnc = preAuth.hmacSecretEnc ?? '';
+    const [ivB64, cipherB64] = rawHmacEnc.split(':');
     if (!ivB64 || !cipherB64) {
         return { authenticated: false, reason: 'Corrupted device HMAC key' };
     }
+    const masterKey = getMasterKey(env);
+    const cacheKey = `${masterKey}\0${rawHmacEnc}`;
+    const nowMs = Date.now();
+    const cached = decryptedAgentHmacCache.get(cacheKey);
     let hmacSecret: string;
-    try {
-        hmacSecret = await decryptAesGcm(getMasterKey(env), cipherB64, ivB64);
-    } catch {
-        return { authenticated: false, reason: 'Failed to decrypt device HMAC key' };
+    if (cached && cached.expiresAt > nowMs) {
+        hmacSecret = cached.secret;
+    } else {
+        try {
+            hmacSecret = await decryptAesGcm(masterKey, cipherB64, ivB64);
+        } catch {
+            return { authenticated: false, reason: 'Failed to decrypt device HMAC key' };
+        }
+        if (decryptedAgentHmacCache.size >= MAX_AGENT_HMAC_CACHE_ENTRIES) {
+            decryptedAgentHmacCache.clear();
+        }
+        decryptedAgentHmacCache.set(cacheKey, {
+            secret: hmacSecret,
+            expiresAt: nowMs + AGENT_HMAC_SECRET_CACHE_TTL_MS
+        });
     }
     const url = new URL(request.url);
     const bodyHash = await sha256Hex(rawBody);
