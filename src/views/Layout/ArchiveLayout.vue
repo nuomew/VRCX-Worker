@@ -38,7 +38,7 @@
                     <ContextMenuTrigger as-child>
                         <nav
                             ref="navContainerRef"
-                            class="relative flex items-center gap-1 flex-1 min-w-0 overflow-hidden px-1 py-1"
+                            class="relative flex items-center justify-evenly gap-1 flex-1 min-w-0 overflow-hidden px-1 py-1"
                             :aria-label="t('nav_menu.custom_nav.header')">
                             <!-- Off-flow measurement mirror so whole skewed tabs move into More cleanly -->
                             <div

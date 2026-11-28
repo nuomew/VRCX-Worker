@@ -38,7 +38,7 @@
                     <ContextMenuTrigger as-child>
                         <nav
                             ref="navContainerRef"
-                            class="relative flex items-center gap-0.5 flex-1 min-w-0 overflow-hidden"
+                            class="relative flex items-center justify-evenly gap-0.5 flex-1 min-w-0 overflow-hidden"
                             :aria-label="t('nav_menu.custom_nav.header')">
                             <!-- Off-flow measurement mirror matching live nav item typography & padding exactly -->
                             <div
