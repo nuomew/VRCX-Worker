@@ -11,6 +11,7 @@ import {
     type ExternalDbShardKey,
     type ManagedMysqlTableName
 } from './externalMysql';
+import { classifyStorageWriteDegradation, withStorageDegradedHeader } from './storageResilience';
 
 const WRITE_TARGET_ONLY_HINT = '/* vrcx:write-target */';
 
@@ -705,8 +706,17 @@ class HybridMysqlPreparedStatement {
                         params,
                         this.shard
                     );
-                    const res = await this.session.query(rewritten.sql, rewritten.params);
-                    return res.rows;
+                    try {
+                        const res = await this.session.query(rewritten.sql, rewritten.params);
+                        return res.rows;
+                    } catch (err) {
+                        const degraded = classifyStorageWriteDegradation(err);
+                        if (degraded) {
+                            this.session.markDegraded(degraded);
+                            return [];
+                        }
+                        throw err;
+                    }
                 }
                 const d1Res = await this.rawD1.prepare(this.rawSql).bind(...params).all<Record<string, unknown>>();
                 return d1Res.results ?? [];
@@ -722,8 +732,22 @@ class HybridMysqlPreparedStatement {
                 params,
                 this.shard
             );
-            const res = await this.session.query(rewritten.sql, rewritten.params);
-            return res.rows;
+            try {
+                const res = await this.session.query(rewritten.sql, rewritten.params);
+                return res.rows;
+            } catch (err) {
+                const degraded = classifyStorageWriteDegradation(err);
+                if (degraded) {
+                    this.session.markDegraded(degraded);
+                    const d1Res = await this.rawD1
+                        .prepare(this.rawSql)
+                        .bind(...params)
+                        .all<Record<string, unknown>>()
+                        .catch(() => null);
+                    return d1Res?.results ?? [];
+                }
+                throw err;
+            }
         }
 
         // 4. Dual-read merge across MySQL (new/migrated data) + D1 (existing unmigrated data)
@@ -738,7 +762,14 @@ class HybridMysqlPreparedStatement {
         );
 
         const [mysqlRes, d1Rows] = await Promise.all([
-            this.session.query(rewritten.sql, rewritten.params),
+            this.session.query(rewritten.sql, rewritten.params).catch((err) => {
+                const degraded = classifyStorageWriteDegradation(err);
+                if (degraded) {
+                    this.session.markDegraded(degraded);
+                    return { rows: [] as Array<Record<string, unknown>>, affectedRows: 0, insertId: 0 };
+                }
+                throw err;
+            }),
             this.rawD1
                 .prepare(querySql)
                 .bind(...params)
@@ -980,7 +1011,11 @@ export async function runWithExternalMysqlEnv<T>(env: Env, fn: (activeEnv: Env) 
     attachRawD1Env(wrappedEnv, rawEnv);
 
     try {
-        return await fn(wrappedEnv);
+        const res = await fn(wrappedEnv);
+        if (session.degradedReason && res instanceof Response) {
+            return withStorageDegradedHeader(res, session.degradedReason) as unknown as T;
+        }
+        return res;
     } finally {
         await session.close();
     }

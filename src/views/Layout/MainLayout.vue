@@ -45,6 +45,34 @@
                             </Button>
                         </div>
                     </div>
+                    <div
+                        v-if="isWeb && cloudState.storageDegraded.active && !cloudState.storageDegraded.dismissed"
+                        class="flex flex-wrap items-center justify-between gap-2 px-3 py-1.5 text-xs border-b border-amber-500/40 bg-amber-500/10 text-amber-800 dark:text-amber-200 shrink-0">
+                        <span class="min-w-0 truncate">
+                            {{
+                                cloudState.storageDegraded.reason === 'external_db_unavailable'
+                                    ? t('cloud_hub.storage_degraded.banner_mysql_down')
+                                    : t('cloud_hub.storage_degraded.banner_full')
+                            }}
+                        </span>
+                        <div class="flex items-center gap-1.5 shrink-0">
+                            <Button
+                                size="sm"
+                                variant="outline"
+                                class="h-6 px-2 text-[11px]"
+                                @click="router.push({ name: 'settings', query: { tab: 'storage' } })">
+                                {{ t('cloud_hub.storage_degraded.open_storage_btn') }}
+                            </Button>
+                            <Button
+                                size="sm"
+                                variant="ghost"
+                                class="h-6 w-6 p-0 text-xs"
+                                :aria-label="t('cloud_hub.storage_degraded.dismiss_btn')"
+                                @click="cloudState.storageDegraded.dismissed = true">
+                                ×
+                            </Button>
+                        </div>
+                    </div>
                     <ResizablePanelGroup
                         direction="horizontal"
                         auto-save-id="vrcx-main-layout-right-sidebar"

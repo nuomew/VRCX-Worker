@@ -10818,4 +10818,210 @@ describe('VRCX Cloud Full Backend E2E (Core, Events, Agent Pairing/HMAC, Residen
             await cacheDb.prepare('DELETE FROM vrc_api_cache WHERE cache_key = ?').bind(rawCacheUrl).run().catch(() => {});
         }
     });
+
+    it('degrades cleanly into Read-Only Basic Mode on D1 write quota / storage full while keeping live chat OSC, bootstrap, and VRChat API working', async () => {
+        const headers = { 'Content-Type': 'application/json', Origin: 'http://example.com' };
+        const keyRes = await exports.default.fetch('http://example.com/api/agent/sync-key', {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({ deviceName: 'ReadOnly-Fallback-PC' })
+        });
+        expect(keyRes.status).toBe(200);
+        const keyJson = (await keyRes.json()) as { data: { deviceId: string; syncKey: string } };
+        const syncHeaders = { 'Content-Type': 'application/json', 'X-Sync-Key': keyJson.data.syncKey };
+
+        // Connect live WebSocket chat agent so we can verify realtime OSC chatbox dispatch survives storage-full D1
+        const chatWsRes = await exports.default.fetch('http://example.com/ws/chat-agent', {
+            headers: {
+                Upgrade: 'websocket',
+                'X-Sync-Key': keyJson.data.syncKey
+            }
+        });
+        expect(chatWsRes.status).toBe(101);
+        const chatWs = chatWsRes.webSocket!;
+        chatWs.accept();
+
+        const quotaErr = () => new Error('D1_ERROR: Exceeded the maximum rows written per day quota.');
+        const isWriteSql = (sql: string) => /^\s*(INSERT|UPDATE|DELETE|REPLACE)\b/i.test(sql);
+        const wrapWriteFullD1 = (db: D1Database): D1Database => {
+            const sqlMap = new WeakMap<D1PreparedStatement, string>();
+            const nativeMap = new WeakMap<D1PreparedStatement, D1PreparedStatement>();
+            const wrapStmt = (rawStmt: D1PreparedStatement, sql: string): D1PreparedStatement => {
+                const proxy = {
+                    bind: (...vals: unknown[]) => wrapStmt(rawStmt.bind(...vals), sql),
+                    first: (col?: string) =>
+                        isWriteSql(sql)
+                            ? Promise.reject(quotaErr())
+                            : col !== undefined
+                              ? rawStmt.first(col)
+                              : rawStmt.first(),
+                    all: () => (isWriteSql(sql) ? Promise.reject(quotaErr()) : rawStmt.all()),
+                    run: () => (isWriteSql(sql) ? Promise.reject(quotaErr()) : rawStmt.run()),
+                    raw: () => (isWriteSql(sql) ? Promise.reject(quotaErr()) : rawStmt.raw())
+                } as unknown as D1PreparedStatement;
+                sqlMap.set(proxy, sql);
+                nativeMap.set(proxy, rawStmt);
+                return proxy;
+            };
+            return {
+                prepare: (query: string) => wrapStmt(db.prepare(query), query),
+                batch: async (stmts: D1PreparedStatement[]) => {
+                    if (stmts.some((s) => isWriteSql(sqlMap.get(s) ?? ''))) {
+                        throw quotaErr();
+                    }
+                    return db.batch(stmts.map((s) => nativeMap.get(s) ?? s));
+                },
+                exec: (q: string) => (isWriteSql(q) ? Promise.reject(quotaErr()) : db.exec(q)),
+                dump: () => db.dump(),
+                withSession: (c?: string) => db.withSession(c)
+            } as unknown as D1Database;
+        };
+
+        const fullEnv: Env = {
+            ...env,
+            DB_CORE: wrapWriteFullD1(env.DB_CORE),
+            DB_GAMELOG: wrapWriteFullD1(env.DB_GAMELOG),
+            DB_FEED: wrapWriteFullD1(env.DB_FEED),
+            DB_CACHE: env.DB_CACHE ? wrapWriteFullD1(env.DB_CACHE) : undefined,
+            DB_LEGACY: env.DB_LEGACY ? wrapWriteFullD1(env.DB_LEGACY) : undefined,
+            DB_CHAT: env.DB_CHAT ? wrapWriteFullD1(env.DB_CHAT) : undefined
+        };
+
+        const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+            const urlStr = typeof input === 'string' ? input : input instanceof Request ? input.url : String(input);
+            if (urlStr.includes('/api/1/worlds/wrld_ro_fallback')) {
+                return Response.json({ id: 'wrld_ro_fallback', name: 'Read-Only Sanctuary' });
+            }
+            return new Response('Not Found', { status: 404 });
+        });
+
+        try {
+            const callWorker = (path: string, init?: RequestInit) =>
+                worker.fetch(new Request(`http://example.com${path}`, init), fullEnv);
+
+            // 1. /api/bootstrap & /api/stats/uptime degrade cleanly without failing startup
+            const bootRes = await callWorker('/api/bootstrap');
+            expect(bootRes.status).toBe(200);
+            expect(bootRes.headers.get('X-VRCX-Storage-Degraded')).toBe('storage_full');
+            const bootJson = (await bootRes.json()) as { ok: boolean; data: { degraded?: string } };
+            expect(bootJson.ok).toBe(true);
+            expect(bootJson.data.degraded).toBe('storage_full');
+
+            const upRes = await callWorker('/api/stats/uptime', { method: 'POST', headers });
+            expect(upRes.status).toBe(200);
+            expect(upRes.headers.get('X-VRCX-Storage-Degraded')).toBe('storage_full');
+
+            // 2. Live VRChat proxy still returns upstream response even though cache write throws quota error
+            const vrcRes = await callWorker('/api/vrc/execute', {
+                method: 'POST',
+                headers,
+                body: JSON.stringify({
+                    url: 'https://api.vrchat.cloud/api/1/worlds/wrld_ro_fallback',
+                    method: 'GET',
+                    bypassCache: true
+                })
+            });
+            expect(vrcRes.status).toBe(200);
+            expect(vrcRes.headers.get('X-VRCX-Storage-Degraded')).toBe('storage_full');
+            const vrcJson = (await vrcRes.json()) as { ok: boolean; data: { data: string; degraded?: string } };
+            expect(vrcJson.data.data).toContain('Read-Only Sanctuary');
+            expect(vrcJson.data.degraded).toBe('storage_full');
+
+            // 3. Live OSC Chatbox send still delivers over WebSocket despite full DB_CHAT & DB_CORE
+            const oscFramePromise = waitForMessage(chatWs, (d) => d.includes('Hello read-only VRChat'));
+            const sendRes = await callWorker('/api/chat/send', {
+                method: 'POST',
+                headers,
+                body: JSON.stringify({
+                    sourceText: 'Hello read-only VRChat',
+                    targetDeviceId: keyJson.data.deviceId,
+                    sendToVrc: true
+                })
+            });
+            expect(sendRes.status).toBe(200);
+            expect(sendRes.headers.get('X-VRCX-Storage-Degraded')).toBe('storage_full');
+            const sendJson = (await sendRes.json()) as {
+                ok: boolean;
+                data: { deliveryStatus: string; persisted: boolean; degraded?: string };
+            };
+            expect(sendJson.data.deliveryStatus).toBe('dispatched');
+            expect(sendJson.data.persisted).toBe(false);
+            expect(sendJson.data.degraded).toBe('storage_full');
+            const oscFrame = await oscFramePromise;
+            expect(oscFrame).toContain('send_osc_chatbox');
+
+            // 4. Incidental feed / gamelog / activity / agent sync degrade cleanly (no 500s, no false DEVICE_REVOKED)
+            const feedRes = await callWorker('/api/feed', {
+                method: 'POST',
+                headers,
+                body: JSON.stringify({
+                    items: [{ type: 'Online', created_at: '2026-11-28T01:00:00.000Z', userId: 'usr_1', displayName: 'A' }]
+                })
+            });
+            expect(feedRes.status).toBe(200);
+            expect(feedRes.headers.get('X-VRCX-Storage-Degraded')).toBe('storage_full');
+
+            const glRes = await callWorker('/api/gamelog', {
+                method: 'POST',
+                headers,
+                body: JSON.stringify({
+                    items: [{ type: 'Event', created_at: '2026-11-28T01:00:01.000Z', data: 'Test' }]
+                })
+            });
+            expect(glRes.status).toBe(200);
+            expect(glRes.headers.get('X-VRCX-Storage-Degraded')).toBe('storage_full');
+
+            const actRes = await callWorker('/api/activity/sessions', {
+                method: 'POST',
+                headers,
+                body: JSON.stringify({
+                    userId: 'usr_1',
+                    replace: true,
+                    sessions: [{ startAt: 1000, endAt: 2000 }]
+                })
+            });
+            expect(actRes.status).toBe(200);
+            expect(actRes.headers.get('X-VRCX-Storage-Degraded')).toBe('storage_full');
+
+            const syncRes = await callWorker('/api/agent/sync', {
+                method: 'POST',
+                headers: syncHeaders,
+                body: JSON.stringify({
+                    events: [{ type: 'Event', created_at: '2026-11-28T01:00:02.000Z', data: 'Agent' }],
+                    state: { vrcRunning: true }
+                })
+            });
+            expect(syncRes.status).toBe(200);
+            expect(syncRes.headers.get('X-VRCX-Storage-Degraded')).toBe('storage_full');
+            const syncJson = (await syncRes.json()) as { data: { degraded?: string } };
+            expect(syncJson.data.degraded).toBe('storage_full');
+
+            // 5. Explicit user-initiated writes return structured 507 STORAGE_READ_ONLY (never silent fake success)
+            const memoRes = await callWorker('/api/memos', {
+                method: 'PUT',
+                headers,
+                body: JSON.stringify({ kind: 'user', id: 'usr_ro_test', memo: 'Cannot write' })
+            });
+            expect(memoRes.status).toBe(507);
+            expect(memoRes.headers.get('X-VRCX-Storage-Degraded')).toBe('storage_full');
+            const memoJson = (await memoRes.json()) as { ok: boolean; error: { code: string; reason: string } };
+            expect(memoJson.ok).toBe(false);
+            expect(memoJson.error.code).toBe('STORAGE_READ_ONLY');
+
+            const cfgRes = await callWorker('/api/config/bundle', {
+                method: 'PUT',
+                headers,
+                body: JSON.stringify({ bundleKey: 'vrcx_config', patch: { testKey: '1' } })
+            });
+            expect(cfgRes.status).toBe(507);
+            expect(cfgRes.headers.get('X-VRCX-Storage-Degraded')).toBe('storage_full');
+        } finally {
+            fetchSpy.mockRestore();
+            chatWs.close();
+            await env.DB_CORE.prepare('DELETE FROM cloud_devices WHERE device_id = ?')
+                .bind(keyJson.data.deviceId)
+                .run()
+                .catch(() => {});
+        }
+    });
 });

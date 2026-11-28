@@ -9,6 +9,12 @@ import {
     mutateArchiveChunks
 } from '../db/compactArchive';
 import { getChatDb } from '../db/schemaBootstrap';
+import {
+    classifyStorageWriteDegradation,
+    mergeStorageDegradedReason,
+    type StorageDegradedReason,
+    withStorageDegradedHeader
+} from '../db/storageResilience';
 import type { Env } from '../env';
 import {
     dispatchAgentCommandInternal,
@@ -1255,6 +1261,7 @@ export async function handleChatOscAgentRoutes(request: Request, env: Env, url: 
     }
 
     if (insertedRows.length > 0) {
+        let syncDegraded: StorageDegradedReason | null = null;
         const tuples = insertedRows.map((row) => [
             row.created_at,
             row.id,
@@ -1274,21 +1281,51 @@ export async function handleChatOscAgentRoutes(request: Request, env: Env, url: 
             row.cmd_id,
             row.error_message
         ]);
-        await appendTuplesToCompactTailChunk({
-            db: chatDb,
-            archiveTable: 'chat_archive_chunks',
-            kindColumn: null,
-            kindValue: 'chat',
-            tuples,
-            dedupKeyFn: chatTupleDedupKey,
-            fallbackIso: nowIso,
-            maxRows: COMPACT_CHUNK_MAX_ROWS,
-            maxJsonBytes: COMPACT_CHUNK_MAX_BYTES
-        });
+        try {
+            await appendTuplesToCompactTailChunk({
+                db: chatDb,
+                archiveTable: 'chat_archive_chunks',
+                kindColumn: null,
+                kindValue: 'chat',
+                tuples,
+                dedupKeyFn: chatTupleDedupKey,
+                fallbackIso: nowIso,
+                maxRows: COMPACT_CHUNK_MAX_ROWS,
+                maxJsonBytes: COMPACT_CHUNK_MAX_BYTES
+            });
+        } catch (err) {
+            const r = classifyStorageWriteDegradation(err);
+            if (!r) throw err;
+            syncDegraded = r;
+        }
         for (const row of insertedRows) {
             await broadcastChatEvent(env, 'chat.message', {
                 message: formatChatMessageDto(row)
             });
+        }
+        if (syncDegraded) {
+            return withStorageDegradedHeader(
+                Response.json({
+                    ok: true,
+                    data: {
+                        deviceId: auth.deviceId,
+                        syncedAt: nowIso,
+                        ingested: 0,
+                        degraded: syncDegraded,
+                        chatSessionActive: webActive.active,
+                        activeUntilIso: webActive.activeUntilIso,
+                        oscConfig: {
+                            enabled: cloudConfig.oscEnabled,
+                            sendPort: cloudConfig.oscSendPort,
+                            listenEnabled: cloudConfig.oscListenEnabled,
+                            listenPort: cloudConfig.oscListenPort,
+                            forwardToVrchat: cloudConfig.oscForwardToVrchat
+                        },
+                        pendingCommands: []
+                    }
+                }),
+                syncDegraded
+            );
         }
     }
 
@@ -1429,12 +1466,18 @@ export async function handleChatOscWebRoutes(request: Request, env: Env, url: UR
                   .bind(limit + 1)
                   .all<ChatMessageRow>();
 
+        let msgDegraded: StorageDegradedReason | null = null;
         const [rowsRes, devices, config, workersAiQuota] = await Promise.all([
             queryPromise,
             isHistoryPage ? Promise.resolve(undefined) : listChatAgentDevices(env),
             isHistoryPage ? Promise.resolve(undefined) : loadChatTranslatorConfig(env),
             isHistoryPage ? Promise.resolve(undefined) : getWorkersAiDailyQuota(env),
-            heartbeat ? touchChatWebActive(env, nowIso) : Promise.resolve()
+            heartbeat
+                ? touchChatWebActive(env, nowIso).catch((err) => {
+                      const r = classifyStorageWriteDegradation(err);
+                      if (r) msgDegraded = mergeStorageDegradedReason(msgDegraded, r);
+                  })
+                : Promise.resolve()
         ]);
 
         const rawRows: ChatMessageRow[] = [...(rowsRes.results ?? [])];
@@ -1490,22 +1533,25 @@ export async function handleChatOscWebRoutes(request: Request, env: Env, url: UR
         const lastRow = pageRows.length > 0 ? pageRows[pageRows.length - 1] : null;
         const messages = pageRows.map(formatChatMessageDto);
 
-        return Response.json(
-            {
-                ok: true,
-                data: {
-                    messages,
-                    hasMore,
-                    nextBefore: hasMore && lastRow ? lastRow.created_at : '',
-                    nextBeforeId: hasMore && lastRow ? lastRow.id : '',
-                    ...(devices !== undefined ? { devices } : {}),
-                    ...(config !== undefined ? { config } : {}),
-                    ...(workersAiQuota !== undefined ? { workersAiQuota } : {}),
-                    chatDbDedicated: Boolean(env.DB_CHAT),
-                    serverTime: nowIso
-                }
-            },
-            { headers: { 'Cache-Control': 'no-store' } }
+        return withStorageDegradedHeader(
+            Response.json(
+                {
+                    ok: true,
+                    data: {
+                        messages,
+                        hasMore,
+                        nextBefore: hasMore && lastRow ? lastRow.created_at : '',
+                        nextBeforeId: hasMore && lastRow ? lastRow.id : '',
+                        ...(devices !== undefined ? { devices } : {}),
+                        ...(config !== undefined ? { config } : {}),
+                        ...(workersAiQuota !== undefined ? { workersAiQuota } : {}),
+                        chatDbDedicated: Boolean(env.DB_CHAT),
+                        serverTime: nowIso
+                    }
+                },
+                { headers: { 'Cache-Control': 'no-store' } }
+            ),
+            msgDegraded
         );
     }
 
@@ -1564,13 +1610,21 @@ export async function handleChatOscWebRoutes(request: Request, env: Env, url: UR
 
         const msgId = `chat_${randomHex(8)}`;
         const nowIso = new Date().toISOString();
-        await touchChatWebActive(env, nowIso);
+        let sendDegraded: StorageDegradedReason | null = null;
+        try {
+            await touchChatWebActive(env, nowIso);
+        } catch (err) {
+            const r = classifyStorageWriteDegradation(err);
+            if (!r) throw err;
+            sendDegraded = mergeStorageDegradedReason(sendDegraded, r);
+        }
 
         let status = sendToVrc ? 'dispatching' : 'synced';
         let cmdId = sendToVrc ? `osc_${randomHex(8)}` : '';
         let resolvedDeviceId = targetDeviceId;
         let errorMessage = '';
         let deliveryStatus: 'dispatched' | 'queued' | 'skipped' | 'failed' = 'skipped';
+        let persisted = true;
 
         // Persist directly into compact chat_archive_chunks tail row BEFORE dispatching over realtime WebSocket
         // so sub-millisecond `chat.osc_result` callbacks always find and update this row cleanly.
@@ -1593,17 +1647,24 @@ export async function handleChatOscWebRoutes(request: Request, env: Env, url: UR
             cmdId,
             ''
         ];
-        await appendTuplesToCompactTailChunk({
-            db: chatDb,
-            archiveTable: 'chat_archive_chunks',
-            kindColumn: null,
-            kindValue: 'chat',
-            tuples: [initialTuple],
-            dedupKeyFn: chatTupleDedupKey,
-            fallbackIso: nowIso,
-            maxRows: COMPACT_CHUNK_MAX_ROWS,
-            maxJsonBytes: COMPACT_CHUNK_MAX_BYTES
-        });
+        try {
+            await appendTuplesToCompactTailChunk({
+                db: chatDb,
+                archiveTable: 'chat_archive_chunks',
+                kindColumn: null,
+                kindValue: 'chat',
+                tuples: [initialTuple],
+                dedupKeyFn: chatTupleDedupKey,
+                fallbackIso: nowIso,
+                maxRows: COMPACT_CHUNK_MAX_ROWS,
+                maxJsonBytes: COMPACT_CHUNK_MAX_BYTES
+            });
+        } catch (err) {
+            const r = classifyStorageWriteDegradation(err);
+            if (!r) throw err;
+            persisted = false;
+            sendDegraded = mergeStorageDegradedReason(sendDegraded, r);
+        }
 
         if (sendToVrc) {
             const oscParams = {
@@ -1628,13 +1689,26 @@ export async function handleChatOscWebRoutes(request: Request, env: Env, url: UR
                 status = 'dispatched';
             } else {
                 // Fallback: queue command if the dedicated chat WS is temporarily disconnected.
-                const dispatch = await dispatchAgentCommandInternal(env, {
-                    action: 'send_osc_chatbox',
-                    params: oscParams,
-                    targetDeviceId: targetDeviceId || undefined,
-                    ttlSec: 120,
-                    requireOnline: false
-                });
+                let dispatch: Awaited<ReturnType<typeof dispatchAgentCommandInternal>>;
+                try {
+                    dispatch = await dispatchAgentCommandInternal(env, {
+                        action: 'send_osc_chatbox',
+                        params: oscParams,
+                        targetDeviceId: targetDeviceId || undefined,
+                        ttlSec: 120,
+                        requireOnline: false
+                    });
+                } catch (err) {
+                    const r = classifyStorageWriteDegradation(err);
+                    if (!r) throw err;
+                    sendDegraded = mergeStorageDegradedReason(sendDegraded, r);
+                    dispatch = {
+                        ok: false,
+                        status: 507,
+                        code: 'STORAGE_READ_ONLY',
+                        message: 'Database is in read-only basic mode; connect WebSocket chat bridge for live OSC'
+                    };
+                }
 
                 if (dispatch.ok) {
                     cmdId = dispatch.cmdId;
@@ -1649,39 +1723,50 @@ export async function handleChatOscWebRoutes(request: Request, env: Env, url: UR
                 }
             }
 
-            await mutateArchiveChunks({
-                db: chatDb,
-                archiveTable: 'chat_archive_chunks',
-                kindColumn: null,
-                kindValue: 'chat',
-                maxChunksToScan: 2,
-                stopAfterFirstChunkChange: true,
-                mutateTuple: (t) => {
-                    if (String(t[1] ?? '') !== msgId || String(t[14] ?? '') !== 'dispatching') return 'keep';
-                    const next = [...t];
-                    next[2] = resolvedDeviceId;
-                    next[14] = status;
-                    next[15] = cmdId;
-                    next[16] = errorMessage;
-                    return next;
+            if (persisted) {
+                try {
+                    await mutateArchiveChunks({
+                        db: chatDb,
+                        archiveTable: 'chat_archive_chunks',
+                        kindColumn: null,
+                        kindValue: 'chat',
+                        maxChunksToScan: 2,
+                        stopAfterFirstChunkChange: true,
+                        mutateTuple: (t) => {
+                            if (String(t[1] ?? '') !== msgId || String(t[14] ?? '') !== 'dispatching') return 'keep';
+                            const next = [...t];
+                            next[2] = resolvedDeviceId;
+                            next[14] = status;
+                            next[15] = cmdId;
+                            next[16] = errorMessage;
+                            return next;
+                        }
+                    });
+                } catch (err) {
+                    const r = classifyStorageWriteDegradation(err);
+                    if (!r) throw err;
+                    persisted = false;
+                    sendDegraded = mergeStorageDegradedReason(sendDegraded, r);
                 }
-            });
+            }
         }
 
         let latestRow: ChatMessageRow | null = null;
-        try {
-            const tailChunks = await chatDb
-                .prepare('SELECT payload_json FROM chat_archive_chunks ORDER BY id DESC LIMIT 2')
-                .all<{ payload_json: string }>();
-            for (const c of tailChunks.results ?? []) {
-                const found = decodeChatChunkRows(c.payload_json).find((r) => r.id === msgId);
-                if (found) {
-                    latestRow = found;
-                    break;
+        if (persisted) {
+            try {
+                const tailChunks = await chatDb
+                    .prepare('SELECT payload_json FROM chat_archive_chunks ORDER BY id DESC LIMIT 2')
+                    .all<{ payload_json: string }>();
+                for (const c of tailChunks.results ?? []) {
+                    const found = decodeChatChunkRows(c.payload_json).find((r) => r.id === msgId);
+                    if (found) {
+                        latestRow = found;
+                        break;
+                    }
                 }
+            } catch {
+                // Non-fatal fallback
             }
-        } catch {
-            // Non-fatal fallback
         }
         const row: ChatMessageRow = latestRow ?? {
             id: msgId,
@@ -1705,13 +1790,18 @@ export async function handleChatOscWebRoutes(request: Request, env: Env, url: UR
         const dto = formatChatMessageDto(row);
         await broadcastChatEvent(env, 'chat.message', { message: dto });
 
-        return Response.json({
-            ok: true,
-            data: {
-                message: dto,
-                deliveryStatus
-            }
-        });
+        return withStorageDegradedHeader(
+            Response.json({
+                ok: true,
+                data: {
+                    message: dto,
+                    deliveryStatus,
+                    persisted,
+                    ...(sendDegraded ? { degraded: sendDegraded } : {})
+                }
+            }),
+            sendDegraded
+        );
     }
 
     // 3. Optional typing indicator sync (`/chatbox/typing`)
@@ -1740,7 +1830,14 @@ export async function handleChatOscWebRoutes(request: Request, env: Env, url: UR
             );
         }
         const targetDeviceId = typeof body.targetDeviceId === 'string' ? body.targetDeviceId.trim().slice(0, 64) : '';
-        await touchChatWebActive(env, new Date().toISOString());
+        let typingDegraded: StorageDegradedReason | null = null;
+        try {
+            await touchChatWebActive(env, new Date().toISOString());
+        } catch (err) {
+            const r = classifyStorageWriteDegradation(err);
+            if (!r) throw err;
+            typingDegraded = r;
+        }
 
         const realtimeCmdId = `osc_${randomHex(8)}`;
         const realtimeDispatch = await dispatchRealtimeChatOsc(env, {
@@ -1750,29 +1847,51 @@ export async function handleChatOscWebRoutes(request: Request, env: Env, url: UR
             params: { typing, oscPort }
         });
         if (realtimeDispatch.ok) {
-            return Response.json({
-                ok: true,
-                data: { skipped: false, cmdId: realtimeCmdId, deliveryStatus: 'dispatched' }
-            });
+            return withStorageDegradedHeader(
+                Response.json({
+                    ok: true,
+                    data: { skipped: false, cmdId: realtimeCmdId, deliveryStatus: 'dispatched' }
+                }),
+                typingDegraded
+            );
         }
 
-        const dispatch = await dispatchAgentCommandInternal(env, {
-            action: 'send_osc_typing',
-            params: { typing, oscPort },
-            targetDeviceId: targetDeviceId || undefined,
-            ttlSec: 30,
-            requireOnline: true
-        });
-        if (!dispatch.ok) {
-            return Response.json({
-                ok: true,
-                data: { skipped: true, reason: dispatch.message }
+        let dispatch: Awaited<ReturnType<typeof dispatchAgentCommandInternal>>;
+        try {
+            dispatch = await dispatchAgentCommandInternal(env, {
+                action: 'send_osc_typing',
+                params: { typing, oscPort },
+                targetDeviceId: targetDeviceId || undefined,
+                ttlSec: 30,
+                requireOnline: true
             });
+        } catch (err) {
+            const r = classifyStorageWriteDegradation(err);
+            if (!r) throw err;
+            return withStorageDegradedHeader(
+                Response.json({
+                    ok: true,
+                    data: { skipped: true, reason: 'storage_full', degraded: r }
+                }),
+                mergeStorageDegradedReason(typingDegraded, r)
+            );
         }
-        return Response.json({
-            ok: true,
-            data: { skipped: false, cmdId: dispatch.cmdId, deliveryStatus: dispatch.deliveryStatus }
-        });
+        if (!dispatch.ok) {
+            return withStorageDegradedHeader(
+                Response.json({
+                    ok: true,
+                    data: { skipped: true, reason: dispatch.message }
+                }),
+                typingDegraded
+            );
+        }
+        return withStorageDegradedHeader(
+            Response.json({
+                ok: true,
+                data: { skipped: false, cmdId: dispatch.cmdId, deliveryStatus: dispatch.deliveryStatus }
+            }),
+            typingDegraded
+        );
     }
 
     // 4. Update translation on an existing message (e.g., auto-translated desktop_sync message)
@@ -1971,11 +2090,23 @@ export async function handleChatOscWebRoutes(request: Request, env: Env, url: UR
         const cacheKey = `${model}|${sourceLang}|${targetLang}|${customPrompt}|${text}`;
         const cached = getCachedTranslation(cacheKey, nowMs);
         if (cached) {
-            const stored = await updateWorkersAiDailyQuotaAtomic(env, nowMs, { cachedHits: 1 });
+            let translateDegraded: StorageDegradedReason | null = null;
+            let stored: StoredWorkersAiDailyQuota;
+            try {
+                stored = await updateWorkersAiDailyQuotaAtomic(env, nowMs, { cachedHits: 1 });
+            } catch (err) {
+                const r = classifyStorageWriteDegradation(err);
+                if (!r) throw err;
+                translateDegraded = r;
+                stored = await loadStoredWorkersAiDailyQuota(env, nowMs);
+            }
             const quota = toWorkersAiDailyQuotaDto(stored, true, nowMs);
-            return Response.json(
-                { ok: true, data: { translatedText: cached, model, cached: true, quota } },
-                { headers: { 'Cache-Control': 'no-store' } }
+            return withStorageDegradedHeader(
+                Response.json(
+                    { ok: true, data: { translatedText: cached, model, cached: true, quota } },
+                    { headers: { 'Cache-Control': 'no-store' } }
+                ),
+                translateDegraded
             );
         }
 
@@ -2066,18 +2197,30 @@ export async function handleChatOscWebRoutes(request: Request, env: Env, url: UR
             const outputTokens = rawUsage?.outputTokens ?? estimateTextTokens(translatedText);
             const neuronsDelta = calculateNeuronsForCall(model, inputTokens, outputTokens);
 
-            const stored = await updateWorkersAiDailyQuotaAtomic(env, nowMs, {
-                neurons: neuronsDelta,
-                requests: 1,
-                inputTokens,
-                outputTokens
-            });
+            let translateDegraded: StorageDegradedReason | null = null;
+            let stored: StoredWorkersAiDailyQuota;
+            try {
+                stored = await updateWorkersAiDailyQuotaAtomic(env, nowMs, {
+                    neurons: neuronsDelta,
+                    requests: 1,
+                    inputTokens,
+                    outputTokens
+                });
+            } catch (quotaErr) {
+                const r = classifyStorageWriteDegradation(quotaErr);
+                if (!r) throw quotaErr;
+                translateDegraded = r;
+                stored = await loadStoredWorkersAiDailyQuota(env, nowMs);
+            }
             const quota = toWorkersAiDailyQuotaDto(stored, true, nowMs);
 
             setCachedTranslation(cacheKey, translatedText, nowMs);
-            return Response.json(
-                { ok: true, data: { translatedText, model, cached: false, neuronsDelta, quota } },
-                { headers: { 'Cache-Control': 'no-store' } }
+            return withStorageDegradedHeader(
+                Response.json(
+                    { ok: true, data: { translatedText, model, cached: false, neuronsDelta, quota } },
+                    { headers: { 'Cache-Control': 'no-store' } }
+                ),
+                translateDegraded
             );
         } catch (err) {
             const rawMsg = err instanceof Error ? err.message : String(err);
@@ -2088,7 +2231,9 @@ export async function handleChatOscWebRoutes(request: Request, env: Env, url: UR
                 isDailyQuotaExhausted || /\b(403|paid plan|upgrade|billing|credits|quota|neurons)\b/i.test(rawMsg);
             let quota: WorkersAiDailyQuotaDto | undefined;
             if (isDailyQuotaExhausted) {
-                const stored = await updateWorkersAiDailyQuotaAtomic(env, nowMs, { exhausted: true });
+                const stored = await updateWorkersAiDailyQuotaAtomic(env, nowMs, { exhausted: true }).catch(() =>
+                    loadStoredWorkersAiDailyQuota(env, nowMs)
+                );
                 quota = toWorkersAiDailyQuotaDto(stored, true, nowMs);
             }
             return Response.json(

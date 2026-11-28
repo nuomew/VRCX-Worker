@@ -2,6 +2,12 @@ import { authenticateAgent, authenticateWeb, handleAuthRoutes, isSameOriginReque
 import { maybeRunDailyAutoCompaction } from './db/compactArchive';
 import { runWithExternalMysqlEnv } from './db/externalMysqlProxy';
 import { ensureSchemaReady } from './db/schemaBootstrap';
+import {
+    classifyStorageWriteDegradation,
+    STORAGE_DEGRADED_HEADER,
+    storageReadOnlyErrorResponse,
+    withStorageDegradedHeader
+} from './db/storageResilience';
 import type { Env } from './env';
 import { AgentHubDO } from './hub/AgentHubDO';
 import { handleAgentPublicRoutes, handleAgentWebRoutes } from './routes/agentRoutes';
@@ -207,7 +213,10 @@ export default {
 
                 if (url.pathname === '/api/bg-sync/run' && request.method === 'POST') {
                     const data = await runBackgroundFeedSync(activeEnv, { force: true, trigger: 'manual' });
-                    return Response.json({ ok: true, data }, { headers: { 'Cache-Control': 'no-store' } });
+                    return withStorageDegradedHeader(
+                        Response.json({ ok: true, data }, { headers: { 'Cache-Control': 'no-store' } }),
+                        data.degradedReason
+                    );
                 }
 
                 if (url.pathname === '/api/bg-sync/config' && request.method === 'PUT') {
@@ -222,13 +231,19 @@ export default {
                 if (url.pathname === '/api/rss/feed' && request.method === 'GET') {
                     const since = url.searchParams.get('since') ?? '';
                     const data = await getRssAggregatedFeed(activeEnv, { since });
-                    return Response.json({ ok: true, data }, { headers: { 'Cache-Control': 'no-store' } });
+                    return withStorageDegradedHeader(
+                        Response.json({ ok: true, data }, { headers: { 'Cache-Control': 'no-store' } }),
+                        data.syncResult?.degradedReason
+                    );
                 }
 
                 if (url.pathname === '/api/rss/sync' && request.method === 'POST') {
                     const since = url.searchParams.get('since') ?? '';
                     const data = await getRssAggregatedFeed(activeEnv, { since, forceSync: true });
-                    return Response.json({ ok: true, data }, { headers: { 'Cache-Control': 'no-store' } });
+                    return withStorageDegradedHeader(
+                        Response.json({ ok: true, data }, { headers: { 'Cache-Control': 'no-store' } }),
+                        data.syncResult?.degradedReason
+                    );
                 }
 
                 const vrcResp = await handleVrcProxyRoutes(request, activeEnv, url);
@@ -261,6 +276,27 @@ export default {
                 );
             });
         } catch (err) {
+            const degraded = classifyStorageWriteDegradation(err);
+            if (degraded) {
+                const method = request.method.toUpperCase();
+                if (method !== 'GET' && method !== 'HEAD' && method !== 'OPTIONS') {
+                    return storageReadOnlyErrorResponse(degraded);
+                }
+                return Response.json(
+                    {
+                        ok: false,
+                        error: {
+                            code: 'STORAGE_UNAVAILABLE',
+                            reason: degraded,
+                            message:
+                                degraded === 'external_db_unavailable'
+                                    ? 'External database is temporarily unreachable'
+                                    : 'Cloud database storage/quota limit reached'
+                        }
+                    },
+                    { status: 503, headers: { [STORAGE_DEGRADED_HEADER]: degraded } }
+                );
+            }
             console.error('[VRCX Cloud] Unhandled Worker error:', err);
             return Response.json(
                 {
@@ -277,11 +313,22 @@ export default {
 
     async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
         const task = (async () => {
-            await ensureSchemaReady(env);
-            await runWithExternalMysqlEnv(env, async (activeEnv) => {
-                await runBackgroundFeedSync(activeEnv, { trigger: 'cron' });
-                await maybeRunDailyAutoCompaction(activeEnv);
-            });
+            try {
+                await ensureSchemaReady(env);
+                await runWithExternalMysqlEnv(env, async (activeEnv) => {
+                    await runBackgroundFeedSync(activeEnv, { trigger: 'cron' }).catch((err) => {
+                        console.warn('[VRCX Cloud] Scheduled feed sync degraded/skipped:', err);
+                    });
+                    await maybeRunDailyAutoCompaction(activeEnv).catch((err) => {
+                        console.warn('[VRCX Cloud] Scheduled compaction degraded/skipped:', err);
+                    });
+                });
+            } catch (err) {
+                if (!classifyStorageWriteDegradation(err)) {
+                    throw err;
+                }
+                console.warn('[VRCX Cloud] Scheduled task skipped in storage read-only mode:', err);
+            }
         })();
         ctx.waitUntil(task);
         await task;

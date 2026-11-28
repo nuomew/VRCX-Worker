@@ -156,8 +156,37 @@ export const cloudState = reactive({
         themeColor: '',
         appLanguage: ''
     },
+    /** Automatic Read-Only Basic Mode state triggered by X-VRCX-Storage-Degraded or HTTP 507. */
+    storageDegraded: {
+        active: false,
+        reason: '',
+        dismissed: false,
+        updatedAt: 0
+    },
     hubDialogOpen: false
 });
+
+/**
+ * Activates Read-Only Basic Mode notice banner & bundle write backoff.
+ * @param {string} [reason]
+ */
+export function markCloudStorageDegraded(reason = 'storage_full') {
+    const normalized = reason === 'external_db_unavailable' ? 'external_db_unavailable' : 'storage_full';
+    const prevReason = cloudState.storageDegraded.reason;
+    cloudState.storageDegraded.active = true;
+    cloudState.storageDegraded.reason = normalized;
+    cloudState.storageDegraded.updatedAt = Date.now();
+    if (!prevReason || prevReason !== normalized) {
+        cloudState.storageDegraded.dismissed = false;
+    }
+}
+
+export function clearCloudStorageDegraded() {
+    cloudState.storageDegraded.active = false;
+    cloudState.storageDegraded.reason = '';
+    cloudState.storageDegraded.dismissed = false;
+    cloudState.storageDegraded.updatedAt = 0;
+}
 
 /**
  * Online recency window for HTTP periodic sync companions (at least 5 minutes, or 3x sync interval).

@@ -4102,6 +4102,12 @@
             "mysql_migrate_done_toast": "全量迁移完成：共安全搬迁 {chunks} 个分块（{rows} 条记录）至 MySQL 5.7，并已释放 D1 空间。",
             "mysql_migrate_more_toast": "本轮已完成 {chunks} 块（{rows} 条）搬迁，请点击「继续断点迁移」处理剩余数据。"
         },
+        "storage_degraded": {
+            "banner_full": "数据库写入/存储额度已满，当前已自动进入只读基础模式（好友在线状态、看世界、进房、OSC 聊天正常可用，新日志暂不落盘）。",
+            "banner_mysql_down": "外置 MySQL 数据库暂时无法连接，当前已自动进入只读基础模式（实时状态、看世界与 OSC 聊天仍可正常使用）。",
+            "open_storage_btn": "打开存储设置",
+            "dismiss_btn": "收起"
+        },
         "settings": {
             "restoring_session": "正在恢复会话...",
             "sync_interval_label": "云端同步间隔（网页端与后台动态）",

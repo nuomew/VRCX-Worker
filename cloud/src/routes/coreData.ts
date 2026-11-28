@@ -8,6 +8,12 @@ import {
     parseActiveArchiveVirtualRowId
 } from '../db/compactArchive';
 import { getLegacyDb } from '../db/schemaBootstrap';
+import {
+    classifyStorageWriteDegradation,
+    mergeStorageDegradedReason,
+    type StorageDegradedReason,
+    withStorageDegradedHeader
+} from '../db/storageResilience';
 import type { Env } from '../env';
 import { loadExternalStorageConfig } from '../storage/objectStorage';
 import { buildBootstrapFriendPresenceTimes, markWebClientActive } from '../sync/backgroundFeedSync';
@@ -547,8 +553,23 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
         const webSyncIntervalSeconds = parseWebSyncIntervalSeconds(vrcxConfigs['cloud:webSyncIntervalSeconds']);
         const nowIso = new Date().toISOString();
         const nowMs = Date.parse(nowIso);
-        const totalUptimeSeconds = await accrueCloudUptime(env.DB_CORE, nowIso, Math.max(syncIntervalSeconds * 3, 360));
-        await markWebClientActive(env, nowIso, false).catch(() => {});
+        let degradedReason: StorageDegradedReason | null = null;
+        let totalUptimeSeconds = Number(counters[CLOUD_TOTAL_UPTIME_COUNTER_KEY] ?? 0) || 0;
+        try {
+            totalUptimeSeconds = await accrueCloudUptime(env.DB_CORE, nowIso, Math.max(syncIntervalSeconds * 3, 360));
+        } catch (err) {
+            const reason = classifyStorageWriteDegradation(err);
+            if (!reason) throw err;
+            degradedReason = mergeStorageDegradedReason(degradedReason, reason);
+        }
+        try {
+            await markWebClientActive(env, nowIso, false);
+        } catch (err) {
+            const reason = classifyStorageWriteDegradation(err);
+            if (reason) {
+                degradedReason = mergeStorageDegradedReason(degradedReason, reason);
+            }
+        }
         counters[CLOUD_TOTAL_UPTIME_COUNTER_KEY] = totalUptimeSeconds;
 
         const rawHub = (hubRes?.data ?? {
@@ -608,38 +629,42 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
                 extStorageCfg.secretAccessKeyEnc
         );
 
-        return Response.json({
-            ok: true,
-            data: {
-                configs: vrcxConfigs,
-                storage: bundles.vrcx_storage ?? {},
-                syncIntervalSeconds,
-                webSyncIntervalSeconds,
-                totalUptimeSeconds,
-                memos,
-                worldMemos,
-                avatarMemos,
-                notes,
-                favoriteFriends,
-                favoriteWorlds,
-                favoriteAvatars,
-                favoritePrints,
-                avatarTags,
-                moderations,
-                userProfiles,
-                statsCounters: counters,
-                friendPresenceTimes,
-                agentStatus: {
-                    ...rawHub,
-                    agentsOnline: mergedAgentsOnline,
-                    wsAgentsOnline,
-                    deviceLastSeen,
-                    deviceStates: mergedDeviceStates
-                },
-                r2Enabled: Boolean(env.R2_MEDIA),
-                b2Enabled
-            }
-        });
+        return withStorageDegradedHeader(
+            Response.json({
+                ok: true,
+                data: {
+                    configs: vrcxConfigs,
+                    storage: bundles.vrcx_storage ?? {},
+                    syncIntervalSeconds,
+                    webSyncIntervalSeconds,
+                    totalUptimeSeconds,
+                    memos,
+                    worldMemos,
+                    avatarMemos,
+                    notes,
+                    favoriteFriends,
+                    favoriteWorlds,
+                    favoriteAvatars,
+                    favoritePrints,
+                    avatarTags,
+                    moderations,
+                    userProfiles,
+                    statsCounters: counters,
+                    friendPresenceTimes,
+                    agentStatus: {
+                        ...rawHub,
+                        agentsOnline: mergedAgentsOnline,
+                        wsAgentsOnline,
+                        deviceLastSeen,
+                        deviceStates: mergedDeviceStates
+                    },
+                    r2Enabled: Boolean(env.R2_MEDIA),
+                    b2Enabled,
+                    ...(degradedReason ? { degraded: degradedReason } : {})
+                }
+            }),
+            degradedReason
+        );
     }
 
     // 2. Bundled config & VRCXStorage persistence (single row upsert)
@@ -1077,19 +1102,28 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
                 );
             }
             const nowIso = new Date().toISOString();
-            for (let i = 0; i < list.length; i += 50) {
-                const chunk = list.slice(i, i + 50);
-                await env.DB_CORE.batch(
-                    chunk.map((e) =>
-                        env.DB_CORE.prepare(
-                            'INSERT OR REPLACE INTO user_profile (user_id, bio, bio_links, updated_at) VALUES (?, ?, ?, ?)'
-                        ).bind(
-                            String(e.userId).trim(),
-                            typeof e.bio === 'string' ? e.bio : '',
-                            JSON.stringify(Array.isArray(e.bioLinks) ? e.bioLinks : []),
-                            typeof e.updatedAt === 'string' && e.updatedAt.trim() ? e.updatedAt.trim() : nowIso
+            try {
+                for (let i = 0; i < list.length; i += 50) {
+                    const chunk = list.slice(i, i + 50);
+                    await env.DB_CORE.batch(
+                        chunk.map((e) =>
+                            env.DB_CORE.prepare(
+                                'INSERT OR REPLACE INTO user_profile (user_id, bio, bio_links, updated_at) VALUES (?, ?, ?, ?)'
+                            ).bind(
+                                String(e.userId).trim(),
+                                typeof e.bio === 'string' ? e.bio : '',
+                                JSON.stringify(Array.isArray(e.bioLinks) ? e.bioLinks : []),
+                                typeof e.updatedAt === 'string' && e.updatedAt.trim() ? e.updatedAt.trim() : nowIso
+                            )
                         )
-                    )
+                    );
+                }
+            } catch (err) {
+                const degraded = classifyStorageWriteDegradation(err);
+                if (!degraded) throw err;
+                return withStorageDegradedHeader(
+                    Response.json({ ok: true, data: { count: 0, degraded } }),
+                    degraded
                 );
             }
             return Response.json({ ok: true, data: { count: list.length } });
@@ -1132,20 +1166,29 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
                     { status: 413 }
                 );
             }
-            for (let i = 0; i < list.length; i += 50) {
-                const chunk = list.slice(i, i + 50);
-                await env.DB_CORE.batch(
-                    chunk.map((e) => {
-                        const fn = Number(e.friend_number ?? 0);
-                        return env.DB_CORE.prepare(
-                            'INSERT OR REPLACE INTO friend_log_current (user_id, display_name, trust_level, friend_number) VALUES (?, ?, ?, ?)'
-                        ).bind(
-                            String(e.user_id).trim(),
-                            typeof e.display_name === 'string' ? e.display_name : '',
-                            typeof e.trust_level === 'string' ? e.trust_level : '',
-                            Number.isFinite(fn) ? fn : 0
-                        );
-                    })
+            try {
+                for (let i = 0; i < list.length; i += 50) {
+                    const chunk = list.slice(i, i + 50);
+                    await env.DB_CORE.batch(
+                        chunk.map((e) => {
+                            const fn = Number(e.friend_number ?? 0);
+                            return env.DB_CORE.prepare(
+                                'INSERT OR REPLACE INTO friend_log_current (user_id, display_name, trust_level, friend_number) VALUES (?, ?, ?, ?)'
+                            ).bind(
+                                String(e.user_id).trim(),
+                                typeof e.display_name === 'string' ? e.display_name : '',
+                                typeof e.trust_level === 'string' ? e.trust_level : '',
+                                Number.isFinite(fn) ? fn : 0
+                            );
+                        })
+                    );
+                }
+            } catch (err) {
+                const degraded = classifyStorageWriteDegradation(err);
+                if (!degraded) throw err;
+                return withStorageDegradedHeader(
+                    Response.json({ ok: true, data: { count: 0, degraded } }),
+                    degraded
                 );
             }
             return Response.json({ ok: true, data: { count: list.length } });
@@ -1276,20 +1319,29 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
                 ];
             });
             if (tuples.length > 0) {
-                const res = await appendTuplesToCompactTailChunk({
-                    db: env.DB_CORE,
-                    archiveTable: 'core_archive_chunks',
-                    kindColumn: 'core_kind',
-                    kindValue: 'friend_log',
-                    tuples,
-                    dedupKeyFn: (t) => coreTupleDedupKey('friend_log', t),
-                    fallbackIso: nowIso,
-                    maxRows: COMPACT_CHUNK_MAX_ROWS,
-                    maxJsonBytes: COMPACT_CHUNK_MAX_BYTES,
-                    negateRowIds: false
-                });
-                if (res.inserted > 0) {
-                    await incrementCounter(env.DB_CORE, 'friend_log_history', res.inserted);
+                try {
+                    const res = await appendTuplesToCompactTailChunk({
+                        db: env.DB_CORE,
+                        archiveTable: 'core_archive_chunks',
+                        kindColumn: 'core_kind',
+                        kindValue: 'friend_log',
+                        tuples,
+                        dedupKeyFn: (t) => coreTupleDedupKey('friend_log', t),
+                        fallbackIso: nowIso,
+                        maxRows: COMPACT_CHUNK_MAX_ROWS,
+                        maxJsonBytes: COMPACT_CHUNK_MAX_BYTES,
+                        negateRowIds: false
+                    });
+                    if (res.inserted > 0) {
+                        await incrementCounter(env.DB_CORE, 'friend_log_history', res.inserted);
+                    }
+                } catch (err) {
+                    const degraded = classifyStorageWriteDegradation(err);
+                    if (!degraded) throw err;
+                    return withStorageDegradedHeader(
+                        Response.json({ ok: true, data: { count: 0, degraded } }),
+                        degraded
+                    );
                 }
             }
             return Response.json({ ok: true, data: { count: list.length } });
@@ -1441,114 +1493,126 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
                 );
             }
             const nowIso = new Date().toISOString();
-            if (body.version === 2) {
-                const tuples: unknown[][] = list.map((e) => [
-                    String(e.createdAt ?? e.created_at ?? nowIso),
-                    typeof e.id === 'string' && e.id.trim() ? e.id.trim() : crypto.randomUUID(),
-                    String(e.updatedAt ?? e.updated_at ?? ''),
-                    String(e.expiresAt ?? e.expires_at ?? ''),
-                    String(e.type ?? ''),
-                    String(e.link ?? ''),
-                    String(e.linkText ?? e.link_text ?? ''),
-                    String(e.message ?? ''),
-                    String(e.title ?? ''),
-                    String(e.imageUrl ?? e.image_url ?? ''),
-                    e.seen ? 1 : 0,
-                    String(e.senderUserId ?? e.sender_user_id ?? ''),
-                    String(e.senderUsername ?? e.sender_username ?? ''),
-                    typeof e.data === 'string' ? e.data : JSON.stringify(e.data ?? {}),
-                    typeof e.responses === 'string' ? e.responses : JSON.stringify(e.responses ?? []),
-                    typeof e.details === 'string' ? e.details : JSON.stringify(e.details ?? {})
-                ]);
-                await appendTuplesToCompactTailChunk({
-                    db: env.DB_CORE,
-                    archiveTable: 'core_archive_chunks',
-                    kindColumn: 'core_kind',
-                    kindValue: 'notif_v2',
-                    tuples,
-                    dedupKeyFn: (t) => coreTupleDedupKey('notif_v2', t),
-                    mergeConflictTuple: (existing, incoming) => {
-                        const next = [...existing];
-                        let changed = false;
-                        const incUpdated = String(incoming[2] ?? '');
-                        if (incUpdated && incUpdated !== String(existing[2] ?? '')) {
-                            next[2] = incUpdated;
-                            changed = true;
-                        }
-                        const curExp = String(existing[3] ?? '');
-                        const incExp = String(incoming[3] ?? '');
-                        if (incExp && (!curExp || incExp < curExp)) {
-                            next[3] = incExp;
-                            changed = true;
-                        }
-                        const mergedSeen = Math.max(Number(existing[10] ?? 0) ? 1 : 0, Number(incoming[10] ?? 0) ? 1 : 0);
-                        if (mergedSeen !== (Number(existing[10] ?? 0) ? 1 : 0)) {
-                            next[10] = mergedSeen;
-                            changed = true;
-                        }
-                        return changed ? next : null;
-                    },
-                    fallbackIso: nowIso,
-                    maxRows: COMPACT_CHUNK_MAX_ROWS,
-                    maxJsonBytes: COMPACT_CHUNK_MAX_BYTES,
-                    negateRowIds: false
-                });
-            } else {
-                const tuples: unknown[][] = list.map((e) => {
-                    const id = typeof e.id === 'string' && e.id.trim() ? e.id.trim() : crypto.randomUUID();
-                    const details = isPlainObject(e.details) ? e.details : {};
-                    return [
-                        String(e.created_at ?? nowIso),
-                        id,
+            try {
+                if (body.version === 2) {
+                    const tuples: unknown[][] = list.map((e) => [
+                        String(e.createdAt ?? e.created_at ?? nowIso),
+                        typeof e.id === 'string' && e.id.trim() ? e.id.trim() : crypto.randomUUID(),
+                        String(e.updatedAt ?? e.updated_at ?? ''),
+                        String(e.expiresAt ?? e.expires_at ?? ''),
                         String(e.type ?? ''),
-                        String(e.senderUserId ?? ''),
-                        String(e.senderUsername ?? ''),
-                        String(e.receiverUserId ?? ''),
+                        String(e.link ?? ''),
+                        String(e.linkText ?? e.link_text ?? ''),
                         String(e.message ?? ''),
-                        String(details.worldId ?? ''),
-                        String(details.worldName ?? ''),
-                        String(details.imageUrl ?? ''),
-                        String(details.inviteMessage ?? ''),
-                        String(details.requestMessage ?? ''),
-                        String(details.responseMessage ?? ''),
-                        e.$isExpired ? 1 : 0
-                    ];
-                });
-                const res = await appendTuplesToCompactTailChunk({
-                    db: env.DB_CORE,
-                    archiveTable: 'core_archive_chunks',
-                    kindColumn: 'core_kind',
-                    kindValue: 'notif_v1',
-                    tuples,
-                    dedupKeyFn: (t) => coreTupleDedupKey('notif_v1', t),
-                    mergeConflictTuple: (existing, incoming) => {
-                        if (Number(incoming[13] ?? 0) && !Number(existing[13] ?? 0)) {
+                        String(e.title ?? ''),
+                        String(e.imageUrl ?? e.image_url ?? ''),
+                        e.seen ? 1 : 0,
+                        String(e.senderUserId ?? e.sender_user_id ?? ''),
+                        String(e.senderUsername ?? e.sender_username ?? ''),
+                        typeof e.data === 'string' ? e.data : JSON.stringify(e.data ?? {}),
+                        typeof e.responses === 'string' ? e.responses : JSON.stringify(e.responses ?? []),
+                        typeof e.details === 'string' ? e.details : JSON.stringify(e.details ?? {})
+                    ]);
+                    await appendTuplesToCompactTailChunk({
+                        db: env.DB_CORE,
+                        archiveTable: 'core_archive_chunks',
+                        kindColumn: 'core_kind',
+                        kindValue: 'notif_v2',
+                        tuples,
+                        dedupKeyFn: (t) => coreTupleDedupKey('notif_v2', t),
+                        mergeConflictTuple: (existing, incoming) => {
                             const next = [...existing];
-                            next[13] = 1;
-                            return next;
+                            let changed = false;
+                            const incUpdated = String(incoming[2] ?? '');
+                            if (incUpdated && incUpdated !== String(existing[2] ?? '')) {
+                                next[2] = incUpdated;
+                                changed = true;
+                            }
+                            const curExp = String(existing[3] ?? '');
+                            const incExp = String(incoming[3] ?? '');
+                            if (incExp && (!curExp || incExp < curExp)) {
+                                next[3] = incExp;
+                                changed = true;
+                            }
+                            const mergedSeen = Math.max(
+                                Number(existing[10] ?? 0) ? 1 : 0,
+                                Number(incoming[10] ?? 0) ? 1 : 0
+                            );
+                            if (mergedSeen !== (Number(existing[10] ?? 0) ? 1 : 0)) {
+                                next[10] = mergedSeen;
+                                changed = true;
+                            }
+                            return changed ? next : null;
+                        },
+                        fallbackIso: nowIso,
+                        maxRows: COMPACT_CHUNK_MAX_ROWS,
+                        maxJsonBytes: COMPACT_CHUNK_MAX_BYTES,
+                        negateRowIds: false
+                    });
+                } else {
+                    const tuples: unknown[][] = list.map((e) => {
+                        const id = typeof e.id === 'string' && e.id.trim() ? e.id.trim() : crypto.randomUUID();
+                        const details = isPlainObject(e.details) ? e.details : {};
+                        return [
+                            String(e.created_at ?? nowIso),
+                            id,
+                            String(e.type ?? ''),
+                            String(e.senderUserId ?? ''),
+                            String(e.senderUsername ?? ''),
+                            String(e.receiverUserId ?? ''),
+                            String(e.message ?? ''),
+                            String(details.worldId ?? ''),
+                            String(details.worldName ?? ''),
+                            String(details.imageUrl ?? ''),
+                            String(details.inviteMessage ?? ''),
+                            String(details.requestMessage ?? ''),
+                            String(details.responseMessage ?? ''),
+                            e.$isExpired ? 1 : 0
+                        ];
+                    });
+                    const res = await appendTuplesToCompactTailChunk({
+                        db: env.DB_CORE,
+                        archiveTable: 'core_archive_chunks',
+                        kindColumn: 'core_kind',
+                        kindValue: 'notif_v1',
+                        tuples,
+                        dedupKeyFn: (t) => coreTupleDedupKey('notif_v1', t),
+                        mergeConflictTuple: (existing, incoming) => {
+                            if (Number(incoming[13] ?? 0) && !Number(existing[13] ?? 0)) {
+                                const next = [...existing];
+                                next[13] = 1;
+                                return next;
+                            }
+                            return null;
+                        },
+                        fallbackIso: nowIso,
+                        maxRows: COMPACT_CHUNK_MAX_ROWS,
+                        maxJsonBytes: COMPACT_CHUNK_MAX_BYTES,
+                        negateRowIds: false
+                    });
+                    // Also mark expired in legacy hot single-row table if that id existed there
+                    const expiredIds = tuples.filter((t) => Number(t[13] ?? 0) === 1).map((t) => String(t[1] ?? ''));
+                    if (expiredIds.length > 0 && res.inserted < list.length) {
+                        for (let i = 0; i < expiredIds.length; i += 50) {
+                            const slice = expiredIds.slice(i, i + 50);
+                            await env.DB_CORE.batch(
+                                slice.map((id) =>
+                                    env.DB_CORE.prepare('UPDATE notifications SET expired = 1 WHERE id = ?').bind(id)
+                                )
+                            );
                         }
-                        return null;
-                    },
-                    fallbackIso: nowIso,
-                    maxRows: COMPACT_CHUNK_MAX_ROWS,
-                    maxJsonBytes: COMPACT_CHUNK_MAX_BYTES,
-                    negateRowIds: false
-                });
-                // Also mark expired in legacy hot single-row table if that id existed there
-                const expiredIds = tuples.filter((t) => Number(t[13] ?? 0) === 1).map((t) => String(t[1] ?? ''));
-                if (expiredIds.length > 0 && res.inserted < list.length) {
-                    for (let i = 0; i < expiredIds.length; i += 50) {
-                        const slice = expiredIds.slice(i, i + 50);
-                        await env.DB_CORE.batch(
-                            slice.map((id) =>
-                                env.DB_CORE.prepare('UPDATE notifications SET expired = 1 WHERE id = ?').bind(id)
-                            )
-                        );
+                    }
+                    if (res.inserted > 0) {
+                        await incrementCounter(env.DB_CORE, 'notifications', res.inserted);
                     }
                 }
-                if (res.inserted > 0) {
-                    await incrementCounter(env.DB_CORE, 'notifications', res.inserted);
-                }
+            } catch (err) {
+                const degraded = classifyStorageWriteDegradation(err);
+                if (!degraded) throw err;
+                return withStorageDegradedHeader(
+                    Response.json({ ok: true, data: { count: 0, degraded } }),
+                    degraded
+                );
             }
             return Response.json({ ok: true, data: { count: list.length } });
         }
@@ -1693,9 +1757,31 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
         const cfg = safeJsonParse<Record<string, string>>(cfgRow?.payload_json, {});
         const syncIntervalSeconds = parseCloudSyncIntervalSeconds(cfg['cloud:syncIntervalSeconds']);
         const webSyncIntervalSeconds = parseWebSyncIntervalSeconds(cfg['cloud:webSyncIntervalSeconds']);
-        const totalUptimeSeconds = await accrueCloudUptime(env.DB_CORE, nowIso, Math.max(syncIntervalSeconds * 3, 360));
+        let degradedReason: StorageDegradedReason | null = null;
+        let totalUptimeSeconds = 0;
+        try {
+            totalUptimeSeconds = await accrueCloudUptime(env.DB_CORE, nowIso, Math.max(syncIntervalSeconds * 3, 360));
+        } catch (err) {
+            const reason = classifyStorageWriteDegradation(err);
+            if (!reason) throw err;
+            degradedReason = mergeStorageDegradedReason(degradedReason, reason);
+            const fallbackCounter = await env.DB_CORE.prepare(
+                'SELECT row_count FROM stats_counters WHERE counter_key = ? LIMIT 1'
+            )
+                .bind(CLOUD_TOTAL_UPTIME_COUNTER_KEY)
+                .first<{ row_count?: number }>()
+                .catch(() => null);
+            totalUptimeSeconds = Math.max(0, Number(fallbackCounter?.row_count ?? 0) || 0);
+        }
         const isClosing = url.searchParams.get('closing') === '1';
-        await markWebClientActive(env, nowIso, isClosing).catch(() => {});
+        try {
+            await markWebClientActive(env, nowIso, isClosing);
+        } catch (err) {
+            const reason = classifyStorageWriteDegradation(err);
+            if (reason) {
+                degradedReason = mergeStorageDegradedReason(degradedReason, reason);
+            }
+        }
         const deviceRows = (devRes?.results ?? []) as Array<{ device_id: string; last_seen_at: string }>;
         const { httpAgentsOnline, deviceLastSeen } = resolveRecentHttpAgents(
             deviceRows,
@@ -1728,19 +1814,23 @@ export async function handleCoreDataRoutes(request: Request, env: Env, url: URL)
                 updatedAt: row.updated_at || nowIso
             };
         }
-        return Response.json({
-            ok: true,
-            data: {
-                totalUptimeSeconds,
-                httpAgentsOnline,
-                wsAgentsOnlineHint,
-                deviceLastSeen,
-                deviceStates,
-                syncIntervalSeconds,
-                webSyncIntervalSeconds,
-                serverNow: nowIso
-            }
-        });
+        return withStorageDegradedHeader(
+            Response.json({
+                ok: true,
+                data: {
+                    totalUptimeSeconds,
+                    httpAgentsOnline,
+                    wsAgentsOnlineHint,
+                    deviceLastSeen,
+                    deviceStates,
+                    syncIntervalSeconds,
+                    webSyncIntervalSeconds,
+                    serverNow: nowIso,
+                    ...(degradedReason ? { degraded: degradedReason } : {})
+                }
+            }),
+            degradedReason
+        );
     }
 
     // 10. Zero-scan table sizes & D1 free-tier quota telemetry

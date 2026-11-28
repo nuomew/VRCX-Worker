@@ -2,6 +2,7 @@ import type { Connection, ConnectionOptions, ResultSetHeader, RowDataPacket } fr
 import { getMasterKey } from '../auth/auth';
 import { decryptAesGcm, encryptAesGcm } from '../crypto/vault';
 import type { Env } from '../env';
+import type { StorageDegradedReason } from './storageResilience';
 
 /**
  * MySQL archive chunk IDs start at 1,000,001 so they never collide with D1 autoincrement IDs (1..999,999).
@@ -1204,6 +1205,7 @@ export class ExternalMysqlSession {
     readonly params: ResolvedMysqlConnectionParams;
     readonly mode: ExternalDbMode;
     readonly d1Drained: boolean;
+    degradedReason: StorageDegradedReason | null = null;
     private conn: MysqlConnectionLike | null = null;
     private connectPromise: Promise<MysqlConnectionLike> | null = null;
     private schemaEnsured = false;
@@ -1214,6 +1216,11 @@ export class ExternalMysqlSession {
         this.params = params;
         this.mode = mode;
         this.d1Drained = d1Drained;
+    }
+
+    markDegraded(reason: StorageDegradedReason): void {
+        if (this.degradedReason === 'storage_full') return;
+        this.degradedReason = reason;
     }
 
     private async resetBrokenConnection(): Promise<void> {

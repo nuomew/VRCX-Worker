@@ -1,4 +1,11 @@
-import { clamp2faTrustSeconds, cloudState, setWsAutoConnectHandler, syncGameRunningBridge } from './cloudState.js';
+import {
+    clamp2faTrustSeconds,
+    clearCloudStorageDegraded,
+    cloudState,
+    markCloudStorageDegraded,
+    setWsAutoConnectHandler,
+    syncGameRunningBridge
+} from './cloudState.js';
 
 /** @type {WebSocket | null} */
 let hubSocket = null;
@@ -108,6 +115,7 @@ function handleCloudUnauthorized(probeAuth = false) {
     cloudState.authCheckFailed = false;
     cloudState.authCheckError = '';
     cloudState.hubDialogOpen = false;
+    clearCloudStorageDegraded();
     cloudState.agentsOnline = [];
     cloudState.wsAgentsOnline = [];
     cloudState.deviceLastSeen = {};
@@ -168,12 +176,32 @@ export async function cloudFetch(path, options = {}) {
         throw new Error('Cloud authentication required');
     }
 
+    const degradedHeader = res.headers?.get?.('X-VRCX-Storage-Degraded') || '';
+    const requestMethod = String(options.method || 'GET').toUpperCase();
+    if (degradedHeader) {
+        markCloudStorageDegraded(degradedHeader);
+    }
+
     const text = await res.text();
     let parsed;
     try {
         parsed = text ? JSON.parse(text) : {};
     } catch {
         throw new Error(`Invalid JSON from ${path} (HTTP ${res.status})`);
+    }
+
+    if (res.status === 507 || parsed?.error?.code === 'STORAGE_READ_ONLY') {
+        markCloudStorageDegraded(parsed?.error?.reason || degradedHeader || 'storage_full');
+    } else if (
+        res.ok &&
+        !degradedHeader &&
+        requestMethod !== 'GET' &&
+        requestMethod !== 'HEAD' &&
+        !path.startsWith('/api/vrc/') &&
+        !path.startsWith('/api/auth/') &&
+        !path.startsWith('/api/stats/uptime')
+    ) {
+        clearCloudStorageDegraded();
     }
 
     if (!res.ok || parsed?.ok === false) {

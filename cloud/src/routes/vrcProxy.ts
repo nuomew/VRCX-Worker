@@ -7,6 +7,12 @@ import {
     putCachedVrcResponses
 } from '../cache/vrcCache';
 import { decryptAesGcm, encryptAesGcm } from '../crypto/vault';
+import {
+    classifyStorageWriteDegradation,
+    mergeStorageDegradedReason,
+    type StorageDegradedReason,
+    withStorageDegradedHeader
+} from '../db/storageResilience';
 import type { Env } from '../env';
 import { parseWebSyncIntervalSeconds } from './coreData';
 
@@ -1074,16 +1080,21 @@ export async function handleVrcProxyRoutes(request: Request, env: Env, url: URL)
                     const status = rpcJson.data.status ?? 200;
                     const bodyText = rpcJson.data.data ?? '';
                     const isBinaryImage = bodyText.startsWith('data:image/') || bodyText.startsWith('data:application/');
+                    let strategy1Degraded: StorageDegradedReason | null = null;
+                    const recordS1Degraded = (err: unknown) => {
+                        const r = classifyStorageWriteDegradation(err);
+                        if (r) strategy1Degraded = mergeStorageDegradedReason(strategy1Degraded, r);
+                    };
                     const isLogoutCall = needsAuthCookie && targetPathname === '/api/1/logout';
                     if (
                         isLogoutCall &&
                         ((status >= 200 && status < 300) || status === 401 || status === 403)
                     ) {
-                        await invalidateVrcCacheOnWrite(env, payload.url).catch(() => {});
-                        await purgeAccountScopedSyncState(env, { dropCookieVault: true });
+                        await invalidateVrcCacheOnWrite(env, payload.url).catch(recordS1Degraded);
+                        await purgeAccountScopedSyncState(env, { dropCookieVault: true }).catch(recordS1Degraded);
                     } else if ((isMutation || hasAuthHeader) && status >= 200 && status < 300) {
                         if (needsAuthCookie) {
-                            await invalidateVrcCacheOnWrite(env, payload.url).catch(() => {});
+                            await invalidateVrcCacheOnWrite(env, payload.url).catch(recordS1Degraded);
                             if (hasAuthHeader) {
                                 // Clear friends_snapshot, friend_log_current/owner AND stale cloud_cookie_vault on
                                 // Basic-Auth account switch so concurrent in-flight Strategy 1 GETs fail
@@ -1091,7 +1102,7 @@ export async function handleVrcProxyRoutes(request: Request, env: Env, url: URL)
                                 await purgeAccountScopedSyncState(env, {
                                     dropCookieVault: true,
                                     clearBackoff: true
-                                });
+                                }).catch(recordS1Degraded);
                             }
                         }
                     } else if (cacheMeta && !isBinaryImage && status >= 200 && status < 300 && isValidJsonText(bodyText)) {
@@ -1104,17 +1115,21 @@ export async function handleVrcProxyRoutes(request: Request, env: Env, url: URL)
                         if (safeToCache) {
                             await putCachedVrcResponses(env, [
                                 { url: payload.url, tier: cacheMeta.tier, status, bodyText, ttlMs: cacheMeta.ttlMs }
-                            ]).catch(() => {});
+                            ]).catch(recordS1Degraded);
                         }
                     }
-                    return Response.json({
-                        ok: true,
-                        data: {
-                            status,
-                            data: bodyText,
-                            route: 'agent_residential_ip'
-                        }
-                    });
+                    return withStorageDegradedHeader(
+                        Response.json({
+                            ok: true,
+                            data: {
+                                status,
+                                data: bodyText,
+                                route: 'agent_residential_ip',
+                                ...(strategy1Degraded ? { degraded: strategy1Degraded } : {})
+                            }
+                        }),
+                        strategy1Degraded
+                    );
                 }
             } else if (isMutation && rpcRes.status !== 503) {
                 // Never replay a non-idempotent write to cloud_direct after an Agent RPC timeout (504) or gateway error.
@@ -1192,6 +1207,11 @@ export async function handleVrcProxyRoutes(request: Request, env: Env, url: URL)
                     (isTranslationTest && isAllowedTranslationTestUrl(candidate, candidateMethod)) ||
                     (await isConfiguredPublicTranslationUrl(env, candidate))
             );
+            let strategy2Degraded: StorageDegradedReason | null = null;
+            const recordS2Degraded = (err: unknown) => {
+                const r = classifyStorageWriteDegradation(err);
+                if (r) strategy2Degraded = mergeStorageDegradedReason(strategy2Degraded, r);
+            };
             let effectiveAuthForCache = prevAuthCookie;
             if (needsAuthCookie) {
                 let cookieChanged = false;
@@ -1245,33 +1265,41 @@ export async function handleVrcProxyRoutes(request: Request, env: Env, url: URL)
                         const isAccountSwitch = Boolean(
                             canEstablishNewSession && nextAuthCookie && nextAuthCookie !== prevAuthCookie
                         );
-                        const saveResult = isAccountSwitch
-                            ? await saveCookieJarAndPurgeAccountStateAtomic(env, jarToSave, { clearBackoff: true })
-                            : await saveCookieJar(env, jarToSave, 'default', {
-                                  requireExisting: !canEstablishNewSession,
-                                  expectedUpdatedAt: canEstablishNewSession ? undefined : initialCookieUpdatedAt || undefined
-                              });
-                        // If a concurrent request rotated an auxiliary cookie (e.g. __cf_bm) for the SAME session while
-                        // this request received an important auth/2FA cookie update or explicit deletion, reload & retry once.
-                        if (!saveResult.saved && !canEstablishNewSession && prevAuthCookie) {
-                            const hasCriticalCookieDelta =
-                                Boolean(incomingSet.twoFactorAuth) ||
-                                Boolean(incomingSet.auth) ||
-                                incomingDeleted.has('twoFactorAuth') ||
-                                incomingDeleted.has('auth');
-                            if (hasCriticalCookieDelta) {
-                                const latest = await loadCookieJarWithMeta(env);
-                                if (latest.updatedAt && (latest.jar.auth ?? '') === prevAuthCookie) {
-                                    const retriedJar: Record<string, string> = { ...latest.jar, ...incomingSet };
-                                    for (const delName of incomingDeleted) {
-                                        delete retriedJar[delName];
+                        try {
+                            const saveResult = isAccountSwitch
+                                ? await saveCookieJarAndPurgeAccountStateAtomic(env, jarToSave, { clearBackoff: true })
+                                : await saveCookieJar(env, jarToSave, 'default', {
+                                      requireExisting: !canEstablishNewSession,
+                                      expectedUpdatedAt: canEstablishNewSession
+                                          ? undefined
+                                          : initialCookieUpdatedAt || undefined
+                                  });
+                            // If a concurrent request rotated an auxiliary cookie (e.g. __cf_bm) for the SAME session while
+                            // this request received an important auth/2FA cookie update or explicit deletion, reload & retry once.
+                            if (!saveResult.saved && !canEstablishNewSession && prevAuthCookie) {
+                                const hasCriticalCookieDelta =
+                                    Boolean(incomingSet.twoFactorAuth) ||
+                                    Boolean(incomingSet.auth) ||
+                                    incomingDeleted.has('twoFactorAuth') ||
+                                    incomingDeleted.has('auth');
+                                if (hasCriticalCookieDelta) {
+                                    const latest = await loadCookieJarWithMeta(env);
+                                    if (latest.updatedAt && (latest.jar.auth ?? '') === prevAuthCookie) {
+                                        const retriedJar: Record<string, string> = { ...latest.jar, ...incomingSet };
+                                        for (const delName of incomingDeleted) {
+                                            delete retriedJar[delName];
+                                        }
+                                        await saveCookieJar(env, retriedJar, 'default', {
+                                            requireExisting: true,
+                                            expectedUpdatedAt: latest.updatedAt
+                                        });
                                     }
-                                    await saveCookieJar(env, retriedJar, 'default', {
-                                        requireExisting: true,
-                                        expectedUpdatedAt: latest.updatedAt
-                                    });
                                 }
                             }
+                        } catch (saveErr) {
+                            const r = classifyStorageWriteDegradation(saveErr);
+                            if (!r || canEstablishNewSession) throw saveErr;
+                            strategy2Degraded = mergeStorageDegradedReason(strategy2Degraded, r);
                         }
                     }
                 }
@@ -1284,11 +1312,11 @@ export async function handleVrcProxyRoutes(request: Request, env: Env, url: URL)
 
             const isLogoutCall = needsAuthCookie && targetPathname === '/api/1/logout';
             if (isLogoutCall && ((upstream.status >= 200 && upstream.status < 300) || upstream.status === 401 || upstream.status === 403)) {
-                await invalidateVrcCacheOnWrite(env, payload.url).catch(() => {});
-                await purgeAccountScopedSyncState(env, { dropCookieVault: true });
+                await invalidateVrcCacheOnWrite(env, payload.url).catch(recordS2Degraded);
+                await purgeAccountScopedSyncState(env, { dropCookieVault: true }).catch(recordS2Degraded);
             } else if ((isMutation || hasAuthHeader) && upstream.status >= 200 && upstream.status < 300) {
                 if (needsAuthCookie) {
-                    await invalidateVrcCacheOnWrite(env, payload.url).catch(() => {});
+                    await invalidateVrcCacheOnWrite(env, payload.url).catch(recordS2Degraded);
                 }
             } else if (cacheMeta && !isBinaryImage && upstream.status >= 200 && upstream.status < 300 && isValidJsonText(text)) {
                 let safeToCache = !needsAuthCookie;
@@ -1306,19 +1334,23 @@ export async function handleVrcProxyRoutes(request: Request, env: Env, url: URL)
                             bodyText: text,
                             ttlMs: cacheMeta.ttlMs
                         }
-                    ]).catch(() => {});
+                    ]).catch(recordS2Degraded);
                 }
             }
 
-            return Response.json({
-                ok: true,
-                data: {
-                    status: upstream.status,
-                    data: text,
-                    route: 'cloud_direct',
-                    wafBlocked
-                }
-            });
+            return withStorageDegradedHeader(
+                Response.json({
+                    ok: true,
+                    data: {
+                        status: upstream.status,
+                        data: text,
+                        route: 'cloud_direct',
+                        wafBlocked,
+                        ...(strategy2Degraded ? { degraded: strategy2Degraded } : {})
+                    }
+                }),
+                strategy2Degraded
+            );
         } catch (err) {
             return Response.json(
                 {
@@ -1523,6 +1555,12 @@ export async function handleVrcProxyRoutes(request: Request, env: Env, url: URL)
             })
         );
 
+        let batchDegraded: StorageDegradedReason | null = null;
+        const recordBatchDegraded = (err: unknown) => {
+            const r = classifyStorageWriteDegradation(err);
+            if (r) batchDegraded = mergeStorageDegradedReason(batchDegraded, r);
+        };
+
         if (toWriteCache.length > 0) {
             const publicEntries = toWriteCache.filter((x) => !x.needsAuth);
             const authEntries = toWriteCache.filter((x) => x.needsAuth);
@@ -1533,7 +1571,7 @@ export async function handleVrcProxyRoutes(request: Request, env: Env, url: URL)
             }
             const safeEntries = allowAuthCache ? [...publicEntries, ...authEntries] : publicEntries;
             if (safeEntries.length > 0) {
-                await putCachedVrcResponses(env, safeEntries).catch(() => {});
+                await putCachedVrcResponses(env, safeEntries).catch(recordBatchDegraded);
             }
         }
         // Read-only batches may only persist auxiliary cookie refreshes (e.g. __cf_bm) for an existing authenticated
@@ -1542,16 +1580,20 @@ export async function handleVrcProxyRoutes(request: Request, env: Env, url: URL)
             await saveCookieJar(env, jar, 'default', {
                 requireExisting: true,
                 expectedUpdatedAt: initialCookieUpdatedAt
-            });
+            }).catch(recordBatchDegraded);
         }
 
-        return Response.json({
-            ok: true,
-            data: {
-                results,
-                route: missIndexes.length === 0 ? 'cloud_cache' : 'cloud_direct'
-            }
-        });
+        return withStorageDegradedHeader(
+            Response.json({
+                ok: true,
+                data: {
+                    results,
+                    route: missIndexes.length === 0 ? 'cloud_cache' : 'cloud_direct',
+                    ...(batchDegraded ? { degraded: batchDegraded } : {})
+                }
+            }),
+            batchDegraded
+        );
     }
 
     return null;

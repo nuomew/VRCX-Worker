@@ -9,6 +9,12 @@ import {
     verifyAgentBodyHmac
 } from '../auth/auth';
 import { encryptAesGcm, randomHex, sha256Hex } from '../crypto/vault';
+import {
+    classifyStorageWriteDegradation,
+    mergeStorageDegradedReason,
+    type StorageDegradedReason,
+    withStorageDegradedHeader
+} from '../db/storageResilience';
 import type { Env } from '../env';
 import {
     B2_KEY_PREFIX_TAG,
@@ -603,7 +609,19 @@ export async function handleAgentPublicRoutes(request: Request, env: Env, url: U
         }
 
         const events = Array.isArray(body.events) ? body.events.slice(0, 100) : [];
-        const result = await ingestGameLogItems(env, events);
+        let ingestDegraded: StorageDegradedReason | null = null;
+        let result: { inserted: number; skipped: number; rowIds: number[] } = {
+            inserted: 0,
+            skipped: events.length,
+            rowIds: []
+        };
+        try {
+            result = await ingestGameLogItems(env, events);
+        } catch (err) {
+            const r = classifyStorageWriteDegradation(err);
+            if (!r) throw err;
+            ingestDegraded = mergeStorageDegradedReason(ingestDegraded, r);
+        }
         const nowIso = new Date().toISOString();
 
         const updates: D1PreparedStatement[] = [
@@ -633,7 +651,13 @@ export async function handleAgentPublicRoutes(request: Request, env: Env, url: U
                 )
             );
         }
-        await env.DB_CORE.batch(updates);
+        try {
+            await env.DB_CORE.batch(updates);
+        } catch (err) {
+            const r = classifyStorageWriteDegradation(err);
+            if (!r) throw err;
+            ingestDegraded = mergeStorageDegradedReason(ingestDegraded, r);
+        }
 
         // Broadcast fresh GameLog events to any open browser tabs via AgentHubDO (outgoing WS is free)
         if (events.length > 0) {
@@ -656,7 +680,13 @@ export async function handleAgentPublicRoutes(request: Request, env: Env, url: U
             await broadcastRes.body?.cancel().catch(() => {});
         }
 
-        return Response.json({ ok: true, data: result });
+        return withStorageDegradedHeader(
+            Response.json({
+                ok: true,
+                data: ingestDegraded ? { ...result, degraded: ingestDegraded } : result
+            }),
+            ingestDegraded
+        );
     }
 
     // 3. Agent screenshot thumbnail upload (R2 optional, D1 metadata always persisted)
@@ -956,8 +986,20 @@ export async function handleAgentPublicRoutes(request: Request, env: Env, url: U
 
         const isProbeOnly = body.probeOnly === true;
         const events = !isProbeOnly && Array.isArray(body.events) ? body.events.slice(0, 100) : [];
-        const ingestRaw = events.length > 0 ? await ingestGameLogItems(env, events) : null;
-        const ingest = ingestRaw ? { inserted: ingestRaw.inserted, skipped: ingestRaw.skipped } : { inserted: 0, skipped: 0 };
+        let syncDegraded: StorageDegradedReason | null = null;
+        let ingestRaw: Awaited<ReturnType<typeof ingestGameLogItems>> | null = null;
+        if (events.length > 0) {
+            try {
+                ingestRaw = await ingestGameLogItems(env, events);
+            } catch (err) {
+                const r = classifyStorageWriteDegradation(err);
+                if (!r) throw err;
+                syncDegraded = mergeStorageDegradedReason(syncDegraded, r);
+            }
+        }
+        const ingest = ingestRaw
+            ? { inserted: ingestRaw.inserted, skipped: ingestRaw.skipped }
+            : { inserted: 0, skipped: events.length };
         const nowIso = new Date().toISOString();
         // Always prefer the authoritative Web-configured deviceName bound to the Sync Key.
         const rawDeviceName = typeof body.deviceName === 'string' ? body.deviceName : '';
@@ -1152,8 +1194,17 @@ export async function handleAgentPublicRoutes(request: Request, env: Env, url: U
             );
         }
 
-        const writeResults = await env.DB_CORE.batch(coreWrites);
-        if (isRegisteredDevice && (writeResults[0]?.meta?.changes ?? 0) === 0) {
+        let coreWriteExecuted = false;
+        let writeResults: D1Result[] = [];
+        try {
+            writeResults = await env.DB_CORE.batch(coreWrites);
+            coreWriteExecuted = true;
+        } catch (err) {
+            const r = classifyStorageWriteDegradation(err);
+            if (!r) throw err;
+            syncDegraded = mergeStorageDegradedReason(syncDegraded, r);
+        }
+        if (coreWriteExecuted && isRegisteredDevice && (writeResults[0]?.meta?.changes ?? 0) === 0) {
             return Response.json(
                 { ok: false, error: { code: 'DEVICE_REVOKED', message: 'Device has been revoked' } },
                 { status: 401 }
@@ -1165,24 +1216,26 @@ export async function handleAgentPublicRoutes(request: Request, env: Env, url: U
             params: Record<string, unknown>;
             expiresAt: string;
         }> = [];
-        for (let i = 0; i < candidateRows.length; i++) {
-            const claimRes = writeResults[claimStartIndex + i];
-            if ((claimRes?.meta?.changes ?? 0) !== 1) {
-                continue;
+        if (coreWriteExecuted) {
+            for (let i = 0; i < candidateRows.length; i++) {
+                const claimRes = writeResults[claimStartIndex + i];
+                if ((claimRes?.meta?.changes ?? 0) !== 1) {
+                    continue;
+                }
+                const row = candidateRows[i]!;
+                let params: Record<string, unknown> = {};
+                try {
+                    params = JSON.parse(row.payload_json || '{}') as Record<string, unknown>;
+                } catch {
+                    params = {};
+                }
+                pendingCommands.push({
+                    cmdId: row.cmd_id,
+                    action: row.action,
+                    params,
+                    expiresAt: row.expires_at
+                });
             }
-            const row = candidateRows[i]!;
-            let params: Record<string, unknown> = {};
-            try {
-                params = JSON.parse(row.payload_json || '{}') as Record<string, unknown>;
-            } catch {
-                params = {};
-            }
-            pendingCommands.push({
-                cmdId: row.cmd_id,
-                action: row.action,
-                params,
-                expiresAt: row.expires_at
-            });
         }
 
         // Periodic HTTP sync persists live state into DB_CORE.cloud_device_states and GameLog into DB_GAMELOG
@@ -1192,23 +1245,33 @@ export async function handleAgentPublicRoutes(request: Request, env: Env, url: U
             getCloudSyncIntervalSeconds(env),
             isChatWebSessionActive(env)
         ]);
-        await accrueCloudUptime(env.DB_CORE, nowIso, Math.max(syncIntervalSeconds * 3, 360));
+        try {
+            await accrueCloudUptime(env.DB_CORE, nowIso, Math.max(syncIntervalSeconds * 3, 360));
+        } catch (err) {
+            const r = classifyStorageWriteDegradation(err);
+            if (!r) throw err;
+            syncDegraded = mergeStorageDegradedReason(syncDegraded, r);
+        }
         const syncedMs = Date.parse(nowIso);
         const nextSyncAt = new Date(syncedMs + syncIntervalSeconds * 1000).toISOString();
 
-        return Response.json({
-            ok: true,
-            data: {
-                deviceId: auth.deviceId,
-                deviceName,
-                syncedAt: nowIso,
-                syncIntervalSeconds,
-                nextSyncAt,
-                ingest,
-                chatSessionActive: chatSession.active,
-                pendingCommands
-            }
-        });
+        return withStorageDegradedHeader(
+            Response.json({
+                ok: true,
+                data: {
+                    deviceId: auth.deviceId,
+                    deviceName,
+                    syncedAt: nowIso,
+                    syncIntervalSeconds,
+                    nextSyncAt,
+                    ingest,
+                    chatSessionActive: chatSession.active,
+                    pendingCommands,
+                    ...(syncDegraded ? { degraded: syncDegraded } : {})
+                }
+            }),
+            syncDegraded
+        );
     }
 
     // 5. HTTP command execution result report from periodic sync Agent

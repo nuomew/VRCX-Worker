@@ -4,7 +4,7 @@
             <div class="shrink-0 p-1.5">
                 <span class="text-lg font-semibold text-foreground">{{ t('view.settings.header') }}</span>
             </div>
-            <TabsUnderline default-value="system" :items="settingsTabs" :unmount-on-hide="false" fill>
+            <TabsUnderline v-model="activeTab" :items="settingsTabs" :unmount-on-hide="false" fill>
                 <template #system>
                     <SystemTab />
                 </template>
@@ -44,7 +44,8 @@
 </template>
 
 <script setup>
-    import { computed, defineAsyncComponent, onBeforeMount } from 'vue';
+    import { computed, defineAsyncComponent, onBeforeMount, ref, watch } from 'vue';
+    import { useRoute } from 'vue-router';
     import { TabsUnderline } from '@/components/ui/tabs';
     import { useI18n } from 'vue-i18n';
 
@@ -62,7 +63,9 @@
     const StorageTab = defineAsyncComponent(() => import('./components/Tabs/StorageTab.vue'));
 
     const { t } = useI18n();
+    const route = useRoute();
     const isWeb = typeof WEB !== 'undefined' && WEB;
+    const activeTab = ref('system');
     const settingsTabs = computed(() => {
         const tabs = [
             { value: 'system', label: t('view.settings.category.system') },
@@ -83,6 +86,17 @@
         ];
         return isWeb ? tabs.filter((tab) => tab.value !== 'vr' && tab.value !== 'media') : tabs;
     });
+
+    watch(
+        () => route.query?.tab,
+        (tab) => {
+            const candidate = typeof tab === 'string' ? tab.trim() : '';
+            if (candidate && settingsTabs.value.some((item) => item.value === candidate)) {
+                activeTab.value = candidate;
+            }
+        },
+        { immediate: true }
+    );
 
     onBeforeMount(() => {
         const menuItem = document.querySelector('li[role="menuitem"].is-active');

@@ -15,6 +15,7 @@ import {
     parseActiveArchiveVirtualRowId
 } from '../db/compactArchive';
 import { getLegacyDb } from '../db/schemaBootstrap';
+import { classifyStorageWriteDegradation, withStorageDegradedHeader } from '../db/storageResilience';
 import type { Env } from '../env';
 import { buildSafeTrigramMatch, escapeSqlLikePattern, searchGameLogByEntity } from '../search/entityFts';
 import {
@@ -1323,8 +1324,21 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
                 : isPlainObject(rawBody.item)
                   ? [rawBody.item as unknown as GameLogIngestItem]
                   : [];
-            const res = await ingestGameLogItems(env, items.slice(0, 100));
-            return Response.json({ ok: true, data: res });
+            const boundedItems = items.slice(0, 100);
+            try {
+                const res = await ingestGameLogItems(env, boundedItems);
+                return Response.json({ ok: true, data: res });
+            } catch (err) {
+                const degraded = classifyStorageWriteDegradation(err);
+                if (!degraded) throw err;
+                return withStorageDegradedHeader(
+                    Response.json({
+                        ok: true,
+                        data: { inserted: 0, skipped: boundedItems.length, rowIds: [], degraded }
+                    }),
+                    degraded
+                );
+            }
         }
 
         if (request.method === 'PATCH') {
@@ -1351,97 +1365,103 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
             const videoName = asStr(rawBody.videoName);
             const hasVideoId = rawBody.videoId !== undefined;
             const videoId = asStr(rawBody.videoId);
-            if (op === 'update_location_time' && createdAt) {
-                const hotUpd = location
-                    ? await env.DB_GAMELOG.prepare(
-                          'UPDATE gamelog_location SET time = ? WHERE created_at = ? AND location = ?'
-                      )
-                          .bind(timeVal, createdAt, location)
-                          .run()
-                    : await env.DB_GAMELOG.prepare('UPDATE gamelog_location SET time = ? WHERE created_at = ?')
-                          .bind(timeVal, createdAt)
-                          .run();
-                if ((hotUpd.meta?.changes ?? 0) === 0) {
-                    const chunkUpd = await mutateArchiveChunks({
-                        db: env.DB_GAMELOG,
-                        archiveTable: 'gamelog_archive_chunks',
-                        kindColumn: 'gamelog_kind',
-                        kindValue: 'location',
-                        maxChunksToScan: 6,
-                        mutateTuple: (t) => {
-                            if (String(t[0] ?? '') !== createdAt) return 'keep';
-                            if (location && String(t[1] ?? '') !== location) return 'keep';
-                            const next = [...t];
-                            next[4] = timeVal;
-                            return next;
-                        }
-                    });
-                    for (const pair of chunkUpd.modifiedPairs) {
-                        const wid = String(pair.after[2] ?? '').trim();
-                        const prevTime = Math.max(0, Number(pair.before[4] ?? 0) || 0);
-                        const nextTime = Math.max(0, Number(pair.after[4] ?? 0) || 0);
-                        await adjustWorldRollupDelta(env.DB_GAMELOG, wid, 0, nextTime - prevTime);
-                    }
-                }
-            } else if (op === 'update_video_name') {
-                const rawRowId = Number(rawBody.rowId ?? 0);
-                const rowId = Number.isFinite(rawRowId) ? Math.floor(rawRowId) : 0;
-                const virtualLoc = parseActiveArchiveVirtualRowId(rowId);
-                if (virtualLoc) {
-                    await mutateArchiveChunks({
-                        db: env.DB_GAMELOG,
-                        archiveTable: 'gamelog_archive_chunks',
-                        kindColumn: 'gamelog_kind',
-                        kindValue: 'video',
-                        chunkIdHint: virtualLoc.chunkId,
-                        stopAfterFirstChunkChange: true,
-                        mutateTuple: (t, _cid, idx) => {
-                            if (idx !== virtualLoc.idxInChunk) return 'keep';
-                            const next = [...t];
-                            next[2] = videoName;
-                            if (hasVideoId) next[3] = videoId;
-                            return next;
-                        }
-                    });
-                } else if (rowId > 0) {
-                    if (hasVideoId) {
-                        await env.DB_GAMELOG.prepare(
-                            'UPDATE gamelog_video_play SET video_name = ?, video_id = ? WHERE id = ?'
-                        )
-                            .bind(videoName, videoId, rowId)
-                            .run();
-                    } else {
-                        await env.DB_GAMELOG.prepare('UPDATE gamelog_video_play SET video_name = ? WHERE id = ?')
-                            .bind(videoName, rowId)
-                            .run();
-                    }
-                } else if (videoUrl) {
-                    const hotVidUpd = hasVideoId
+            try {
+                if (op === 'update_location_time' && createdAt) {
+                    const hotUpd = location
                         ? await env.DB_GAMELOG.prepare(
-                              'UPDATE gamelog_video_play SET video_name = ?, video_id = ? WHERE video_url = ?'
+                              'UPDATE gamelog_location SET time = ? WHERE created_at = ? AND location = ?'
                           )
-                              .bind(videoName, videoId, videoUrl)
+                              .bind(timeVal, createdAt, location)
                               .run()
-                        : await env.DB_GAMELOG.prepare('UPDATE gamelog_video_play SET video_name = ? WHERE video_url = ?')
-                              .bind(videoName, videoUrl)
+                        : await env.DB_GAMELOG.prepare('UPDATE gamelog_location SET time = ? WHERE created_at = ?')
+                              .bind(timeVal, createdAt)
                               .run();
-                    if ((hotVidUpd.meta?.changes ?? 0) === 0) {
+                    if ((hotUpd.meta?.changes ?? 0) === 0) {
+                        const chunkUpd = await mutateArchiveChunks({
+                            db: env.DB_GAMELOG,
+                            archiveTable: 'gamelog_archive_chunks',
+                            kindColumn: 'gamelog_kind',
+                            kindValue: 'location',
+                            maxChunksToScan: 6,
+                            mutateTuple: (t) => {
+                                if (String(t[0] ?? '') !== createdAt) return 'keep';
+                                if (location && String(t[1] ?? '') !== location) return 'keep';
+                                const next = [...t];
+                                next[4] = timeVal;
+                                return next;
+                            }
+                        });
+                        for (const pair of chunkUpd.modifiedPairs) {
+                            const wid = String(pair.after[2] ?? '').trim();
+                            const prevTime = Math.max(0, Number(pair.before[4] ?? 0) || 0);
+                            const nextTime = Math.max(0, Number(pair.after[4] ?? 0) || 0);
+                            await adjustWorldRollupDelta(env.DB_GAMELOG, wid, 0, nextTime - prevTime);
+                        }
+                    }
+                } else if (op === 'update_video_name') {
+                    const rawRowId = Number(rawBody.rowId ?? 0);
+                    const rowId = Number.isFinite(rawRowId) ? Math.floor(rawRowId) : 0;
+                    const virtualLoc = parseActiveArchiveVirtualRowId(rowId);
+                    if (virtualLoc) {
                         await mutateArchiveChunks({
                             db: env.DB_GAMELOG,
                             archiveTable: 'gamelog_archive_chunks',
                             kindColumn: 'gamelog_kind',
                             kindValue: 'video',
-                            maxChunksToScan: 8,
-                            mutateTuple: (t) => {
-                                if (String(t[1] ?? '') !== videoUrl) return 'keep';
+                            chunkIdHint: virtualLoc.chunkId,
+                            stopAfterFirstChunkChange: true,
+                            mutateTuple: (t, _cid, idx) => {
+                                if (idx !== virtualLoc.idxInChunk) return 'keep';
                                 const next = [...t];
                                 next[2] = videoName;
                                 if (hasVideoId) next[3] = videoId;
                                 return next;
                             }
                         });
+                    } else if (rowId > 0) {
+                        if (hasVideoId) {
+                            await env.DB_GAMELOG.prepare(
+                                'UPDATE gamelog_video_play SET video_name = ?, video_id = ? WHERE id = ?'
+                            )
+                                .bind(videoName, videoId, rowId)
+                                .run();
+                        } else {
+                            await env.DB_GAMELOG.prepare('UPDATE gamelog_video_play SET video_name = ? WHERE id = ?')
+                                .bind(videoName, rowId)
+                                .run();
+                        }
+                    } else if (videoUrl) {
+                        const hotVidUpd = hasVideoId
+                            ? await env.DB_GAMELOG.prepare(
+                                  'UPDATE gamelog_video_play SET video_name = ?, video_id = ? WHERE video_url = ?'
+                              )
+                                  .bind(videoName, videoId, videoUrl)
+                                  .run()
+                            : await env.DB_GAMELOG.prepare('UPDATE gamelog_video_play SET video_name = ? WHERE video_url = ?')
+                                  .bind(videoName, videoUrl)
+                                  .run();
+                        if ((hotVidUpd.meta?.changes ?? 0) === 0) {
+                            await mutateArchiveChunks({
+                                db: env.DB_GAMELOG,
+                                archiveTable: 'gamelog_archive_chunks',
+                                kindColumn: 'gamelog_kind',
+                                kindValue: 'video',
+                                maxChunksToScan: 8,
+                                mutateTuple: (t) => {
+                                    if (String(t[1] ?? '') !== videoUrl) return 'keep';
+                                    const next = [...t];
+                                    next[2] = videoName;
+                                    if (hasVideoId) next[3] = videoId;
+                                    return next;
+                                }
+                            });
+                        }
                     }
                 }
+            } catch (err) {
+                const degraded = classifyStorageWriteDegradation(err);
+                if (!degraded) throw err;
+                return withStorageDegradedHeader(Response.json({ ok: true, data: { degraded } }), degraded);
             }
             return Response.json({ ok: true });
         }
@@ -3995,8 +4015,20 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
             const list = (Array.isArray(rawBody.items) ? rawBody.items : []).slice(0, 50) as Array<
                 Record<string, unknown>
             >;
-            const result = await ingestFeedItems(env, list);
-            return Response.json({ ok: true, data: result });
+            try {
+                const result = await ingestFeedItems(env, list);
+                return Response.json({ ok: true, data: result });
+            } catch (err) {
+                const degraded = classifyStorageWriteDegradation(err);
+                if (!degraded) throw err;
+                return withStorageDegradedHeader(
+                    Response.json({
+                        ok: true,
+                        data: { inserted: 0, skipped: list.length, degraded }
+                    }),
+                    degraded
+                );
+            }
         }
     }
 
@@ -5056,7 +5088,13 @@ export async function handleEventsDataRoutes(request: Request, env: Env, url: UR
             }
             // Execute DELETE + all INSERTs atomically in a single D1 batch transaction (rawSessions <= 1000).
             if (stmts.length > 0) {
-                await env.DB_FEED.batch(stmts);
+                try {
+                    await env.DB_FEED.batch(stmts);
+                } catch (err) {
+                    const degraded = classifyStorageWriteDegradation(err);
+                    if (!degraded) throw err;
+                    return withStorageDegradedHeader(Response.json({ ok: true, data: { degraded } }), degraded);
+                }
             }
             return Response.json({ ok: true });
         }

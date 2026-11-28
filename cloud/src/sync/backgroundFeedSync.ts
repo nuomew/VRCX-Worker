@@ -17,6 +17,11 @@ import {
     decodeFeedChunkRows
 } from '../db/compactArchive';
 import { getCacheDb } from '../db/schemaBootstrap';
+import {
+    classifyStorageWriteDegradation,
+    mergeStorageDegradedReason,
+    type StorageDegradedReason
+} from '../db/storageResilience';
 import type { Env } from '../env';
 import { parseCloudSyncIntervalSeconds, parseWebSyncIntervalSeconds } from '../routes/coreData';
 import { ingestFeedItems } from '../routes/eventsData';
@@ -94,6 +99,7 @@ export interface PollerMeta {
         | 'no_session'
         | 'auth_expired'
         | 'rate_limited'
+        | 'degraded_storage'
         | 'error';
     lastError: string;
     lastOnlineCount: number;
@@ -122,6 +128,7 @@ export interface BackgroundFeedSyncResult {
     notificationsInserted: number;
     bioChecked: number;
     friendLogInserted?: number;
+    degradedReason?: StorageDegradedReason;
     error?: string;
 }
 
@@ -1441,9 +1448,13 @@ export async function runBackgroundFeedSync(
     const nowIso = new Date(nowMs).toISOString();
 
     // Acquire the atomic lease BEFORE reading poller state to eliminate read-before-lock TOCTOU races
-    // (fail-closed if lock acquisition errors).
+    // (if D1/external storage is in read-only degraded mode, fall back cleanly so forced manual syncs still serve live VRChat status).
     const lockToken = crypto.randomUUID();
-    const acquired = await tryAcquirePollerLease(env, nowMs, lockToken).catch(() => false);
+    let leaseDegraded: StorageDegradedReason | null = null;
+    const acquired = await tryAcquirePollerLease(env, nowMs, lockToken).catch((err) => {
+        leaseDegraded = classifyStorageWriteDegradation(err);
+        return Boolean(leaseDegraded && force);
+    });
     if (!acquired) {
         return {
             ran: false,
@@ -1456,7 +1467,8 @@ export async function runBackgroundFeedSync(
     }
 
     let meta: PollerMeta = defaultPollerMeta();
-    let leaseReleased = false;
+    let leaseReleased = Boolean(leaseDegraded);
+    let syncDegradedReason: StorageDegradedReason | null = leaseDegraded;
     try {
         // Always read poller state AFTER holding the lease so concurrent runs never diff against stale snapshots.
         const pollerState = await readPollerState(env);
@@ -1897,70 +1909,88 @@ export async function runBackgroundFeedSync(
         // and use authoritative actually-inserted counts for counters & metadata.
         const freshV1Tuples = notifFetch.v1Tuples.filter((t) => !existingV1Ids.has(String(t[1] ?? '')));
         let actualV1Inserted = 0;
-        if (freshV1Tuples.length > 0) {
-            const v1ChunkRes = await appendTuplesToCompactTailChunk({
-                db: env.DB_CORE,
-                archiveTable: 'core_archive_chunks',
-                kindColumn: 'core_kind',
-                kindValue: 'notif_v1',
-                tuples: freshV1Tuples,
-                dedupKeyFn: (t) => coreTupleDedupKey('notif_v1', t),
-                fallbackIso: nowIso,
-                maxRows: COMPACT_CHUNK_MAX_ROWS,
-                maxJsonBytes: COMPACT_CHUNK_MAX_BYTES,
-                negateRowIds: false
-            });
-            actualV1Inserted = v1ChunkRes.inserted;
+        if (freshV1Tuples.length > 0 && !syncDegradedReason) {
+            try {
+                const v1ChunkRes = await appendTuplesToCompactTailChunk({
+                    db: env.DB_CORE,
+                    archiveTable: 'core_archive_chunks',
+                    kindColumn: 'core_kind',
+                    kindValue: 'notif_v1',
+                    tuples: freshV1Tuples,
+                    dedupKeyFn: (t) => coreTupleDedupKey('notif_v1', t),
+                    fallbackIso: nowIso,
+                    maxRows: COMPACT_CHUNK_MAX_ROWS,
+                    maxJsonBytes: COMPACT_CHUNK_MAX_BYTES,
+                    negateRowIds: false
+                });
+                actualV1Inserted = v1ChunkRes.inserted;
+            } catch (err) {
+                const r = classifyStorageWriteDegradation(err);
+                if (!r) throw err;
+                syncDegradedReason = mergeStorageDegradedReason(syncDegradedReason, r);
+            }
         }
         let actualV2Inserted = 0;
-        if (v2Tuples.length > 0) {
-            const v2ChunkRes = await appendTuplesToCompactTailChunk({
-                db: env.DB_CORE,
-                archiveTable: 'core_archive_chunks',
-                kindColumn: 'core_kind',
-                kindValue: 'notif_v2',
-                tuples: v2Tuples,
-                dedupKeyFn: (t) => coreTupleDedupKey('notif_v2', t),
-                mergeConflictTuple: (existing, incoming) => {
-                    const next = [...existing];
-                    const incUpdated = String(incoming[2] ?? '');
-                    if (incUpdated) next[2] = incUpdated;
-                    const curExp = String(existing[3] ?? '');
-                    const incExp = String(incoming[3] ?? '');
-                    if (incExp && (!curExp || incExp < curExp)) next[3] = incExp;
-                    next[5] = incoming[5];
-                    next[6] = incoming[6];
-                    next[7] = incoming[7];
-                    next[8] = incoming[8];
-                    next[9] = incoming[9];
-                    next[10] = Math.max(Number(existing[10] ?? 0) ? 1 : 0, Number(incoming[10] ?? 0) ? 1 : 0);
-                    next[13] = incoming[13];
-                    next[14] = incoming[14];
-                    next[15] = incoming[15];
-                    return JSON.stringify(next) !== JSON.stringify(existing) ? next : null;
-                },
-                fallbackIso: nowIso,
-                maxRows: COMPACT_CHUNK_MAX_ROWS,
-                maxJsonBytes: COMPACT_CHUNK_MAX_BYTES,
-                negateRowIds: false
-            });
-            actualV2Inserted = v2ChunkRes.inserted;
+        if (v2Tuples.length > 0 && !syncDegradedReason) {
+            try {
+                const v2ChunkRes = await appendTuplesToCompactTailChunk({
+                    db: env.DB_CORE,
+                    archiveTable: 'core_archive_chunks',
+                    kindColumn: 'core_kind',
+                    kindValue: 'notif_v2',
+                    tuples: v2Tuples,
+                    dedupKeyFn: (t) => coreTupleDedupKey('notif_v2', t),
+                    mergeConflictTuple: (existing, incoming) => {
+                        const next = [...existing];
+                        const incUpdated = String(incoming[2] ?? '');
+                        if (incUpdated) next[2] = incUpdated;
+                        const curExp = String(existing[3] ?? '');
+                        const incExp = String(incoming[3] ?? '');
+                        if (incExp && (!curExp || incExp < curExp)) next[3] = incExp;
+                        next[5] = incoming[5];
+                        next[6] = incoming[6];
+                        next[7] = incoming[7];
+                        next[8] = incoming[8];
+                        next[9] = incoming[9];
+                        next[10] = Math.max(Number(existing[10] ?? 0) ? 1 : 0, Number(incoming[10] ?? 0) ? 1 : 0);
+                        next[13] = incoming[13];
+                        next[14] = incoming[14];
+                        next[15] = incoming[15];
+                        return JSON.stringify(next) !== JSON.stringify(existing) ? next : null;
+                    },
+                    fallbackIso: nowIso,
+                    maxRows: COMPACT_CHUNK_MAX_ROWS,
+                    maxJsonBytes: COMPACT_CHUNK_MAX_BYTES,
+                    negateRowIds: false
+                });
+                actualV2Inserted = v2ChunkRes.inserted;
+            } catch (err) {
+                const r = classifyStorageWriteDegradation(err);
+                if (!r) throw err;
+                syncDegradedReason = mergeStorageDegradedReason(syncDegradedReason, r);
+            }
         }
         let actualFriendLogInserted = 0;
-        if (friendLogPrep.historyTuples.length > 0) {
-            const flChunkRes = await appendTuplesToCompactTailChunk({
-                db: env.DB_CORE,
-                archiveTable: 'core_archive_chunks',
-                kindColumn: 'core_kind',
-                kindValue: 'friend_log',
-                tuples: friendLogPrep.historyTuples,
-                dedupKeyFn: (t) => coreTupleDedupKey('friend_log', t),
-                fallbackIso: nowIso,
-                maxRows: COMPACT_CHUNK_MAX_ROWS,
-                maxJsonBytes: COMPACT_CHUNK_MAX_BYTES,
-                negateRowIds: false
-            });
-            actualFriendLogInserted = flChunkRes.inserted;
+        if (friendLogPrep.historyTuples.length > 0 && !syncDegradedReason) {
+            try {
+                const flChunkRes = await appendTuplesToCompactTailChunk({
+                    db: env.DB_CORE,
+                    archiveTable: 'core_archive_chunks',
+                    kindColumn: 'core_kind',
+                    kindValue: 'friend_log',
+                    tuples: friendLogPrep.historyTuples,
+                    dedupKeyFn: (t) => coreTupleDedupKey('friend_log', t),
+                    fallbackIso: nowIso,
+                    maxRows: COMPACT_CHUNK_MAX_ROWS,
+                    maxJsonBytes: COMPACT_CHUNK_MAX_BYTES,
+                    negateRowIds: false
+                });
+                actualFriendLogInserted = flChunkRes.inserted;
+            } catch (err) {
+                const r = classifyStorageWriteDegradation(err);
+                if (!r) throw err;
+                syncDegradedReason = mergeStorageDegradedReason(syncDegradedReason, r);
+            }
         }
         const effectiveNotifInserted = actualV1Inserted + actualV2Inserted;
         nextMeta.lastNotificationsInserted = effectiveNotifInserted;
@@ -2000,35 +2030,51 @@ export async function runBackgroundFeedSync(
         // Step 3a: Commit all DB_CORE writes (friend_log_history, friend_log_current, snapshot, nextMeta)
         // in one atomic D1 batch transaction while keeping poller_lock held through Step 3b and Step 3c
         // (finally block releases poller_lock once all shards finish).
-        if (coreFinalStmts.length > 0) {
-            await env.DB_CORE.batch(coreFinalStmts);
+        if (coreFinalStmts.length > 0 && !syncDegradedReason) {
+            try {
+                await env.DB_CORE.batch(coreFinalStmts);
+            } catch (err) {
+                const r = classifyStorageWriteDegradation(err);
+                if (!r) throw err;
+                syncDegradedReason = mergeStorageDegradedReason(syncDegradedReason, r);
+            }
         }
 
         // Step 3b: Write DB_FEED after DB_CORE succeeded (all feed tables carry UNIQUE dedup constraints).
         // Retry once on transient D1 error; if still failing, surface error status rather than silently reporting ok.
         let feedInserted = 0;
         let feedWriteError = '';
-        if (feedItems.length > 0) {
+        if (feedItems.length > 0 && !syncDegradedReason) {
             try {
                 const ingestRes = await ingestFeedItems(env, feedItems);
                 feedInserted = ingestRes.inserted;
             } catch (firstErr) {
-                try {
-                    const retryRes = await ingestFeedItems(env, feedItems);
-                    feedInserted = retryRes.inserted;
-                } catch (secondErr) {
-                    const errObj = secondErr ?? firstErr;
-                    feedWriteError = errObj instanceof Error ? errObj.message : 'Feed DB write failed';
-                    await writePollerMeta(
-                        env,
-                        {
-                            ...nextMeta,
-                            lastStatus: 'error',
-                            lastFeedInserted: 0,
-                            lastError: `Feed persist error: ${feedWriteError}`.slice(0, 240)
-                        },
-                        nowIso
-                    ).catch(() => {});
+                const firstDegraded = classifyStorageWriteDegradation(firstErr);
+                if (firstDegraded) {
+                    syncDegradedReason = mergeStorageDegradedReason(syncDegradedReason, firstDegraded);
+                } else {
+                    try {
+                        const retryRes = await ingestFeedItems(env, feedItems);
+                        feedInserted = retryRes.inserted;
+                    } catch (secondErr) {
+                        const errObj = secondErr ?? firstErr;
+                        const secondDegraded = classifyStorageWriteDegradation(errObj);
+                        if (secondDegraded) {
+                            syncDegradedReason = mergeStorageDegradedReason(syncDegradedReason, secondDegraded);
+                        } else {
+                            feedWriteError = errObj instanceof Error ? errObj.message : 'Feed DB write failed';
+                            await writePollerMeta(
+                                env,
+                                {
+                                    ...nextMeta,
+                                    lastStatus: 'error',
+                                    lastFeedInserted: 0,
+                                    lastError: `Feed persist error: ${feedWriteError}`.slice(0, 240)
+                                },
+                                nowIso
+                            ).catch(() => {});
+                        }
+                    }
                 }
             }
         }
@@ -2057,26 +2103,50 @@ export async function runBackgroundFeedSync(
             const cacheDb = getCacheDb(env);
             try {
                 await cacheDb.batch([...vrcCacheStmts, rssSnapshotStmt]);
-            } catch {
-                await rssSnapshotStmt.run().catch(() => {});
+            } catch (cacheErr) {
+                const cr = classifyStorageWriteDegradation(cacheErr);
+                if (cr) {
+                    syncDegradedReason = mergeStorageDegradedReason(syncDegradedReason, cr);
+                } else {
+                    await rssSnapshotStmt.run().catch((rssErr) => {
+                        const rr = classifyStorageWriteDegradation(rssErr);
+                        if (rr) {
+                            syncDegradedReason = mergeStorageDegradedReason(syncDegradedReason, rr);
+                        }
+                    });
+                }
             }
             committedRssSnapshot = rssSnapshotPayload;
         }
 
         return {
             ran: true,
-            status: feedWriteError ? 'error' : nextMeta.lastStatus,
+            status: syncDegradedReason ? 'degraded_storage' : feedWriteError ? 'error' : nextMeta.lastStatus,
             onlineCount: inGameCount,
             feedInserted,
             notificationsInserted: effectiveNotifInserted,
             bioChecked: bioRes.bioChecked,
             friendLogInserted: actualFriendLogInserted,
+            ...(syncDegradedReason ? { degradedReason: syncDegradedReason } : {}),
             ...(feedWriteError ? { error: feedWriteError.slice(0, 240) } : {}),
             ...(committedRssSnapshot ? { rssSnapshot: committedRssSnapshot } : {}),
             webSyncIntervalSeconds,
             hasVrcSession: sessionStillSameForCache
         };
     } catch (err) {
+        const degraded = classifyStorageWriteDegradation(err);
+        if (degraded) {
+            return {
+                ran: true,
+                status: 'degraded_storage',
+                onlineCount: meta.lastOnlineCount,
+                feedInserted: 0,
+                notificationsInserted: 0,
+                bioChecked: 0,
+                friendLogInserted: 0,
+                degradedReason: mergeStorageDegradedReason(syncDegradedReason, degraded) ?? degraded
+            };
+        }
         const msg = err instanceof Error ? err.message : 'Unexpected background sync error';
         const errorMeta: PollerMeta = {
             ...meta,

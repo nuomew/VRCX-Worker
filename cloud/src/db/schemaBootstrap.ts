@@ -1,4 +1,5 @@
 import type { Env } from '../env';
+import { isStorageWriteDegradableError } from './storageResilience';
 
 let schemaInitialized = false;
 let initPromise: Promise<void> | null = null;
@@ -914,20 +915,30 @@ async function initCoreIfNeeded(db: D1Database): Promise<void> {
     const dedupStartIdx = CORE_STATEMENTS.findIndex((sql) => sql.startsWith('DELETE FROM cloud_screenshots '));
     const dedupEndIdx = dedupStartIdx >= 0 ? dedupStartIdx + 3 : -1;
     let cursor = 0;
-    while (cursor < CORE_STATEMENTS.length) {
-        let nextEnd = Math.min(cursor + 20, CORE_STATEMENTS.length);
-        if (dedupStartIdx >= 0 && cursor < dedupStartIdx && nextEnd > dedupStartIdx && nextEnd < dedupEndIdx) {
-            nextEnd = dedupStartIdx;
-        } else if (dedupStartIdx >= 0 && cursor === dedupStartIdx && nextEnd < dedupEndIdx) {
-            nextEnd = dedupEndIdx;
+    try {
+        while (cursor < CORE_STATEMENTS.length) {
+            let nextEnd = Math.min(cursor + 20, CORE_STATEMENTS.length);
+            if (dedupStartIdx >= 0 && cursor < dedupStartIdx && nextEnd > dedupStartIdx && nextEnd < dedupEndIdx) {
+                nextEnd = dedupStartIdx;
+            } else if (dedupStartIdx >= 0 && cursor === dedupStartIdx && nextEnd < dedupEndIdx) {
+                nextEnd = dedupEndIdx;
+            }
+            await db.batch(CORE_STATEMENTS.slice(cursor, nextEnd).map((sql) => db.prepare(sql)));
+            cursor = nextEnd;
         }
-        await db.batch(CORE_STATEMENTS.slice(cursor, nextEnd).map((sql) => db.prepare(sql)));
-        cursor = nextEnd;
+        await db
+            .prepare("INSERT OR REPLACE INTO schema_meta (meta_key, meta_value) VALUES ('version', ?)")
+            .bind(SCHEMA_VERSION)
+            .run();
+    } catch (err) {
+        if (isStorageWriteDegradableError(err)) {
+            const probe = await db.prepare('SELECT 1 FROM config_bundles LIMIT 1').first().catch(() => null);
+            if (probe) {
+                return;
+            }
+        }
+        throw err;
     }
-    await db
-        .prepare("INSERT OR REPLACE INTO schema_meta (meta_key, meta_value) VALUES ('version', ?)")
-        .bind(SCHEMA_VERSION)
-        .run();
 }
 
 async function initShardIfNeeded(
@@ -961,19 +972,29 @@ async function initLegacyIfNeeded(db: D1Database): Promise<void> {
     } catch {
         // legacy_migration_state does not exist yet
     }
-    for (let i = 0; i < LEGACY_STATEMENTS.length; i += 20) {
-        await db.batch(LEGACY_STATEMENTS.slice(i, i + 20).map((sql) => db.prepare(sql)));
+    try {
+        for (let i = 0; i < LEGACY_STATEMENTS.length; i += 20) {
+            await db.batch(LEGACY_STATEMENTS.slice(i, i + 20).map((sql) => db.prepare(sql)));
+        }
+        await db
+            .prepare(
+                `INSERT INTO legacy_migration_state (state_key, payload_json, updated_at)
+                 VALUES ('schema_version', ?, ?)
+                 ON CONFLICT(state_key) DO UPDATE SET
+                    payload_json = excluded.payload_json,
+                    updated_at = excluded.updated_at`
+            )
+            .bind(LEGACY_SCHEMA_VERSION, new Date().toISOString())
+            .run();
+    } catch (err) {
+        if (isStorageWriteDegradableError(err)) {
+            const probe = await db.prepare('SELECT 1 FROM legacy_migration_state LIMIT 1').first().catch(() => null);
+            if (probe) {
+                return;
+            }
+        }
+        throw err;
     }
-    await db
-        .prepare(
-            `INSERT INTO legacy_migration_state (state_key, payload_json, updated_at)
-             VALUES ('schema_version', ?, ?)
-             ON CONFLICT(state_key) DO UPDATE SET
-                payload_json = excluded.payload_json,
-                updated_at = excluded.updated_at`
-        )
-        .bind(LEGACY_SCHEMA_VERSION, new Date().toISOString())
-        .run();
 }
 
 /**

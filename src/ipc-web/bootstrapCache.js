@@ -320,6 +320,9 @@ function scheduleConfigFlush(delayMs) {
                         pendingConfigPatch[k] = v;
                     }
                 }
+                if (err?.code === 'STORAGE_READ_ONLY' || cloudState.storageDegraded.active) {
+                    return;
+                }
                 if (
                     Object.keys(pendingConfigPatch).length > 0 &&
                     !flushConfigTimer &&
@@ -360,6 +363,9 @@ function scheduleStorageFlush(delayMs) {
                     if (!Object.prototype.hasOwnProperty.call(pendingStoragePatch, k)) {
                         pendingStoragePatch[k] = v;
                     }
+                }
+                if (err?.code === 'STORAGE_READ_ONLY' || cloudState.storageDegraded.active) {
+                    return;
                 }
                 if (
                     Object.keys(pendingStoragePatch).length > 0 &&

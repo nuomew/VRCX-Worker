@@ -2456,4 +2456,82 @@ describe('External MySQL 5.7+ Database Integration (Hybrid New-Writes Mode & Ful
             clearMysqlSchemaReadyCache();
         }
     });
+
+    it('falls back cleanly to native D1 reads and Read-Only Basic Mode when external MySQL is offline or full', async () => {
+        await ensureSchemaReady(env);
+        const headers = { 'Content-Type': 'application/json', Origin: 'http://example.com' };
+        let mysqlDownMode: 'refused' | 'full' = 'refused';
+        setMysqlConnectionFactoryForTests(async () => {
+            if (mysqlDownMode === 'refused') {
+                throw Object.assign(new Error('connect ECONNREFUSED 203.0.113.50:3306'), { code: 'ECONNREFUSED' });
+            }
+            return {
+                async execute() {
+                    throw Object.assign(new Error('The table vrcx_feed_archive_chunks is full'), {
+                        code: 'ER_RECORD_FILE_FULL',
+                        errno: 1114
+                    });
+                },
+                async close() {}
+            };
+        });
+
+        try {
+            // Seed a native D1 feed event while MySQL is disabled so D1 has baseline read data
+            await env.DB_FEED.prepare(
+                `INSERT OR IGNORE INTO feed_status (created_at, user_id, display_name, status, status_description, previous_status, previous_status_description)
+                 VALUES ('2026-11-28T02:00:00.000Z', 'usr_mysql_fallback', 'FallbackFriend', 'active', 'Online in D1', 'active', '')`
+            ).run();
+
+            expect(
+                (
+                    await exports.default.fetch('http://example.com/api/storage/mysql/config', {
+                        method: 'PUT',
+                        headers,
+                        body: JSON.stringify({
+                            enabled: true,
+                            mode: 'new_writes_only',
+                            connectionType: 'direct',
+                            host: 'db.example.com',
+                            port: 3306,
+                            database: 'vrcx_db',
+                            username: 'vrcx',
+                            password: 'secret',
+                            sslMode: 'disabled',
+                            tablePrefix: 'vrcx_'
+                        })
+                    })
+                ).status
+            ).toBe(200);
+
+            // 1. ECONNREFUSED on MySQL: GET /api/feed falls back cleanly to D1 rows + sets external_db_unavailable header
+            mysqlDownMode = 'refused';
+            const feedGetRes = await exports.default.fetch('http://example.com/api/feed?limit=20');
+            expect(feedGetRes.status).toBe(200);
+            expect(feedGetRes.headers.get('X-VRCX-Storage-Degraded')).toBe('external_db_unavailable');
+            const feedGetJson = (await feedGetRes.json()) as { data: Array<{ userId?: string }> };
+            expect(feedGetJson.data.some((r) => r.userId === 'usr_mysql_fallback')).toBe(true);
+
+            // 2. ER_RECORD_FILE_FULL on MySQL writes: POST /api/feed degrades cleanly to 200 + storage_full header
+            mysqlDownMode = 'full';
+            const feedPostRes = await exports.default.fetch('http://example.com/api/feed', {
+                method: 'POST',
+                headers,
+                body: JSON.stringify({
+                    items: [{ type: 'Online', created_at: '2026-11-28T02:01:00.000Z', userId: 'usr_2', displayName: 'B' }]
+                })
+            });
+            expect(feedPostRes.status).toBe(200);
+            expect(feedPostRes.headers.get('X-VRCX-Storage-Degraded')).toBe('storage_full');
+            const feedPostJson = (await feedPostRes.json()) as { data: { degraded?: string } };
+            expect(feedPostJson.data.degraded).toBe('storage_full');
+        } finally {
+            setMysqlConnectionFactoryForTests(null);
+            await env.DB_FEED.prepare("DELETE FROM feed_status WHERE user_id = 'usr_mysql_fallback'").run().catch(() => {});
+            await saveExternalDbConfig(env, defaultExternalDbConfig());
+            await saveExternalDbMigrationState(env, defaultExternalDbMigrationState());
+            invalidateExternalDbConfigCache();
+            clearMysqlSchemaReadyCache();
+        }
+    });
 });

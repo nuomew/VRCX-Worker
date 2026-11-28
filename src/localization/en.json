@@ -4104,6 +4104,12 @@
             "mysql_migrate_done_toast": "Full migration complete: verified {chunks} chunks ({rows} rows) in MySQL 5.7 and freed D1 space.",
             "mysql_migrate_more_toast": "Moved {chunks} chunks ({rows} rows) this round. Click Resume Migration to finish remaining data."
         },
+        "storage_degraded": {
+            "banner_full": "Database write/storage quota reached — running in Read-Only Basic Mode (live friends, worlds, and OSC chat continue working; new logs are temporarily skipped).",
+            "banner_mysql_down": "External MySQL server is temporarily unreachable — running in Read-Only Basic Mode (live friends, worlds, and OSC chat continue working).",
+            "open_storage_btn": "Open Storage",
+            "dismiss_btn": "Dismiss"
+        },
         "settings": {
             "restoring_session": "Restoring session...",
             "sync_interval_label": "Cloud Sync Interval (Web & Background Feed)",

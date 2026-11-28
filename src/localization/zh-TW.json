@@ -3751,6 +3751,12 @@
             "mysql_migrate_done_toast": "全量遷移完成：共安全搬遷 {chunks} 個分塊（{rows} 筆記錄）至 MySQL 5.7，並已釋放 D1 空間。",
             "mysql_migrate_more_toast": "本輪已完成 {chunks} 塊（{rows} 筆）搬遷，請點擊「繼續斷點遷移」處理剩餘資料。"
         },
+        "storage_degraded": {
+            "banner_full": "資料庫寫入/儲存額度已滿，目前已自動進入唯讀基礎模式（好友在線狀態、看世界、進房、OSC 聊天正常可用，新日誌暫不落盤）。",
+            "banner_mysql_down": "外置 MySQL 資料庫暫時無法連線，目前已自動進入唯讀基礎模式（即時狀態、看世界與 OSC 聊天仍可正常使用）。",
+            "open_storage_btn": "開啟儲存設定",
+            "dismiss_btn": "收起"
+        },
         "settings": {
             "restoring_session": "正在恢復工作階段...",
             "sync_interval_label": "雲端同步間隔（網頁端與背景動態）",
